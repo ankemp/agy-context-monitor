@@ -1,0 +1,88 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100" fill="none">
+  <defs>
+    <!-- Ambient & Neon Glow Filter -->
+    <filter id="neon-glow" x="-25%" y="-25%" width="150%" height="150%">
+      <feGaussianBlur stdDeviation="3.5" result="blur1"/>
+      <feGaussianBlur stdDeviation="7" result="blur2"/>
+      <feMerge>
+        <feMergeNode in="blur2"/>
+        <feMergeNode in="blur1"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+
+    <!-- Gradients -->
+    <linearGradient id="orbit-grad" x1="10" y1="30" x2="90" y2="70" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#38bdf8" stop-opacity="0.95"/>
+      <stop offset="50%" stop-color="#818cf8" stop-opacity="0.3"/>
+      <stop offset="100%" stop-color="#c084fc" stop-opacity="0.95"/>
+    </linearGradient>
+
+    <linearGradient id="facet-left" x1="20" y1="15" x2="45" y2="85" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#38bdf8"/>
+      <stop offset="55%" stop-color="#4f46e5"/>
+      <stop offset="100%" stop-color="#1e1b4b"/>
+    </linearGradient>
+
+    <linearGradient id="facet-right" x1="50" y1="15" x2="80" y2="85" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#67e8f9"/>
+      <stop offset="50%" stop-color="#6366f1"/>
+      <stop offset="100%" stop-color="#312e81"/>
+    </linearGradient>
+
+    <linearGradient id="facet-center" x1="50" y1="20" x2="50" y2="62" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#e0e7ff" stop-opacity="0.95"/>
+      <stop offset="50%" stop-color="#a855f7" stop-opacity="0.8"/>
+      <stop offset="100%" stop-color="#4338ca" stop-opacity="0.95"/>
+    </linearGradient>
+
+    <linearGradient id="facet-top" x1="44" y1="10" x2="56" y2="22" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#ffffff"/>
+      <stop offset="100%" stop-color="#38bdf8"/>
+    </linearGradient>
+
+    <linearGradient id="core-glow" x1="25" y1="62" x2="75" y2="62" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#22d3ee"/>
+      <stop offset="50%" stop-color="#818cf8"/>
+      <stop offset="100%" stop-color="#c084fc"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Background Glow & Energy Halo -->
+  <circle cx="50" cy="50" r="36" fill="#6366f1" opacity="0.12" filter="url(#neon-glow)"/>
+
+  <!-- Zero-Gravity Orbital Energy Loop -->
+  <path d="M16 64 C12 50, 26 32, 54 28 C76 25, 88 34, 84 46 C80 58, 66 69, 42 73 C26 76, 17 72, 16 64 Z" 
+        stroke="url(#orbit-grad)" stroke-width="1.8" stroke-dasharray="3 3" opacity="0.75" fill="none"/>
+
+  <!-- Left Main Leg -->
+  <polygon points="50,15 20,82 34,82 50,42" fill="url(#facet-left)"/>
+  <!-- Left Outer Bevel -->
+  <polygon points="50,15 20,82 14,75 44,12" fill="#0284c7" opacity="0.85"/>
+
+  <!-- Right Main Leg -->
+  <polygon points="50,15 80,82 66,82 50,42" fill="url(#facet-right)"/>
+  <!-- Right Outer Bevel -->
+  <polygon points="50,15 80,82 86,75 56,12" fill="#0891b2" opacity="0.85"/>
+
+  <!-- Center Facet / Inner Depth Prism -->
+  <polygon points="50,22 36,60 64,60" fill="url(#facet-center)"/>
+
+  <!-- Top Apex Crystal Cap -->
+  <polygon points="50,12 44,18 50,22 56,18" fill="url(#facet-top)"/>
+
+  <!-- Zero-Gravity Energy Crossbar (Glowing Bridge) -->
+  <line x1="27" y1="62" x2="73" y2="62" stroke="url(#core-glow)" stroke-width="3.6" stroke-linecap="round" filter="url(#neon-glow)"/>
+  <line x1="31" y1="62" x2="69" y2="62" stroke="#ffffff" stroke-width="1.4" stroke-linecap="round"/>
+
+  <!-- High-Tech Sharp Edge Outlines -->
+  <polyline points="20,82 50,15 80,82" stroke="#38bdf8" stroke-width="1.4" stroke-linejoin="round" fill="none" opacity="0.95"/>
+  <polyline points="14,75 44,12 50,15 56,12 86,75" stroke="#67e8f9" stroke-width="1.1" stroke-linejoin="round" fill="none" opacity="0.8"/>
+
+  <!-- Floating Energy Spark Particles -->
+  <circle cx="22" cy="36" r="1.6" fill="#38bdf8" filter="url(#neon-glow)"/>
+  <circle cx="78" cy="30" r="1.4" fill="#c084fc" filter="url(#neon-glow)"/>
+  <circle cx="50" cy="8" r="2.2" fill="#ffffff" filter="url(#neon-glow)"/>
+  <circle cx="74" cy="72" r="1.5" fill="#22d3ee" filter="url(#neon-glow)"/>
+  <circle cx="26" cy="70" r="1.2" fill="#a855f7" filter="url(#neon-glow)"/>
+</svg>

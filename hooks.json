@@ -1,0 +1,11 @@
+{
+  "context-indicator": {
+    "PostInvocation": [
+      {
+        "type": "command",
+        "command": "uv run --no-project ./scripts/show_usage.py",
+        "timeout": 10
+      }
+    ]
+  }
+}
