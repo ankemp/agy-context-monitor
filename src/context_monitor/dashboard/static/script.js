@@ -584,15 +584,17 @@
       if (btn30d) btn30d.className = days === 30 ? btnClasses.active : btnClasses.inactive;
       if (btnAll) btnAll.className = days === null ? btnClasses.active : btnClasses.inactive;
       
-      const sliced = (days && allTimelineData.length > days) ? allTimelineData.slice(-days) : allTimelineData;
+      const sliced = days ? allTimelineData.slice(-days) : allTimelineData;
       renderTimelineChart(sliced);
     }
+    window.setTimelineRange = setTimelineRange;
 
     function renderTimelineChart(data) {
       const ctx = document.getElementById('timelineChart').getContext('2d');
       const labels = data.map(d => d.day);
       const tokens = data.map(d => d.tokens);
       const sessions = data.map(d => d.sessions);
+      const costs = data.map(d => d.cost || 0);
 
       if (timelineChart) timelineChart.destroy();
 
@@ -608,7 +610,21 @@
               borderColor: '#6366f1',
               borderWidth: 1,
               borderRadius: 4,
-              yAxisID: 'y'
+              yAxisID: 'y',
+              order: 3
+            },
+            {
+              label: 'Est. API Value ($)',
+              data: costs,
+              type: 'line',
+              borderColor: '#f43f5e',
+              backgroundColor: '#f43f5e',
+              borderWidth: 2,
+              tension: 0.3,
+              pointRadius: 2,
+              pointHoverRadius: 4,
+              yAxisID: 'yCost',
+              order: 1
             },
             {
               label: 'Sessions',
@@ -619,7 +635,9 @@
               borderWidth: 2,
               tension: 0.3,
               pointRadius: 2,
-              yAxisID: 'y1'
+              pointHoverRadius: 4,
+              yAxisID: 'y1',
+              order: 2
             }
           ]
         },
@@ -631,22 +649,40 @@
             legend: { labels: { color: '#9ca3af', font: { size: 11 } } },
             tooltip: {
               callbacks: {
-                label: (ctx) => ctx.datasetIndex === 0 ? `Tokens: ${formatTokens(ctx.raw)}` : `Sessions: ${ctx.raw}`
+                label: (ctx) => {
+                  if (ctx.dataset.label === 'Tokens Consumed') return `Tokens: ${formatTokens(ctx.raw)}`;
+                  if (ctx.dataset.label === 'Est. API Value ($)') return `Est. API Value: $${Number(ctx.raw || 0).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}`;
+                  return `Sessions: ${ctx.raw}`;
+                }
               }
             }
           },
           scales: {
             x: { grid: { color: '#1f2937' }, ticks: { color: '#9ca3af', maxTicksLimit: 12, font: { size: 10 } } },
             y: {
+              type: 'linear',
+              position: 'left',
               grid: { color: '#1f2937' },
               ticks: { color: '#9ca3af', callback: v => formatTokens(v), font: { size: 10 } },
               title: { display: true, text: 'Tokens', color: '#6b7280', font: { size: 10 } }
             },
             y1: {
+              type: 'linear',
               position: 'right',
               grid: { drawOnChartArea: false },
               ticks: { color: '#38bdf8', font: { size: 10 } },
               title: { display: true, text: 'Sessions', color: '#38bdf8', font: { size: 10 } }
+            },
+            yCost: {
+              type: 'linear',
+              position: 'right',
+              grid: { drawOnChartArea: false },
+              ticks: {
+                color: '#f43f5e',
+                callback: v => '$' + (v >= 1000 ? (v / 1000).toFixed(1) + 'k' : v.toFixed(v < 10 ? 2 : 0)),
+                font: { size: 10 }
+              },
+              title: { display: true, text: 'Est. API Value', color: '#f43f5e', font: { size: 10 } }
             }
           }
         }

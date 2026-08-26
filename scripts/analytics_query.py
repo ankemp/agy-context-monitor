@@ -462,12 +462,36 @@ def print_hot_files(conn):
 def print_timeline(conn, days: int = 14):
     local_tz = datetime.now().astimezone().tzinfo
     tz_abbr = datetime.now().astimezone().strftime('%Z')
-    print("\n" + "=" * 70)
+    print("\n" + "=" * 75)
     print(f" 📅 ACTIVITY TIMELINE (LAST {days} DAYS — {tz_abbr})")
-    print("=" * 70)
+    print("=" * 75)
     cur = conn.cursor()
+
+    conv_costs = {}
+    cur.execute("""
+        SELECT s.conversation_id, COALESCE(s.model_name, c.model_name, 'Gemini Flash'), s.step_type, s.est_tokens
+        FROM steps s
+        JOIN conversations c ON s.conversation_id = c.id
+        ORDER BY s.conversation_id, s.step_index ASC
+    """)
+    cur_conv = None
+    running_ctx = 0
+    for cid, model_name, s_type, tokens in cur.fetchall():
+        if cid != cur_conv:
+            cur_conv = cid
+            running_ctx = 0
+            conv_costs[cid] = 0.0
+        cur_pkey = get_pricing_key(model_name)
+        if s_type == "PLANNER_RESPONSE":
+            in_rate_low, in_rate_high, out_rate = PRICING[cur_pkey]
+            in_rate = in_rate_high if running_ctx > 128_000 else in_rate_low
+            conv_costs[cid] += (running_ctx / 1_000_000 * in_rate) + (tokens / 1_000_000 * out_rate)
+            running_ctx += tokens
+        else:
+            running_ctx += tokens
+
     rows = cur.execute("""
-        SELECT created_at, total_steps, total_tokens
+        SELECT id, created_at, total_steps, total_tokens
         FROM conversations
         WHERE created_at IS NOT NULL AND created_at != ''
     """).fetchall()
@@ -478,20 +502,21 @@ def print_timeline(conn, days: int = 14):
             dt = datetime.fromisoformat(r["created_at"].replace("Z", "+00:00")).astimezone(local_tz)
             d_str = dt.strftime("%Y-%m-%d")
             if d_str not in daily_map:
-                daily_map[d_str] = {"sessions": 0, "steps": 0, "tokens": 0}
+                daily_map[d_str] = {"sessions": 0, "steps": 0, "tokens": 0, "cost": 0.0}
             daily_map[d_str]["sessions"] += 1
             daily_map[d_str]["steps"] += r["total_steps"] or 0
             daily_map[d_str]["tokens"] += r["total_tokens"] or 0
+            daily_map[d_str]["cost"] += conv_costs.get(r["id"], 0.0)
         except Exception:
             pass
 
     sorted_days = sorted(daily_map.keys())[-days:]
-    print(f"  {'Date (' + tz_abbr + ')':<14} | {'Sessions':<10} | {'Steps Logged':<14} | {'Tokens Consumed':<16}")
-    print("  " + "-" * 60)
+    print(f"  {'Date (' + tz_abbr + ')':<14} | {'Sessions':<10} | {'Steps Logged':<14} | {'Tokens Consumed':<16} | {'Est API Value':<14}")
+    print("  " + "-" * 75)
     for day in reversed(sorted_days):
         info = daily_map[day]
-        print(f"  {day:<14} | {info['sessions']:<10,}| {info['steps']:<14,}| {format_tokens(info['tokens']):<16}")
-    print("=" * 70 + "\n")
+        print(f"  {day:<14} | {info['sessions']:<10,}| {info['steps']:<14,}| {format_tokens(info['tokens']):<16} | ${info['cost']:<13,.2f}")
+    print("=" * 75 + "\n")
 
 def generate_global_report(conn, output_path: Path = Path(os.path.expanduser("~/.gemini/antigravity/global_analytics.md"))):
     cur = conn.cursor()

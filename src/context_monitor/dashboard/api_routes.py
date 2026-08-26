@@ -206,8 +206,33 @@ def query_summary_data(conn, tz=None):
 
 def query_timeline_data(conn, days=None, tz=None):
     cur = conn.cursor()
+
+    # Pre-calculate conversation cost map
+    conv_costs = {}
+    cur.execute("""
+        SELECT s.conversation_id, COALESCE(s.model_name, c.model_name, 'Gemini Flash'), s.step_type, s.est_tokens
+        FROM steps s
+        JOIN conversations c ON s.conversation_id = c.id
+        ORDER BY s.conversation_id, s.step_index ASC
+    """)
+    cur_conv = None
+    running_ctx = 0
+    for cid, model_name, s_type, tokens in cur.fetchall():
+        if cid != cur_conv:
+            cur_conv = cid
+            running_ctx = 0
+            conv_costs[cid] = 0.0
+        cur_pkey = get_pricing_key(model_name)
+        if s_type == "PLANNER_RESPONSE":
+            in_rate_low, in_rate_high, out_rate = PRICING[cur_pkey]
+            in_rate = in_rate_high if running_ctx > 128_000 else in_rate_low
+            conv_costs[cid] += (running_ctx / 1_000_000 * in_rate) + (tokens / 1_000_000 * out_rate)
+            running_ctx += tokens
+        else:
+            running_ctx += tokens
+
     rows = cur.execute("""
-        SELECT created_at, total_steps, total_tokens
+        SELECT id, created_at, total_steps, total_tokens
         FROM conversations
         WHERE created_at IS NOT NULL AND created_at != ''
     """).fetchall()
@@ -221,13 +246,18 @@ def query_timeline_data(conn, days=None, tz=None):
             continue
         day_str = dt.strftime("%Y-%m-%d")
         if day_str not in daily_map:
-            daily_map[day_str] = {"day": day_str, "sessions": 0, "steps": 0, "tokens": 0}
+            daily_map[day_str] = {"day": day_str, "sessions": 0, "steps": 0, "tokens": 0, "cost": 0.0}
         daily_map[day_str]["sessions"] += 1
         daily_map[day_str]["steps"] += r["total_steps"] or 0
         daily_map[day_str]["tokens"] += r["total_tokens"] or 0
+        daily_map[day_str]["cost"] += conv_costs.get(r["id"], 0.0)
 
     sorted_days = sorted(daily_map.keys())
-    timeline = [daily_map[d] for d in sorted_days]
+    timeline = []
+    for d in sorted_days:
+        item = daily_map[d]
+        item["cost"] = round(item["cost"], 2)
+        timeline.append(item)
 
     if days and len(timeline) > int(days):
         return timeline[-int(days):]

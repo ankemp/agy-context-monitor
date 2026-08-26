@@ -99,7 +99,8 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             if path == "/api/summary":
                 data = api_routes.query_summary_data(conn, target_tz)
             elif path == "/api/timeline":
-                days = int(qs.get("days", [7])[0])
+                days_param = qs.get("days", [None])[0]
+                days = int(days_param) if days_param else None
                 data = api_routes.query_timeline_data(conn, days, target_tz)
             elif path == "/api/tools":
                 data = api_routes.query_tools_data(conn)
