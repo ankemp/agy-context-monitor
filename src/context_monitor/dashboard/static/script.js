@@ -1067,9 +1067,7 @@
             <span class="text-[10px] text-gray-500 block">(${formatDuration(wallSec)})</span>
           </td>
           <td class="py-2.5 px-3 text-center">
-            <button onclick="inspectSession('${c.id}')" class="px-2.5 py-1 rounded bg-brand-600/80 hover:bg-brand-600 text-[11px] font-medium text-white transition">
-              Inspect
-            </button>
+            ${(typeof IS_STATIC_EXPORT !== "undefined" && IS_STATIC_EXPORT) ? "" : `<button onclick="inspectSession('${c.id}')" class="px-2.5 py-1 rounded bg-brand-600/80 hover:bg-brand-600 text-[11px] font-medium text-white transition">Inspect</button>`}
           </td>
         `;
         tbody.appendChild(tr);

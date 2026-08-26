@@ -112,8 +112,8 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             elif path == "/api/conversations":
                 limit = int(qs.get("limit", [200])[0])
                 data = api_routes.query_conversations_list(conn, limit, target_tz)
-            elif path == "/api/session":
-                session_id = qs.get("id", [""])[0]
+            elif path.startswith("/api/session/"):
+                session_id = path.split("/")[-1]
                 data = api_routes.query_session_details(conn, session_id, target_tz)
             else:
                 self.send_error(404)
@@ -211,6 +211,7 @@ def main():
     parser.add_argument("--export-html", type=str, help="Export a standalone offline HTML report to this path")
     parser.add_argument("--include-conversations", action="store_true", help="Include full conversation explorer in exported HTML")
     parser.add_argument("--tz", type=str, help="Target timezone (e.g. 'America/New_York') for exported report. Defaults to system local.")
+    parser.add_argument("--open", action="store_true", help="Automatically open the dashboard in the default web browser")
     args = parser.parse_args()
 
     if args.export_html:
@@ -231,7 +232,8 @@ def main():
         httpd = DashboardServer(server_address, DashboardHTTPHandler)
         url = f"http://{args.host}:{args.port}"
         print(f"Antigravity Analytics Live Dashboard: {url}")
-        threading.Timer(0.5, lambda: webbrowser.open(url)).start()
+        if args.open:
+            threading.Timer(0.5, lambda: webbrowser.open(url)).start()
         httpd.serve_forever()
     except KeyboardInterrupt:
         print("\nShutting down dashboard server...")
