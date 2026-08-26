@@ -20,12 +20,13 @@ import re
 from pathlib import Path
 from datetime import datetime
 
-try:
-    from db import get_db_connection, init_db, DEFAULT_DB_PATH
-except ImportError:
-    script_dir = Path(__file__).resolve().parent
-    sys.path.insert(0, str(script_dir))
-    from db import get_db_connection, init_db, DEFAULT_DB_PATH
+import sys
+from pathlib import Path
+_root = Path(__file__).resolve().parent.parent
+if str(_root / "src") not in sys.path:
+    sys.path.insert(0, str(_root / "src"))
+
+from context_monitor.db import get_db_connection, init_db, DEFAULT_DB_PATH
 
 CHARS_PER_TOKEN = 3.8
 

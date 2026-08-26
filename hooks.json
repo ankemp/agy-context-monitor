@@ -3,7 +3,7 @@
     "PostInvocation": [
       {
         "type": "command",
-        "command": "uv run --no-project ./scripts/show_usage.py",
+        "command": "uv run --no-project ./scripts/ingest.py",
         "timeout": 10
       }
     ]
