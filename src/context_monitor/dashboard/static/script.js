@@ -1234,12 +1234,321 @@
           sBody.appendChild(tr);
         }
 
+        renderFlowSequence(data.steps);
+        setSessionViewMode('flow');
+
         document.getElementById('sessionModal').classList.remove('hidden');
         document.getElementById('sessionModal').classList.add('flex');
         lucide.createIcons();
       } catch (err) {
         console.error("Failed to fetch session", err);
       }
+    }
+
+    function setSessionViewMode(mode) {
+      const btnTable = document.getElementById('btnViewTable');
+      const btnFlow = document.getElementById('btnViewFlow');
+      const tableContainer = document.getElementById('sessionViewTable');
+      const flowContainer = document.getElementById('sessionViewFlow');
+
+      const activeClass = 'px-2.5 py-1 rounded-md bg-brand-600 text-white font-medium shadow transition whitespace-nowrap';
+      const inactiveClass = 'px-2.5 py-1 rounded-md text-gray-400 hover:text-white transition whitespace-nowrap';
+
+      if (mode === 'table') {
+        btnTable.className = activeClass;
+        btnFlow.className = inactiveClass;
+        tableContainer.classList.remove('hidden');
+        flowContainer.classList.add('hidden');
+      } else {
+        btnFlow.className = activeClass;
+        btnTable.className = inactiveClass;
+        flowContainer.classList.remove('hidden');
+        tableContainer.classList.add('hidden');
+      }
+    }
+
+    function hashCode(str) {
+      let hash = 0;
+      if (!str || str.length === 0) return hash;
+      for (let i = 0; i < str.length; i++) {
+        const char = str.charCodeAt(i);
+        hash = ((hash << 5) - hash) + char;
+        hash = hash & hash;
+      }
+      return hash;
+    }
+
+    function getColorFromCallId(callId) {
+      const colors = ['#f87171', '#fb923c', '#fbbf24', '#a3e635', '#34d399', '#22d3ee', '#38bdf8', '#818cf8', '#a78bfa', '#e879f9', '#f43f5e'];
+      if (!callId) return '#6b7280';
+      const hash = Math.abs(hashCode(callId));
+      return colors[hash % colors.length];
+    }
+
+    function renderCollapsibleBody(content) {
+      if (!content) return '';
+      let formatted = content;
+      try {
+        const trimmed = content.trim();
+        if ((trimmed.startsWith('{') && trimmed.endsWith('}')) || (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
+          formatted = JSON.stringify(JSON.parse(trimmed), null, 2);
+        }
+      } catch (e) {}
+
+      const lines = formatted.split('\n');
+      const escapedContent = formatted.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+      if (lines.length > 15 || formatted.length > 800) {
+        return `
+          <details class="group mt-2">
+            <summary class="text-[10px] text-gray-400 cursor-pointer select-none hover:text-gray-200 transition font-mono flex items-center space-x-1 py-1">
+              <span class="inline-block transition group-open:rotate-90">▸</span>
+              <span>show ${lines.length} lines (${Math.round(formatted.length / 1024 * 10) / 10} KB)</span>
+            </summary>
+            <pre class="mt-1 text-[10px] text-gray-300 bg-dark-900/80 p-2.5 rounded border border-dark-700/60 whitespace-pre-wrap break-all overflow-x-auto max-h-[400px] overflow-y-auto font-mono leading-relaxed">${escapedContent}</pre>
+          </details>
+        `;
+      } else {
+        return `<pre class="mt-2 text-[10px] text-gray-300 bg-dark-900/80 p-2.5 rounded border border-dark-700/60 whitespace-pre-wrap break-all font-mono leading-relaxed">${escapedContent}</pre>`;
+      }
+    }
+
+    function renderFlowSequence(steps) {
+      const container = document.getElementById('modalFlowSequence');
+      container.innerHTML = '';
+
+      if (!steps || steps.length === 0) {
+        container.innerHTML = '<div class="text-xs text-gray-500 italic p-4 text-center">No steps found for this session.</div>';
+        return;
+      }
+
+      let subagentCidMap = {};
+
+      for (const step of steps) {
+        const blocks = (step.blocks && step.blocks.length > 0) ? step.blocks : [];
+
+        // Fallback for steps without parsed transcript blocks
+        if (blocks.length === 0) {
+          const row = document.createElement('div');
+          row.className = 'flex flex-col bg-dark-800 rounded-lg border border-dark-700 p-3.5 border-l-4 border-l-gray-600';
+          row.innerHTML = `
+            <div class="flex items-center justify-between">
+              <div class="flex items-center space-x-2 text-xs font-semibold text-gray-200">
+                <i data-lucide="layers" class="w-3.5 h-3.5 opacity-70"></i>
+                <span>${step.activity || 'Step'}</span>
+                <span class="text-gray-400 font-mono text-[11px] font-normal">(${step.tool_or_source || step.source || ''})</span>
+              </div>
+              <div class="text-[10px] text-gray-500 font-mono">Step #${step.step_index}</div>
+            </div>
+            ${step.detail ? `<div class="mt-1 text-[11px] text-gray-300 font-mono">${step.detail}</div>` : ''}
+          `;
+          container.appendChild(row);
+          continue;
+        }
+
+        for (const b of blocks) {
+          const blockType = b.block_type || b.type;
+          const callId = b.call_id;
+          const content = b.content || '';
+          const colorHex = b.color || getColorFromCallId(callId);
+
+          const row = document.createElement('div');
+          row.className = 'flex flex-col bg-dark-800 rounded-lg border border-dark-700 overflow-hidden';
+
+          if (blockType === 'user' || blockType === 'system') {
+            const isUser = blockType === 'user';
+            const title = isUser ? 'User Prompt' : 'System';
+            const icon = isUser ? 'user' : 'cpu';
+            const headerColor = isUser ? 'border-l-blue-500' : 'border-l-gray-600';
+            const bgColor = isUser ? 'bg-blue-950/20' : 'bg-dark-900/30';
+
+            row.innerHTML = `
+              <div class="p-3.5 border-l-4 ${headerColor} ${bgColor}">
+                <div class="flex items-center justify-between">
+                  <div class="flex items-center space-x-2 text-xs font-semibold text-gray-200">
+                    <i data-lucide="${icon}" class="w-3.5 h-3.5 text-blue-400"></i>
+                    <span>${title}</span>
+                  </div>
+                  <div class="text-[10px] text-gray-500 font-mono">Step #${step.step_index}</div>
+                </div>
+                ${renderCollapsibleBody(content)}
+              </div>
+            `;
+            container.appendChild(row);
+            continue;
+          }
+
+          if (blockType === 'thinking') {
+            row.innerHTML = `
+              <div class="p-3.5 border-l-4 border-l-purple-500 bg-purple-950/15">
+                <div class="flex items-center justify-between">
+                  <div class="flex items-center space-x-2 text-xs font-semibold text-purple-300">
+                    <i data-lucide="brain-circuit" class="w-3.5 h-3.5 text-purple-400"></i>
+                    <span>Model Reasoning (Thinking)</span>
+                  </div>
+                  <div class="text-[10px] text-gray-500 font-mono">Step #${step.step_index}</div>
+                </div>
+                ${renderCollapsibleBody(content)}
+              </div>
+            `;
+            container.appendChild(row);
+            continue;
+          }
+
+          if (blockType === 'assistant') {
+            row.innerHTML = `
+              <div class="p-3.5 border-l-4 border-l-indigo-500 bg-indigo-950/15">
+                <div class="flex items-center justify-between">
+                  <div class="flex items-center space-x-2 text-xs font-semibold text-indigo-200">
+                    <i data-lucide="message-square" class="w-3.5 h-3.5 text-indigo-400"></i>
+                    <span>Assistant Response</span>
+                  </div>
+                  <div class="text-[10px] text-gray-500 font-mono">Step #${step.step_index}</div>
+                </div>
+                ${renderCollapsibleBody(content)}
+              </div>
+            `;
+            container.appendChild(row);
+            continue;
+          }
+
+          if (blockType === 'tool_use') {
+            row.style.borderLeft = `4px solid ${colorHex}`;
+            const toolName = b.tool_name || 'Tool Call';
+            const isSubagent = b.is_subagent || toolName === 'invoke_subagent';
+            const isSkill = b.is_skill || Boolean(b.skill_name);
+            const isMcp = Boolean(b.mcp_server) || toolName.startsWith('mcp_') || toolName === 'call_mcp_tool';
+
+            let badgesHtml = '';
+            if (isSubagent) {
+              badgesHtml += `<span class="px-2 py-0.5 rounded text-[10px] font-semibold bg-pink-950/80 text-pink-300 border border-pink-500/40 flex items-center space-x-1"><i data-lucide="bot" class="w-3 h-3"></i><span>Sub-Agent</span></span>`;
+            }
+            if (isSkill) {
+              badgesHtml += `<span class="px-2 py-0.5 rounded text-[10px] font-semibold bg-purple-950/80 text-purple-300 border border-purple-500/40 flex items-center space-x-1"><i data-lucide="sparkles" class="w-3 h-3"></i><span>Skill: ${b.skill_name || 'Skill'}</span></span>`;
+            }
+            if (isMcp) {
+              const serverName = b.mcp_server || toolName.replace('mcp_', '');
+              badgesHtml += `<span class="px-2 py-0.5 rounded text-[10px] font-semibold bg-cyan-950/80 text-cyan-300 border border-cyan-500/40 font-mono flex items-center space-x-1"><i data-lucide="plug" class="w-3 h-3"></i><span>MCP: ${serverName}</span></span>`;
+            }
+
+            // Sub-agent task cards isolation
+            let subagentCardHtml = '';
+            if (isSubagent && b.subagents && b.subagents.length > 0) {
+              for (const sa of b.subagents) {
+                const saRole = sa.Role || sa.role || 'Autonomous Worker';
+                const saModel = sa.Model || sa.model || 'inherit';
+                const saType = sa.TypeName || sa.type || 'self';
+                const saPrompt = sa.Prompt || sa.prompt || '';
+                const promptLines = saPrompt ? saPrompt.split('\n').length : 0;
+
+                subagentCardHtml += `
+                  <div class="mt-3 p-3 rounded-lg bg-dark-900/90 border border-pink-500/30 space-y-2">
+                    <div class="flex items-center justify-between">
+                      <div class="flex items-center space-x-2">
+                        <span class="px-2 py-0.5 rounded bg-pink-500/20 text-pink-300 font-semibold text-xs font-mono flex items-center space-x-1">
+                          <i data-lucide="bot" class="w-3 h-3"></i>
+                          <span>${saRole}</span>
+                        </span>
+                        <span class="px-1.5 py-0.5 rounded bg-dark-800 text-gray-300 text-[10px] font-mono border border-dark-700">model: ${saModel}</span>
+                        <span class="px-1.5 py-0.5 rounded bg-dark-800 text-gray-400 text-[10px] font-mono border border-dark-700">type: ${saType}</span>
+                      </div>
+                      <span class="text-[10px] text-emerald-400 font-mono font-medium flex items-center space-x-1">
+                        <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
+                        <span>Dispatched</span>
+                      </span>
+                    </div>
+                    ${saPrompt ? `
+                      <details class="group">
+                        <summary class="text-[10px] text-pink-300/80 cursor-pointer select-none hover:text-pink-200 transition font-mono flex items-center space-x-1">
+                          <span class="inline-block transition group-open:rotate-90">▸</span>
+                          <span>show task prompt (${promptLines} lines)</span>
+                        </summary>
+                        <pre class="mt-1 text-[10px] text-gray-300 bg-dark-950/80 p-2 rounded border border-dark-800 whitespace-pre-wrap break-all font-mono max-h-[300px] overflow-y-auto">${saPrompt.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')}</pre>
+                      </details>
+                    ` : ''}
+                  </div>
+                `;
+              }
+            }
+
+            row.innerHTML = `
+              <div class="p-3.5 bg-amber-950/10">
+                <div class="flex items-center justify-between">
+                  <div class="flex items-center space-x-2.5">
+                    <span class="px-2 py-0.5 rounded text-xs font-mono font-bold border flex items-center space-x-1.5" style="background-color: ${colorHex}20; color: ${colorHex}; border-color: ${colorHex}50;">
+                      <i data-lucide="wrench" class="w-3.5 h-3.5"></i>
+                      <span>${toolName}</span>
+                    </span>
+                    ${badgesHtml}
+                  </div>
+                  <div class="flex items-center space-x-2 text-[10px] text-gray-500 font-mono">
+                    ${callId ? `<span class="px-1.5 py-0.5 rounded bg-dark-900 border border-dark-700 text-gray-400">id: ${callId}</span>` : ''}
+                    <span>Step #${step.step_index}</span>
+                  </div>
+                </div>
+                ${subagentCardHtml ? subagentCardHtml : renderCollapsibleBody(content)}
+              </div>
+            `;
+            container.appendChild(row);
+            continue;
+          }
+
+          if (blockType === 'tool_result') {
+            row.style.borderLeft = `4px solid ${colorHex}`;
+            const pairedName = b.paired_tool_name || 'Tool';
+            const isSubagent = b.is_subagent || pairedName === 'invoke_subagent';
+            const subagentCid = b.subagent_conversation_id;
+
+            let inspectSubagentBtn = '';
+            if (subagentCid) {
+              inspectSubagentBtn = `
+                <button onclick="inspectSession('${subagentCid}')" class="px-2.5 py-1 rounded bg-pink-600 hover:bg-pink-500 text-white font-medium text-[11px] transition shadow-md shadow-pink-900/30 flex items-center space-x-1.5">
+                  <i data-lucide="external-link" class="w-3.5 h-3.5"></i>
+                  <span>Inspect Sub-Agent Flow</span>
+                </button>
+              `;
+            }
+
+            row.innerHTML = `
+              <div class="p-3.5 bg-emerald-950/10">
+                <div class="flex items-center justify-between">
+                  <div class="flex items-center space-x-2.5">
+                    <span class="px-2 py-0.5 rounded text-xs font-mono font-bold border flex items-center space-x-1.5" style="background-color: ${colorHex}20; color: ${colorHex}; border-color: ${colorHex}50;">
+                      <i data-lucide="check-square" class="w-3.5 h-3.5"></i>
+                      <span>${pairedName} Result</span>
+                    </span>
+                    ${isSubagent ? `<span class="px-2 py-0.5 rounded text-[10px] font-semibold bg-pink-950/80 text-pink-300 border border-pink-500/40 font-mono">Sub-Agent Output</span>` : ''}
+                    ${inspectSubagentBtn}
+                  </div>
+                  <div class="flex items-center space-x-2 text-[10px] text-gray-500 font-mono">
+                    ${callId ? `<span class="px-1.5 py-0.5 rounded bg-dark-900 border border-dark-700 text-gray-400">id: ${callId}</span>` : ''}
+                    <span>Step #${step.step_index}</span>
+                  </div>
+                </div>
+                ${renderCollapsibleBody(content)}
+              </div>
+            `;
+            container.appendChild(row);
+            continue;
+          }
+
+          // Other block types
+          row.innerHTML = `
+            <div class="p-3.5 border-l-4 border-l-gray-600 bg-dark-900/30">
+              <div class="flex items-center justify-between">
+                <div class="flex items-center space-x-2 text-xs font-semibold text-gray-200">
+                  <i data-lucide="circle" class="w-3.5 h-3.5 opacity-70"></i>
+                  <span>${blockType}</span>
+                </div>
+                <div class="text-[10px] text-gray-500 font-mono">Step #${step.step_index}</div>
+              </div>
+              ${renderCollapsibleBody(content)}
+            </div>
+          `;
+          container.appendChild(row);
+        }
+      }
+      lucide.createIcons();
     }
 
     function closeModal() {

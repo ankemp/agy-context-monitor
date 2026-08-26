@@ -65,6 +65,9 @@ def query_summary_data(conn, tz=None):
             SUM(lines_written) as total_written,
             SUM(lines_edited) as total_edited,
             SUM(failed_tool_calls) as total_fails,
+            SUM(billed_cost) as total_billed_cost,
+            SUM(billed_input_tokens) as total_billed_input_tokens,
+            SUM(billed_output_tokens) as total_billed_output_tokens,
             AVG(total_steps) as avg_steps,
             AVG(total_tokens) as avg_tokens,
             MIN(created_at) as earliest,
@@ -110,34 +113,9 @@ def query_summary_data(conn, tz=None):
     """).fetchall()
     bloat_steps = [{"step_index": r["step_index"], "phase": r["phase"] or "other", "tool_or_source": r["tool_or_source"], "est_tokens": r["est_tokens"], "detail": r["detail"]} for r in bloat_rows]
 
-    cur.execute("""
-        SELECT s.conversation_id, COALESCE(s.model_name, c.model_name, 'Gemini Flash'), s.step_type, s.est_tokens
-        FROM steps s
-        JOIN conversations c ON s.conversation_id = c.id
-        ORDER BY s.conversation_id, s.step_index ASC
-    """)
-
-    total_billed_cost = 0.0
-    total_billed_input_tokens = 0
-    total_billed_output_tokens = 0
-    cur_conv = None
-    running_ctx = 0
-
-    for cid, model_name, s_type, tokens in cur.fetchall():
-        if cid != cur_conv:
-            cur_conv = cid
-            running_ctx = 0
-            
-        cur_pkey = get_pricing_key(model_name)
-        if s_type == "PLANNER_RESPONSE":
-            in_rate_low, in_rate_high, out_rate = PRICING[cur_pkey]
-            in_rate = in_rate_high if running_ctx > 128_000 else in_rate_low
-            total_billed_cost += (running_ctx / 1_000_000 * in_rate) + (tokens / 1_000_000 * out_rate)
-            total_billed_input_tokens += running_ctx
-            total_billed_output_tokens += tokens
-            running_ctx += tokens
-        else:
-            running_ctx += tokens
+    total_billed_cost = row["total_billed_cost"] or 0.0
+    total_billed_input_tokens = row["total_billed_input_tokens"] or 0
+    total_billed_output_tokens = row["total_billed_output_tokens"] or 0
 
     models = []
     for r in cur.execute("""
@@ -207,32 +185,8 @@ def query_summary_data(conn, tz=None):
 def query_timeline_data(conn, days=None, tz=None):
     cur = conn.cursor()
 
-    # Pre-calculate conversation cost map
-    conv_costs = {}
-    cur.execute("""
-        SELECT s.conversation_id, COALESCE(s.model_name, c.model_name, 'Gemini Flash'), s.step_type, s.est_tokens
-        FROM steps s
-        JOIN conversations c ON s.conversation_id = c.id
-        ORDER BY s.conversation_id, s.step_index ASC
-    """)
-    cur_conv = None
-    running_ctx = 0
-    for cid, model_name, s_type, tokens in cur.fetchall():
-        if cid != cur_conv:
-            cur_conv = cid
-            running_ctx = 0
-            conv_costs[cid] = 0.0
-        cur_pkey = get_pricing_key(model_name)
-        if s_type == "PLANNER_RESPONSE":
-            in_rate_low, in_rate_high, out_rate = PRICING[cur_pkey]
-            in_rate = in_rate_high if running_ctx > 128_000 else in_rate_low
-            conv_costs[cid] += (running_ctx / 1_000_000 * in_rate) + (tokens / 1_000_000 * out_rate)
-            running_ctx += tokens
-        else:
-            running_ctx += tokens
-
     rows = cur.execute("""
-        SELECT id, created_at, total_steps, total_tokens
+        SELECT id, created_at, total_steps, total_tokens, billed_cost
         FROM conversations
         WHERE created_at IS NOT NULL AND created_at != ''
     """).fetchall()
@@ -250,7 +204,7 @@ def query_timeline_data(conn, days=None, tz=None):
         daily_map[day_str]["sessions"] += 1
         daily_map[day_str]["steps"] += r["total_steps"] or 0
         daily_map[day_str]["tokens"] += r["total_tokens"] or 0
-        daily_map[day_str]["cost"] += conv_costs.get(r["id"], 0.0)
+        daily_map[day_str]["cost"] += r["billed_cost"] or 0.0
 
     sorted_days = sorted(daily_map.keys())
     timeline = []
@@ -508,6 +462,136 @@ def query_session_details(conn, cid, tz=None):
         ORDER BY step_index ASC
     """, (cid,)).fetchall()
 
+    # 1. Fetch tool executions for tool name mapping
+    tool_rows = cur.execute("""
+        SELECT step_index, tool_name, mcp_server, mcp_tool, target_path, command_line, is_error
+        FROM tool_executions
+        WHERE conversation_id = ?
+        ORDER BY id ASC
+    """, (cid,)).fetchall()
+
+    tool_execs_by_step = {}
+    for tr in tool_rows:
+        s_idx = tr["step_index"]
+        if s_idx not in tool_execs_by_step:
+            tool_execs_by_step[s_idx] = []
+        tool_execs_by_step[s_idx].append(dict(tr))
+
+    # 2. Fetch transcript blocks
+    blocks_rows = cur.execute("""
+        SELECT step_index, block_type, content, call_id
+        FROM transcript_blocks
+        WHERE conversation_id = ?
+        ORDER BY step_index ASC, id ASC
+    """, (cid,)).fetchall()
+    
+    TOOL_PALETTE = [
+        "#f87171", "#fb923c", "#fbbf24", "#a3e635", "#34d399",
+        "#22d3ee", "#38bdf8", "#818cf8", "#a78bfa", "#e879f9",
+        "#f43f5e", "#2dd4bf"
+    ]
+
+    import hashlib
+    def get_color(cid_str):
+        if not cid_str:
+            return "#6b7280"
+        val = int(hashlib.md5(cid_str.encode("utf-8")).hexdigest(), 16)
+        return TOOL_PALETTE[val % len(TOOL_PALETTE)]
+
+    tool_calls_map = {}
+    blocks_by_step = {}
+    for b in blocks_rows:
+        idx = b["step_index"]
+        if idx not in blocks_by_step:
+            blocks_by_step[idx] = []
+        b_dict = dict(b)
+        b_type = b_dict.get("block_type")
+        call_id = b_dict.get("call_id")
+
+        if call_id:
+            b_dict["color"] = get_color(call_id)
+
+        if b_type == "tool_use":
+            current_tool_idx = sum(1 for prev_b in blocks_by_step[idx] if prev_b.get("block_type") == "tool_use")
+            exec_list = tool_execs_by_step.get(idx, [])
+            matched_exec = exec_list[current_tool_idx] if current_tool_idx < len(exec_list) else None
+
+            tool_name = matched_exec["tool_name"] if matched_exec else "Tool"
+            target_path = matched_exec["target_path"] if matched_exec else ""
+            mcp_server = matched_exec["mcp_server"] if matched_exec else None
+            mcp_tool = matched_exec["mcp_tool"] if matched_exec else None
+
+            b_dict["tool_name"] = tool_name
+            b_dict["target_path"] = target_path
+            b_dict["mcp_server"] = mcp_server
+            b_dict["mcp_tool"] = mcp_tool
+
+            # Sub-agent detection
+            if tool_name == "invoke_subagent":
+                b_dict["is_subagent"] = True
+                try:
+                    raw_content = b_dict.get("content", "").strip()
+                    parsed_args = json.loads(raw_content) if raw_content.startswith("{") else {}
+                    subagents_raw = parsed_args.get("Subagents", "")
+                    if isinstance(subagents_raw, str) and subagents_raw.startswith("["):
+                        subagents_list = json.loads(subagents_raw)
+                    elif isinstance(subagents_raw, list):
+                        subagents_list = subagents_raw
+                    else:
+                        subagents_list = []
+                    b_dict["subagents"] = subagents_list
+                    b_dict["tool_action"] = parsed_args.get("toolAction")
+                    b_dict["tool_summary"] = parsed_args.get("toolSummary")
+                except Exception:
+                    b_dict["subagents"] = []
+
+            # Skill detection
+            if target_path and ("skills/" in target_path or "SKILL.md" in target_path):
+                b_dict["is_skill"] = True
+                m = re.search(r"skills/([^/]+)/SKILL\.md", target_path)
+                if m:
+                    b_dict["skill_name"] = m.group(1)
+            elif "skills/" in b_dict.get("content", ""):
+                m = re.search(r"skills/([^/]+)/SKILL\.md", b_dict.get("content", ""))
+                if m:
+                    b_dict["is_skill"] = True
+                    b_dict["skill_name"] = m.group(1)
+
+            if call_id:
+                tool_calls_map[call_id] = {
+                    "tool_name": tool_name,
+                    "target_path": target_path,
+                    "step_index": idx,
+                    "is_subagent": b_dict.get("is_subagent", False),
+                    "is_skill": b_dict.get("is_skill", False),
+                    "skill_name": b_dict.get("skill_name"),
+                    "subagents": b_dict.get("subagents"),
+                    "color": b_dict.get("color"),
+                    "use_block": b_dict
+                }
+
+        elif b_type == "tool_result":
+            if call_id and call_id in tool_calls_map:
+                paired_use = tool_calls_map[call_id]
+                b_dict["paired_tool_name"] = paired_use.get("tool_name", "Tool")
+                b_dict["paired_step_index"] = paired_use.get("step_index")
+                b_dict["is_subagent"] = paired_use.get("is_subagent", False)
+                b_dict["is_skill"] = paired_use.get("is_skill", False)
+                b_dict["skill_name"] = paired_use.get("skill_name")
+                b_dict["subagents"] = paired_use.get("subagents")
+                if "color" not in b_dict or not b_dict["color"]:
+                    b_dict["color"] = paired_use.get("color")
+                if "use_block" in paired_use:
+                    paired_use["use_block"]["result_step_index"] = idx
+
+            # Extract subagent conversation ID from result content
+            content_str = b_dict.get("content", "")
+            cid_match = re.search(r"([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})", content_str)
+            if cid_match:
+                b_dict["subagent_conversation_id"] = cid_match.group(1)
+
+        blocks_by_step[idx].append(b_dict)
+
     target_tz = get_target_tz(tz)
     steps = []
     for r in steps_rows:
@@ -515,6 +599,7 @@ def query_session_details(conn, cid, tz=None):
         dt = parse_to_local_dt(d["created_at"], target_tz)
         if dt:
             d["created_at"] = dt.strftime("%Y-%m-%d %H:%M:%S")
+        d["blocks"] = blocks_by_step.get(d["step_index"], [])
         steps.append(d)
 
     cat_rows = cur.execute("""

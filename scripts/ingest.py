@@ -424,6 +424,43 @@ def analyze_transcript(transcript_path: Path, initial_model: str = "Gemini 3.7 F
     # Append dynamically loaded tool schemas
     parsed_blocks.extend(block_parser.load_tool_schemas())
 
+    # Calculate billed cost based on steps
+    total_billed_cost = 0.0
+    total_billed_input_tokens = 0
+    total_billed_output_tokens = 0
+    running_ctx = 0
+    
+    # We need pricing for the cost calculation
+    PRICING = {
+        "pro": (1.25, 2.50, 10.00),     # Gemini Pro / 3.1 Pro / 2.5 Pro
+        "flash": (0.075, 0.15, 0.60),   # Gemini Flash / 3.6 / 3.7 Flash
+        "claude": (3.00, 3.00, 15.00),  # Claude 3.5 / 3.7 Sonnet
+        "gpt": (2.50, 2.50, 10.00),     # GPT-4o / o1
+    }
+    
+    def get_pricing_key(m_name):
+        m = (m_name or "").lower()
+        if "claude" in m: return "claude"
+        if "gpt" in m or "o1" in m: return "gpt"
+        if "pro" in m: return "pro"
+        return "flash"
+
+    for s in steps:
+        m_name = s.get("model_name", cur_model)
+        s_type = s.get("step_type")
+        tokens = s.get("est_tokens", 0)
+        
+        pkey = get_pricing_key(m_name)
+        if s_type == "PLANNER_RESPONSE":
+            in_rate_low, in_rate_high, out_rate = PRICING[pkey]
+            in_rate = in_rate_high if running_ctx > 128_000 else in_rate_low
+            total_billed_cost += (running_ctx / 1_000_000 * in_rate) + (tokens / 1_000_000 * out_rate)
+            total_billed_input_tokens += running_ctx
+            total_billed_output_tokens += tokens
+            running_ctx += tokens
+        else:
+            running_ctx += tokens
+
     return {
         "title": title or "Active Session",
         "start_time": start_time,
@@ -438,6 +475,9 @@ def analyze_transcript(transcript_path: Path, initial_model: str = "Gemini 3.7 F
         "lines_written": lines_written,
         "lines_edited": lines_edited,
         "failed_tool_calls": failed_tool_calls,
+        "billed_cost": total_billed_cost,
+        "billed_input_tokens": total_billed_input_tokens,
+        "billed_output_tokens": total_billed_output_tokens,
         "latest_model": cur_model,
         "latest_max_tokens": get_model_context_limit(cur_model),
         "steps": steps,
@@ -461,9 +501,10 @@ def sync_to_sqlite(cid: str, model_name: str, analysis: dict):
                 INSERT INTO conversations (
                     id, title, model_name, created_at, updated_at, total_steps, total_characters, total_tokens,
                     duration_seconds, active_agent_seconds, active_pairing_seconds, thinking_tokens,
-                    user_prompts, tool_calls_count, redundant_file_reads, lines_written, lines_edited, failed_tool_calls
+                    user_prompts, tool_calls_count, redundant_file_reads, lines_written, lines_edited, failed_tool_calls,
+                    billed_cost, billed_input_tokens, billed_output_tokens
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     title = excluded.title,
                     model_name = excluded.model_name,
@@ -480,7 +521,10 @@ def sync_to_sqlite(cid: str, model_name: str, analysis: dict):
                     redundant_file_reads = excluded.redundant_file_reads,
                     lines_written = excluded.lines_written,
                     lines_edited = excluded.lines_edited,
-                    failed_tool_calls = excluded.failed_tool_calls
+                    failed_tool_calls = excluded.failed_tool_calls,
+                    billed_cost = excluded.billed_cost,
+                    billed_input_tokens = excluded.billed_input_tokens,
+                    billed_output_tokens = excluded.billed_output_tokens
             """, (
                 cid, analysis["title"], active_model, analysis["start_time"] or datetime.now().isoformat(),
                 analysis["end_time"] or datetime.now().isoformat(), len(analysis["steps"]),
@@ -489,7 +533,10 @@ def sync_to_sqlite(cid: str, model_name: str, analysis: dict):
                 analysis.get("thinking_tokens", 0), analysis.get("user_prompts", 0),
                 analysis.get("tool_calls_count", 0), analysis.get("redundant_file_reads", 0),
                 analysis.get("lines_written", 0), analysis.get("lines_edited", 0),
-                analysis.get("failed_tool_calls", 0)
+                analysis.get("failed_tool_calls", 0),
+                analysis.get("billed_cost", 0.0),
+                analysis.get("billed_input_tokens", 0),
+                analysis.get("billed_output_tokens", 0)
             ))
 
             # Upsert steps with step-level model_name

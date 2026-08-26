@@ -427,6 +427,42 @@ def parse_conversation(conv_dir: Path) -> dict | None:
     # Append dynamically loaded tool schemas
     parsed_blocks.extend(block_parser.load_tool_schemas())
 
+    # Calculate billed cost based on steps
+    total_billed_cost = 0.0
+    total_billed_input_tokens = 0
+    total_billed_output_tokens = 0
+    running_ctx = 0
+    
+    PRICING = {
+        "pro": (1.25, 2.50, 10.00),     # Gemini Pro / 3.1 Pro / 2.5 Pro
+        "flash": (0.075, 0.15, 0.60),   # Gemini Flash / 3.6 / 3.7 Flash
+        "claude": (3.00, 3.00, 15.00),  # Claude 3.5 / 3.7 Sonnet
+        "gpt": (2.50, 2.50, 10.00),     # GPT-4o / o1
+    }
+    
+    def get_pricing_key(m_name):
+        m = (m_name or "").lower()
+        if "claude" in m: return "claude"
+        if "gpt" in m or "o1" in m: return "gpt"
+        if "pro" in m: return "pro"
+        return "flash"
+
+    for s in steps:
+        m_name = s.get("model_name", cur_model)
+        s_type = s.get("step_type")
+        tokens = s.get("est_tokens", 0)
+        
+        pkey = get_pricing_key(m_name)
+        if s_type == "PLANNER_RESPONSE":
+            in_rate_low, in_rate_high, out_rate = PRICING[pkey]
+            in_rate = in_rate_high if running_ctx > 128_000 else in_rate_low
+            total_billed_cost += (running_ctx / 1_000_000 * in_rate) + (tokens / 1_000_000 * out_rate)
+            total_billed_input_tokens += running_ctx
+            total_billed_output_tokens += tokens
+            running_ctx += tokens
+        else:
+            running_ctx += tokens
+
     return {
         "conversation": {
             "id": cid,
@@ -446,7 +482,10 @@ def parse_conversation(conv_dir: Path) -> dict | None:
             "redundant_file_reads": redundant_reads,
             "lines_written": lines_written,
             "lines_edited": lines_edited,
-            "failed_tool_calls": failed_tool_calls
+            "failed_tool_calls": failed_tool_calls,
+            "billed_cost": total_billed_cost,
+            "billed_input_tokens": total_billed_input_tokens,
+            "billed_output_tokens": total_billed_output_tokens
         },
         "steps": steps,
         "tool_executions": tool_execs,
@@ -490,9 +529,10 @@ def run_backfill(brain_dir: Path = Path(os.path.expanduser("~/.gemini/antigravit
                     INSERT INTO conversations (
                         id, title, model_name, created_at, updated_at, total_steps, total_characters, total_tokens,
                         duration_seconds, active_agent_seconds, active_pairing_seconds, thinking_tokens,
-                        user_prompts, tool_calls_count, redundant_file_reads, lines_written, lines_edited, failed_tool_calls
+                        user_prompts, tool_calls_count, redundant_file_reads, lines_written, lines_edited, failed_tool_calls,
+                        billed_cost, billed_input_tokens, billed_output_tokens
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(id) DO UPDATE SET
                         title = excluded.title,
                         model_name = excluded.model_name,
@@ -510,7 +550,10 @@ def run_backfill(brain_dir: Path = Path(os.path.expanduser("~/.gemini/antigravit
                         redundant_file_reads = excluded.redundant_file_reads,
                         lines_written = excluded.lines_written,
                         lines_edited = excluded.lines_edited,
-                        failed_tool_calls = excluded.failed_tool_calls
+                        failed_tool_calls = excluded.failed_tool_calls,
+                        billed_cost = excluded.billed_cost,
+                        billed_input_tokens = excluded.billed_input_tokens,
+                        billed_output_tokens = excluded.billed_output_tokens
                 """, (
                     conv["id"], conv["title"], conv["model_name"], conv["created_at"],
                     conv["updated_at"], conv["total_steps"], conv["total_characters"],
@@ -518,7 +561,10 @@ def run_backfill(brain_dir: Path = Path(os.path.expanduser("~/.gemini/antigravit
                     conv["active_agent_seconds"], conv["active_pairing_seconds"],
                     conv["thinking_tokens"], conv["user_prompts"], conv["tool_calls_count"],
                     conv["redundant_file_reads"], conv["lines_written"], conv["lines_edited"],
-                    conv["failed_tool_calls"]
+                    conv["failed_tool_calls"],
+                    conv.get("billed_cost", 0.0),
+                    conv.get("billed_input_tokens", 0),
+                    conv.get("billed_output_tokens", 0)
                 ))
 
                 # Bulk insert steps (replace existing)

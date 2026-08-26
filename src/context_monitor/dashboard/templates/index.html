@@ -772,11 +772,23 @@
         </div>
 
         <div>
-          <h4 class="text-xs font-semibold text-gray-300 uppercase tracking-wider mb-2 flex items-center space-x-1.5">
-            <i data-lucide="list-ordered" class="w-3.5 h-3.5 text-brand-500"></i>
-            <span>Step-by-Step Operations Log</span>
-          </h4>
-          <div class="overflow-x-auto max-h-[300px] overflow-y-auto">
+          <div class="flex items-center justify-between mb-2">
+            <h4 class="text-xs font-semibold text-gray-300 uppercase tracking-wider flex items-center space-x-1.5">
+              <i data-lucide="list-ordered" class="w-3.5 h-3.5 text-brand-500"></i>
+              <span>Agent Sequence</span>
+            </h4>
+            <div class="flex items-center space-x-1 bg-dark-900 border border-dark-700 rounded-lg p-1 text-xs">
+              <button onclick="setSessionViewMode('flow')" id="btnViewFlow" class="px-2.5 py-1 rounded-md bg-brand-600 text-white font-medium shadow transition whitespace-nowrap">
+                Flow View
+              </button>
+              <button onclick="setSessionViewMode('table')" id="btnViewTable" class="px-2.5 py-1 rounded-md text-gray-400 hover:text-white transition whitespace-nowrap">
+                Table View
+              </button>
+            </div>
+          </div>
+
+          <!-- Table View Container -->
+          <div id="sessionViewTable" class="hidden overflow-x-auto max-h-[300px] overflow-y-auto">
             <table class="w-full text-left text-xs text-gray-300">
               <thead class="text-[10px] text-gray-400 uppercase bg-dark-800 border-b border-dark-700 sticky top-0">
                 <tr>
@@ -790,6 +802,13 @@
               <tbody id="modalStepList" class="divide-y divide-dark-700">
               </tbody>
             </table>
+          </div>
+          
+          <!-- Flow View Container -->
+          <div id="sessionViewFlow" class="overflow-x-auto max-h-[400px] overflow-y-auto bg-dark-800/50 rounded-lg border border-dark-700 p-4 space-y-4">
+            <div id="modalFlowSequence" class="flex flex-col space-y-3">
+              <!-- Flow sequence blocks will be rendered here -->
+            </div>
           </div>
         </div>
 

@@ -129,7 +129,10 @@ def init_db(db_path: Path = DEFAULT_DB_PATH):
             ("redundant_file_reads", "INTEGER DEFAULT 0"),
             ("lines_written", "INTEGER DEFAULT 0"),
             ("lines_edited", "INTEGER DEFAULT 0"),
-            ("failed_tool_calls", "INTEGER DEFAULT 0")
+            ("failed_tool_calls", "INTEGER DEFAULT 0"),
+            ("billed_cost", "REAL DEFAULT 0.0"),
+            ("billed_input_tokens", "INTEGER DEFAULT 0"),
+            ("billed_output_tokens", "INTEGER DEFAULT 0")
         ]
         for col, ctype in conv_new_cols:
             if col not in conv_cols:
