@@ -27,6 +27,7 @@ if str(_root / "src") not in sys.path:
     sys.path.insert(0, str(_root / "src"))
 
 from context_monitor.db import get_db_connection, init_db, DEFAULT_DB_PATH
+from context_monitor.formats import BlockParser
 
 CHARS_PER_TOKEN = 3.8
 
@@ -36,31 +37,6 @@ def format_tokens(n: int | float) -> str:
     elif n >= 1_000:
         return f"{n / 1_000:.1f}k"
     return str(int(n))
-
-def detect_model(transcript_path: Path) -> tuple[str, int]:
-    detected_model = "Gemini 3.7 Flash"
-    try:
-        with open(transcript_path, "r", encoding="utf-8", errors="replace") as f:
-            for line in f:
-                if "Model Selection" in line:
-                    m = re.search(r"Model Selection\` from \S+ to (.+?)\.\s*(?:No need|$)", line)
-                    if m:
-                        detected_model = m.group(1).strip()
-                        break
-    except Exception:
-        pass
-
-def get_model_context_limit(model_name: str) -> int:
-    lower = (model_name or "").lower()
-    if "pro" in lower:
-        return 2_000_000
-    elif "flash" in lower or "gemini" in lower:
-        return 1_000_000
-    elif "claude" in lower:
-        return 200_000
-    elif "gpt" in lower or "o1" in lower or "o3" in lower:
-        return 128_000
-    return 1_000_000
 
 def detect_model(transcript_path: Path) -> tuple[str, str, int]:
     first_model = "Gemini 3.7 Flash"
@@ -82,6 +58,18 @@ def detect_model(transcript_path: Path) -> tuple[str, str, int]:
 
     max_tokens = get_model_context_limit(latest_model)
     return first_model, latest_model, max_tokens
+
+def get_model_context_limit(model_name: str) -> int:
+    lower = (model_name or "").lower()
+    if "pro" in lower:
+        return 2_000_000
+    elif "flash" in lower or "gemini" in lower:
+        return 1_000_000
+    elif "claude" in lower:
+        return 200_000
+    elif "gpt" in lower or "o1" in lower or "o3" in lower:
+        return 128_000
+    return 1_000_000
 
 def extract_file_basename(content: str) -> str:
     m = re.search(r"File Path:\s*`?(?:file://)?([^`\r\n]+)`?", content)
@@ -136,6 +124,8 @@ def analyze_transcript(transcript_path: Path, initial_model: str = "Gemini 3.7 F
     seen_files = set()
     pending_tool_calls = []
     tool_execs = []
+    parsed_blocks = []
+    block_parser = BlockParser()
     title = ""
     start_time = None
     end_time = None
@@ -151,6 +141,8 @@ def analyze_transcript(transcript_path: Path, initial_model: str = "Gemini 3.7 F
                 continue
 
             step_idx = step.get("step_index", len(steps) + 1)
+            parsed_blocks.extend(block_parser.parse_step(step, step_idx))
+            
             source = step.get("source", "UNKNOWN")
             step_type = step.get("type", "UNKNOWN")
             created_at = step.get("created_at", "")
@@ -429,6 +421,9 @@ def analyze_transcript(transcript_path: Path, initial_model: str = "Gemini 3.7 F
     if start_dt and end_dt:
         duration_seconds = max((end_dt - start_dt).total_seconds(), 0.0)
 
+    # Append dynamically loaded tool schemas
+    parsed_blocks.extend(block_parser.load_tool_schemas())
+
     return {
         "title": title or "Active Session",
         "start_time": start_time,
@@ -449,7 +444,8 @@ def analyze_transcript(transcript_path: Path, initial_model: str = "Gemini 3.7 F
         "total_chars": total_chars,
         "total_tokens": total_tokens,
         "category_stats": category_stats,
-        "tool_executions": tool_execs
+        "tool_executions": tool_execs,
+        "parsed_blocks": parsed_blocks
     }
 
 def sync_to_sqlite(cid: str, model_name: str, analysis: dict):
@@ -533,6 +529,27 @@ def sync_to_sqlite(cid: str, model_name: str, analysis: dict):
                     )
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, tool_params)
+
+            # Sync transcript blocks
+            if analysis.get("parsed_blocks"):
+                conn.execute("DELETE FROM transcript_blocks WHERE conversation_id = ?", (cid,))
+                block_params = []
+                for b in analysis["parsed_blocks"]:
+                    content_str = b.text
+                    if b.arguments is not None:
+                        import json
+                        content_str += "\n" + json.dumps(b.arguments)
+
+                    block_params.append((
+                        cid, b.step_index, b.kind.value, content_str, b.hash, b.call_id
+                    ))
+                
+                conn.executemany("""
+                    INSERT INTO transcript_blocks (
+                        conversation_id, step_index, block_type, content, block_hash, call_id
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?)
+                """, block_params)
 
         conn.close()
     except Exception:

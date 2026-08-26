@@ -27,6 +27,7 @@ if str(_root / "src") not in sys.path:
     sys.path.insert(0, str(_root / "src"))
 
 from context_monitor.db import get_db_connection, init_db, DEFAULT_DB_PATH
+from context_monitor.formats import BlockParser
 
 CHARS_PER_TOKEN = 3.8
 
@@ -116,6 +117,8 @@ def parse_conversation(conv_dir: Path) -> dict | None:
     tool_execs = []
     pending_tool_calls = []
     seen_files = set()
+    parsed_blocks = []
+    block_parser = BlockParser()
     title = ""
     start_time = None
     end_time = None
@@ -138,6 +141,8 @@ def parse_conversation(conv_dir: Path) -> dict | None:
                 continue
 
             step_idx = step.get("step_index", len(steps))
+            parsed_blocks.extend(block_parser.parse_step(step, step_idx))
+            
             source = step.get("source", "UNKNOWN")
             step_type = step.get("type", "UNKNOWN")
             created_at = step.get("created_at", "")
@@ -419,6 +424,9 @@ def parse_conversation(conv_dir: Path) -> dict | None:
 
     total_tokens = int(total_chars / CHARS_PER_TOKEN)
 
+    # Append dynamically loaded tool schemas
+    parsed_blocks.extend(block_parser.load_tool_schemas())
+
     return {
         "conversation": {
             "id": cid,
@@ -441,7 +449,8 @@ def parse_conversation(conv_dir: Path) -> dict | None:
             "failed_tool_calls": failed_tool_calls
         },
         "steps": steps,
-        "tool_executions": tool_execs
+        "tool_executions": tool_execs,
+        "parsed_blocks": parsed_blocks
     }
 
 def run_backfill(brain_dir: Path = Path(os.path.expanduser("~/.gemini/antigravity/brain"))):
@@ -541,6 +550,27 @@ def run_backfill(brain_dir: Path = Path(os.path.expanduser("~/.gemini/antigravit
                     INSERT INTO tool_executions (conversation_id, step_index, tool_name, mcp_server, mcp_tool, target_path, command_line, exit_code, is_error)
                     VALUES (:conversation_id, :step_index, :tool_name, :mcp_server, :mcp_tool, :target_path, :command_line, :exit_code, :is_error)
                 """, tools)
+
+                # Insert transcript blocks
+                if data.get("parsed_blocks"):
+                    conn.execute("DELETE FROM transcript_blocks WHERE conversation_id = ?", (conv["id"],))
+                    block_params = []
+                    for b in data["parsed_blocks"]:
+                        content_str = b.text
+                        if b.arguments is not None:
+                            import json
+                            content_str += "\n" + json.dumps(b.arguments)
+
+                        block_params.append((
+                            conv["id"], b.step_index, b.kind.value, content_str, b.hash, b.call_id
+                        ))
+                    
+                    conn.executemany("""
+                        INSERT INTO transcript_blocks (
+                            conversation_id, step_index, block_type, content, block_hash, call_id
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    """, block_params)
 
                 processed_convs += 1
                 total_steps_inserted += len(steps)

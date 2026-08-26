@@ -10,6 +10,7 @@ These invariants protect the system's performance and the agent's context window
 - **Zero polling**: UI clients must rely exclusively on Server-Sent Events (SSE) pushes. Do not implement idle polling loops.
 - **Static charts**: Disable all animations on charts to prevent visual jumping during rapid live-sync updates.
 - **Clean markdown**: Omit decorative icons and emojis in markdown reports (e.g., `context_usage.md`, `global_analytics.md`).
+- **Backfill parity**: When modifying database schemas or metric definitions, update `scripts/backfill_analytics.py` to backfill historical data.
 
 ## Context Pointers
 

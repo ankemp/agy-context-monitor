@@ -1,13 +1,13 @@
 # Task 02: Structured Content Block & Transcript Parsing
 
 ## Checklist
-- [ ] Implement a transcript block extractor in `scripts/ingest.py` / `src/context_monitor/` that extracts structured blocks (`system`, `messages`, `tools`, `response`).
-- [ ] Intercept and parse `<think>...</think>` reasoning tags and planning blocks into discrete `thinking` blocks.
-- [ ] Parse tool call invocations, extracting tool names, tool call IDs, and normalized JSON arguments.
-- [ ] Parse tool execution results and link them to their originating tool call ID.
-- [ ] Extract full tool schemas offered by Antigravity and registered MCP servers.
-- [ ] Generate SHA-1 content hashes for every extracted block to support turn-to-turn diffing.
-- [ ] Ensure backward compatibility with all historical session transcripts in SQLite.
+- [x] Implement a transcript block extractor in `scripts/ingest.py` / `src/context_monitor/` that extracts structured blocks (`system`, `messages`, `tools`, `response`).
+- [x] Intercept and parse `<think>...</think>` reasoning tags and planning blocks into discrete `thinking` blocks.
+- [x] Parse tool call invocations, extracting tool names, tool call IDs, and normalized JSON arguments.
+- [x] Parse tool execution results and link them to their originating tool call ID.
+- [x] Extract full tool schemas offered by Antigravity and registered MCP servers.
+- [x] Generate SHA-1 content hashes for every extracted block to support turn-to-turn diffing.
+- [x] Ensure backward compatibility with all historical session transcripts in SQLite.
 
 ## Breakdown
 Following the architecture of CC Glass (`src/formats/` and `src/diff.js`), we must convert raw transcript steps into an array of structured, typed content blocks instead of passing unparsed string blobs to the frontend.

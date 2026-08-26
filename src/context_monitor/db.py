@@ -71,6 +71,17 @@ CREATE TABLE IF NOT EXISTS tool_executions (
     is_error INTEGER DEFAULT 0,
     FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
 );
+
+CREATE TABLE IF NOT EXISTS transcript_blocks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    conversation_id TEXT NOT NULL,
+    step_index INTEGER NOT NULL,
+    block_type TEXT NOT NULL,
+    content TEXT NOT NULL,
+    block_hash TEXT NOT NULL,
+    call_id TEXT,
+    FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+);
 """
 
 INDEXES_SQL = """
@@ -84,6 +95,7 @@ CREATE INDEX IF NOT EXISTS idx_tool_exec_name ON tool_executions(tool_name);
 CREATE INDEX IF NOT EXISTS idx_tool_exec_server ON tool_executions(mcp_server);
 CREATE INDEX IF NOT EXISTS idx_tool_exec_mcp_tool ON tool_executions(mcp_tool);
 CREATE INDEX IF NOT EXISTS idx_tool_exec_path ON tool_executions(target_path);
+CREATE INDEX IF NOT EXISTS idx_blocks_conv_hash ON transcript_blocks(conversation_id, block_hash);
 """
 
 def get_db_connection(db_path: Path = DEFAULT_DB_PATH, timeout: float = 30.0) -> sqlite3.Connection:
