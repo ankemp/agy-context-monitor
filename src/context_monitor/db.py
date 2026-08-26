@@ -54,6 +54,9 @@ CREATE TABLE IF NOT EXISTS steps (
     phase TEXT,
     model_name TEXT,
     detail TEXT,
+    billed_cost REAL DEFAULT 0.0,
+    billed_input_tokens INTEGER DEFAULT 0,
+    billed_output_tokens INTEGER DEFAULT 0,
     FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE,
     UNIQUE(conversation_id, step_index)
 );
@@ -86,6 +89,7 @@ CREATE TABLE IF NOT EXISTS transcript_blocks (
 
 INDEXES_SQL = """
 CREATE INDEX IF NOT EXISTS idx_conversations_created ON conversations(created_at);
+CREATE INDEX IF NOT EXISTS idx_steps_created ON steps(created_at);
 CREATE INDEX IF NOT EXISTS idx_steps_conv_step ON steps(conversation_id, step_index);
 CREATE INDEX IF NOT EXISTS idx_steps_category ON steps(category);
 CREATE INDEX IF NOT EXISTS idx_steps_activity ON steps(activity);
@@ -146,7 +150,10 @@ def init_db(db_path: Path = DEFAULT_DB_PATH):
         step_new_cols = [
             ("thinking_tokens", "INTEGER DEFAULT 0"),
             ("phase", "TEXT"),
-            ("model_name", "TEXT")
+            ("model_name", "TEXT"),
+            ("billed_cost", "REAL DEFAULT 0.0"),
+            ("billed_input_tokens", "INTEGER DEFAULT 0"),
+            ("billed_output_tokens", "INTEGER DEFAULT 0")
         ]
         for col, ctype in step_new_cols:
             if col not in step_cols:

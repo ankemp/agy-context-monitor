@@ -73,6 +73,15 @@ def format_duration(seconds: float) -> str:
 
 def calculate_billed_cost(conn):
     cur = conn.cursor()
+    # Check if steps have populated billed_cost
+    try:
+        row = cur.execute("SELECT SUM(billed_cost), SUM(billed_input_tokens), SUM(billed_output_tokens) FROM steps").fetchone()
+        if row and row[0] is not None and row[0] > 0:
+            return row[0] or 0.0, row[1] or 0, row[2] or 0
+    except Exception:
+        pass
+
+    # Fallback to accurate multi-turn calculation
     cur.execute("""
         SELECT s.conversation_id, COALESCE(s.model_name, c.model_name, 'Gemini Flash'), s.step_type, s.est_tokens
         FROM steps s
@@ -85,20 +94,29 @@ def calculate_billed_cost(conn):
     total_out = 0
     cur_conv = None
     running_ctx = 0
+    current_ephemeral = 0
 
     for cid, model_name, s_type, tokens in cur.fetchall():
         if cid != cur_conv:
             cur_conv = cid
             running_ctx = 0
+            current_ephemeral = 0
             
         cur_pkey = get_pricing_key(model_name)
-        if s_type == "PLANNER_RESPONSE":
+        if s_type == "CHECKPOINT":
+            running_ctx = tokens
+            current_ephemeral = 0
+        elif s_type == "EPHEMERAL_MESSAGE":
+            current_ephemeral = tokens
+        elif s_type == "PLANNER_RESPONSE":
             in_rate_low, in_rate_high, out_rate = PRICING[cur_pkey]
-            in_rate = in_rate_high if running_ctx > 128_000 else in_rate_low
-            total_cost += (running_ctx / 1_000_000 * in_rate) + (tokens / 1_000_000 * out_rate)
-            total_in += running_ctx
+            actual_in = running_ctx + current_ephemeral
+            in_rate = in_rate_high if actual_in > 128_000 else in_rate_low
+            total_cost += (actual_in / 1_000_000 * in_rate) + (tokens / 1_000_000 * out_rate)
+            total_in += actual_in
             total_out += tokens
             running_ctx += tokens
+            current_ephemeral = 0
         else:
             running_ctx += tokens
 
@@ -467,48 +485,30 @@ def print_timeline(conn, days: int = 14):
     print("=" * 75)
     cur = conn.cursor()
 
-    conv_costs = {}
-    cur.execute("""
-        SELECT s.conversation_id, COALESCE(s.model_name, c.model_name, 'Gemini Flash'), s.step_type, s.est_tokens
-        FROM steps s
-        JOIN conversations c ON s.conversation_id = c.id
-        ORDER BY s.conversation_id, s.step_index ASC
-    """)
-    cur_conv = None
-    running_ctx = 0
-    for cid, model_name, s_type, tokens in cur.fetchall():
-        if cid != cur_conv:
-            cur_conv = cid
-            running_ctx = 0
-            conv_costs[cid] = 0.0
-        cur_pkey = get_pricing_key(model_name)
-        if s_type == "PLANNER_RESPONSE":
-            in_rate_low, in_rate_high, out_rate = PRICING[cur_pkey]
-            in_rate = in_rate_high if running_ctx > 128_000 else in_rate_low
-            conv_costs[cid] += (running_ctx / 1_000_000 * in_rate) + (tokens / 1_000_000 * out_rate)
-            running_ctx += tokens
-        else:
-            running_ctx += tokens
-
     rows = cur.execute("""
-        SELECT id, created_at, total_steps, total_tokens
-        FROM conversations
+        SELECT created_at, conversation_id, est_tokens, billed_cost
+        FROM steps
         WHERE created_at IS NOT NULL AND created_at != ''
     """).fetchall()
 
     daily_map = {}
+    day_sessions = {}
     for r in rows:
         try:
             dt = datetime.fromisoformat(r["created_at"].replace("Z", "+00:00")).astimezone(local_tz)
             d_str = dt.strftime("%Y-%m-%d")
             if d_str not in daily_map:
                 daily_map[d_str] = {"sessions": 0, "steps": 0, "tokens": 0, "cost": 0.0}
-            daily_map[d_str]["sessions"] += 1
-            daily_map[d_str]["steps"] += r["total_steps"] or 0
-            daily_map[d_str]["tokens"] += r["total_tokens"] or 0
-            daily_map[d_str]["cost"] += conv_costs.get(r["id"], 0.0)
+                day_sessions[d_str] = set()
+            daily_map[d_str]["steps"] += 1
+            daily_map[d_str]["tokens"] += r["est_tokens"] or 0
+            daily_map[d_str]["cost"] += r["billed_cost"] or 0.0
+            day_sessions[d_str].add(r["conversation_id"])
         except Exception:
             pass
+
+    for d_str, s_set in day_sessions.items():
+        daily_map[d_str]["sessions"] = len(s_set)
 
     sorted_days = sorted(daily_map.keys())[-days:]
     print(f"  {'Date (' + tz_abbr + ')':<14} | {'Sessions':<10} | {'Steps Logged':<14} | {'Tokens Consumed':<16} | {'Est API Value':<14}")

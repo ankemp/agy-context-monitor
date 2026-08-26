@@ -432,6 +432,7 @@ def parse_conversation(conv_dir: Path) -> dict | None:
     total_billed_input_tokens = 0
     total_billed_output_tokens = 0
     running_ctx = 0
+    current_ephemeral = 0
     
     PRICING = {
         "pro": (1.25, 2.50, 10.00),     # Gemini Pro / 3.1 Pro / 2.5 Pro
@@ -453,15 +454,35 @@ def parse_conversation(conv_dir: Path) -> dict | None:
         tokens = s.get("est_tokens", 0)
         
         pkey = get_pricing_key(m_name)
-        if s_type == "PLANNER_RESPONSE":
+        step_cost = 0.0
+        step_in_tokens = 0
+        step_out_tokens = 0
+
+        if s_type == "CHECKPOINT":
+            # Context truncation: reset running_ctx to checkpoint tokens
+            running_ctx = tokens
+            current_ephemeral = 0
+        elif s_type == "EPHEMERAL_MESSAGE":
+            # Transient injection for immediate turn only
+            current_ephemeral = tokens
+        elif s_type == "PLANNER_RESPONSE":
             in_rate_low, in_rate_high, out_rate = PRICING[pkey]
-            in_rate = in_rate_high if running_ctx > 128_000 else in_rate_low
-            total_billed_cost += (running_ctx / 1_000_000 * in_rate) + (tokens / 1_000_000 * out_rate)
-            total_billed_input_tokens += running_ctx
-            total_billed_output_tokens += tokens
+            actual_in = running_ctx + current_ephemeral
+            in_rate = in_rate_high if actual_in > 128_000 else in_rate_low
+            step_cost = (actual_in / 1_000_000 * in_rate) + (tokens / 1_000_000 * out_rate)
+            step_in_tokens = actual_in
+            step_out_tokens = tokens
+            total_billed_cost += step_cost
+            total_billed_input_tokens += step_in_tokens
+            total_billed_output_tokens += step_out_tokens
             running_ctx += tokens
+            current_ephemeral = 0
         else:
             running_ctx += tokens
+
+        s["billed_cost"] = step_cost
+        s["billed_input_tokens"] = step_in_tokens
+        s["billed_output_tokens"] = step_out_tokens
 
     return {
         "conversation": {
@@ -571,10 +592,12 @@ def run_backfill(brain_dir: Path = Path(os.path.expanduser("~/.gemini/antigravit
                 conn.executemany("""
                     INSERT INTO steps (
                         conversation_id, step_index, created_at, source, step_type, category, activity,
-                        tool_or_source, characters, est_tokens, thinking_tokens, phase, model_name, detail
+                        tool_or_source, characters, est_tokens, thinking_tokens, phase, model_name, detail,
+                        billed_cost, billed_input_tokens, billed_output_tokens
                     )
                     VALUES (:conversation_id, :step_index, :created_at, :source, :step_type, :category, :activity,
-                            :tool_or_source, :characters, :est_tokens, :thinking_tokens, :phase, :model_name, :detail)
+                            :tool_or_source, :characters, :est_tokens, :thinking_tokens, :phase, :model_name, :detail,
+                            :billed_cost, :billed_input_tokens, :billed_output_tokens)
                     ON CONFLICT(conversation_id, step_index) DO UPDATE SET
                         created_at = excluded.created_at,
                         source = excluded.source,
@@ -587,7 +610,10 @@ def run_backfill(brain_dir: Path = Path(os.path.expanduser("~/.gemini/antigravit
                         thinking_tokens = excluded.thinking_tokens,
                         phase = excluded.phase,
                         model_name = excluded.model_name,
-                        detail = excluded.detail
+                        detail = excluded.detail,
+                        billed_cost = excluded.billed_cost,
+                        billed_input_tokens = excluded.billed_input_tokens,
+                        billed_output_tokens = excluded.billed_output_tokens
                 """, steps)
 
                 # Insert tool executions

@@ -186,12 +186,13 @@ def query_timeline_data(conn, days=None, tz=None):
     cur = conn.cursor()
 
     rows = cur.execute("""
-        SELECT id, created_at, total_steps, total_tokens, billed_cost
-        FROM conversations
+        SELECT created_at, conversation_id, est_tokens, billed_cost
+        FROM steps
         WHERE created_at IS NOT NULL AND created_at != ''
     """).fetchall()
 
     daily_map = {}
+    day_sessions = {}
     target_tz = get_target_tz(tz)
 
     for r in rows:
@@ -201,10 +202,14 @@ def query_timeline_data(conn, days=None, tz=None):
         day_str = dt.strftime("%Y-%m-%d")
         if day_str not in daily_map:
             daily_map[day_str] = {"day": day_str, "sessions": 0, "steps": 0, "tokens": 0, "cost": 0.0}
-        daily_map[day_str]["sessions"] += 1
-        daily_map[day_str]["steps"] += r["total_steps"] or 0
-        daily_map[day_str]["tokens"] += r["total_tokens"] or 0
+            day_sessions[day_str] = set()
+        daily_map[day_str]["steps"] += 1
+        daily_map[day_str]["tokens"] += r["est_tokens"] or 0
         daily_map[day_str]["cost"] += r["billed_cost"] or 0.0
+        day_sessions[day_str].add(r["conversation_id"])
+
+    for day_str, s_set in day_sessions.items():
+        daily_map[day_str]["sessions"] = len(s_set)
 
     sorted_days = sorted(daily_map.keys())
     timeline = []
@@ -456,7 +461,8 @@ def query_session_details(conn, cid, tz=None):
         return None
 
     steps_rows = cur.execute("""
-        SELECT step_index, created_at, source, activity, tool_or_source, category, est_tokens, thinking_tokens, phase, model_name, detail
+        SELECT step_index, created_at, source, activity, tool_or_source, category, est_tokens, thinking_tokens, phase, model_name, detail,
+               billed_cost, billed_input_tokens, billed_output_tokens
         FROM steps
         WHERE conversation_id = ?
         ORDER BY step_index ASC

@@ -429,6 +429,7 @@ def analyze_transcript(transcript_path: Path, initial_model: str = "Gemini 3.7 F
     total_billed_input_tokens = 0
     total_billed_output_tokens = 0
     running_ctx = 0
+    current_ephemeral = 0
     
     # We need pricing for the cost calculation
     PRICING = {
@@ -451,15 +452,35 @@ def analyze_transcript(transcript_path: Path, initial_model: str = "Gemini 3.7 F
         tokens = s.get("est_tokens", 0)
         
         pkey = get_pricing_key(m_name)
-        if s_type == "PLANNER_RESPONSE":
+        step_cost = 0.0
+        step_in_tokens = 0
+        step_out_tokens = 0
+
+        if s_type == "CHECKPOINT":
+            # Context truncation: reset running_ctx to checkpoint tokens
+            running_ctx = tokens
+            current_ephemeral = 0
+        elif s_type == "EPHEMERAL_MESSAGE":
+            # Transient injection for immediate turn only
+            current_ephemeral = tokens
+        elif s_type == "PLANNER_RESPONSE":
             in_rate_low, in_rate_high, out_rate = PRICING[pkey]
-            in_rate = in_rate_high if running_ctx > 128_000 else in_rate_low
-            total_billed_cost += (running_ctx / 1_000_000 * in_rate) + (tokens / 1_000_000 * out_rate)
-            total_billed_input_tokens += running_ctx
-            total_billed_output_tokens += tokens
+            actual_in = running_ctx + current_ephemeral
+            in_rate = in_rate_high if actual_in > 128_000 else in_rate_low
+            step_cost = (actual_in / 1_000_000 * in_rate) + (tokens / 1_000_000 * out_rate)
+            step_in_tokens = actual_in
+            step_out_tokens = tokens
+            total_billed_cost += step_cost
+            total_billed_input_tokens += step_in_tokens
+            total_billed_output_tokens += step_out_tokens
             running_ctx += tokens
+            current_ephemeral = 0
         else:
             running_ctx += tokens
+
+        s["billed_cost"] = step_cost
+        s["billed_input_tokens"] = step_in_tokens
+        s["billed_output_tokens"] = step_out_tokens
 
     return {
         "title": title or "Active Session",
@@ -483,6 +504,7 @@ def analyze_transcript(transcript_path: Path, initial_model: str = "Gemini 3.7 F
         "steps": steps,
         "total_chars": total_chars,
         "total_tokens": total_tokens,
+        "active_context_tokens": running_ctx,
         "category_stats": category_stats,
         "tool_executions": tool_execs,
         "parsed_blocks": parsed_blocks
@@ -543,22 +565,27 @@ def sync_to_sqlite(cid: str, model_name: str, analysis: dict):
             step_params = [
                 (cid, s["step_index"], s["created_at"], s["source"], s["step_type"], s["category"], s["activity"],
                  s["tool_or_source"], s["characters"], s["est_tokens"], s.get("thinking_tokens", 0), s.get("phase", "reasoning"),
-                 s.get("model_name", active_model), s["detail"])
+                 s.get("model_name", active_model), s["detail"], s.get("billed_cost", 0.0), s.get("billed_input_tokens", 0),
+                 s.get("billed_output_tokens", 0))
                 for s in analysis["steps"]
             ]
             conn.executemany("""
                 INSERT INTO steps (
                     conversation_id, step_index, created_at, source, step_type, category, activity,
-                    tool_or_source, characters, est_tokens, thinking_tokens, phase, model_name, detail
+                    tool_or_source, characters, est_tokens, thinking_tokens, phase, model_name, detail,
+                    billed_cost, billed_input_tokens, billed_output_tokens
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(conversation_id, step_index) DO UPDATE SET
                     characters = excluded.characters,
                     est_tokens = excluded.est_tokens,
                     thinking_tokens = excluded.thinking_tokens,
                     phase = excluded.phase,
                     model_name = excluded.model_name,
-                    detail = excluded.detail
+                    detail = excluded.detail,
+                    billed_cost = excluded.billed_cost,
+                    billed_input_tokens = excluded.billed_input_tokens,
+                    billed_output_tokens = excluded.billed_output_tokens
             """, step_params)
 
             # Sync tool executions
@@ -608,17 +635,22 @@ def generate_artifact_report(cid: str, model_name: str, max_tokens: int, analysi
         report_file = artifact_dir / "context_usage.md"
         active_model = analysis.get("latest_model", model_name)
         active_max = analysis.get("latest_max_tokens", max_tokens)
+        active_tokens = analysis.get("active_context_tokens", analysis["total_tokens"])
         used_tokens = analysis["total_tokens"]
-        pct = (used_tokens / active_max * 100) if active_max else 0.0
+        active_pct = (active_tokens / active_max * 100) if active_max else 0.0
+        cost = analysis.get("billed_cost", 0.0)
+        in_toks = analysis.get("billed_input_tokens", 0)
+        out_toks = analysis.get("billed_output_tokens", 0)
         
         top_steps = sorted(analysis["steps"], key=lambda s: s["characters"], reverse=True)[:10]
 
         lines = [
             "# Live Context Window Usage Report",
             f"\n> **Conversation**: `{cid}`  ",
-            f"> **Model**: `{active_model}` ({format_tokens(active_max)} token context window)  ",
-            f"> **Current Utilization**: **{pct:.1f}%** ({format_tokens(used_tokens)} / {format_tokens(active_max)} estimated tokens)  ",
-            f"> **Total Steps Logged**: {len(analysis['steps'])}\n",
+            f"> **Model**: `{active_model}` ({format_tokens(active_max)} token window limit)  ",
+            f"> **Active Context Window**: **{active_pct:.1f}%** ({format_tokens(active_tokens)} / {format_tokens(active_max)} estimated tokens)  ",
+            f"> **Cumulative Disk Footprint**: **{format_tokens(used_tokens)} tokens** across {len(analysis['steps'])} logged steps  ",
+            f"> **Session API Value**: **${cost:,.4f}** (~{format_tokens(in_toks)} in / {format_tokens(out_toks)} out)\n",
             "## 1. Granular Context Breakdown by Category\n",
             "| Category | Characters | Est. Tokens | Share |",
             "| :--- | :--- | :--- | :--- |"
