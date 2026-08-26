@@ -795,17 +795,18 @@
       if (mcpServerChart) mcpServerChart.destroy();
 
       mcpServerChart = new Chart(ctx, {
-        type: 'doughnut',
+        type: 'bar',
         data: {
           labels: labels,
           datasets: [{
             data: data,
-            backgroundColor: colors.slice(0, labels.length),
-            borderColor: '#111827',
-            borderWidth: 2
+            backgroundColor: colors.slice(0, labels.length).map(c => c + 'cc'),
+            borderColor: colors.slice(0, labels.length),
+            borderWidth: 1
           }]
         },
         options: {
+          indexAxis: 'y',
           responsive: true,
           maintainAspectRatio: false,
           plugins: {
@@ -816,7 +817,17 @@
               }
             }
           },
-          cutout: '68%'
+          scales: {
+            x: {
+              beginAtZero: true,
+              grid: { color: '#1f2937' },
+              ticks: { color: '#9ca3af', font: { size: 10 } }
+            },
+            y: {
+              grid: { display: false },
+              ticks: { color: '#9ca3af', font: { size: 10 } }
+            }
+          }
         }
       });
 
@@ -901,21 +912,22 @@
       if (categoryChart) categoryChart.destroy();
 
       categoryChart = new Chart(ctx, {
-        type: 'polarArea',
+        type: 'bar',
         data: {
           labels: labels,
           datasets: [{
             data: data,
             backgroundColor: colors.map(c => c + 'aa'),
-            borderColor: '#111827',
+            borderColor: colors,
             borderWidth: 1
           }]
         },
         options: {
+          indexAxis: 'y',
           responsive: true,
           maintainAspectRatio: false,
           plugins: {
-            legend: { position: 'right', labels: { color: '#9ca3af', boxWidth: 10, font: { size: 9.5 } } },
+            legend: { display: false },
             tooltip: {
               callbacks: {
                 label: (ctx) => ` ${ctx.label}: ${formatTokens(ctx.raw)} tokens`
@@ -923,7 +935,15 @@
             }
           },
           scales: {
-            r: { grid: { color: '#1f2937' }, ticks: { display: false } }
+            x: {
+              beginAtZero: true,
+              grid: { color: '#1f2937' },
+              ticks: { color: '#9ca3af', callback: v => formatTokens(v), font: { size: 10 } }
+            },
+            y: {
+              grid: { display: false },
+              ticks: { color: '#9ca3af', font: { size: 10 } }
+            }
           }
         }
       });
@@ -947,17 +967,18 @@
       if (phaseChart) phaseChart.destroy();
 
       phaseChart = new Chart(ctx, {
-        type: 'doughnut',
+        type: 'bar',
         data: {
           labels: labels,
           datasets: [{
             data: data,
-            backgroundColor: bgColors,
-            borderColor: '#111827',
-            borderWidth: 2
+            backgroundColor: bgColors.map(c => c + 'cc'),
+            borderColor: bgColors,
+            borderWidth: 1
           }]
         },
         options: {
+          indexAxis: 'y',
           responsive: true,
           maintainAspectRatio: false,
           plugins: {
@@ -968,7 +989,17 @@
               }
             }
           },
-          cutout: '68%'
+          scales: {
+            x: {
+              beginAtZero: true,
+              grid: { color: '#1f2937' },
+              ticks: { color: '#9ca3af', callback: v => formatTokens(v), font: { size: 10 } }
+            },
+            y: {
+              grid: { display: false },
+              ticks: { color: '#9ca3af', font: { size: 10 } }
+            }
+          }
         }
       });
 
