@@ -27,7 +27,7 @@ import sys
 import json
 import argparse
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import sys
 from pathlib import Path
@@ -510,11 +510,16 @@ def print_timeline(conn, days: int = 14):
     for d_str, s_set in day_sessions.items():
         daily_map[d_str]["sessions"] = len(s_set)
 
-    sorted_days = sorted(daily_map.keys())[-days:]
+    today = datetime.now(local_tz).date()
+    timeline_days = []
+    for i in range(days):
+        d_str = (today - timedelta(days=i)).strftime("%Y-%m-%d")
+        timeline_days.append(d_str)
+
     print(f"  {'Date (' + tz_abbr + ')':<14} | {'Sessions':<10} | {'Steps Logged':<14} | {'Tokens Consumed':<16} | {'Est API Value':<14}")
     print("  " + "-" * 75)
-    for day in reversed(sorted_days):
-        info = daily_map[day]
+    for day in timeline_days:
+        info = daily_map.get(day, {"sessions": 0, "steps": 0, "tokens": 0, "cost": 0.0})
         print(f"  {day:<14} | {info['sessions']:<10,}| {info['steps']:<14,}| {format_tokens(info['tokens']):<16} | ${info['cost']:<13,.2f}")
     print("=" * 75 + "\n")
 

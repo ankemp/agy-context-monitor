@@ -584,7 +584,17 @@
       if (btn30d) btn30d.className = days === 30 ? btnClasses.active : btnClasses.inactive;
       if (btnAll) btnAll.className = days === null ? btnClasses.active : btnClasses.inactive;
       
-      const sliced = days ? allTimelineData.slice(-days) : allTimelineData;
+      let sliced = allTimelineData;
+      if (days) {
+        sliced = allTimelineData.slice(-days);
+      } else {
+        const firstActiveIdx = allTimelineData.findIndex(d => (d.steps > 0 || d.tokens > 0 || d.sessions > 0));
+        if (firstActiveIdx > 0 && (allTimelineData.length - firstActiveIdx) >= 1) {
+          sliced = allTimelineData.slice(firstActiveIdx);
+        } else {
+          sliced = allTimelineData;
+        }
+      }
       renderTimelineChart(sliced);
     }
     window.setTimelineRange = setTimelineRange;
@@ -662,6 +672,7 @@
             y: {
               type: 'linear',
               position: 'left',
+              beginAtZero: true,
               grid: { color: '#1f2937' },
               ticks: { color: '#9ca3af', callback: v => formatTokens(v), font: { size: 10 } },
               title: { display: true, text: 'Tokens', color: '#6b7280', font: { size: 10 } }
@@ -669,13 +680,15 @@
             y1: {
               type: 'linear',
               position: 'right',
+              beginAtZero: true,
               grid: { drawOnChartArea: false },
-              ticks: { color: '#38bdf8', font: { size: 10 } },
+              ticks: { color: '#38bdf8', font: { size: 10 }, precision: 0 },
               title: { display: true, text: 'Sessions', color: '#38bdf8', font: { size: 10 } }
             },
             yCost: {
               type: 'linear',
               position: 'right',
+              beginAtZero: true,
               grid: { drawOnChartArea: false },
               ticks: {
                 color: '#f43f5e',

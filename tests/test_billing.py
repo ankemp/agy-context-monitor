@@ -156,7 +156,7 @@ def test_timeline_date_attribution_multi_day(tmp_path):
     conn.commit()
     
     # Query timeline data in UTC
-    timeline = query_timeline_data(conn, days=7, tz="UTC")
+    timeline = query_timeline_data(conn, tz="UTC")
     conn.close()
     
     date_map = {item["day"]: item for item in timeline}
@@ -175,3 +175,67 @@ def test_timeline_date_attribution_multi_day(tmp_path):
     assert date_map["2026-08-22"]["cost"] == 0.02
     assert date_map["2026-08-22"]["steps"] == 1
     assert date_map["2026-08-22"]["sessions"] == 1
+
+def test_timeline_fills_gap_days_with_zeros(tmp_path):
+    """
+    Verifies that intermediate gap days with no recorded activity are populated
+    with zero values (tokens=0, steps=0, sessions=0, cost=0.0).
+    """
+    db_file = tmp_path / "test_gap_days.db"
+    init_db(db_file)
+    conn = get_db_connection(db_file)
+
+    conn.execute("""
+        INSERT INTO conversations (id, title, model_name, created_at, updated_at, total_steps, total_tokens, billed_cost)
+        VALUES ('conv-gap', 'Gap Session', 'Gemini Flash', '2026-08-01T10:00:00Z', '2026-08-05T15:00:00Z', 2, 1000, 0.02)
+    """)
+
+    steps = [
+        ('conv-gap', 1, '2026-08-01T10:00:00Z', 'MODEL', 'PLANNER_RESPONSE', 500, 0.01),
+        ('conv-gap', 2, '2026-08-05T10:00:00Z', 'MODEL', 'PLANNER_RESPONSE', 500, 0.01),
+    ]
+
+    conn.executemany("""
+        INSERT INTO steps (conversation_id, step_index, created_at, source, step_type, est_tokens, billed_cost)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, steps)
+    conn.commit()
+
+    timeline = query_timeline_data(conn, tz="UTC")
+    conn.close()
+
+    date_map = {item["day"]: item for item in timeline}
+    # Check active days
+    assert date_map["2026-08-01"]["tokens"] == 500
+    assert date_map["2026-08-05"]["tokens"] == 500
+
+    # Check intermediate zero-data gap days
+    for gap_day in ["2026-08-02", "2026-08-03", "2026-08-04"]:
+        assert gap_day in date_map
+        assert date_map[gap_day]["tokens"] == 0
+        assert date_map[gap_day]["steps"] == 0
+        assert date_map[gap_day]["sessions"] == 0
+        assert date_map[gap_day]["cost"] == 0.0
+
+def test_timeline_fixed_day_counts(tmp_path):
+    """
+    Verifies that passing days=7, days=14, days=30 returns exactly that many items.
+    """
+    db_file = tmp_path / "test_fixed_days.db"
+    init_db(db_file)
+    conn = get_db_connection(db_file)
+
+    t7 = query_timeline_data(conn, days=7, tz="UTC")
+    t14 = query_timeline_data(conn, days=14, tz="UTC")
+    t30 = query_timeline_data(conn, days=30, tz="UTC")
+    conn.close()
+
+    assert len(t7) == 7
+    assert len(t14) == 14
+    assert len(t30) == 30
+
+    for item in t7:
+        assert item["tokens"] == 0
+        assert item["sessions"] == 0
+        assert item["steps"] == 0
+        assert item["cost"] == 0.0

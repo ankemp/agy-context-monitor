@@ -211,15 +211,40 @@ def query_timeline_data(conn, days=None, tz=None):
     for day_str, s_set in day_sessions.items():
         daily_map[day_str]["sessions"] = len(s_set)
 
-    sorted_days = sorted(daily_map.keys())
-    timeline = []
-    for d in sorted_days:
-        item = daily_map[d]
-        item["cost"] = round(item["cost"], 2)
-        timeline.append(item)
+    today = datetime.now(target_tz).date()
 
-    if days and len(timeline) > int(days):
-        return timeline[-int(days):]
+    if days is not None:
+        num_days = int(days)
+        start_date = today - timedelta(days=num_days - 1)
+        end_date = today
+    else:
+        if daily_map:
+            min_date = min(datetime.strptime(d, "%Y-%m-%d").date() for d in daily_map.keys())
+            max_date = max(datetime.strptime(d, "%Y-%m-%d").date() for d in daily_map.keys())
+            start_date = min(min_date, today - timedelta(days=29))
+            end_date = max(max_date, today)
+        else:
+            start_date = today - timedelta(days=29)
+            end_date = today
+
+    timeline = []
+    curr = start_date
+    while curr <= end_date:
+        d_str = curr.strftime("%Y-%m-%d")
+        if d_str in daily_map:
+            item = daily_map[d_str]
+            item["cost"] = round(item["cost"], 2)
+            timeline.append(item)
+        else:
+            timeline.append({
+                "day": d_str,
+                "sessions": 0,
+                "steps": 0,
+                "tokens": 0,
+                "cost": 0.0
+            })
+        curr += timedelta(days=1)
+
     return timeline
 
 def query_tools_data(conn):
