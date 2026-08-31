@@ -116,6 +116,27 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             elif path.startswith("/api/session/"):
                 session_id = path.split("/")[-1]
                 data = api_routes.query_session_details(conn, session_id, target_tz)
+            elif path == "/api/turn-diff":
+                conv_id = qs.get("conv_id", qs.get("cid", [None]))[0]
+                step_a_param = qs.get("a", qs.get("step_a", [None]))[0]
+                step_b_param = qs.get("b", qs.get("step_b", [None]))[0]
+                cumulative_param = qs.get("cumulative", ["true"])[0].lower()
+                cumulative = cumulative_param in ("true", "1", "yes")
+
+                if not conv_id or step_a_param is None or step_b_param is None:
+                    self.send_error(400, "Missing required params: conv_id, a, b")
+                    return
+                try:
+                    step_a = int(step_a_param)
+                    step_b = int(step_b_param)
+                except ValueError:
+                    self.send_error(400, "Invalid step parameters: a and b must be integers")
+                    return
+
+                data = api_routes.query_turn_diff(conn, conv_id, step_a, step_b, cumulative, target_tz)
+                if data is None:
+                    self.send_error(404, "Conversation not found")
+                    return
             else:
                 self.send_error(404)
                 return

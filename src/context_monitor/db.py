@@ -100,6 +100,7 @@ CREATE INDEX IF NOT EXISTS idx_tool_exec_server ON tool_executions(mcp_server);
 CREATE INDEX IF NOT EXISTS idx_tool_exec_mcp_tool ON tool_executions(mcp_tool);
 CREATE INDEX IF NOT EXISTS idx_tool_exec_path ON tool_executions(target_path);
 CREATE INDEX IF NOT EXISTS idx_blocks_conv_hash ON transcript_blocks(conversation_id, block_hash);
+CREATE INDEX IF NOT EXISTS idx_blocks_conv_step ON transcript_blocks(conversation_id, step_index);
 """
 
 def get_db_connection(db_path: Path = DEFAULT_DB_PATH, timeout: float = 30.0) -> sqlite3.Connection:

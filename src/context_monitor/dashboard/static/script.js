@@ -1234,6 +1234,8 @@
           sBody.appendChild(tr);
         }
 
+        currentSessionData = data;
+        populateDiffSelectors(data.steps);
         renderFlowSequence(data.steps);
         setSessionViewMode('flow');
 
@@ -1248,23 +1250,350 @@
     function setSessionViewMode(mode) {
       const btnTable = document.getElementById('btnViewTable');
       const btnFlow = document.getElementById('btnViewFlow');
+      const btnDiff = document.getElementById('btnViewDiff');
       const tableContainer = document.getElementById('sessionViewTable');
       const flowContainer = document.getElementById('sessionViewFlow');
+      const diffContainer = document.getElementById('sessionViewDiff');
 
       const activeClass = 'px-2.5 py-1 rounded-md bg-brand-600 text-white font-medium shadow transition whitespace-nowrap';
       const inactiveClass = 'px-2.5 py-1 rounded-md text-gray-400 hover:text-white transition whitespace-nowrap';
 
-      if (mode === 'table') {
-        btnTable.className = activeClass;
-        btnFlow.className = inactiveClass;
-        tableContainer.classList.remove('hidden');
-        flowContainer.classList.add('hidden');
-      } else {
-        btnFlow.className = activeClass;
-        btnTable.className = inactiveClass;
-        flowContainer.classList.remove('hidden');
-        tableContainer.classList.add('hidden');
+      btnTable.className = mode === 'table' ? activeClass : inactiveClass;
+      btnFlow.className = mode === 'flow' ? activeClass : inactiveClass;
+      if (btnDiff) {
+        btnDiff.className = (mode === 'diff' ? activeClass : inactiveClass) + ' flex items-center space-x-1';
       }
+
+      tableContainer.classList.toggle('hidden', mode !== 'table');
+      flowContainer.classList.toggle('hidden', mode !== 'flow');
+      if (diffContainer) {
+        diffContainer.classList.toggle('hidden', mode !== 'diff');
+      }
+
+      if (mode === 'diff') {
+        onDiffStepChange();
+      }
+    }
+
+    function populateDiffSelectors(steps) {
+      const selectA = document.getElementById('diffSelectA');
+      const selectB = document.getElementById('diffSelectB');
+      if (!selectA || !selectB) return;
+      selectA.innerHTML = '';
+      selectB.innerHTML = '';
+
+      if (!steps || steps.length === 0) return;
+
+      for (let i = 0; i < steps.length; i++) {
+        const s = steps[i];
+        const label = `Step #${s.step_index}: ${s.activity || 'Step'} (${formatTokens(s.est_tokens)} tok)`;
+        const optA = document.createElement('option');
+        optA.value = s.step_index;
+        optA.textContent = label;
+        selectA.appendChild(optA);
+
+        const optB = document.createElement('option');
+        optB.value = s.step_index;
+        optB.textContent = label;
+        selectB.appendChild(optB);
+      }
+
+      if (steps.length > 1) {
+        selectA.value = steps[steps.length - 2].step_index;
+        selectB.value = steps[steps.length - 1].step_index;
+      } else {
+        selectA.value = steps[0].step_index;
+        selectB.value = steps[0].step_index;
+      }
+    }
+
+    function setDiffPreset(preset) {
+      if (!currentSessionData || !currentSessionData.steps || currentSessionData.steps.length === 0) return;
+      const steps = currentSessionData.steps;
+      const selectA = document.getElementById('diffSelectA');
+      const selectB = document.getElementById('diffSelectB');
+      if (!selectA || !selectB) return;
+
+      if (preset === 'prev') {
+        const curBIdx = selectB.selectedIndex;
+        if (curBIdx > 0) {
+          selectA.selectedIndex = curBIdx - 1;
+        } else if (steps.length > 1) {
+          selectA.selectedIndex = steps.length - 2;
+          selectB.selectedIndex = steps.length - 1;
+        }
+      } else if (preset === 'first_to_last') {
+        selectA.selectedIndex = 0;
+        selectB.selectedIndex = steps.length - 1;
+      }
+      onDiffStepChange();
+    }
+
+    async function onDiffStepChange() {
+      const selectA = document.getElementById('diffSelectA');
+      const selectB = document.getElementById('diffSelectB');
+      const toggleCumulative = document.getElementById('diffCumulativeToggle');
+      if (!selectA || !selectB || !currentSessionData) return;
+
+      const stepA = parseInt(selectA.value, 10);
+      const stepB = parseInt(selectB.value, 10);
+      const cumulative = toggleCumulative ? toggleCumulative.checked : true;
+
+      await loadTurnDiff(currentSessionData.conversation.id, stepA, stepB, cumulative);
+    }
+
+    function computeLocalTurnDiff(steps, stepA, stepB, cumulative) {
+      let blocksA = [];
+      let blocksB = [];
+
+      for (const s of steps) {
+        const sBlocks = s.blocks || [];
+        if (cumulative) {
+          if (s.step_index <= stepA) blocksA.push(...sBlocks);
+          if (s.step_index <= stepB) blocksB.push(...sBlocks);
+        } else {
+          if (s.step_index === stepA) blocksA.push(...sBlocks);
+          if (s.step_index === stepB) blocksB.push(...sBlocks);
+        }
+      }
+
+      function norm(b) {
+        const kind = b.block_type || b.type || b.kind || 'generic';
+        const content = b.content || b.text || '';
+        const hash = b.block_hash || b.hash || `${kind}:${content.substring(0, 100)}`;
+        const tokens = b.est_tokens || Math.max(1, Math.round(content.length / 3.8));
+        return {
+          kind,
+          block_type: kind,
+          content,
+          hash,
+          step_index: b.step_index || 0,
+          call_id: b.call_id,
+          tool_name: b.tool_name,
+          est_tokens: tokens
+        };
+      }
+
+      const normA = blocksA.map(norm);
+      const normB = blocksB.map(norm);
+
+      const aKeys = new Set(normA.map(x => x.hash));
+      const bKeys = new Set(normB.map(x => x.hash));
+
+      const added = normB.filter(x => !aKeys.has(x.hash));
+      const removed = normA.filter(x => !bKeys.has(x.hash));
+      const common = normB.filter(x => aKeys.has(x.hash));
+
+      const addedTokens = added.reduce((sum, x) => sum + x.est_tokens, 0);
+      const removedTokens = removed.reduce((sum, x) => sum + x.est_tokens, 0);
+      const commonTokens = common.reduce((sum, x) => sum + x.est_tokens, 0);
+
+      const stepAObj = steps.find(s => s.step_index === stepA) || { step_index: stepA };
+      const stepBObj = steps.find(s => s.step_index === stepB) || { step_index: stepB };
+
+      return {
+        conversation_id: currentSessionData.conversation.id,
+        step_a: stepAObj,
+        step_b: stepBObj,
+        cumulative: cumulative,
+        added: added,
+        removed: removed,
+        common: common,
+        stats: {
+          added_count: added.length,
+          removed_count: removed.length,
+          common_count: common.length,
+          added_tokens: addedTokens,
+          removed_tokens: removedTokens,
+          common_tokens: commonTokens,
+          net_token_delta: addedTokens - removedTokens,
+          compaction_detected: removed.length > 0,
+          pruned_step_indices: [...new Set(removed.map(x => x.step_index))],
+          pruned_kinds: {},
+          summary: `+${added.length} blocks (~${addedTokens} tok)`
+        }
+      };
+    }
+
+    async function loadTurnDiff(cid, stepA, stepB, cumulative) {
+      try {
+        let diffData = null;
+        if (typeof IS_STATIC_EXPORT !== 'undefined' && IS_STATIC_EXPORT) {
+          diffData = computeLocalTurnDiff(currentSessionData.steps, stepA, stepB, cumulative);
+        } else {
+          const clientTz = Intl.DateTimeFormat().resolvedOptions().timeZone || '';
+          const res = await fetch(`/api/turn-diff?conv_id=${encodeURIComponent(cid)}&a=${stepA}&b=${stepB}&cumulative=${cumulative}&tz=${encodeURIComponent(clientTz)}`);
+          if (res.ok) {
+            diffData = await res.json();
+          } else {
+            diffData = computeLocalTurnDiff(currentSessionData.steps, stepA, stepB, cumulative);
+          }
+        }
+        renderTurnDiff(diffData);
+      } catch (e) {
+        console.error("Failed to fetch turn diff", e);
+        if (currentSessionData && currentSessionData.steps) {
+          const fallback = computeLocalTurnDiff(currentSessionData.steps, stepA, stepB, cumulative);
+          renderTurnDiff(fallback);
+        }
+      }
+    }
+
+    function renderDiffBlock(block, mode) {
+      const isAdded = mode === 'added';
+      const isRemoved = mode === 'removed';
+      const kind = block.block_type || block.kind || 'generic';
+      const content = block.content || block.text || '';
+      const tokens = block.est_tokens || 0;
+      const stepIdx = block.step_index || 0;
+
+      let borderCls = 'border-l-4 border-l-gray-600 bg-dark-900/30';
+      let badgeCls = 'bg-gray-500/20 text-gray-300 border-gray-500/40';
+      let signLabel = '= Retained';
+
+      if (isAdded) {
+        borderCls = 'border-l-4 border-l-emerald-500 bg-emerald-950/20';
+        badgeCls = 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40';
+        signLabel = '+ Added';
+      } else if (isRemoved) {
+        borderCls = 'border-l-4 border-l-rose-500 bg-rose-950/20';
+        badgeCls = 'bg-rose-500/20 text-rose-300 border-rose-500/40';
+        signLabel = '- Evicted';
+      }
+
+      let kindIcon = 'file-text';
+      let kindTitle = kind.toUpperCase();
+      if (kind === 'user') { kindIcon = 'user'; kindTitle = 'User Prompt'; }
+      else if (kind === 'assistant') { kindIcon = 'message-square'; kindTitle = 'Assistant Response'; }
+      else if (kind === 'thinking') { kindIcon = 'brain-circuit'; kindTitle = 'Model Reasoning'; }
+      else if (kind === 'tool_use') { kindIcon = 'wrench'; kindTitle = `Tool Call (${block.name || block.tool_name || 'Tool'})`; }
+      else if (kind === 'tool_result') { kindIcon = 'check-square'; kindTitle = 'Tool Output'; }
+      else if (kind === 'system') { kindIcon = 'cpu'; kindTitle = 'System Context'; }
+
+      return `
+        <div class="flex flex-col bg-dark-800 rounded-lg border border-dark-700 overflow-hidden ${borderCls} p-3.5">
+          <div class="flex items-center justify-between">
+            <div class="flex items-center space-x-2">
+              <span class="px-2 py-0.5 rounded text-[10px] font-bold uppercase font-mono border ${badgeCls}">${signLabel}</span>
+              <div class="flex items-center space-x-1.5 text-xs font-semibold text-gray-200">
+                <i data-lucide="${kindIcon}" class="w-3.5 h-3.5 opacity-80"></i>
+                <span>${kindTitle}</span>
+              </div>
+            </div>
+            <div class="flex items-center space-x-2 text-[10px] font-mono">
+              <span class="text-gray-400 font-bold">~${formatTokens(tokens)} tok</span>
+              <span class="text-gray-500">Step #${stepIdx}</span>
+            </div>
+          </div>
+          ${renderCollapsibleBody(content)}
+        </div>
+      `;
+    }
+
+    function renderTurnDiff(diffData) {
+      if (!diffData) return;
+      const stats = diffData.stats || {};
+
+      // 1. Update KPI numbers
+      document.getElementById('diffKpiAdded').textContent = `+${formatTokens(stats.added_tokens || 0)} tok`;
+      document.getElementById('diffKpiAddedSub').textContent = `${(stats.added_count || 0).toLocaleString()} block${stats.added_count === 1 ? '' : 's'}`;
+
+      document.getElementById('diffKpiRemoved').textContent = `-${formatTokens(stats.removed_tokens || 0)} tok`;
+      document.getElementById('diffKpiRemovedSub').textContent = `${(stats.removed_count || 0).toLocaleString()} block${stats.removed_count === 1 ? '' : 's'}`;
+
+      const delta = stats.net_token_delta || 0;
+      const deltaEl = document.getElementById('diffKpiDelta');
+      deltaEl.textContent = `${delta >= 0 ? '+' : ''}${formatTokens(delta)} tok`;
+      deltaEl.className = delta > 0 ? 'font-bold text-emerald-400 font-mono mt-0.5 block text-sm' : (delta < 0 ? 'font-bold text-rose-400 font-mono mt-0.5 block text-sm' : 'font-bold text-indigo-300 font-mono mt-0.5 block text-sm');
+
+      const compactionEl = document.getElementById('diffKpiCompaction');
+      const compactionAlert = document.getElementById('diffCompactionAlert');
+      const compactionDetail = document.getElementById('diffCompactionDetail');
+
+      if (stats.compaction_detected) {
+        compactionEl.textContent = `⚠️ Compaction (${stats.removed_count} pruned)`;
+        compactionEl.className = 'font-bold text-amber-400 text-xs mt-0.5';
+        if (compactionAlert) {
+          compactionAlert.classList.remove('hidden');
+          const prunedSteps = (stats.pruned_step_indices || []).join(', ') || 'earlier turns';
+          compactionDetail.textContent = `Context Compaction / Truncation Boundary Detected: Older history blocks from step(s) ${prunedSteps} (~${formatTokens(stats.removed_tokens)} tokens) were evicted from the prompt window.`;
+        }
+      } else {
+        compactionEl.textContent = '✓ Clean (0 pruned)';
+        compactionEl.className = 'font-bold text-emerald-400 text-xs mt-0.5';
+        if (compactionAlert) {
+          compactionAlert.classList.add('hidden');
+        }
+      }
+
+      // 2. Render diff stream
+      const container = document.getElementById('diffStreamContainer');
+      container.innerHTML = '';
+
+      const added = diffData.added || [];
+      const removed = diffData.removed || [];
+      const common = diffData.common || [];
+
+      if (added.length === 0 && removed.length === 0 && common.length === 0) {
+        container.innerHTML = '<div class="text-xs text-gray-500 italic p-6 text-center">No blocks found between Turn A and Turn B.</div>';
+        lucide.createIcons();
+        return;
+      }
+
+      // Evicted blocks section
+      if (removed.length > 0) {
+        const header = document.createElement('div');
+        header.className = 'text-xs font-bold text-rose-400 uppercase tracking-wider flex items-center space-x-1.5 pt-1';
+        header.innerHTML = `<i data-lucide="minus-circle" class="w-3.5 h-3.5"></i><span>Evicted / Pruned from Context (${removed.length} blocks • ~${formatTokens(stats.removed_tokens)} tok)</span>`;
+        container.appendChild(header);
+
+        for (const b of removed) {
+          const el = document.createElement('div');
+          el.innerHTML = renderDiffBlock(b, 'removed');
+          container.appendChild(el.firstElementChild);
+        }
+      }
+
+      // Added blocks section
+      if (added.length > 0) {
+        const header = document.createElement('div');
+        header.className = 'text-xs font-bold text-emerald-400 uppercase tracking-wider flex items-center space-x-1.5 pt-2';
+        header.innerHTML = `<i data-lucide="plus-circle" class="w-3.5 h-3.5"></i><span>Added to Context (${added.length} blocks • ~${formatTokens(stats.added_tokens)} tok)</span>`;
+        container.appendChild(header);
+
+        for (const b of added) {
+          const el = document.createElement('div');
+          el.innerHTML = renderDiffBlock(b, 'added');
+          container.appendChild(el.firstElementChild);
+        }
+      }
+
+      // Retained / Common blocks section (collapsible)
+      if (common.length > 0) {
+        const details = document.createElement('details');
+        details.className = 'group bg-dark-900/60 rounded-lg border border-dark-700/60 p-3 mt-2';
+        
+        let commonBlocksHtml = '';
+        for (const b of common) {
+          commonBlocksHtml += renderDiffBlock(b, 'common');
+        }
+
+        details.innerHTML = `
+          <summary class="text-xs text-gray-400 font-semibold cursor-pointer select-none hover:text-gray-200 transition flex items-center justify-between">
+            <div class="flex items-center space-x-1.5">
+              <span class="inline-block transition group-open:rotate-90">▸</span>
+              <span>= Retained Context (${common.length} blocks • ~${formatTokens(stats.common_tokens)} tok)</span>
+            </div>
+            <span class="text-[10px] text-gray-500 font-mono">click to expand</span>
+          </summary>
+          <div class="mt-3 space-y-2 pt-2 border-t border-dark-800">
+            ${commonBlocksHtml}
+          </div>
+        `;
+        container.appendChild(details);
+      }
+
+      lucide.createIcons();
     }
 
     function hashCode(str) {

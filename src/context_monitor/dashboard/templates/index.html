@@ -784,6 +784,10 @@
               <button onclick="setSessionViewMode('table')" id="btnViewTable" class="px-2.5 py-1 rounded-md text-gray-400 hover:text-white transition whitespace-nowrap">
                 Table View
               </button>
+              <button onclick="setSessionViewMode('diff')" id="btnViewDiff" class="px-2.5 py-1 rounded-md text-gray-400 hover:text-white transition whitespace-nowrap flex items-center space-x-1">
+                <i data-lucide="git-compare" class="w-3.5 h-3.5"></i>
+                <span>Diff View</span>
+              </button>
             </div>
           </div>
 
@@ -808,6 +812,74 @@
           <div id="sessionViewFlow" class="overflow-x-auto max-h-[400px] overflow-y-auto bg-dark-800/50 rounded-lg border border-dark-700 p-4 space-y-4">
             <div id="modalFlowSequence" class="flex flex-col space-y-3">
               <!-- Flow sequence blocks will be rendered here -->
+            </div>
+          </div>
+
+          <!-- Diff View Container (DIFF_ENGINE_UI) -->
+          <div id="sessionViewDiff" class="hidden space-y-4">
+            <!-- Diff Controls Bar -->
+            <div class="bg-dark-800/80 p-3.5 rounded-lg border border-dark-700 flex flex-col md:flex-row md:items-center justify-between gap-3 text-xs">
+              <div class="flex items-center space-x-2 flex-wrap gap-y-2">
+                <div class="flex items-center space-x-1.5">
+                  <span class="text-gray-400 font-medium">Turn A:</span>
+                  <select id="diffSelectA" onchange="onDiffStepChange()" class="bg-dark-900 border border-dark-700 rounded px-2 py-1 text-gray-200 font-mono text-xs focus:outline-none focus:border-brand-500">
+                  </select>
+                </div>
+                <span class="text-gray-500 font-bold">➔</span>
+                <div class="flex items-center space-x-1.5">
+                  <span class="text-gray-400 font-medium">Turn B:</span>
+                  <select id="diffSelectB" onchange="onDiffStepChange()" class="bg-dark-900 border border-dark-700 rounded px-2 py-1 text-gray-200 font-mono text-xs focus:outline-none focus:border-brand-500">
+                  </select>
+                </div>
+                <div class="flex items-center space-x-1 ml-2 bg-dark-900 border border-dark-700 rounded p-0.5">
+                  <button onclick="setDiffPreset('prev')" class="px-2 py-0.5 rounded text-[11px] text-gray-300 hover:text-white transition">Step N-1 ➔ N</button>
+                  <button onclick="setDiffPreset('first_to_last')" class="px-2 py-0.5 rounded text-[11px] text-gray-300 hover:text-white transition">Step 1 ➔ N</button>
+                </div>
+              </div>
+
+              <div class="flex items-center space-x-3">
+                <label class="flex items-center space-x-1.5 cursor-pointer select-none text-gray-300">
+                  <input type="checkbox" id="diffCumulativeToggle" onchange="onDiffStepChange()" checked class="rounded bg-dark-900 border-dark-700 text-brand-600 focus:ring-0 focus:ring-offset-0">
+                  <span class="text-[11px]">Cumulative Context</span>
+                </label>
+              </div>
+            </div>
+
+            <!-- Diff KPI Metric Strip -->
+            <div class="grid grid-cols-2 sm:grid-cols-4 gap-2.5 text-xs text-center">
+              <div class="p-2.5 rounded-lg bg-emerald-950/20 border border-emerald-500/30">
+                <span class="text-gray-400 block text-[10px] uppercase font-medium">Added Context</span>
+                <span id="diffKpiAdded" class="font-bold text-emerald-400 font-mono mt-0.5 block text-sm">+0 tok</span>
+                <span id="diffKpiAddedSub" class="text-[10px] text-gray-400">0 blocks</span>
+              </div>
+              <div class="p-2.5 rounded-lg bg-rose-950/20 border border-rose-500/30">
+                <span class="text-gray-400 block text-[10px] uppercase font-medium">Evicted / Pruned</span>
+                <span id="diffKpiRemoved" class="font-bold text-rose-400 font-mono mt-0.5 block text-sm">-0 tok</span>
+                <span id="diffKpiRemovedSub" class="text-[10px] text-gray-400">0 blocks</span>
+              </div>
+              <div class="p-2.5 rounded-lg bg-indigo-950/20 border border-indigo-500/30">
+                <span class="text-gray-400 block text-[10px] uppercase font-medium">Net Delta</span>
+                <span id="diffKpiDelta" class="font-bold text-indigo-300 font-mono mt-0.5 block text-sm">0 tok</span>
+                <span id="diffKpiDeltaSub" class="text-[10px] text-gray-400">turn change</span>
+              </div>
+              <div class="p-2.5 rounded-lg bg-dark-900/60 border border-dark-700/60 flex flex-col justify-center items-center">
+                <span class="text-gray-400 block text-[10px] uppercase font-medium">Compaction</span>
+                <span id="diffKpiCompaction" class="font-bold text-emerald-400 text-xs mt-0.5">✓ Clean</span>
+              </div>
+            </div>
+
+            <!-- Compaction Detected Alert Banner -->
+            <div id="diffCompactionAlert" class="hidden p-3 rounded-lg bg-amber-950/40 border border-amber-500/40 text-xs text-amber-200 flex items-start space-x-2.5">
+              <i data-lucide="alert-triangle" class="w-4 h-4 text-amber-400 shrink-0 mt-0.5"></i>
+              <div>
+                <span class="font-bold">Context Compaction / Truncation Boundary Detected!</span>
+                <p class="text-[11px] text-amber-300/80 mt-0.5" id="diffCompactionDetail">Older history blocks were evicted from the prompt context between Turn A and Turn B.</p>
+              </div>
+            </div>
+
+            <!-- Diff Content View Area -->
+            <div id="diffStreamContainer" class="overflow-x-auto max-h-[420px] overflow-y-auto bg-dark-800/50 rounded-lg border border-dark-700 p-4 space-y-3">
+              <!-- Diff blocks will be rendered here -->
             </div>
           </div>
         </div>

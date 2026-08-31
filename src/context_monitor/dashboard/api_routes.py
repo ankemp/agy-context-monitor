@@ -641,3 +641,23 @@ def query_session_details(conn, cid, tz=None):
         "top_consumers": top_consumers
     }
 
+def query_turn_diff(conn, conv_id: str, step_a: int, step_b: int, cumulative: bool = True, tz=None):
+    from context_monitor.diff import get_turn_diff_from_db
+    cur = conn.cursor()
+    conv = cur.execute("SELECT id, title, model_name FROM conversations WHERE id = ?", (conv_id,)).fetchone()
+    if not conv:
+        return None
+
+    diff_data = get_turn_diff_from_db(conn, conv_id, step_a, step_b, cumulative=cumulative)
+    target_tz = get_target_tz(tz)
+    for step_key in ("step_a", "step_b"):
+        if diff_data.get(step_key) and diff_data[step_key].get("created_at"):
+            dt = parse_to_local_dt(diff_data[step_key]["created_at"], target_tz)
+            if dt:
+                diff_data[step_key]["created_at"] = dt.strftime("%Y-%m-%d %H:%M:%S")
+
+    diff_data["conversation_title"] = conv["title"] or f"Session {conv['id'][:8]}"
+    diff_data["model_name"] = conv["model_name"] or "Gemini"
+    return diff_data
+
+
