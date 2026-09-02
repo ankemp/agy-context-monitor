@@ -33,6 +33,9 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         path = parsed.path
         qs = parse_qs(parsed.query)
         client_tz = qs.get("tz", [None])[0]
+        project_param = qs.get("project", [None])[0]
+        if project_param == "all" or not project_param:
+            project_param = None
 
         if path == "/" or path == "/index.html":
             template = env.get_template('index.html')
@@ -96,23 +99,28 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         conn = get_db_connection()
         target_tz = api_routes.get_target_tz(client_tz)
         try:
-            if path == "/api/summary":
-                data = api_routes.query_summary_data(conn, target_tz)
+            if path == "/api/projects":
+                cur = conn.cursor()
+                rows = cur.execute("SELECT DISTINCT project FROM conversations WHERE project IS NOT NULL AND project != '' ORDER BY project ASC").fetchall()
+                data = [r["project"] for r in rows]
+            elif path == "/api/summary":
+                data = api_routes.query_summary_data(conn, target_tz, project_param)
             elif path == "/api/timeline":
-                days_param = qs.get("days", [None])[0]
-                days = int(days_param) if days_param else None
-                data = api_routes.query_timeline_data(conn, days, target_tz)
+                days = qs.get("days", [None])[0]
+                data = api_routes.query_timeline_data(conn, days, target_tz, project_param)
+            elif path == "/api/cost-by-project":
+                data = api_routes.query_cost_by_project(conn, target_tz, project_param)
             elif path == "/api/tools":
-                data = api_routes.query_tools_data(conn)
+                data = api_routes.query_tools_data(conn, project_param)
             elif path == "/api/mcp":
-                data = api_routes.query_mcp_data(conn)
+                data = api_routes.query_mcp_data(conn, project_param)
             elif path == "/api/hot-files":
-                data = api_routes.query_hot_files_data(conn)
+                data = api_routes.query_hot_files_data(conn, project_param)
             elif path == "/api/activity-matrix":
-                data = api_routes.query_activity_matrix(conn, target_tz)
+                data = api_routes.query_activity_matrix(conn, target_tz, project_param)
             elif path == "/api/conversations":
                 limit = int(qs.get("limit", [200])[0])
-                data = api_routes.query_conversations_list(conn, limit, target_tz)
+                data = api_routes.query_conversations_list(conn, limit, target_tz, project_param)
             elif path.startswith("/api/session/"):
                 session_id = path.split("/")[-1]
                 data = api_routes.query_session_details(conn, session_id, target_tz)
@@ -169,6 +177,7 @@ def export_standalone_html(output_path: Path, include_conversations: bool = Fals
     try:
         summary = api_routes.query_summary_data(conn, target_tz)
         timeline = api_routes.query_timeline_data(conn, None, target_tz)
+        cost_by_project = api_routes.query_cost_by_project(conn, target_tz)
         tools = api_routes.query_tools_data(conn)
         mcp = api_routes.query_mcp_data(conn)
         hot_files = api_routes.query_hot_files_data(conn)
@@ -183,6 +192,7 @@ def export_standalone_html(output_path: Path, include_conversations: bool = Fals
       const STATIC_DATA = {{
         summary: {json.dumps(summary)},
         timeline: {json.dumps(timeline)},
+        cost_by_project: {json.dumps(cost_by_project)},
         tools: {json.dumps(tools)},
         mcp: {json.dumps(mcp)},
         hot_files: {json.dumps(hot_files)},
@@ -193,6 +203,7 @@ def export_standalone_html(output_path: Path, include_conversations: bool = Fals
       window.fetch = async function(url) {{
         if (url.includes('/api/summary')) return {{ json: async () => STATIC_DATA.summary }};
         if (url.includes('/api/timeline')) return {{ json: async () => STATIC_DATA.timeline }};
+        if (url.includes('/api/cost-by-project')) return {{ json: async () => STATIC_DATA.cost_by_project }};
         if (url.includes('/api/tools')) return {{ json: async () => STATIC_DATA.tools }};
         if (url.includes('/api/mcp')) return {{ json: async () => STATIC_DATA.mcp }};
         if (url.includes('/api/hot-files')) return {{ json: async () => STATIC_DATA.hot_files }};

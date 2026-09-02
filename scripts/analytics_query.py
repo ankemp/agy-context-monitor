@@ -246,6 +246,25 @@ def print_summary(conn):
         toks = r["tokens"] or 0
         share = (toks / tot_model_tokens * 100) if tot_model_tokens else 0.0
         print(f"  {(r['mname'] or 'Unknown'):<30} | {r['step_count']:<10,}| {format_tokens(toks):<12} | {share:5.1f}%")
+
+    print("\n[4] Cost & Context by Project:")
+    print(f"  {'Project':<28} | {'Cost':<10} | {'Share':<7} | {'Sessions':<10} | {'Tokens':<10}")
+    print("  " + "-" * 72)
+    proj_rows = cur.execute("""
+        SELECT 
+            COALESCE(NULLIF(project, ''), '(unassigned)') as project_name,
+            COUNT(*) as session_count,
+            SUM(total_tokens) as total_tokens,
+            SUM(billed_cost) as billed_cost
+        FROM conversations
+        GROUP BY project_name
+        ORDER BY billed_cost DESC, total_tokens DESC
+    """).fetchall()
+    tot_proj_cost = sum(r["billed_cost"] or 0.0 for r in proj_rows)
+    for r in proj_rows:
+        c = r["billed_cost"] or 0.0
+        pct = (c / tot_proj_cost * 100) if tot_proj_cost else 0.0
+        print(f"  {(r['project_name']):<28} | ${c:<9.2f}| {pct:5.1f}% | {r['session_count']:<10,}| {format_tokens(r['total_tokens'] or 0):<10}")
     print("=" * 70 + "\n")
 
 def print_mcp(conn):

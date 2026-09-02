@@ -20,6 +20,7 @@ TABLES_SQL = """
 CREATE TABLE IF NOT EXISTS conversations (
     id TEXT PRIMARY KEY,
     title TEXT,
+    project TEXT,
     model_name TEXT,
     created_at TEXT,
     updated_at TEXT,
@@ -89,6 +90,7 @@ CREATE TABLE IF NOT EXISTS transcript_blocks (
 
 INDEXES_SQL = """
 CREATE INDEX IF NOT EXISTS idx_conversations_created ON conversations(created_at);
+CREATE INDEX IF NOT EXISTS idx_conversations_project ON conversations(project);
 CREATE INDEX IF NOT EXISTS idx_steps_created ON steps(created_at);
 CREATE INDEX IF NOT EXISTS idx_steps_conv_step ON steps(conversation_id, step_index);
 CREATE INDEX IF NOT EXISTS idx_steps_category ON steps(category);
@@ -126,6 +128,7 @@ def init_db(db_path: Path = DEFAULT_DB_PATH):
         # Conversations column migrations
         conv_cols = [c[1] for c in cur.execute("PRAGMA table_info(conversations)").fetchall()]
         conv_new_cols = [
+            ("project", "TEXT"),
             ("active_agent_seconds", "REAL DEFAULT 0.0"),
             ("active_pairing_seconds", "REAL DEFAULT 0.0"),
             ("thinking_tokens", "INTEGER DEFAULT 0"),

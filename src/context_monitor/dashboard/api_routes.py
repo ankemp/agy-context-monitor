@@ -47,9 +47,28 @@ def parse_to_local_dt(iso_str, tz=None):
     except Exception:
         return None
 
-def query_summary_data(conn, tz=None):
+def query_summary_data(conn, tz=None, project=None):
     cur = conn.cursor()
-    row = cur.execute("""
+    
+    where_conv = ""
+    params_conv = ()
+    where_tool = ""
+    where_step_and = ""
+    where_step_join = ""
+    if project:
+        if project == "(unassigned)":
+            where_conv = "WHERE (project IS NULL OR project = '')"
+            where_tool = "AND conversation_id IN (SELECT id FROM conversations WHERE project IS NULL OR project = '')"
+            where_step_and = "AND conversation_id IN (SELECT id FROM conversations WHERE project IS NULL OR project = '')"
+            where_step_join = "AND (c.project IS NULL OR c.project = '')"
+        else:
+            where_conv = "WHERE project = ?"
+            where_tool = "AND conversation_id IN (SELECT id FROM conversations WHERE project = ?)"
+            where_step_and = "AND conversation_id IN (SELECT id FROM conversations WHERE project = ?)"
+            where_step_join = "AND c.project = ?"
+            params_conv = (project,)
+        
+    row = cur.execute(f"""
         SELECT 
             COUNT(*) as total_convs,
             SUM(total_steps) as total_steps,
@@ -73,7 +92,8 @@ def query_summary_data(conn, tz=None):
             MIN(created_at) as earliest,
             MAX(updated_at) as latest
         FROM conversations
-    """).fetchone()
+        {where_conv}
+    """, params_conv).fetchone()
 
     total_prompts = row["total_prompts"] or 0
     total_tools = row["total_tools"] or 0
@@ -82,35 +102,35 @@ def query_summary_data(conn, tz=None):
     total_fails = row["total_fails"] or 0
     resilience_rate = round(((total_tools - total_fails) / max(1, total_tools)) * 100, 1)
 
-    view_row = cur.execute("SELECT COUNT(*) FROM tool_executions WHERE tool_name = 'view_file'").fetchone()
+    view_row = cur.execute(f"SELECT COUNT(*) FROM tool_executions WHERE tool_name = 'view_file' {where_tool}", params_conv).fetchone()
     total_views = view_row[0] if view_row else 0
     total_re_reads = row["total_re_reads"] or 0
     re_read_rate = round((total_re_reads / max(1, total_views)) * 100, 1)
     re_read_waste_tokens = total_re_reads * 750
 
-    reads_cnt = cur.execute("SELECT COUNT(*) FROM tool_executions WHERE tool_name IN ('view_file', 'grep_search', 'find_by_name', 'list_dir')").fetchone()[0]
-    cmds_cnt = cur.execute("SELECT COUNT(*) FROM tool_executions WHERE tool_name = 'run_command'").fetchone()[0]
-    edits_cnt = cur.execute("SELECT COUNT(*) FROM tool_executions WHERE tool_name IN ('write_to_file', 'replace_file_content', 'multi_replace_file_content')").fetchone()[0]
+    reads_cnt = cur.execute(f"SELECT COUNT(*) FROM tool_executions WHERE tool_name IN ('view_file', 'grep_search', 'find_by_name', 'list_dir') {where_tool}", params_conv).fetchone()[0]
+    cmds_cnt = cur.execute(f"SELECT COUNT(*) FROM tool_executions WHERE tool_name = 'run_command' {where_tool}", params_conv).fetchone()[0]
+    edits_cnt = cur.execute(f"SELECT COUNT(*) FROM tool_executions WHERE tool_name IN ('write_to_file', 'replace_file_content', 'multi_replace_file_content') {where_tool}", params_conv).fetchone()[0]
     saved_hours = round(((reads_cnt * 30) + (cmds_cnt * 45) + (edits_cnt * 120)) / 3600)
 
     # Phase breakdown
-    phase_rows = cur.execute("""
+    phase_rows = cur.execute(f"""
         SELECT phase, COUNT(*) as steps, SUM(est_tokens) as tokens
         FROM steps
-        WHERE phase IS NOT NULL
+        WHERE phase IS NOT NULL {where_step_and}
         GROUP BY phase
         ORDER BY tokens DESC
-    """).fetchall()
+    """, params_conv).fetchall()
     phases = [{"phase": r["phase"], "steps": r["steps"], "tokens": r["tokens"] or 0} for r in phase_rows]
 
     # Top bloat steps
-    bloat_rows = cur.execute("""
+    bloat_rows = cur.execute(f"""
         SELECT step_index, phase, tool_or_source, est_tokens, detail
         FROM steps
-        WHERE est_tokens > 2000
+        WHERE est_tokens > 2000 {where_step_and}
         ORDER BY est_tokens DESC
         LIMIT 8
-    """).fetchall()
+    """, params_conv).fetchall()
     bloat_steps = [{"step_index": r["step_index"], "phase": r["phase"] or "other", "tool_or_source": r["tool_or_source"], "est_tokens": r["est_tokens"], "detail": r["detail"]} for r in bloat_rows]
 
     total_billed_cost = row["total_billed_cost"] or 0.0
@@ -118,15 +138,16 @@ def query_summary_data(conn, tz=None):
     total_billed_output_tokens = row["total_billed_output_tokens"] or 0
 
     models = []
-    for r in cur.execute("""
+    for r in cur.execute(f"""
         SELECT COALESCE(s.model_name, c.model_name, 'Gemini Flash') as mname,
                COUNT(*) as steps,
                SUM(s.est_tokens) as tokens
         FROM steps s
         JOIN conversations c ON s.conversation_id = c.id
+        WHERE 1=1 {where_step_join}
         GROUP BY mname
         ORDER BY tokens DESC
-    """):
+    """, params_conv):
         models.append({
             "model_name": r["mname"] or "Unknown",
             "steps": r["steps"],
@@ -134,7 +155,7 @@ def query_summary_data(conn, tz=None):
         })
 
     categories = []
-    for r in cur.execute("SELECT category, SUM(est_tokens) as tokens FROM steps WHERE category IS NOT NULL GROUP BY category ORDER BY tokens DESC LIMIT 10"):
+    for r in cur.execute(f"SELECT category, SUM(est_tokens) as tokens FROM steps WHERE category IS NOT NULL {where_step_and} GROUP BY category ORDER BY tokens DESC LIMIT 10", params_conv):
         categories.append({
             "category": r["category"],
             "tokens": r["tokens"] or 0
@@ -182,14 +203,104 @@ def query_summary_data(conn, tz=None):
         "categories": categories
     }
 
-def query_timeline_data(conn, days=None, tz=None):
+def query_cost_by_project(conn, tz=None, project=None, limit_sessions=6):
+    cur = conn.cursor()
+    rows = cur.execute("""
+        SELECT 
+            COALESCE(NULLIF(project, ''), '(unassigned)') as project_name,
+            COUNT(*) as session_count,
+            SUM(total_steps) as total_steps,
+            SUM(total_tokens) as total_tokens,
+            SUM(billed_cost) as billed_cost,
+            SUM(billed_input_tokens) as billed_input_tokens,
+            SUM(billed_output_tokens) as billed_output_tokens
+        FROM conversations
+        GROUP BY project_name
+        ORDER BY billed_cost DESC, total_tokens DESC
+    """).fetchall()
+
+    total_cost = sum(r["billed_cost"] or 0.0 for r in rows)
+
+    projects = []
+    filtered_project_cost = None
+    for r in rows:
+        cost = round(r["billed_cost"] or 0.0, 2)
+        pct = round((cost / total_cost * 100), 1) if total_cost > 0 else 0.0
+        p_name = r["project_name"]
+        if project and (p_name == project or (project == "(unassigned)" and p_name == "(unassigned)")):
+            filtered_project_cost = cost
+        projects.append({
+            "project": p_name,
+            "raw_project": None if p_name == "(unassigned)" else p_name,
+            "cost": cost,
+            "percentage": pct,
+            "sessions": r["session_count"],
+            "tokens": r["total_tokens"] or 0,
+            "steps": r["total_steps"] or 0,
+            "billed_input_tokens": r["billed_input_tokens"] or 0,
+            "billed_output_tokens": r["billed_output_tokens"] or 0
+        })
+
+    # Query top expensive sessions (narrowed to project if filtered)
+    where_sess = ""
+    params_sess = ()
+    if project and project != "all":
+        if project == "(unassigned)":
+            where_sess = "WHERE (project IS NULL OR project = '')"
+        else:
+            where_sess = "WHERE project = ?"
+            params_sess = (project,)
+
+    sess_rows = cur.execute(f"""
+        SELECT id, title, project, model_name, created_at, total_steps, total_tokens, duration_seconds, active_agent_seconds, billed_cost
+        FROM conversations
+        {where_sess}
+        ORDER BY billed_cost DESC, total_tokens DESC
+        LIMIT {limit_sessions}
+    """, params_sess).fetchall()
+
+    top_sessions = []
+    target_tz = get_target_tz(tz)
+    for sr in sess_rows:
+        dt = parse_to_local_dt(sr["created_at"], target_tz)
+        top_sessions.append({
+            "id": sr["id"],
+            "title": sr["title"] or f"Session {sr['id'][:8]}",
+            "project": sr["project"] or "(unassigned)",
+            "model_name": sr["model_name"] or "Gemini",
+            "created_at": dt.strftime("%Y-%m-%d %H:%M") if dt else (sr["created_at"] or "--"),
+            "total_steps": sr["total_steps"] or 0,
+            "total_tokens": sr["total_tokens"] or 0,
+            "duration_seconds": sr["duration_seconds"] or 0,
+            "active_agent_seconds": sr["active_agent_seconds"] or 0,
+            "billed_cost": round(sr["billed_cost"] or 0.0, 2)
+        })
+
+    return {
+        "total_cost": round(total_cost, 2),
+        "projects": projects,
+        "top_sessions": top_sessions,
+        "filtered_project": project if (project and project != "all") else None,
+        "filtered_project_cost": filtered_project_cost
+    }
+
+def query_timeline_data(conn, days=None, tz=None, project=None):
     cur = conn.cursor()
 
-    rows = cur.execute("""
+    where_clause = "WHERE created_at IS NOT NULL AND created_at != ''"
+    params = ()
+    if project:
+        if project == "(unassigned)":
+            where_clause += " AND conversation_id IN (SELECT id FROM conversations WHERE project IS NULL OR project = '')"
+        else:
+            where_clause += " AND conversation_id IN (SELECT id FROM conversations WHERE project = ?)"
+            params = (project,)
+
+    rows = cur.execute(f"""
         SELECT created_at, conversation_id, est_tokens, billed_cost
         FROM steps
-        WHERE created_at IS NOT NULL AND created_at != ''
-    """).fetchall()
+        {where_clause}
+    """, params).fetchall()
 
     daily_map = {}
     day_sessions = {}
@@ -247,19 +358,30 @@ def query_timeline_data(conn, days=None, tz=None):
 
     return timeline
 
-def query_tools_data(conn):
+def query_tools_data(conn, project=None):
     cur = conn.cursor()
-    rows = cur.execute("""
+
+    where_clause = ""
+    params = ()
+    if project:
+        if project == "(unassigned)":
+            where_clause = "WHERE conversation_id IN (SELECT id FROM conversations WHERE project IS NULL OR project = '')"
+        else:
+            where_clause = "WHERE conversation_id IN (SELECT id FROM conversations WHERE project = ?)"
+            params = (project,)
+
+    rows = cur.execute(f"""
         SELECT 
             tool_name, 
             mcp_server,
             COUNT(*) as total_calls,
             COUNT(DISTINCT conversation_id) as distinct_sessions
         FROM tool_executions
+        {where_clause}
         GROUP BY tool_name
         ORDER BY total_calls DESC
         LIMIT 50
-    """).fetchall()
+    """, params).fetchall()
 
     tools = []
     for r in rows:
@@ -272,19 +394,29 @@ def query_tools_data(conn):
         })
     return tools
 
-def query_mcp_data(conn):
+def query_mcp_data(conn, project=None):
     cur = conn.cursor()
-    server_rows = cur.execute("""
+
+    where_clause = "WHERE mcp_server IS NOT NULL"
+    params = ()
+    if project:
+        if project == "(unassigned)":
+            where_clause += " AND conversation_id IN (SELECT id FROM conversations WHERE project IS NULL OR project = '')"
+        else:
+            where_clause += " AND conversation_id IN (SELECT id FROM conversations WHERE project = ?)"
+            params = (project,)
+
+    server_rows = cur.execute(f"""
         SELECT 
             mcp_server,
             COUNT(*) as total_calls,
             COUNT(DISTINCT conversation_id) as sessions,
             AVG(CASE WHEN is_error = 1 THEN 1.0 ELSE 0.0 END) * 100 as error_rate
         FROM tool_executions
-        WHERE mcp_server IS NOT NULL
+        {where_clause}
         GROUP BY mcp_server
         ORDER BY total_calls DESC
-    """).fetchall()
+    """, params).fetchall()
 
     servers = []
     for s in server_rows:
@@ -308,9 +440,19 @@ def query_mcp_data(conn):
         })
     return servers
 
-def query_hot_files_data(conn):
+def query_hot_files_data(conn, project=None):
     cur = conn.cursor()
-    rows = cur.execute("""
+    
+    where_clause = "WHERE target_path IS NOT NULL AND target_path != ''"
+    params = ()
+    if project:
+        if project == "(unassigned)":
+            where_clause += " AND conversation_id IN (SELECT id FROM conversations WHERE project IS NULL OR project = '')"
+        else:
+            where_clause += " AND conversation_id IN (SELECT id FROM conversations WHERE project = ?)"
+            params = (project,)
+
+    rows = cur.execute(f"""
         SELECT 
             target_path,
             COUNT(*) as total_touches,
@@ -319,11 +461,11 @@ def query_hot_files_data(conn):
             COUNT(CASE WHEN tool_name IN ('grep_search', 'find_by_name', 'list_dir') THEN 1 END) as searches,
             COUNT(DISTINCT conversation_id) as sessions
         FROM tool_executions
-        WHERE target_path IS NOT NULL AND target_path != ''
+        {where_clause}
         GROUP BY target_path
         ORDER BY total_touches DESC
         LIMIT 150
-    """).fetchall()
+    """, params).fetchall()
 
     items = []
     for r in rows:
@@ -360,15 +502,24 @@ def query_hot_files_data(conn):
         })
     return items
 
-def query_activity_matrix(conn, tz=None):
+def query_activity_matrix(conn, tz=None, project=None):
     cur = conn.cursor()
     target_tz = get_target_tz(tz)
     
-    step_rows = cur.execute("""
+    where_clause = "WHERE created_at IS NOT NULL AND created_at != ''"
+    params = ()
+    if project:
+        if project == "(unassigned)":
+            where_clause += " AND conversation_id IN (SELECT id FROM conversations WHERE project IS NULL OR project = '')"
+        else:
+            where_clause += " AND conversation_id IN (SELECT id FROM conversations WHERE project = ?)"
+            params = (project,)
+        
+    step_rows = cur.execute(f"""
         SELECT created_at, conversation_id, est_tokens
         FROM steps
-        WHERE created_at IS NOT NULL AND created_at != ''
-    """).fetchall()
+        {where_clause}
+    """, params).fetchall()
 
     daily_map = {}
     hourly_aggregate = [[0 for _ in range(24)] for _ in range(7)]
@@ -452,14 +603,24 @@ def query_activity_matrix(conn, tz=None):
         }
     }
 
-def query_conversations_list(conn, limit=200, tz=None):
+def query_conversations_list(conn, limit=200, tz=None, project=None):
     cur = conn.cursor()
+    where_clause = ""
+    params = ()
+    if project:
+        if project == "(unassigned)":
+            where_clause = "WHERE (project IS NULL OR project = '')"
+        else:
+            where_clause = "WHERE project = ?"
+            params = (project,)
+        
     rows = cur.execute(f"""
-        SELECT id, title, model_name, created_at, total_steps, total_tokens, duration_seconds, active_agent_seconds, active_pairing_seconds
+        SELECT id, title, project, model_name, created_at, total_steps, total_tokens, duration_seconds, active_agent_seconds, active_pairing_seconds, billed_cost
         FROM conversations
+        {where_clause}
         ORDER BY created_at DESC
         LIMIT {limit}
-    """).fetchall()
+    """, params).fetchall()
 
     convs = []
     target_tz = get_target_tz(tz)
@@ -469,13 +630,15 @@ def query_conversations_list(conn, limit=200, tz=None):
         convs.append({
             "id": r["id"],
             "title": r["title"] or f"Conversation {r['id'][:8]}",
+            "project": r["project"] or "(unassigned)",
             "model_name": r["model_name"] or "Gemini",
             "created_at": dt.strftime("%Y-%m-%d %H:%M") if dt else r["created_at"],
             "total_steps": r["total_steps"] or 0,
             "total_tokens": r["total_tokens"] or 0,
             "duration_seconds": r["duration_seconds"] or 0,
             "active_agent_seconds": r["active_agent_seconds"] or 0,
-            "active_pairing_seconds": r["active_pairing_seconds"] or 0
+            "active_pairing_seconds": r["active_pairing_seconds"] or 0,
+            "billed_cost": round(r["billed_cost"] or 0.0, 2)
         })
     return convs
 

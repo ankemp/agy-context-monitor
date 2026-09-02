@@ -10,6 +10,7 @@
 
     let timelineChart = null;
     let modelsChart = null;
+    let projectCostChart = null;
     let toolsChart = null;
     let categoryChart = null;
     let phaseChart = null;
@@ -18,6 +19,7 @@
     let allHotFiles = [];
     let allConversations = [];
     let allTimelineData = [];
+    let allProjectCostData = null;
     let allToolsData = [];
     let allMcpData = [];
     let currentTimelineDays = 30;
@@ -26,6 +28,50 @@
     let cachedActivityMatrix = null;
     let currentHeatmapMode = 'year';
     let localTimezoneAbbr = Intl.DateTimeFormat().resolvedOptions().timeZone || 'Local';
+    let currentProject = 'all';
+
+    window.handleProjectChange = function(val) {
+      currentProject = val;
+      const filterSelect = document.getElementById('projectFilter');
+      if (filterSelect && filterSelect.value !== val) {
+        let opt = Array.from(filterSelect.options).find(o => o.value === val);
+        if (!opt && val !== 'all') {
+          opt = document.createElement('option');
+          opt.value = val;
+          opt.textContent = val;
+          filterSelect.appendChild(opt);
+        }
+        filterSelect.value = val;
+      }
+      fetchDashboardData();
+    };
+
+    let currentProjectMetric = 'cost'; // 'cost' | 'tokens'
+
+    window.setProjectCostMetric = function(metric) {
+      currentProjectMetric = metric;
+      const btnCost = document.getElementById('projectMetricCost');
+      const btnTokens = document.getElementById('projectMetricTokens');
+      const activeCls = 'px-2.5 py-1 rounded bg-brand-600 text-white font-medium shadow transition text-[11px]';
+      const inactiveCls = 'px-2.5 py-1 rounded text-gray-400 hover:text-white transition text-[11px]';
+      if (btnCost) btnCost.className = metric === 'cost' ? activeCls : inactiveCls;
+      if (btnTokens) btnTokens.className = metric === 'tokens' ? activeCls : inactiveCls;
+      if (allProjectCostData) {
+        renderProjectCostSection(allProjectCostData, currentProject);
+      }
+    };
+
+    const PROJECT_PALETTE = [
+      '#6366f1', '#a855f7', '#06b6d4', '#10b981', '#f59e0b',
+      '#ec4899', '#3b82f6', '#14b8a6', '#f43f5e', '#8b5cf6'
+    ];
+
+    function getProjectColor(projectName, index) {
+      if (!projectName || projectName === '(unassigned)') {
+        return '#64748b';
+      }
+      return PROJECT_PALETTE[index % PROJECT_PALETTE.length];
+    }
 
     const COLOR_PALETTE = {
       lvl0: '#151d2f',
@@ -54,19 +100,24 @@
     async function fetchDashboardData() {
       try {
         const clientTz = Intl.DateTimeFormat().resolvedOptions().timeZone || '';
-        const tzParam = clientTz ? `?tz=${encodeURIComponent(clientTz)}` : '';
+        let baseQuery = [];
+        if (clientTz) baseQuery.push(`tz=${encodeURIComponent(clientTz)}`);
+        if (currentProject !== 'all') baseQuery.push(`project=${encodeURIComponent(currentProject)}`);
+        const queryStr = baseQuery.length > 0 ? `?${baseQuery.join('&')}` : '';
 
-        const [summaryRes, timelineRes, toolsRes, mcpRes, hotFilesRes, matrixRes, convsRes] = await Promise.all([
-          fetch(`/api/summary${tzParam}`).then(r => r.json()),
-          fetch(`/api/timeline${tzParam}`).then(r => r.json()),
-          fetch('/api/tools').then(r => r.json()),
-          fetch('/api/mcp').then(r => r.json()),
-          fetch('/api/hot-files').then(r => r.json()),
-          fetch(`/api/activity-matrix${tzParam}`).then(r => r.json()),
-          fetch(`/api/conversations${tzParam}`).then(r => r.json())
+        const [summaryRes, timelineRes, costProjRes, toolsRes, mcpRes, hotFilesRes, matrixRes, convsRes] = await Promise.all([
+          fetch(`/api/summary${queryStr}`).then(r => r.json()),
+          fetch(`/api/timeline${queryStr}`).then(r => r.json()),
+          fetch(`/api/cost-by-project${queryStr}`).then(r => r.json()),
+          fetch(`/api/tools${queryStr}`).then(r => r.json()),
+          fetch(`/api/mcp${queryStr}`).then(r => r.json()),
+          fetch(`/api/hot-files${queryStr}`).then(r => r.json()),
+          fetch(`/api/activity-matrix${queryStr}`).then(r => r.json()),
+          fetch(`/api/conversations${queryStr}`).then(r => r.json())
         ]);
 
         allTimelineData = timelineRes || [];
+        allProjectCostData = costProjRes || { total_cost: 0, projects: [] };
         allToolsData = toolsRes || [];
         allMcpData = mcpRes || [];
         cachedActivityMatrix = matrixRes;
@@ -83,6 +134,7 @@
         renderKPIs(summaryRes);
         setTimelineRange(currentTimelineDays);
         renderModelsChart(summaryRes.models);
+        renderProjectCostSection(allProjectCostData, currentProject);
         renderToolsChart(allToolsData);
         renderMcpSection(allMcpData);
         renderCategoryChart(summaryRes.categories);
@@ -735,6 +787,238 @@
           cutout: '65%'
         }
       });
+    }
+
+    function renderProjectCostSection(costData, currentProject) {
+      if (!costData) return;
+      const projects = costData.projects || [];
+      const totalCost = costData.total_cost || 0;
+
+      // Header Filter Badge & Subtitle
+      const filterBadge = document.getElementById('costProjectFilterBadge');
+      const filterText = document.getElementById('costProjectFilterText');
+      const costSub = document.getElementById('costProjectSub');
+      const isFiltered = Boolean(currentProject && currentProject !== 'all');
+
+      if (filterBadge && filterText) {
+        if (isFiltered) {
+          filterText.textContent = currentProject;
+          filterBadge.classList.remove('hidden');
+          filterBadge.classList.add('inline-flex');
+        } else {
+          filterBadge.classList.add('hidden');
+          filterBadge.classList.remove('inline-flex');
+        }
+      }
+
+      if (costSub) {
+        if (isFiltered) {
+          costSub.textContent = `Filtered to ${currentProject} • Non-selected projects de-emphasized in grayscale`;
+        } else {
+          costSub.textContent = 'Cumulative API cost and resource attribution across workspaces';
+        }
+      }
+
+      // Total Spend / Tokens KPI Stat Callout
+      const totalTokens = projects.reduce((acc, p) => acc + (p.tokens || 0), 0);
+      const selProj = projects.find(p => p.project === currentProject);
+      const headerValEl = document.getElementById('projectCostHeaderValue');
+      const headerLabelEl = document.getElementById('projectCostHeaderLabel');
+
+      if (headerValEl && headerLabelEl) {
+        if (currentProjectMetric === 'cost') {
+          if (isFiltered) {
+            const costVal = selProj ? selProj.cost : (costData.filtered_project_cost || 0);
+            headerValEl.textContent = '$' + costVal.toFixed(2);
+            headerLabelEl.textContent = `${currentProject} SPEND (${selProj ? selProj.percentage : 0}%)`;
+          } else {
+            headerValEl.textContent = '$' + totalCost.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+            headerLabelEl.textContent = 'TOTAL SPEND';
+          }
+        } else {
+          if (isFiltered) {
+            const tokVal = selProj ? selProj.tokens : 0;
+            const pctTok = totalTokens > 0 ? (tokVal / totalTokens * 100).toFixed(1) : '0';
+            headerValEl.textContent = formatTokens(tokVal);
+            headerLabelEl.textContent = `${currentProject} TOKENS (${pctTok}%)`;
+          } else {
+            headerValEl.textContent = formatTokens(totalTokens);
+            headerLabelEl.textContent = 'TOTAL TOKENS';
+          }
+        }
+      }
+
+      const elCountBadge = document.getElementById('projectCountBadge');
+      if (elCountBadge) {
+        elCountBadge.textContent = `${projects.length} project${projects.length === 1 ? '' : 's'}`;
+      }
+
+      // 1. Chart.js Horizontal Bar Chart
+      const chartCanvas = document.getElementById('projectCostChart');
+      if (chartCanvas) {
+        const ctx = chartCanvas.getContext('2d');
+        const labels = projects.map(p => p.project);
+        const isCost = (currentProjectMetric === 'cost');
+        const dataValues = isCost ? projects.map(p => p.cost) : projects.map(p => p.tokens);
+
+        const backgroundColors = [];
+        const borderColors = [];
+        const borderWidths = [];
+
+        projects.forEach((p, idx) => {
+          const baseColor = getProjectColor(p.project, idx);
+          const isSelected = isFiltered && (p.project === currentProject);
+
+          if (!isFiltered) {
+            // Normal state: all projects vibrant
+            backgroundColors.push(baseColor + 'cc');
+            borderColors.push(baseColor);
+            borderWidths.push(1);
+          } else if (isSelected) {
+            // Active selected project: intense highlight
+            backgroundColors.push(baseColor);
+            borderColors.push('#ffffff');
+            borderWidths.push(2);
+          } else {
+            // Other projects: GRAYSCALE
+            backgroundColors.push('rgba(75, 85, 99, 0.35)');
+            borderColors.push('#4b5563');
+            borderWidths.push(1);
+          }
+        });
+
+        if (projectCostChart) projectCostChart.destroy();
+
+        projectCostChart = new Chart(ctx, {
+          type: 'bar',
+          data: {
+            labels: labels,
+            datasets: [{
+              data: dataValues,
+              backgroundColor: backgroundColors,
+              borderColor: borderColors,
+              borderWidth: borderWidths,
+              borderRadius: 4
+            }]
+          },
+          options: {
+            indexAxis: 'y',
+            responsive: true,
+            maintainAspectRatio: false,
+            animation: false,
+            animations: false,
+            plugins: {
+              legend: { display: false },
+              tooltip: {
+                callbacks: {
+                  label: (ctx) => {
+                    const p = projects[ctx.dataIndex];
+                    if (isCost) {
+                      const costStr = '$' + ctx.raw.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+                      return ` ${costStr} (${p.percentage}% share • ${p.sessions} sessions • ${formatTokens(p.tokens)} tokens)`;
+                    } else {
+                      const tokShare = totalTokens > 0 ? (p.tokens / totalTokens * 100).toFixed(1) : '0';
+                      return ` ${formatTokens(ctx.raw)} tokens (${tokShare}% share • $${p.cost.toFixed(2)} • ${p.sessions} sessions)`;
+                    }
+                  }
+                }
+              }
+            },
+            onClick: (evt, elements) => {
+              if (elements && elements.length > 0) {
+                const idx = elements[0].index;
+                const clickedProject = labels[idx];
+                if (currentProject === clickedProject) {
+                  window.handleProjectChange('all');
+                } else {
+                  window.handleProjectChange(clickedProject);
+                }
+              }
+            },
+            scales: {
+              x: {
+                beginAtZero: true,
+                grid: { color: '#1f2937' },
+                ticks: {
+                  color: '#9ca3af',
+                  font: { size: 10 },
+                  callback: v => isCost ? ('$' + (v >= 1000 ? (v / 1000).toFixed(1) + 'k' : v.toFixed(v < 10 ? 2 : 0))) : formatTokens(v)
+                }
+              },
+              y: {
+                grid: { display: false },
+                ticks: {
+                  color: (ctx) => {
+                    const label = labels[ctx.index];
+                    if (!isFiltered) return '#e5e7eb';
+                    return label === currentProject ? '#ffffff' : '#6b7280';
+                  },
+                  font: (ctx) => {
+                    const label = labels[ctx.index];
+                    const isSelected = isFiltered && label === currentProject;
+                    return {
+                      size: 11,
+                      weight: isSelected ? 'bold' : 'normal'
+                    };
+                  }
+                }
+              }
+            }
+          }
+        });
+      }
+
+      // 2. Top Cost Drivers Table
+      const subEl = document.getElementById('topCostDriversSub');
+      if (subEl) {
+        if (currentProject && currentProject !== 'all') {
+          subEl.textContent = `Highest-expenditure conversations in ${currentProject}`;
+        } else {
+          subEl.textContent = 'Highest-expenditure conversations across all projects';
+        }
+      }
+
+      const scopeBadge = document.getElementById('topCostScopeBadge');
+      if (scopeBadge) {
+        if (currentProject && currentProject !== 'all') {
+          scopeBadge.textContent = currentProject;
+          scopeBadge.className = 'text-[11px] font-mono px-2 py-0.5 rounded bg-brand-500/20 border border-brand-500/40 text-brand-300';
+        } else {
+          scopeBadge.textContent = 'Global Top 6';
+          scopeBadge.className = 'text-[11px] font-mono px-2 py-0.5 rounded bg-dark-800 border border-dark-700 text-gray-300';
+        }
+      }
+
+      const topSessions = costData.top_sessions || [];
+      const countBadge = document.getElementById('topCostCountBadge');
+      if (countBadge) {
+        countBadge.textContent = `${topSessions.length} session${topSessions.length === 1 ? '' : 's'}`;
+      }
+
+      const tbody = document.getElementById('topCostDriversBody');
+      if (tbody) {
+        tbody.innerHTML = '';
+        if (topSessions.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="6" class="py-6 text-center text-gray-500 font-mono text-xs">No sessions recorded</td></tr>';
+        } else {
+          const isStatic = (typeof IS_STATIC_EXPORT !== "undefined" && IS_STATIC_EXPORT);
+          topSessions.forEach(s => {
+            const tr = document.createElement('tr');
+            tr.className = 'hover:bg-dark-800/60 transition';
+            tr.innerHTML = `
+              <td class="py-2 px-2 font-medium text-white max-w-[140px] truncate" title="${s.title}">${s.title}</td>
+              <td class="py-2 px-2 whitespace-nowrap"><span class="px-1.5 py-0.5 rounded text-[10px] font-mono bg-dark-900 border border-dark-700 text-gray-300">${s.project}</span></td>
+              <td class="py-2 px-2 text-purple-300 whitespace-nowrap text-[11px]">${s.model_name}</td>
+              <td class="py-2 px-2 text-right font-semibold text-indigo-400 font-mono text-[11px]">${formatTokens(s.total_tokens)}</td>
+              <td class="py-2 px-2 text-right font-mono font-bold text-rose-400 text-[11px]">$${s.billed_cost.toFixed(2)}</td>
+              <td class="py-2 px-2 text-center">
+                ${isStatic ? '' : `<button onclick="inspectSession('${s.id}')" class="px-2 py-0.5 rounded bg-brand-600/80 hover:bg-brand-600 text-[10px] font-medium text-white transition">Inspect</button>`}
+              </td>
+            `;
+            tbody.appendChild(tr);
+          });
+        }
+      }
     }
 
     function setToolFilter(filter) {
@@ -1932,7 +2216,22 @@
       connect();
     }
 
-    document.addEventListener('DOMContentLoaded', () => {
+    document.addEventListener('DOMContentLoaded', async () => {
+      try {
+        const projects = await fetch('/api/projects').then(r => r.json());
+        const filterSelect = document.getElementById('projectFilter');
+        if (filterSelect && projects.length > 0) {
+          projects.forEach(p => {
+            const opt = document.createElement('option');
+            opt.value = p;
+            opt.textContent = p;
+            filterSelect.appendChild(opt);
+          });
+          filterSelect.classList.remove('hidden');
+        }
+      } catch (e) {
+        console.error('Failed to load projects', e);
+      }
       fetchDashboardData();
       if (typeof IS_STATIC_EXPORT === "undefined" || !IS_STATIC_EXPORT) { initLiveSyncSSE(); }
     });

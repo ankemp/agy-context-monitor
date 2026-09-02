@@ -130,6 +130,7 @@ def analyze_transcript(transcript_path: Path, initial_model: str = "Gemini 3.7 F
     start_time = None
     end_time = None
     cur_model = initial_model
+    project = None
 
     with open(transcript_path, "r", encoding="utf-8", errors="replace") as f:
         for line in f:
@@ -157,6 +158,11 @@ def analyze_transcript(transcript_path: Path, initial_model: str = "Gemini 3.7 F
                 m = re.search(r"Model Selection\` from (?:.*?) to (.+?)\.\s*(?:No need|$)", content)
                 if m:
                     cur_model = m.group(1).strip()
+
+            if not project and step_type in ("USER_INPUT", "CHECKPOINT") and "<user_information>" in content:
+                m = re.search(r"(?:/Users/[^\s]+)\s*->\s*[^\s]+/([^\s]+)", content)
+                if m:
+                    project = m.group(1)
 
             if is_error:
                 failed_tool_calls += 1
@@ -195,6 +201,11 @@ def analyze_transcript(transcript_path: Path, initial_model: str = "Gemini 3.7 F
                     detail = f"Tools called: {', '.join(tool_names)}"
                     for tc_name, tc_args in pending_tool_calls:
                         target_p = tc_args.get("TargetFile") or tc_args.get("AbsolutePath") or tc_args.get("SearchPath") or tc_args.get("DirectoryPath") or ""
+                        proj_path = target_p or tc_args.get("Cwd") or ""
+                        if not project and proj_path and "/Users/akemp/Workspace/" in proj_path:
+                            m = re.search(r"/Users/akemp/Workspace/([^/\"\'\s]+)", proj_path)
+                            if m:
+                                project = m.group(1)
                         clean_path = str(target_p).strip("\"'") if target_p else None
                         
                         if tc_name == "view_file" and clean_path:
@@ -501,6 +512,7 @@ def analyze_transcript(transcript_path: Path, initial_model: str = "Gemini 3.7 F
         "billed_output_tokens": total_billed_output_tokens,
         "latest_model": cur_model,
         "latest_max_tokens": get_model_context_limit(cur_model),
+        "project": project,
         "steps": steps,
         "total_chars": total_chars,
         "total_tokens": total_tokens,
@@ -521,14 +533,15 @@ def sync_to_sqlite(cid: str, model_name: str, analysis: dict):
             # Upsert conversation record
             conn.execute("""
                 INSERT INTO conversations (
-                    id, title, model_name, created_at, updated_at, total_steps, total_characters, total_tokens,
+                    id, title, project, model_name, created_at, updated_at, total_steps, total_characters, total_tokens,
                     duration_seconds, active_agent_seconds, active_pairing_seconds, thinking_tokens,
                     user_prompts, tool_calls_count, redundant_file_reads, lines_written, lines_edited, failed_tool_calls,
                     billed_cost, billed_input_tokens, billed_output_tokens
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     title = excluded.title,
+                    project = COALESCE(excluded.project, conversations.project),
                     model_name = excluded.model_name,
                     updated_at = excluded.updated_at,
                     total_steps = excluded.total_steps,
@@ -548,7 +561,7 @@ def sync_to_sqlite(cid: str, model_name: str, analysis: dict):
                     billed_input_tokens = excluded.billed_input_tokens,
                     billed_output_tokens = excluded.billed_output_tokens
             """, (
-                cid, analysis["title"], active_model, analysis["start_time"] or datetime.now().isoformat(),
+                cid, analysis["title"], analysis.get("project"), active_model, analysis["start_time"] or datetime.now().isoformat(),
                 analysis["end_time"] or datetime.now().isoformat(), len(analysis["steps"]),
                 analysis["total_chars"], analysis["total_tokens"], analysis["duration_seconds"],
                 analysis.get("active_agent_seconds", 0.0), analysis.get("active_pairing_seconds", 0.0),

@@ -130,9 +130,12 @@
       </div>
 {% else %}
       <div id="headerActions" class="flex items-center space-x-4">
+        <select id="projectFilter" class="bg-dark-800 text-white text-xs px-3 py-1.5 rounded-lg border border-dark-700 outline-none hover:border-brand-500 transition-colors hidden cursor-pointer" onchange="window.handleProjectChange(this.value)">
+          <option value="all">All Projects</option>
+        </select>
         <div class="flex items-center space-x-2 text-xs text-gray-400 bg-dark-800 px-3 py-1.5 rounded-lg border border-dark-700">
           <div class="w-2 h-2 rounded-full bg-green-500 animate-pulse"></div>
-          <span id="liveStatus">Analytics Active</span>
+          <span id="liveStatus2">Analytics Active</span>
         </div>
       </div>
 {% endif %}
@@ -296,6 +299,98 @@
         </div>
         <div class="flex-1 relative min-h-[220px] flex items-center justify-center">
           <canvas id="modelsChart"></canvas>
+        </div>
+      </div>
+    </div>
+
+    <!-- 2b. Project Cost & Top Cost Drivers (Macro-to-Micro Spend Pair) -->
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+      <!-- Left Card (50%): Cost by Project Horizontal Bar Chart -->
+      <div class="card p-5 flex flex-col justify-between">
+        <div>
+          <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-4">
+            <div>
+              <div class="flex items-center space-x-2">
+                <h2 class="text-sm font-semibold text-white flex items-center space-x-2">
+                  <i data-lucide="badge-dollar-sign" class="w-4 h-4 text-rose-400"></i>
+                  <span>Cost by Project</span>
+                </h2>
+                <span id="costProjectFilterBadge" class="hidden items-center space-x-1.5 px-2 py-0.5 rounded-full text-[11px] font-medium bg-brand-500/20 text-brand-300 border border-brand-500/40">
+                  <span id="costProjectFilterText">--</span>
+                  <button onclick="window.handleProjectChange('all')" class="text-brand-400 hover:text-white transition leading-none font-bold ml-1" title="Clear filter">×</button>
+                </span>
+              </div>
+              <p id="costProjectSub" class="text-xs text-gray-400 mt-0.5">Cumulative API cost and resource attribution across workspaces</p>
+            </div>
+
+            <div class="flex items-center space-x-3 shrink-0">
+              <!-- Metric Toggle: Cost vs Tokens -->
+              <div class="flex items-center space-x-1 bg-dark-800 border border-dark-700 rounded-md p-0.5 text-xs">
+                <button id="projectMetricCost" onclick="window.setProjectCostMetric('cost')" class="px-2.5 py-1 rounded bg-brand-600 text-white font-medium shadow transition text-[11px]">Cost ($)</button>
+                <button id="projectMetricTokens" onclick="window.setProjectCostMetric('tokens')" class="px-2.5 py-1 rounded text-gray-400 hover:text-white transition text-[11px]">Tokens</button>
+              </div>
+
+              <!-- Stat KPI Callout -->
+              <div class="text-right pl-3 border-l border-dark-700">
+                <div id="projectCostHeaderValue" class="text-xs font-mono font-bold text-rose-400">$0.00</div>
+                <div id="projectCostHeaderLabel" class="text-[10px] text-gray-500 uppercase tracking-wider font-mono">Total Spend</div>
+              </div>
+            </div>
+          </div>
+          <div class="relative min-h-[260px] flex-1">
+            <canvas id="projectCostChart"></canvas>
+          </div>
+        </div>
+        <div class="mt-3 pt-2.5 border-t border-dark-700/60 flex items-center justify-between text-[11px] text-gray-400">
+          <span class="flex items-center space-x-1">
+            <i data-lucide="mouse-pointer-click" class="w-3.5 h-3.5 text-brand-400"></i>
+            <span>Click any project bar to filter; other projects grayscale</span>
+          </span>
+          <span id="projectCountBadge" class="font-mono">-- projects</span>
+        </div>
+      </div>
+
+      <!-- Right Card (50%): Top Cost Drivers (Most Expensive Sessions) Table -->
+      <div class="card p-5 flex flex-col justify-between">
+        <div>
+          <div class="flex items-center justify-between mb-4">
+            <div>
+              <h2 class="text-sm font-semibold text-white flex items-center space-x-2">
+                <i data-lucide="flame" class="w-4 h-4 text-amber-400"></i>
+                <span>Top Cost Drivers</span>
+              </h2>
+              <p id="topCostDriversSub" class="text-xs text-gray-400 mt-0.5">Highest-expenditure conversations across all projects</p>
+            </div>
+            <span id="topCostScopeBadge" class="text-[11px] font-mono px-2 py-0.5 rounded bg-dark-800 border border-dark-700 text-gray-300">
+              Global Top 6
+            </span>
+          </div>
+
+          <div class="overflow-x-auto max-h-[265px] overflow-y-auto pr-1">
+            <table class="w-full text-left text-xs text-gray-300">
+              <thead class="text-[10px] text-gray-400 uppercase bg-dark-800 border-b border-dark-700 sticky top-0">
+                <tr>
+                  <th class="py-1.5 px-2">Session Title</th>
+                  <th class="py-1.5 px-2">Project</th>
+                  <th class="py-1.5 px-2">Model</th>
+                  <th class="py-1.5 px-2 text-right">Tokens</th>
+                  <th class="py-1.5 px-2 text-right">Cost</th>
+                  <th class="py-1.5 px-2 text-center">Action</th>
+                </tr>
+              </thead>
+              <tbody id="topCostDriversBody" class="divide-y divide-dark-700">
+                <!-- Dynamically populated top cost driver rows -->
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="mt-3 pt-2.5 border-t border-dark-700/60 flex items-center justify-between text-[11px] text-gray-400">
+          <span class="flex items-center space-x-1">
+            <i data-lucide="layers" class="w-3.5 h-3.5 text-indigo-400"></i>
+            <span>Inspect session opens turn-by-turn context timeline</span>
+          </span>
+          <span id="topCostCountBadge" class="font-mono">6 sessions</span>
         </div>
       </div>
     </div>
