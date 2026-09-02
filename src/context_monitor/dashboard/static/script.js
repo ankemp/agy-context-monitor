@@ -29,6 +29,20 @@
     let currentHeatmapMode = 'year';
     let localTimezoneAbbr = Intl.DateTimeFormat().resolvedOptions().timeZone || 'Local';
     let currentProject = 'all';
+    let currentTimelineViewMode = 'stacked'; // 'stacked' | 'aggregate'
+
+    window.setTimelineViewMode = function(mode) {
+      currentTimelineViewMode = mode;
+      const btnStacked = document.getElementById('btnTmStacked');
+      const btnAggregate = document.getElementById('btnTmAggregate');
+      const btnClasses = {
+        active: 'px-2.5 py-1 rounded-md bg-brand-600 text-white font-medium shadow-sm transition text-[11px] whitespace-nowrap outline-none focus:outline-none focus:ring-0',
+        inactive: 'px-2.5 py-1 rounded-md text-gray-400 hover:text-white transition text-[11px] whitespace-nowrap outline-none focus:outline-none focus:ring-0'
+      };
+      if (btnStacked) btnStacked.className = mode === 'stacked' ? btnClasses.active : btnClasses.inactive;
+      if (btnAggregate) btnAggregate.className = mode === 'aggregate' ? btnClasses.active : btnClasses.inactive;
+      setTimelineRange(currentTimelineDays);
+    };
 
     window.handleProjectChange = function(val) {
       currentProject = val;
@@ -42,6 +56,17 @@
           filterSelect.appendChild(opt);
         }
         filterSelect.value = val;
+      }
+      const modeGroup = document.getElementById('timelineModeGroup');
+      const divider = document.getElementById('timelineDivider');
+      if (modeGroup) {
+        if (val !== 'all') {
+          modeGroup.classList.add('hidden');
+          if (divider) divider.classList.add('hidden');
+        } else {
+          modeGroup.classList.remove('hidden');
+          if (divider) divider.classList.remove('hidden');
+        }
       }
       fetchDashboardData();
     };
@@ -179,17 +204,48 @@
       if (elAutonomy) elAutonomy.textContent = `${data.autonomy_multiplier || 1}x`;
       const elAutonomySub = document.getElementById('kpiAutonomySub');
       if (elAutonomySub) elAutonomySub.textContent = `${(data.total_tools || 0).toLocaleString()} ops / ${(data.total_prompts || 0).toLocaleString()} prompts`;
+      const cardAutonomy = document.getElementById('cardAutonomy');
+      if (cardAutonomy) {
+        const tools = (data.total_tools || 0).toLocaleString();
+        const prompts = (data.total_prompts || 0).toLocaleString();
+        const multiplier = data.autonomy_multiplier || 1;
+        cardAutonomy.title = `Autonomous leverage ratio: ${multiplier}x\nAverage of ${tools} automated operations executed across ${prompts} human prompts.\nHigher ratios represent deeper autonomous execution per instruction.`;
+      }
 
       const elThinking = document.getElementById('kpiThinking');
       if (elThinking) elThinking.textContent = formatTokens(data.total_thinking || 0);
+      const cardThinking = document.getElementById('cardThinking');
+      if (cardThinking) {
+        const thinkingTokens = (data.total_thinking || 0).toLocaleString();
+        cardThinking.title = `Internal chain-of-thought volume: ${thinkingTokens} thinking tokens.\nGenerated during deep reasoning and deliberative planning phases before producing visible responses.`;
+      }
 
       const elCodeLines = document.getElementById('kpiCodeLines');
       if (elCodeLines) elCodeLines.textContent = (data.total_code_lines || 0).toLocaleString();
       const elCodeSub = document.getElementById('kpiCodeSub');
       if (elCodeSub) elCodeSub.textContent = `+${(data.lines_written || 0).toLocaleString()} / ~${(data.lines_edited || 0).toLocaleString()}`;
+      const cardCodeLines = document.getElementById('cardCodeLines');
+      if (cardCodeLines) {
+        const total = (data.total_code_lines || 0).toLocaleString();
+        const written = (data.lines_written || 0).toLocaleString();
+        const edited = (data.lines_edited || 0).toLocaleString();
+        cardCodeLines.title = `Total code authored: ${total} lines\n• +${written} new lines written to created files (write_to_file)\n• ~${edited} modified lines replaced in existing files (replace_file_content)`;
+      }
 
       const elTimeSaved = document.getElementById('kpiTimeSaved');
       if (elTimeSaved) elTimeSaved.textContent = `~${(data.saved_hours || 0).toLocaleString()}h`;
+      const cardTimeSaved = document.getElementById('cardTimeSaved');
+      if (cardTimeSaved) {
+        if (data.saved_reads != null) {
+          const reads = (data.saved_reads || 0).toLocaleString();
+          const cmds = (data.saved_cmds || 0).toLocaleString();
+          const edits = (data.saved_edits || 0).toLocaleString();
+          const hours = (data.saved_hours || 0).toLocaleString();
+          cardTimeSaved.title = `Calculated from automated developer actions (~${hours}h saved):\n• ${reads} file reads/searches (30s each)\n• ${cmds} command executions (45s each)\n• ${edits} code edits/writes (120s each)`;
+        } else {
+          cardTimeSaved.title = `Calculated from automated developer actions: 30s per file read/search (view_file, grep_search, find_by_name, list_dir), 45s per command execution (run_command), and 120s per code write/edit (write_to_file, replace_file_content).`;
+        }
+      }
 
       // Context Hygiene Diagnostics
       const elReReadRate = document.getElementById('diagReReadRate');
@@ -200,6 +256,13 @@
       if (elReReadCount) elReReadCount.textContent = `${(data.total_re_reads || 0).toLocaleString()} repeated views`;
       const elReReadWaste = document.getElementById('diagReReadWaste');
       if (elReReadWaste) elReReadWaste.textContent = `~${formatTokens(data.re_read_waste_tokens || 0)} waste`;
+      const cardDiagReRead = document.getElementById('cardDiagReRead');
+      if (cardDiagReRead) {
+        const rate = data.re_read_rate || 0;
+        const count = (data.total_re_reads || 0).toLocaleString();
+        const waste = formatTokens(data.re_read_waste_tokens || 0);
+        cardDiagReRead.title = `Context cache health: ${rate}% re-read rate\n${count} repeated views of previously inspected files in the same session.\nEstimated context waste: ~${waste} tokens (~750 tok/re-read).`;
+      }
 
       const elResilienceRate = document.getElementById('diagResilienceRate');
       if (elResilienceRate) elResilienceRate.textContent = `${data.resilience_rate || 100}%`;
@@ -207,6 +270,13 @@
       if (elResilienceBar) elResilienceBar.style.width = `${Math.min(data.resilience_rate || 100, 100)}%`;
       const elErrorCount = document.getElementById('diagErrorCount');
       if (elErrorCount) elErrorCount.textContent = `${(data.failed_tool_calls || 0).toLocaleString()} errors resolved`;
+      const cardDiagResilience = document.getElementById('cardDiagResilience');
+      if (cardDiagResilience) {
+        const rate = data.resilience_rate || 100;
+        const fails = (data.failed_tool_calls || 0).toLocaleString();
+        const tools = (data.total_tools || 0).toLocaleString();
+        cardDiagResilience.title = `Tool execution resilience: ${rate}% first-attempt success\n${fails} errors recovered across ${tools} total tool calls.\nMeasures autonomous self-correction without human intervention.`;
+      }
 
       // Bloat Table
       const bloatTbody = document.getElementById('bloatTableBody');
@@ -627,8 +697,8 @@
       const btnAll = document.getElementById('btnAll');
 
       const btnClasses = {
-        active: 'px-2.5 py-1 rounded bg-brand-600 text-white font-medium shadow transition',
-        inactive: 'px-2.5 py-1 rounded text-gray-400 hover:text-white transition'
+        active: 'px-2.5 py-1 rounded-md bg-brand-600 text-white font-medium shadow-sm transition text-[11px] whitespace-nowrap outline-none focus:outline-none focus:ring-0',
+        inactive: 'px-2.5 py-1 rounded-md text-gray-400 hover:text-white transition text-[11px] whitespace-nowrap outline-none focus:outline-none focus:ring-0'
       };
 
       if (btn7d) btn7d.className = days === 7 ? btnClasses.active : btnClasses.inactive;
@@ -654,9 +724,131 @@
     function renderTimelineChart(data) {
       const ctx = document.getElementById('timelineChart').getContext('2d');
       const labels = data.map(d => d.day);
-      const tokens = data.map(d => d.tokens);
+      const isStacked = (currentTimelineViewMode === 'stacked' && currentProject === 'all');
+
+      let barDatasets = [];
+
+      if (!isStacked) {
+        barDatasets = [
+          {
+            label: currentProject !== 'all' ? `Tokens (${currentProject})` : 'Tokens Consumed',
+            data: data.map(d => d.tokens),
+            backgroundColor: 'rgba(99, 102, 241, 0.65)',
+            borderColor: '#6366f1',
+            borderWidth: 1,
+            borderRadius: 4,
+            yAxisID: 'y',
+            order: 3
+          }
+        ];
+      } else {
+        // Collect all project token sums across the current slice
+        const projectSums = {};
+        data.forEach(d => {
+          if (d.projects) {
+            Object.entries(d.projects).forEach(([proj, tok]) => {
+              projectSums[proj] = (projectSums[proj] || 0) + (tok || 0);
+            });
+          }
+        });
+
+        const sortedProjects = Object.entries(projectSums)
+          .filter(([_, sum]) => sum > 0)
+          .sort((a, b) => b[1] - a[1])
+          .map(entry => entry[0]);
+
+        const topProjects = sortedProjects.slice(0, 5);
+        const otherProjects = new Set(sortedProjects.slice(5));
+
+        const PROJECT_COLORS = ['#6366f1', '#38bdf8', '#a855f7', '#10b981', '#f59e0b'];
+        const OTHER_COLOR = '#64748b';
+
+        barDatasets = topProjects.map((proj, idx) => {
+          const color = PROJECT_COLORS[idx % PROJECT_COLORS.length];
+          return {
+            label: proj,
+            type: 'bar',
+            stack: 'tokens_stack',
+            data: data.map(d => (d.projects ? d.projects[proj] || 0 : 0)),
+            backgroundColor: color + 'B3', // ~70% opacity
+            borderColor: color,
+            borderWidth: 1,
+            borderRadius: 2,
+            yAxisID: 'y',
+            order: 3
+          };
+        });
+
+        if (otherProjects.size > 0) {
+          barDatasets.push({
+            label: 'Other Projects',
+            type: 'bar',
+            stack: 'tokens_stack',
+            data: data.map(d => {
+              if (!d.projects) return 0;
+              let sumOther = 0;
+              for (const [p, tok] of Object.entries(d.projects)) {
+                if (otherProjects.has(p)) {
+                  sumOther += (tok || 0);
+                }
+              }
+              return sumOther;
+            }),
+            backgroundColor: OTHER_COLOR + 'B3',
+            borderColor: OTHER_COLOR,
+            borderWidth: 1,
+            borderRadius: 2,
+            yAxisID: 'y',
+            order: 3
+          });
+        }
+
+        if (barDatasets.length === 0) {
+          barDatasets.push({
+            label: 'Tokens Consumed',
+            data: data.map(d => d.tokens),
+            backgroundColor: 'rgba(99, 102, 241, 0.65)',
+            borderColor: '#6366f1',
+            borderWidth: 1,
+            borderRadius: 4,
+            yAxisID: 'y',
+            order: 3
+          });
+        }
+      }
+
       const sessions = data.map(d => d.sessions);
       const costs = data.map(d => d.cost || 0);
+
+      const lineDatasets = [
+        {
+          label: 'Est. API Value ($)',
+          data: costs,
+          type: 'line',
+          borderColor: '#f43f5e',
+          backgroundColor: '#f43f5e',
+          borderWidth: 2,
+          tension: 0.3,
+          pointRadius: 2,
+          pointHoverRadius: 4,
+          yAxisID: 'yCost',
+          order: 1
+        },
+        {
+          label: 'Sessions',
+          data: sessions,
+          type: 'line',
+          borderColor: '#e0e7ff',
+          backgroundColor: '#e0e7ff',
+          borderWidth: 2,
+          borderDash: [4, 4],
+          tension: 0.3,
+          pointRadius: 2,
+          pointHoverRadius: 4,
+          yAxisID: 'y1',
+          order: 2
+        }
+      ];
 
       if (timelineChart) timelineChart.destroy();
 
@@ -664,66 +856,63 @@
         type: 'bar',
         data: {
           labels: labels,
-          datasets: [
-            {
-              label: 'Tokens Consumed',
-              data: tokens,
-              backgroundColor: 'rgba(99, 102, 241, 0.65)',
-              borderColor: '#6366f1',
-              borderWidth: 1,
-              borderRadius: 4,
-              yAxisID: 'y',
-              order: 3
-            },
-            {
-              label: 'Est. API Value ($)',
-              data: costs,
-              type: 'line',
-              borderColor: '#f43f5e',
-              backgroundColor: '#f43f5e',
-              borderWidth: 2,
-              tension: 0.3,
-              pointRadius: 2,
-              pointHoverRadius: 4,
-              yAxisID: 'yCost',
-              order: 1
-            },
-            {
-              label: 'Sessions',
-              data: sessions,
-              type: 'line',
-              borderColor: '#38bdf8',
-              backgroundColor: '#38bdf8',
-              borderWidth: 2,
-              tension: 0.3,
-              pointRadius: 2,
-              pointHoverRadius: 4,
-              yAxisID: 'y1',
-              order: 2
-            }
-          ]
+          datasets: [...barDatasets, ...lineDatasets]
         },
         options: {
+          animation: false,
           responsive: true,
           maintainAspectRatio: false,
           interaction: { mode: 'index', intersect: false },
           plugins: {
-            legend: { labels: { color: '#9ca3af', font: { size: 11 } } },
+            legend: { 
+              labels: { 
+                color: '#9ca3af', 
+                font: { size: 10 },
+                usePointStyle: true,
+                boxWidth: 8
+              } 
+            },
             tooltip: {
+              filter: function(tooltipItem) {
+                if (isStacked && tooltipItem.dataset.stack === 'tokens_stack') {
+                  return (tooltipItem.raw || 0) > 0;
+                }
+                return true;
+              },
               callbacks: {
                 label: (ctx) => {
-                  if (ctx.dataset.label === 'Tokens Consumed') return `Tokens: ${formatTokens(ctx.raw)}`;
-                  if (ctx.dataset.label === 'Est. API Value ($)') return `Est. API Value: $${Number(ctx.raw || 0).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}`;
-                  return `Sessions: ${ctx.raw}`;
+                  if (ctx.dataset.label === 'Est. API Value ($)') {
+                    return `Est. API Value: $${Number(ctx.raw || 0).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}`;
+                  }
+                  if (ctx.dataset.label === 'Sessions') {
+                    return `Sessions: ${ctx.raw}`;
+                  }
+                  if (isStacked && ctx.dataset.stack === 'tokens_stack') {
+                    const dayTotal = data[ctx.dataIndex]?.tokens || 0;
+                    const pct = dayTotal > 0 ? ((ctx.raw / dayTotal) * 100).toFixed(1) : '0.0';
+                    return `${ctx.dataset.label}: ${formatTokens(ctx.raw)} (${pct}%)`;
+                  }
+                  return `Tokens: ${formatTokens(ctx.raw)}`;
+                },
+                footer: (items) => {
+                  if (!isStacked) return '';
+                  const idx = items[0]?.dataIndex;
+                  const dayTokens = data[idx]?.tokens || 0;
+                  return `Total Tokens: ${formatTokens(dayTokens)}`;
                 }
               }
             }
           },
           scales: {
-            x: { grid: { color: '#1f2937' }, ticks: { color: '#9ca3af', maxTicksLimit: 12, font: { size: 10 } } },
+            x: { 
+              stacked: isStacked,
+              grid: { color: '#1f2937' }, 
+              ticks: { color: '#9ca3af', maxTicksLimit: 12, font: { size: 10 } } 
+            },
             y: {
               type: 'linear',
               position: 'left',
+              stacked: isStacked,
               beginAtZero: true,
               grid: { color: '#1f2937' },
               ticks: { color: '#9ca3af', callback: v => formatTokens(v), font: { size: 10 } },
@@ -732,14 +921,16 @@
             y1: {
               type: 'linear',
               position: 'right',
+              stacked: false,
               beginAtZero: true,
               grid: { drawOnChartArea: false },
-              ticks: { color: '#38bdf8', font: { size: 10 }, precision: 0 },
-              title: { display: true, text: 'Sessions', color: '#38bdf8', font: { size: 10 } }
+              ticks: { color: '#e0e7ff', font: { size: 10 }, precision: 0 },
+              title: { display: true, text: 'Sessions', color: '#e0e7ff', font: { size: 10 } }
             },
             yCost: {
               type: 'linear',
               position: 'right',
+              stacked: false,
               beginAtZero: true,
               grid: { drawOnChartArea: false },
               ticks: {
@@ -1466,9 +1657,17 @@
         const autonomyRatio = (toolsCnt / Math.max(1, promptsCnt)).toFixed(1);
         const elAutonomy = document.getElementById('modalAutonomy');
         if (elAutonomy) elAutonomy.textContent = `${autonomyRatio}x (${toolsCnt} tools)`;
+        const cardModalAutonomy = document.getElementById('modalAutonomyCard');
+        if (cardModalAutonomy) {
+          cardModalAutonomy.title = `Autonomous leverage: ${autonomyRatio}x\n${toolsCnt.toLocaleString()} automated operations executed across ${promptsCnt.toLocaleString()} human prompts in this session.`;
+        }
 
         const elThinking = document.getElementById('modalThinking');
         if (elThinking) elThinking.textContent = formatTokens(conv.thinking_tokens || 0);
+        const cardModalThinking = document.getElementById('modalThinkingCard');
+        if (cardModalThinking) {
+          cardModalThinking.title = `Internal chain-of-thought: ${(conv.thinking_tokens || 0).toLocaleString()} tokens\nGenerated during deep reasoning and deliberative planning phases in this session.`;
+        }
 
         const elReReads = document.getElementById('modalReReads');
         const reReads = conv.redundant_file_reads || 0;
@@ -1476,9 +1675,20 @@
           elReReads.textContent = reReads === 0 ? '✓ 0 re-reads' : `⚠️ ${reReads} repeated`;
           elReReads.className = reReads === 0 ? 'font-semibold text-emerald-400 font-mono mt-0.5 block' : 'font-semibold text-amber-400 font-mono mt-0.5 block';
         }
+        const cardModalReReads = document.getElementById('modalReReadsCard');
+        if (cardModalReReads) {
+          cardModalReReads.title = `Context cache health: ${reReads} repeated file views in this session (~${formatTokens(reReads * 750)} estimated wasted context tokens).`;
+        }
 
         const elCodeLines = document.getElementById('modalCodeLines');
         if (elCodeLines) elCodeLines.textContent = `+${(conv.lines_written || 0).toLocaleString()} / ~${(conv.lines_edited || 0).toLocaleString()}`;
+        const cardModalCodeLines = document.getElementById('modalCodeLinesCard');
+        if (cardModalCodeLines) {
+          const written = (conv.lines_written || 0).toLocaleString();
+          const edited = (conv.lines_edited || 0).toLocaleString();
+          const total = ((conv.lines_written || 0) + (conv.lines_edited || 0)).toLocaleString();
+          cardModalCodeLines.title = `Code authored in this session: ${total} total lines\n• +${written} new lines written (write_to_file)\n• ~${edited} modified lines replaced (replace_file_content)`;
+        }
 
         function formatToolBadge(toolOrSource, activity) {
           const isMcp = (activity && activity.startsWith('MCP')) || (toolOrSource && (toolOrSource.includes(':') || toolOrSource.startsWith('`mcp')));

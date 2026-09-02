@@ -156,4 +156,44 @@ def test_export_standalone_html_includes_cost_by_project(tmp_path, monkeypatch):
     assert "cost_by_project" in content
     assert "agy-context-monitor" in content
     assert "/api/cost-by-project" in content
+    assert 'id="cardTimeSaved"' in content
+    assert "Calculated from automated developer actions" in content
+    assert 'id="cardAutonomy"' in content
+    assert "Autonomous leverage ratio" in content
+    assert 'id="cardThinking"' in content
+    assert "Internal chain-of-thought volume" in content
+    assert 'id="cardCodeLines"' in content
+    assert "Total code authored" in content
+    assert 'id="cardDiagReRead"' in content
+    assert "Measures context cache efficiency" in content
+    assert 'id="cardDiagResilience"' in content
+    assert "First-attempt execution success rate" in content
+    assert "Context Bloat Culprits" in content
+    assert "High-watermark threshold" in content
+
+
+def test_query_summary_dev_time_saved_breakdown(tmp_path):
+    db_file = tmp_path / "test_summary_saved.db"
+    init_db(db_file)
+    conn = get_db_connection(db_file)
+
+    conn.execute("""
+        INSERT INTO conversations (id, title, project, model_name, created_at, total_steps, total_tokens, billed_cost)
+        VALUES ('c1', 'Conv 1', 'test_proj', 'Gemini Flash', '2026-08-20T10:00:00Z', 5, 10000, 0.50)
+    """)
+    # Insert tool executions: 2 reads (30s each = 60s), 1 cmd (45s), 1 edit (120s) -> total 225s
+    conn.execute("INSERT INTO tool_executions (conversation_id, step_index, tool_name) VALUES ('c1', 1, 'view_file')")
+    conn.execute("INSERT INTO tool_executions (conversation_id, step_index, tool_name) VALUES ('c1', 2, 'grep_search')")
+    conn.execute("INSERT INTO tool_executions (conversation_id, step_index, tool_name) VALUES ('c1', 3, 'run_command')")
+    conn.execute("INSERT INTO tool_executions (conversation_id, step_index, tool_name) VALUES ('c1', 4, 'replace_file_content')")
+    conn.commit()
+
+    summary = query_summary_data(conn)
+    conn.close()
+
+    assert summary["saved_reads"] == 2
+    assert summary["saved_cmds"] == 1
+    assert summary["saved_edits"] == 1
+    assert "saved_hours" in summary
+
 

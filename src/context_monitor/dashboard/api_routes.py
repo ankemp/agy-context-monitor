@@ -188,6 +188,9 @@ def query_summary_data(conn, tz=None, project=None):
         "resilience_rate": resilience_rate,
         "failed_tool_calls": total_fails,
         "saved_hours": saved_hours,
+        "saved_reads": reads_cnt,
+        "saved_cmds": cmds_cnt,
+        "saved_edits": edits_cnt,
         "phases": phases,
         "bloat_steps": bloat_steps,
         "total_billed_cost": round(total_billed_cost, 2),
@@ -287,18 +290,24 @@ def query_cost_by_project(conn, tz=None, project=None, limit_sessions=6):
 def query_timeline_data(conn, days=None, tz=None, project=None):
     cur = conn.cursor()
 
-    where_clause = "WHERE created_at IS NOT NULL AND created_at != ''"
+    where_clause = "WHERE s.created_at IS NOT NULL AND s.created_at != ''"
     params = ()
-    if project:
+    if project and project != "all":
         if project == "(unassigned)":
-            where_clause += " AND conversation_id IN (SELECT id FROM conversations WHERE project IS NULL OR project = '')"
+            where_clause += " AND (c.project IS NULL OR c.project = '')"
         else:
-            where_clause += " AND conversation_id IN (SELECT id FROM conversations WHERE project = ?)"
+            where_clause += " AND c.project = ?"
             params = (project,)
 
     rows = cur.execute(f"""
-        SELECT created_at, conversation_id, est_tokens, billed_cost
-        FROM steps
+        SELECT 
+            s.created_at, 
+            s.conversation_id, 
+            s.est_tokens, 
+            s.billed_cost,
+            COALESCE(NULLIF(c.project, ''), '(unassigned)') as project_name
+        FROM steps s
+        LEFT JOIN conversations c ON s.conversation_id = c.id
         {where_clause}
     """, params).fetchall()
 
@@ -312,12 +321,23 @@ def query_timeline_data(conn, days=None, tz=None, project=None):
             continue
         day_str = dt.strftime("%Y-%m-%d")
         if day_str not in daily_map:
-            daily_map[day_str] = {"day": day_str, "sessions": 0, "steps": 0, "tokens": 0, "cost": 0.0}
+            daily_map[day_str] = {
+                "day": day_str, 
+                "sessions": 0, 
+                "steps": 0, 
+                "tokens": 0, 
+                "cost": 0.0,
+                "projects": {}
+            }
             day_sessions[day_str] = set()
         daily_map[day_str]["steps"] += 1
-        daily_map[day_str]["tokens"] += r["est_tokens"] or 0
+        tokens = r["est_tokens"] or 0
+        daily_map[day_str]["tokens"] += tokens
         daily_map[day_str]["cost"] += r["billed_cost"] or 0.0
         day_sessions[day_str].add(r["conversation_id"])
+
+        proj = r["project_name"] or "(unassigned)"
+        daily_map[day_str]["projects"][proj] = daily_map[day_str]["projects"].get(proj, 0) + tokens
 
     for day_str, s_set in day_sessions.items():
         daily_map[day_str]["sessions"] = len(s_set)
@@ -352,7 +372,8 @@ def query_timeline_data(conn, days=None, tz=None, project=None):
                 "sessions": 0,
                 "steps": 0,
                 "tokens": 0,
-                "cost": 0.0
+                "cost": 0.0,
+                "projects": {}
             })
         curr += timedelta(days=1)
 

@@ -239,3 +239,103 @@ def test_timeline_fixed_day_counts(tmp_path):
         assert item["sessions"] == 0
         assert item["steps"] == 0
         assert item["cost"] == 0.0
+        assert item["projects"] == {}
+
+def test_timeline_projects_breakdown(tmp_path):
+    """
+    Verifies that query_timeline_data groups tokens by project across multi-project conversations.
+    """
+    db_file = tmp_path / "test_timeline_projects.db"
+    init_db(db_file)
+    conn = get_db_connection(db_file)
+
+    conn.execute("""
+        INSERT INTO conversations (id, title, project, created_at, updated_at, total_steps, total_tokens)
+        VALUES ('conv-proj-1', 'Project 1 Session', 'alpha-proj', '2026-08-10T10:00:00Z', '2026-08-10T12:00:00Z', 2, 800)
+    """)
+    conn.execute("""
+        INSERT INTO conversations (id, title, project, created_at, updated_at, total_steps, total_tokens)
+        VALUES ('conv-proj-2', 'Project 2 Session', 'beta-proj', '2026-08-10T11:00:00Z', '2026-08-10T13:00:00Z', 1, 400)
+    """)
+
+    steps = [
+        ('conv-proj-1', 1, '2026-08-10T10:00:00Z', 'MODEL', 'PLANNER_RESPONSE', 500, 0.01),
+        ('conv-proj-1', 2, '2026-08-10T11:30:00Z', 'MODEL', 'PLANNER_RESPONSE', 300, 0.01),
+        ('conv-proj-2', 1, '2026-08-10T12:00:00Z', 'MODEL', 'PLANNER_RESPONSE', 400, 0.01),
+    ]
+    conn.executemany("""
+        INSERT INTO steps (conversation_id, step_index, created_at, source, step_type, est_tokens, billed_cost)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, steps)
+    conn.commit()
+
+    timeline = query_timeline_data(conn, tz="UTC")
+    conn.close()
+
+    date_map = {item["day"]: item for item in timeline}
+    assert "2026-08-10" in date_map
+    day_item = date_map["2026-08-10"]
+    assert day_item["tokens"] == 1200
+    assert day_item["projects"]["alpha-proj"] == 800
+    assert day_item["projects"]["beta-proj"] == 400
+
+def test_timeline_unassigned_project(tmp_path):
+    """
+    Verifies that conversations with empty or NULL project are grouped under '(unassigned)'.
+    """
+    db_file = tmp_path / "test_unassigned.db"
+    init_db(db_file)
+    conn = get_db_connection(db_file)
+
+    conn.execute("""
+        INSERT INTO conversations (id, title, project, created_at, updated_at, total_steps, total_tokens)
+        VALUES ('conv-no-proj', 'No Project Session', NULL, '2026-08-12T10:00:00Z', '2026-08-12T11:00:00Z', 1, 600)
+    """)
+    conn.execute("""
+        INSERT INTO steps (conversation_id, step_index, created_at, source, step_type, est_tokens, billed_cost)
+        VALUES ('conv-no-proj', 1, '2026-08-12T10:00:00Z', 'MODEL', 'PLANNER_RESPONSE', 600, 0.01)
+    """)
+    conn.commit()
+
+    timeline = query_timeline_data(conn, tz="UTC")
+    conn.close()
+
+    date_map = {item["day"]: item for item in timeline}
+    assert "2026-08-12" in date_map
+    assert date_map["2026-08-12"]["projects"]["(unassigned)"] == 600
+
+def test_timeline_single_project_filter(tmp_path):
+    """
+    Verifies that filtering by project isolates only that project's records.
+    """
+    db_file = tmp_path / "test_filter_proj.db"
+    init_db(db_file)
+    conn = get_db_connection(db_file)
+
+    conn.execute("""
+        INSERT INTO conversations (id, title, project, created_at, updated_at, total_steps, total_tokens)
+        VALUES ('c1', 'C1', 'target-proj', '2026-08-15T10:00:00Z', '2026-08-15T11:00:00Z', 1, 500)
+    """)
+    conn.execute("""
+        INSERT INTO conversations (id, title, project, created_at, updated_at, total_steps, total_tokens)
+        VALUES ('c2', 'C2', 'other-proj', '2026-08-15T12:00:00Z', '2026-08-15T13:00:00Z', 1, 700)
+    """)
+
+    conn.execute("""
+        INSERT INTO steps (conversation_id, step_index, created_at, source, step_type, est_tokens, billed_cost)
+        VALUES ('c1', 1, '2026-08-15T10:00:00Z', 'MODEL', 'PLANNER_RESPONSE', 500, 0.01)
+    """)
+    conn.execute("""
+        INSERT INTO steps (conversation_id, step_index, created_at, source, step_type, est_tokens, billed_cost)
+        VALUES ('c2', 1, '2026-08-15T12:00:00Z', 'MODEL', 'PLANNER_RESPONSE', 700, 0.01)
+    """)
+    conn.commit()
+
+    timeline = query_timeline_data(conn, tz="UTC", project="target-proj")
+    conn.close()
+
+    date_map = {item["day"]: item for item in timeline}
+    assert date_map["2026-08-15"]["tokens"] == 500
+    assert date_map["2026-08-15"]["projects"]["target-proj"] == 500
+    assert "other-proj" not in date_map["2026-08-15"]["projects"]
+

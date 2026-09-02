@@ -221,7 +221,7 @@
 
     <!-- 1b. Developer Velocity & Autonomy ROI Banner -->
     <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
-      <div class="card p-3.5 flex items-center space-x-3.5 border-l-4 border-l-indigo-500">
+      <div id="cardAutonomy" class="card p-3.5 flex items-center space-x-3.5 border-l-4 border-l-indigo-500 cursor-help" title="Autonomous leverage ratio: Average automated tool operations executed per human prompt (total_tools / user_prompts). Higher ratios represent deeper autonomous execution per instruction.">
         <div class="p-2.5 rounded-lg bg-indigo-500/10 text-indigo-400">
           <i data-lucide="zap" class="w-5 h-5"></i>
         </div>
@@ -232,7 +232,7 @@
         </div>
       </div>
 
-      <div class="card p-3.5 flex items-center space-x-3.5 border-l-4 border-l-purple-500">
+      <div id="cardThinking" class="card p-3.5 flex items-center space-x-3.5 border-l-4 border-l-purple-500 cursor-help" title="Internal chain-of-thought volume: Cumulative tokens generated during deep reasoning and deliberative planning phases before producing visible responses.">
         <div class="p-2.5 rounded-lg bg-purple-500/10 text-purple-400">
           <i data-lucide="brain-circuit" class="w-5 h-5"></i>
         </div>
@@ -243,7 +243,7 @@
         </div>
       </div>
 
-      <div class="card p-3.5 flex items-center space-x-3.5 border-l-4 border-l-emerald-500">
+      <div id="cardCodeLines" class="card p-3.5 flex items-center space-x-3.5 border-l-4 border-l-emerald-500 cursor-help" title="Total code authored: Combined count of new lines written to created files (write_to_file) and modified lines replaced in existing files (replace_file_content).">
         <div class="p-2.5 rounded-lg bg-emerald-500/10 text-emerald-400">
           <i data-lucide="code-2" class="w-5 h-5"></i>
         </div>
@@ -254,7 +254,7 @@
         </div>
       </div>
 
-      <div class="card p-3.5 flex items-center space-x-3.5 border-l-4 border-l-amber-500">
+      <div id="cardTimeSaved" class="card p-3.5 flex items-center space-x-3.5 border-l-4 border-l-amber-500 cursor-help" title="Calculated from automated developer actions: 30s per file read/search (view_file, grep_search, find_by_name, list_dir), 45s per command execution (run_command), and 120s per code write/edit (write_to_file, replace_file_content).">
         <div class="p-2.5 rounded-lg bg-amber-500/10 text-amber-400">
           <i data-lucide="hourglass" class="w-5 h-5"></i>
         </div>
@@ -269,19 +269,26 @@
     <!-- 2. Main Visual Charts (Token Velocity & Model Shares) -->
     <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
       <div class="card p-5 lg:col-span-2 flex flex-col">
-        <div class="flex items-center justify-between mb-4">
-          <div>
+        <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-4">
+          <div class="min-w-0">
             <h2 class="text-sm font-semibold text-white flex items-center space-x-2">
               <i data-lucide="trending-up" class="w-4 h-4 text-indigo-400"></i>
               <span>Token Consumption Velocity</span>
             </h2>
-            <p class="text-xs text-gray-400">Daily tokens consumed, estimated API billing value, and session counts over time</p>
+            <p class="text-xs text-gray-400 mt-0.5">Daily tokens consumed, estimated API billing value, and session counts</p>
           </div>
-          <div class="flex items-center space-x-1 bg-dark-800 border border-dark-700 rounded-md p-0.5 text-xs">
-            <button onclick="setTimelineRange(7)" id="btn7d" class="px-2.5 py-1 rounded text-gray-400 hover:text-white transition">7D</button>
-            <button onclick="setTimelineRange(14)" id="btn14d" class="px-2.5 py-1 rounded text-gray-400 hover:text-white transition">14D</button>
-            <button onclick="setTimelineRange(30)" id="btn30d" class="px-2.5 py-1 rounded bg-brand-600 text-white font-medium shadow transition">30D</button>
-            <button onclick="setTimelineRange(null)" id="btnAll" class="px-2.5 py-1 rounded text-gray-400 hover:text-white transition">All</button>
+          <div class="flex items-center bg-dark-800 border border-dark-700 rounded-lg p-0.5 shrink-0 self-start sm:self-auto">
+            <div id="timelineModeGroup" class="flex items-center space-x-0.5">
+              <button onclick="setTimelineViewMode('stacked')" id="btnTmStacked" class="px-2.5 py-1 rounded-md bg-brand-600 text-white font-medium shadow-sm transition text-[11px] whitespace-nowrap outline-none focus:outline-none">By Project</button>
+              <button onclick="setTimelineViewMode('aggregate')" id="btnTmAggregate" class="px-2.5 py-1 rounded-md text-gray-400 hover:text-white transition text-[11px] whitespace-nowrap outline-none focus:outline-none">Aggregate</button>
+            </div>
+            <div id="timelineDivider" class="h-3.5 w-px bg-dark-700 mx-1"></div>
+            <div class="flex items-center space-x-0.5">
+              <button onclick="setTimelineRange(7)" id="btn7d" class="px-2.5 py-1 rounded-md text-gray-400 hover:text-white transition text-[11px] whitespace-nowrap outline-none focus:outline-none">7D</button>
+              <button onclick="setTimelineRange(14)" id="btn14d" class="px-2.5 py-1 rounded-md text-gray-400 hover:text-white transition text-[11px] whitespace-nowrap outline-none focus:outline-none">14D</button>
+              <button onclick="setTimelineRange(30)" id="btn30d" class="px-2.5 py-1 rounded-md bg-brand-600 text-white font-medium shadow-sm transition text-[11px] whitespace-nowrap outline-none focus:outline-none">30D</button>
+              <button onclick="setTimelineRange(null)" id="btnAll" class="px-2.5 py-1 rounded-md text-gray-400 hover:text-white transition text-[11px] whitespace-nowrap outline-none focus:outline-none">All</button>
+            </div>
           </div>
         </div>
         <div class="flex-1 relative min-h-[260px]">
@@ -461,7 +468,7 @@
           </div>
 
           <div class="space-y-3.5 mt-3">
-            <div class="bg-dark-800/80 p-3 rounded-lg border border-dark-700">
+            <div id="cardDiagReRead" class="bg-dark-800/80 p-3 rounded-lg border border-dark-700 cursor-help" title="Measures context cache efficiency: Repeated views of previously inspected files within the same session. Context waste is estimated at ~750 tokens per redundant re-read.">
               <div class="flex justify-between items-center text-xs mb-1.5">
                 <span class="text-gray-300 font-medium">Redundant File Re-Reads</span>
                 <span id="diagReReadRate" class="font-mono font-bold text-amber-400">--%</span>
@@ -475,7 +482,7 @@
               </div>
             </div>
 
-            <div class="bg-dark-800/80 p-3 rounded-lg border border-dark-700">
+            <div id="cardDiagResilience" class="bg-dark-800/80 p-3 rounded-lg border border-dark-700 cursor-help" title="First-attempt execution success rate: (total_tools - failed_tool_calls) / total_tools. Measures how reliably agent operations succeed without requiring error recovery or retry steps.">
               <div class="flex justify-between items-center text-xs mb-1.5">
                 <span class="text-gray-300 font-medium">Tool Execution Resilience</span>
                 <span id="diagResilienceRate" class="font-mono font-bold text-emerald-400">--%</span>
@@ -499,12 +506,12 @@
 
       <!-- Top Bloat Injections Table -->
       <div class="card p-5 flex flex-col">
-        <div class="mb-3">
+        <div class="mb-3 cursor-help" title="High-watermark threshold: Identifies individual operations injecting over 2,000 tokens into the conversation context in a single turn.">
           <h2 class="text-sm font-semibold text-white flex items-center space-x-2">
             <i data-lucide="flame" class="w-4 h-4 text-rose-400"></i>
             <span>Context Bloat Culprits</span>
           </h2>
-          <p class="text-xs text-gray-400">Largest single-step token injections</p>
+          <p class="text-xs text-gray-400">Largest single-step token injections (>2k tokens)</p>
         </div>
         <div class="overflow-x-auto">
           <table class="w-full text-left text-xs text-gray-300">
@@ -826,19 +833,19 @@
 
         <!-- Session Efficiency Scorecard -->
         <div class="grid grid-cols-2 sm:grid-cols-4 gap-2.5 bg-dark-800/50 p-3 rounded-lg border border-dark-700 text-xs">
-          <div class="p-2 rounded bg-dark-900/60 border border-dark-700/50">
+          <div id="modalAutonomyCard" class="p-2 rounded bg-dark-900/60 border border-dark-700/50 cursor-help" title="Autonomous leverage ratio: Automated operations executed per user prompt in this session (tools / prompts).">
             <span class="text-gray-400 block text-[10px] uppercase font-medium">Autonomy Leverage</span>
             <span id="modalAutonomy" class="font-semibold text-white font-mono mt-0.5 block">--</span>
           </div>
-          <div class="p-2 rounded bg-dark-900/60 border border-dark-700/50">
+          <div id="modalThinkingCard" class="p-2 rounded bg-dark-900/60 border border-dark-700/50 cursor-help" title="Internal chain-of-thought tokens generated during deep reasoning and deliberative planning phases in this session.">
             <span class="text-gray-400 block text-[10px] uppercase font-medium">Deep Reasoning</span>
             <span id="modalThinking" class="font-semibold text-purple-400 font-mono mt-0.5 block">--</span>
           </div>
-          <div class="p-2 rounded bg-dark-900/60 border border-dark-700/50">
+          <div id="modalReReadsCard" class="p-2 rounded bg-dark-900/60 border border-dark-700/50 cursor-help" title="Context cache health: Redundant views of previously inspected files within this session (~750 wasted tokens per re-read).">
             <span class="text-gray-400 block text-[10px] uppercase font-medium">Re-Read Health</span>
             <span id="modalReReads" class="font-semibold text-amber-400 font-mono mt-0.5 block">--</span>
           </div>
-          <div class="p-2 rounded bg-dark-900/60 border border-dark-700/50">
+          <div id="modalCodeLinesCard" class="p-2 rounded bg-dark-900/60 border border-dark-700/50 cursor-help" title="Total code authored in this session: new lines written to created files (write_to_file) and modified lines replaced in existing files (replace_file_content).">
             <span class="text-gray-400 block text-[10px] uppercase font-medium">Code Authored</span>
             <span id="modalCodeLines" class="font-semibold text-emerald-400 font-mono mt-0.5 block">--</span>
           </div>
