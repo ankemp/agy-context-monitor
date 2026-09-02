@@ -27,6 +27,32 @@ from context_monitor.dashboard import api_routes, sse_stream
 DASHBOARD_DIR = Path(__file__).resolve().parent
 env = Environment(loader=FileSystemLoader(DASHBOARD_DIR / 'templates'))
 
+# In-memory API response cache invalidated automatically via SQLite PRAGMA data_version
+_API_CACHE_LOCK = threading.Lock()
+_API_CACHE = {}
+_LAST_DATA_VERSION = -1
+
+def get_cached_api_response(conn, cache_key: str, compute_fn):
+    global _LAST_DATA_VERSION
+    cur = conn.cursor()
+    dv = cur.execute("PRAGMA data_version;").fetchone()[0]
+    with _API_CACHE_LOCK:
+        if dv != _LAST_DATA_VERSION:
+            _API_CACHE.clear()
+            _LAST_DATA_VERSION = dv
+        if cache_key in _API_CACHE:
+            return _API_CACHE[cache_key]
+
+    data = compute_fn()
+    if isinstance(data, tuple) and data[0] == "error":
+        return data
+
+    serialized = json.dumps(data).encode("utf-8")
+    with _API_CACHE_LOCK:
+        if dv == _LAST_DATA_VERSION:
+            _API_CACHE[cache_key] = serialized
+    return serialized
+
 class DashboardHTTPHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
@@ -99,60 +125,68 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         conn = get_db_connection()
         target_tz = api_routes.get_target_tz(client_tz)
         try:
-            if path == "/api/projects":
-                cur = conn.cursor()
-                rows = cur.execute("SELECT DISTINCT project FROM conversations WHERE project IS NOT NULL AND project != '' ORDER BY project ASC").fetchall()
-                data = [r["project"] for r in rows]
-            elif path == "/api/summary":
-                data = api_routes.query_summary_data(conn, target_tz, project_param)
-            elif path == "/api/timeline":
-                days = qs.get("days", [None])[0]
-                data = api_routes.query_timeline_data(conn, days, target_tz, project_param)
-            elif path == "/api/cost-by-project":
-                data = api_routes.query_cost_by_project(conn, target_tz, project_param)
-            elif path == "/api/tools":
-                data = api_routes.query_tools_data(conn, project_param)
-            elif path == "/api/mcp":
-                data = api_routes.query_mcp_data(conn, project_param)
-            elif path == "/api/hot-files":
-                data = api_routes.query_hot_files_data(conn, project_param)
-            elif path == "/api/activity-matrix":
-                data = api_routes.query_activity_matrix(conn, target_tz, project_param)
-            elif path == "/api/conversations":
-                limit = int(qs.get("limit", [200])[0])
-                data = api_routes.query_conversations_list(conn, limit, target_tz, project_param)
-            elif path.startswith("/api/session/"):
-                session_id = path.split("/")[-1]
-                data = api_routes.query_session_details(conn, session_id, target_tz)
-            elif path == "/api/turn-diff":
-                conv_id = qs.get("conv_id", qs.get("cid", [None]))[0]
-                step_a_param = qs.get("a", qs.get("step_a", [None]))[0]
-                step_b_param = qs.get("b", qs.get("step_b", [None]))[0]
-                cumulative_param = qs.get("cumulative", ["true"])[0].lower()
-                cumulative = cumulative_param in ("true", "1", "yes")
+            cache_key = self.path
 
-                if not conv_id or step_a_param is None or step_b_param is None:
-                    self.send_error(400, "Missing required params: conv_id, a, b")
-                    return
-                try:
-                    step_a = int(step_a_param)
-                    step_b = int(step_b_param)
-                except ValueError:
-                    self.send_error(400, "Invalid step parameters: a and b must be integers")
-                    return
+            def compute():
+                if path == "/api/projects":
+                    cur = conn.cursor()
+                    rows = cur.execute("SELECT DISTINCT project FROM conversations WHERE project IS NOT NULL AND project != '' ORDER BY project ASC").fetchall()
+                    return [r["project"] for r in rows]
+                elif path == "/api/summary":
+                    return api_routes.query_summary_data(conn, target_tz, project_param)
+                elif path == "/api/timeline":
+                    days = qs.get("days", [None])[0]
+                    return api_routes.query_timeline_data(conn, days, target_tz, project_param)
+                elif path == "/api/cost-by-project":
+                    return api_routes.query_cost_by_project(conn, target_tz, project_param)
+                elif path == "/api/tools":
+                    return api_routes.query_tools_data(conn, project_param)
+                elif path == "/api/mcp":
+                    return api_routes.query_mcp_data(conn, project_param)
+                elif path == "/api/hot-files":
+                    return api_routes.query_hot_files_data(conn, project_param)
+                elif path == "/api/activity-matrix":
+                    return api_routes.query_activity_matrix(conn, target_tz, project_param)
+                elif path == "/api/conversations":
+                    limit = int(qs.get("limit", [200])[0])
+                    return api_routes.query_conversations_list(conn, limit, target_tz, project_param)
+                elif path.startswith("/api/session/"):
+                    session_id = path.split("/")[-1]
+                    session_data = api_routes.query_session_details(conn, session_id, target_tz)
+                    if session_data is None:
+                        return ("error", 404, "Session not found")
+                    return session_data
+                elif path == "/api/turn-diff":
+                    conv_id = qs.get("conv_id", qs.get("cid", [None]))[0]
+                    step_a_param = qs.get("a", qs.get("step_a", [None]))[0]
+                    step_b_param = qs.get("b", qs.get("step_b", [None]))[0]
+                    cumulative_param = qs.get("cumulative", ["true"])[0].lower()
+                    cumulative = cumulative_param in ("true", "1", "yes")
 
-                data = api_routes.query_turn_diff(conn, conv_id, step_a, step_b, cumulative, target_tz)
-                if data is None:
-                    self.send_error(404, "Conversation not found")
-                    return
-            else:
-                self.send_error(404)
+                    if not conv_id or step_a_param is None or step_b_param is None:
+                        return ("error", 400, "Missing required params: conv_id, a, b")
+                    try:
+                        step_a = int(step_a_param)
+                        step_b = int(step_b_param)
+                    except ValueError:
+                        return ("error", 400, "Invalid step parameters: a and b must be integers")
+
+                    data = api_routes.query_turn_diff(conn, conv_id, step_a, step_b, cumulative, target_tz)
+                    if data is None:
+                        return ("error", 404, "Conversation not found")
+                    return data
+                else:
+                    return ("error", 404, "Not found")
+
+            res = get_cached_api_response(conn, cache_key, compute)
+            if isinstance(res, tuple) and res[0] == "error":
+                self.send_error(res[1], res[2])
                 return
 
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.end_headers()
-            self.wfile.write(json.dumps(data).encode("utf-8"))
+            self.wfile.write(res)
         except Exception as e:
             self.send_error(500, str(e))
         finally:

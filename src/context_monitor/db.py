@@ -97,6 +97,11 @@ CREATE INDEX IF NOT EXISTS idx_steps_category ON steps(category);
 CREATE INDEX IF NOT EXISTS idx_steps_activity ON steps(activity);
 CREATE INDEX IF NOT EXISTS idx_steps_phase ON steps(phase);
 CREATE INDEX IF NOT EXISTS idx_steps_model ON steps(model_name);
+CREATE INDEX IF NOT EXISTS idx_steps_cat_tokens ON steps(category, est_tokens);
+CREATE INDEX IF NOT EXISTS idx_steps_model_tokens ON steps(model_name, est_tokens);
+CREATE INDEX IF NOT EXISTS idx_steps_phase_tokens ON steps(phase, est_tokens);
+CREATE INDEX IF NOT EXISTS idx_steps_est_tokens ON steps(est_tokens DESC);
+CREATE INDEX IF NOT EXISTS idx_tool_exec_conv ON tool_executions(conversation_id);
 CREATE INDEX IF NOT EXISTS idx_tool_exec_name ON tool_executions(tool_name);
 CREATE INDEX IF NOT EXISTS idx_tool_exec_server ON tool_executions(mcp_server);
 CREATE INDEX IF NOT EXISTS idx_tool_exec_mcp_tool ON tool_executions(mcp_tool);
@@ -116,6 +121,9 @@ def get_db_connection(db_path: Path = DEFAULT_DB_PATH, timeout: float = 30.0) ->
     conn.execute(f"PRAGMA busy_timeout = {int(timeout * 1000)};")
     conn.execute("PRAGMA synchronous = NORMAL;")
     conn.execute("PRAGMA foreign_keys = ON;")
+    conn.execute("PRAGMA cache_size = -64000;")
+    conn.execute("PRAGMA mmap_size = 268435456;")
+    conn.execute("PRAGMA temp_store = MEMORY;")
     
     return conn
 

@@ -102,15 +102,26 @@ def query_summary_data(conn, tz=None, project=None):
     total_fails = row["total_fails"] or 0
     resilience_rate = round(((total_tools - total_fails) / max(1, total_tools)) * 100, 1)
 
-    view_row = cur.execute(f"SELECT COUNT(*) FROM tool_executions WHERE tool_name = 'view_file' {where_tool}", params_conv).fetchone()
-    total_views = view_row[0] if view_row else 0
+    # Consolidated single query for tool execution counts
+    where_tool_clause = f"WHERE 1=1 {where_tool}"
+    tool_counts = cur.execute(f"""
+        SELECT 
+            COUNT(CASE WHEN tool_name = 'view_file' THEN 1 END) as view_cnt,
+            COUNT(CASE WHEN tool_name IN ('view_file', 'grep_search', 'find_by_name', 'list_dir') THEN 1 END) as reads_cnt,
+            COUNT(CASE WHEN tool_name = 'run_command' THEN 1 END) as cmds_cnt,
+            COUNT(CASE WHEN tool_name IN ('write_to_file', 'replace_file_content', 'multi_replace_file_content') THEN 1 END) as edits_cnt
+        FROM tool_executions
+        {where_tool_clause}
+    """, params_conv).fetchone()
+
+    total_views = tool_counts["view_cnt"] or 0
+    reads_cnt = tool_counts["reads_cnt"] or 0
+    cmds_cnt = tool_counts["cmds_cnt"] or 0
+    edits_cnt = tool_counts["edits_cnt"] or 0
+
     total_re_reads = row["total_re_reads"] or 0
     re_read_rate = round((total_re_reads / max(1, total_views)) * 100, 1)
     re_read_waste_tokens = total_re_reads * 750
-
-    reads_cnt = cur.execute(f"SELECT COUNT(*) FROM tool_executions WHERE tool_name IN ('view_file', 'grep_search', 'find_by_name', 'list_dir') {where_tool}", params_conv).fetchone()[0]
-    cmds_cnt = cur.execute(f"SELECT COUNT(*) FROM tool_executions WHERE tool_name = 'run_command' {where_tool}", params_conv).fetchone()[0]
-    edits_cnt = cur.execute(f"SELECT COUNT(*) FROM tool_executions WHERE tool_name IN ('write_to_file', 'replace_file_content', 'multi_replace_file_content') {where_tool}", params_conv).fetchone()[0]
     saved_hours = round(((reads_cnt * 30) + (cmds_cnt * 45) + (edits_cnt * 120)) / 3600)
 
     # Phase breakdown
@@ -138,16 +149,30 @@ def query_summary_data(conn, tz=None, project=None):
     total_billed_output_tokens = row["total_billed_output_tokens"] or 0
 
     models = []
-    for r in cur.execute(f"""
-        SELECT COALESCE(s.model_name, c.model_name, 'Gemini Flash') as mname,
-               COUNT(*) as steps,
-               SUM(s.est_tokens) as tokens
-        FROM steps s
-        JOIN conversations c ON s.conversation_id = c.id
-        WHERE 1=1 {where_step_join}
-        GROUP BY mname
-        ORDER BY tokens DESC
-    """, params_conv):
+    if project:
+        model_sql = f"""
+            SELECT COALESCE(s.model_name, c.model_name, 'Gemini Flash') as mname,
+                   COUNT(*) as steps,
+                   SUM(s.est_tokens) as tokens
+            FROM steps s
+            JOIN conversations c ON s.conversation_id = c.id
+            WHERE 1=1 {where_step_join}
+            GROUP BY mname
+            ORDER BY tokens DESC
+        """
+        model_params = params_conv
+    else:
+        model_sql = """
+            SELECT COALESCE(model_name, 'Gemini Flash') as mname,
+                   COUNT(*) as steps,
+                   SUM(est_tokens) as tokens
+            FROM steps
+            GROUP BY mname
+            ORDER BY tokens DESC
+        """
+        model_params = ()
+
+    for r in cur.execute(model_sql, model_params):
         models.append({
             "model_name": r["mname"] or "Unknown",
             "steps": r["steps"],
@@ -289,37 +314,49 @@ def query_cost_by_project(conn, tz=None, project=None, limit_sessions=6):
 
 def query_timeline_data(conn, days=None, tz=None, project=None):
     cur = conn.cursor()
+    target_tz = get_target_tz(tz)
 
-    where_clause = "WHERE s.created_at IS NOT NULL AND s.created_at != ''"
+    conv_proj = dict(cur.execute('SELECT id, COALESCE(NULLIF(project, ""), "(unassigned)") FROM conversations').fetchall())
+
+    where_clause = "WHERE created_at IS NOT NULL AND created_at != ''"
     params = ()
     if project and project != "all":
         if project == "(unassigned)":
-            where_clause += " AND (c.project IS NULL OR c.project = '')"
+            where_clause += " AND conversation_id IN (SELECT id FROM conversations WHERE project IS NULL OR project = '')"
         else:
-            where_clause += " AND c.project = ?"
+            where_clause += " AND conversation_id IN (SELECT id FROM conversations WHERE project = ?)"
             params = (project,)
 
     rows = cur.execute(f"""
         SELECT 
-            s.created_at, 
-            s.conversation_id, 
-            s.est_tokens, 
-            s.billed_cost,
-            COALESCE(NULLIF(c.project, ''), '(unassigned)') as project_name
-        FROM steps s
-        LEFT JOIN conversations c ON s.conversation_id = c.id
+            substr(created_at, 1, 13) as hour_key,
+            conversation_id,
+            COUNT(*) as step_count,
+            SUM(est_tokens) as tokens,
+            SUM(billed_cost) as cost
+        FROM steps
         {where_clause}
+        GROUP BY hour_key, conversation_id
     """, params).fetchall()
 
     daily_map = {}
     day_sessions = {}
-    target_tz = get_target_tz(tz)
+    hour_cache = {}
 
     for r in rows:
-        dt = parse_to_local_dt(r["created_at"], target_tz)
-        if not dt:
-            continue
-        day_str = dt.strftime("%Y-%m-%d")
+        hour_key = r["hour_key"]
+        cid = r["conversation_id"]
+        step_cnt = r["step_count"]
+        tokens = r["tokens"] or 0
+        cost = r["cost"] or 0.0
+
+        cached_day = hour_cache.get(hour_key)
+        if cached_day is None:
+            dt = datetime.fromisoformat(hour_key + ":00:00+00:00").astimezone(target_tz)
+            cached_day = dt.strftime("%Y-%m-%d")
+            hour_cache[hour_key] = cached_day
+        day_str = cached_day
+
         if day_str not in daily_map:
             daily_map[day_str] = {
                 "day": day_str, 
@@ -330,13 +367,13 @@ def query_timeline_data(conn, days=None, tz=None, project=None):
                 "projects": {}
             }
             day_sessions[day_str] = set()
-        daily_map[day_str]["steps"] += 1
-        tokens = r["est_tokens"] or 0
-        daily_map[day_str]["tokens"] += tokens
-        daily_map[day_str]["cost"] += r["billed_cost"] or 0.0
-        day_sessions[day_str].add(r["conversation_id"])
 
-        proj = r["project_name"] or "(unassigned)"
+        daily_map[day_str]["steps"] += step_cnt
+        daily_map[day_str]["tokens"] += tokens
+        daily_map[day_str]["cost"] += cost
+        day_sessions[day_str].add(cid)
+
+        proj = conv_proj.get(cid, "(unassigned)")
         daily_map[day_str]["projects"][proj] = daily_map[day_str]["projects"].get(proj, 0) + tokens
 
     for day_str, s_set in day_sessions.items():
@@ -536,10 +573,15 @@ def query_activity_matrix(conn, tz=None, project=None):
             where_clause += " AND conversation_id IN (SELECT id FROM conversations WHERE project = ?)"
             params = (project,)
         
-    step_rows = cur.execute(f"""
-        SELECT created_at, conversation_id, est_tokens
+    rows = cur.execute(f"""
+        SELECT 
+            substr(created_at, 1, 13) as hour_key,
+            conversation_id,
+            COUNT(*) as step_count,
+            SUM(est_tokens) as tokens
         FROM steps
         {where_clause}
+        GROUP BY hour_key, conversation_id
     """, params).fetchall()
 
     daily_map = {}
@@ -557,30 +599,33 @@ def query_activity_matrix(conn, tz=None, project=None):
         past_7_days_hourly[d_str] = [0 for _ in range(24)]
 
     day_sessions = {}
+    hour_cache = {}
 
-    for r in step_rows:
-        dt = parse_to_local_dt(r["created_at"], target_tz)
-        if not dt:
-            continue
-        
-        weekday = dt.weekday()
-        hour = dt.hour
-        d_str = dt.strftime("%Y-%m-%d")
-        tokens = r["est_tokens"] or 0
+    for r in rows:
+        hour_key = r["hour_key"]
         cid = r["conversation_id"]
+        step_cnt = r["step_count"]
+        tokens = r["tokens"] or 0
 
-        hourly_aggregate[weekday][hour] += 1
-        
+        cached = hour_cache.get(hour_key)
+        if cached is None:
+            dt = datetime.fromisoformat(hour_key + ":00:00+00:00").astimezone(target_tz)
+            cached = (dt.strftime("%Y-%m-%d"), dt.weekday(), dt.hour)
+            hour_cache[hour_key] = cached
+        d_str, weekday, hour = cached
+
+        hourly_aggregate[weekday][hour] += step_cnt
+
         if d_str in past_30_days_hourly:
-            past_30_days_hourly[d_str][hour] += 1
+            past_30_days_hourly[d_str][hour] += step_cnt
         if d_str in past_7_days_hourly:
-            past_7_days_hourly[d_str][hour] += 1
+            past_7_days_hourly[d_str][hour] += step_cnt
 
         if d_str not in daily_map:
             daily_map[d_str] = {"steps": 0, "tokens": 0, "sessions": 0}
             day_sessions[d_str] = set()
-            
-        daily_map[d_str]["steps"] += 1
+
+        daily_map[d_str]["steps"] += step_cnt
         daily_map[d_str]["tokens"] += tokens
         day_sessions[d_str].add(cid)
 

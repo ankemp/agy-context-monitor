@@ -32,6 +32,11 @@ def test_database_schema_and_migration(tmp_path):
     indexes = [r[1] for r in cur.execute("SELECT type, name FROM sqlite_master WHERE type='index'").fetchall()]
     assert "idx_steps_created" in indexes
     assert "idx_steps_conv_step" in indexes
+    assert "idx_tool_exec_conv" in indexes
+    assert "idx_steps_cat_tokens" in indexes
+    assert "idx_steps_model_tokens" in indexes
+    assert "idx_steps_phase_tokens" in indexes
+    assert "idx_steps_est_tokens" in indexes
     conn.close()
 
 def test_ephemeral_not_accumulated_in_context():

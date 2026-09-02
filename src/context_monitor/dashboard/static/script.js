@@ -15,6 +15,78 @@
     let categoryChart = null;
     let phaseChart = null;
     let mcpServerChart = null;
+    let activeHeatmapHover = null;
+
+    function trackCanvasPointer(canvas) {
+      if (!canvas || canvas._hasPointerTracker) return;
+      canvas._hasPointerTracker = true;
+      canvas.addEventListener('pointermove', (e) => {
+        canvas._lastPointer = {
+          clientX: e.clientX,
+          clientY: e.clientY
+        };
+      });
+      canvas.addEventListener('pointerleave', () => {
+        canvas._lastPointer = null;
+      });
+    }
+
+    function restoreChartTooltip(chart) {
+      const canvas = chart?.canvas;
+      if (!chart || !canvas || !canvas._lastPointer) return;
+      const pos = canvas._lastPointer;
+
+      // 1. Dispatch synthetic mousemove so Chart.js native event handlers recalculate hover
+      canvas.dispatchEvent(new MouseEvent('mousemove', {
+        clientX: pos.clientX,
+        clientY: pos.clientY,
+        bubbles: true
+      }));
+
+      // 2. Programmatically ensure active elements & tooltip plugin are synced
+      try {
+        const rect = canvas.getBoundingClientRect();
+        const relativePos = {
+          x: pos.clientX - rect.left,
+          y: pos.clientY - rect.top
+        };
+        const mode = chart.options?.interaction?.mode || 'nearest';
+        const intersect = chart.options?.interaction?.intersect ?? true;
+        const elements = chart.getElementsAtEventForMode(relativePos, mode, { intersect }, false);
+        if (elements && elements.length > 0) {
+          chart.setActiveElements(elements);
+          if (chart.tooltip) {
+            chart.tooltip.setActiveElements(elements, relativePos);
+          }
+          chart.render();
+        }
+      } catch (e) {
+        // Safe fallback for transient geometry calculation during redraws
+      }
+    }
+
+    function upsertChart(existingChart, canvas, config) {
+      if (!canvas) return null;
+      trackCanvasPointer(canvas);
+
+      if (existingChart && existingChart.config.type === config.type) {
+        existingChart.data.labels = config.data.labels;
+        existingChart.data.datasets = config.data.datasets;
+        if (config.options) {
+          existingChart.options = config.options;
+        }
+        existingChart.update('none');
+        restoreChartTooltip(existingChart);
+        return existingChart;
+      }
+
+      if (existingChart) {
+        try { existingChart.destroy(); } catch (e) {}
+      }
+      const newChart = new Chart(canvas.getContext('2d'), config);
+      restoreChartTooltip(newChart);
+      return newChart;
+    }
 
     let allHotFiles = [];
     let allConversations = [];
@@ -335,6 +407,34 @@
       renderPast7HourlyGrid(data.past_7_days_hourly || {});
       // View 5: 24x7 Aggregate (Hourly 24x7 Commit Squares)
       renderHourlyAggregateGrid(data.hourly_aggregate || []);
+
+      if (activeHeatmapHover) {
+        if (activeHeatmapHover.type === 'daily') {
+          const dayData = daily[activeHeatmapHover.dateStr] || { steps: 0, tokens: 0, sessions: 0 };
+          const tooltipMsg = dayData.steps > 0 
+            ? `${dayData.steps.toLocaleString()} operations (${formatTokens(dayData.tokens)} tokens across ${dayData.sessions} sessions) on ${activeHeatmapHover.formattedDate}`
+            : `No operations on ${activeHeatmapHover.formattedDate}`;
+          document.getElementById('ghTooltipText').innerHTML = `<strong>${tooltipMsg}</strong>`;
+        } else if (activeHeatmapHover.type === 'month_hourly') {
+          const monthHourly = data.past_30_days_hourly || {};
+          const hours = monthHourly[activeHeatmapHover.dateStr] || [];
+          const val = hours[activeHeatmapHover.hour] || 0;
+          const tooltipMsg = `${activeHeatmapHover.dateStr} @ ${activeHeatmapHover.timeFormatted} — ${val.toLocaleString()} operations`;
+          document.getElementById('ghTooltipText').innerHTML = `<strong>${tooltipMsg}</strong>`;
+        } else if (activeHeatmapHover.type === 'past7_hourly') {
+          const past7 = data.past_7_days_hourly || {};
+          const hours = past7[activeHeatmapHover.dateStr] || [];
+          const val = hours[activeHeatmapHover.hour] || 0;
+          const tooltipMsg = `${activeHeatmapHover.dateStr} @ ${activeHeatmapHover.timeFormatted} — ${val.toLocaleString()} operations`;
+          document.getElementById('ghTooltipText').innerHTML = `<strong>${tooltipMsg}</strong>`;
+        } else if (activeHeatmapHover.type === 'hourly_agg') {
+          const agg = data.hourly_aggregate || [];
+          const row = agg[activeHeatmapHover.dayIdx] || [];
+          const val = row[activeHeatmapHover.hour] || 0;
+          const tooltipMsg = `${activeHeatmapHover.dayName} at ${activeHeatmapHover.timeFormatted} (${localTimezoneAbbr}) — ${val.toLocaleString()} operations across all history`;
+          document.getElementById('ghTooltipText').innerHTML = `<strong>${tooltipMsg}</strong>`;
+        }
+      }
     }
 
     // --- Mode 1: 52-Week Grid ---
@@ -386,9 +486,11 @@
             : `No operations on ${formattedDate}`;
 
           cell.addEventListener('mouseenter', () => {
+            activeHeatmapHover = { type: 'daily', dateStr, formattedDate };
             document.getElementById('ghTooltipText').innerHTML = `<strong>${tooltipMsg}</strong>`;
           });
           cell.addEventListener('mouseleave', () => {
+            activeHeatmapHover = null;
             document.getElementById('ghTooltipText').textContent = 'Hover over any commit square to see operations';
           });
           cell.addEventListener('click', () => {
@@ -461,8 +563,14 @@
           const formattedDate = currentDate.toLocaleDateString('default', { weekday: 'short', month: 'short', day: 'numeric' });
           const tooltipMsg = `${dayData.steps.toLocaleString()} ops (${formatTokens(dayData.tokens)} tokens) on ${formattedDate}`;
 
-          cell.addEventListener('mouseenter', () => { document.getElementById('ghTooltipText').innerHTML = `<strong>${tooltipMsg}</strong>`; });
-          cell.addEventListener('mouseleave', () => { document.getElementById('ghTooltipText').textContent = 'Hover over any commit square to see operations'; });
+          cell.addEventListener('mouseenter', () => {
+            activeHeatmapHover = { type: 'daily', dateStr, formattedDate };
+            document.getElementById('ghTooltipText').innerHTML = `<strong>${tooltipMsg}</strong>`;
+          });
+          cell.addEventListener('mouseleave', () => {
+            activeHeatmapHover = null;
+            document.getElementById('ghTooltipText').textContent = 'Hover over any commit square to see operations';
+          });
           cell.addEventListener('click', () => {
             const el = document.getElementById('convSearch');
             if (el) {
@@ -531,9 +639,11 @@
           const tooltipMsg = `${dateStr} @ ${timeFormatted} — ${val.toLocaleString()} operations`;
 
           cell.addEventListener('mouseenter', () => {
+            activeHeatmapHover = { type: 'month_hourly', dateStr, timeFormatted, hour: h };
             document.getElementById('ghTooltipText').innerHTML = `<strong>${tooltipMsg}</strong>`;
           });
           cell.addEventListener('mouseleave', () => {
+            activeHeatmapHover = null;
             document.getElementById('ghTooltipText').textContent = 'Hover over any commit square to see operations';
           });
           cell.addEventListener('click', () => {
@@ -591,9 +701,11 @@
           const tooltipMsg = `${dateStr} @ ${timeFormatted} — ${val.toLocaleString()} operations`;
 
           cell.addEventListener('mouseenter', () => {
+            activeHeatmapHover = { type: 'past7_hourly', dateStr, timeFormatted, hour: h };
             document.getElementById('ghTooltipText').innerHTML = `<strong>${tooltipMsg}</strong>`;
           });
           cell.addEventListener('mouseleave', () => {
+            activeHeatmapHover = null;
             document.getElementById('ghTooltipText').textContent = 'Hover over any commit square to see operations';
           });
           cell.addEventListener('click', () => {
@@ -652,9 +764,11 @@
           const tooltipMsg = `${days[d]} at ${timeFormatted} (${localTimezoneAbbr}) — ${val.toLocaleString()} operations across all history`;
 
           cell.addEventListener('mouseenter', () => {
+            activeHeatmapHover = { type: 'hourly_agg', dayName: days[d], timeFormatted, dayIdx: d, hour: h };
             document.getElementById('ghTooltipText').innerHTML = `<strong>${tooltipMsg}</strong>`;
           });
           cell.addEventListener('mouseleave', () => {
+            activeHeatmapHover = null;
             document.getElementById('ghTooltipText').textContent = 'Hover over any commit square to see operations';
           });
 
@@ -722,7 +836,8 @@
     window.setTimelineRange = setTimelineRange;
 
     function renderTimelineChart(data) {
-      const ctx = document.getElementById('timelineChart').getContext('2d');
+      const canvas = document.getElementById('timelineChart');
+      if (!canvas) return;
       const labels = data.map(d => d.day);
       const isStacked = (currentTimelineViewMode === 'stacked' && currentProject === 'all');
 
@@ -850,9 +965,7 @@
         }
       ];
 
-      if (timelineChart) timelineChart.destroy();
-
-      timelineChart = new Chart(ctx, {
+      timelineChart = upsertChart(timelineChart, canvas, {
         type: 'bar',
         data: {
           labels: labels,
@@ -946,14 +1059,13 @@
     }
 
     function renderModelsChart(models) {
-      const ctx = document.getElementById('modelsChart').getContext('2d');
+      const canvas = document.getElementById('modelsChart');
+      if (!canvas || !models) return;
       const labels = models.map(m => m.model_name);
       const data = models.map(m => m.tokens);
       const colors = ['#6366f1', '#a855f7', '#ec4899', '#3b82f6', '#10b981', '#f59e0b'];
 
-      if (modelsChart) modelsChart.destroy();
-
-      modelsChart = new Chart(ctx, {
+      modelsChart = upsertChart(modelsChart, canvas, {
         type: 'doughnut',
         data: {
           labels: labels,
@@ -1078,9 +1190,7 @@
           }
         });
 
-        if (projectCostChart) projectCostChart.destroy();
-
-        projectCostChart = new Chart(ctx, {
+        projectCostChart = upsertChart(projectCostChart, chartCanvas, {
           type: 'bar',
           data: {
             labels: labels,
@@ -1228,7 +1338,8 @@
     }
 
     function renderToolsChart(tools) {
-      const ctx = document.getElementById('toolsChart').getContext('2d');
+      const canvas = document.getElementById('toolsChart');
+      if (!canvas) return;
       let filtered = tools || [];
       if (currentToolFilter === 'native') {
         filtered = filtered.filter(t => !t.is_mcp);
@@ -1240,12 +1351,10 @@
       const labels = top10.map(t => t.tool_name);
       const data = top10.map(t => t.total_calls);
 
-      if (toolsChart) toolsChart.destroy();
-
       const barBg = currentToolFilter === 'mcp' ? 'rgba(6, 182, 212, 0.75)' : 'rgba(245, 158, 11, 0.75)';
       const barBorder = currentToolFilter === 'mcp' ? '#06b6d4' : '#f59e0b';
 
-      toolsChart = new Chart(ctx, {
+      toolsChart = upsertChart(toolsChart, canvas, {
         type: 'bar',
         data: {
           labels: labels,
@@ -1273,16 +1382,14 @@
 
     function renderMcpSection(mcpData) {
       allMcpData = mcpData || [];
-      const ctx = document.getElementById('mcpServerChart').getContext('2d');
-      if (!allMcpData || allMcpData.length === 0) return;
+      const canvas = document.getElementById('mcpServerChart');
+      if (!canvas || !allMcpData || allMcpData.length === 0) return;
 
       const labels = allMcpData.map(s => s.server);
       const data = allMcpData.map(s => s.calls);
       const colors = ['#06b6d4', '#3b82f6', '#10b981', '#f59e0b', '#ec4899', '#8b5cf6', '#a855f7', '#64748b'];
 
-      if (mcpServerChart) mcpServerChart.destroy();
-
-      mcpServerChart = new Chart(ctx, {
+      mcpServerChart = upsertChart(mcpServerChart, canvas, {
         type: 'bar',
         data: {
           labels: labels,
@@ -1391,15 +1498,14 @@
     }
 
     function renderCategoryChart(categories) {
-      const ctx = document.getElementById('categoryChart').getContext('2d');
+      const canvas = document.getElementById('categoryChart');
+      if (!canvas || !categories) return;
       const top7 = categories.slice(0, 7);
       const labels = top7.map(c => c.category);
       const data = top7.map(c => c.tokens);
       const colors = ['#10b981', '#6366f1', '#3b82f6', '#f59e0b', '#ec4899', '#8b5cf6', '#64748b'];
 
-      if (categoryChart) categoryChart.destroy();
-
-      categoryChart = new Chart(ctx, {
+      categoryChart = upsertChart(categoryChart, canvas, {
         type: 'bar',
         data: {
           labels: labels,
@@ -1438,8 +1544,8 @@
     }
 
     function renderPhaseChart(phases) {
-      const ctx = document.getElementById('phaseChart').getContext('2d');
-      if (!phases || phases.length === 0) return;
+      const canvas = document.getElementById('phaseChart');
+      if (!canvas || !phases || phases.length === 0) return;
 
       const labels = phases.map(p => p.phase.charAt(0).toUpperCase() + p.phase.slice(1));
       const data = phases.map(p => p.tokens);
@@ -1452,9 +1558,7 @@
       };
       const bgColors = labels.map(l => colors[l] || '#6366f1');
 
-      if (phaseChart) phaseChart.destroy();
-
-      phaseChart = new Chart(ctx, {
+      phaseChart = upsertChart(phaseChart, canvas, {
         type: 'bar',
         data: {
           labels: labels,
