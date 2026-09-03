@@ -153,7 +153,7 @@ def query_summary_data(conn, tz=None, project=None):
         model_sql = f"""
             SELECT COALESCE(s.model_name, c.model_name, 'Gemini Flash') as mname,
                    COUNT(*) as steps,
-                   SUM(s.est_tokens) as tokens
+                   SUM(COALESCE(s.billed_input_tokens, 0) + COALESCE(s.billed_output_tokens, 0)) as tokens
             FROM steps s
             JOIN conversations c ON s.conversation_id = c.id
             WHERE 1=1 {where_step_join}
@@ -165,7 +165,7 @@ def query_summary_data(conn, tz=None, project=None):
         model_sql = """
             SELECT COALESCE(model_name, 'Gemini Flash') as mname,
                    COUNT(*) as steps,
-                   SUM(est_tokens) as tokens
+                   SUM(COALESCE(billed_input_tokens, 0) + COALESCE(billed_output_tokens, 0)) as tokens
             FROM steps
             GROUP BY mname
             ORDER BY tokens DESC
@@ -257,13 +257,15 @@ def query_cost_by_project(conn, tz=None, project=None, limit_sessions=6):
         p_name = r["project_name"]
         if project and (p_name == project or (project == "(unassigned)" and p_name == "(unassigned)")):
             filtered_project_cost = cost
+        act_tokens = (r["billed_input_tokens"] or 0) + (r["billed_output_tokens"] or 0)
         projects.append({
             "project": p_name,
             "raw_project": None if p_name == "(unassigned)" else p_name,
             "cost": cost,
             "percentage": pct,
             "sessions": r["session_count"],
-            "tokens": r["total_tokens"] or 0,
+            "tokens": act_tokens,
+            "disk_tokens": r["total_tokens"] or 0,
             "steps": r["total_steps"] or 0,
             "billed_input_tokens": r["billed_input_tokens"] or 0,
             "billed_output_tokens": r["billed_output_tokens"] or 0
@@ -280,10 +282,10 @@ def query_cost_by_project(conn, tz=None, project=None, limit_sessions=6):
             params_sess = (project,)
 
     sess_rows = cur.execute(f"""
-        SELECT id, title, project, model_name, created_at, total_steps, total_tokens, duration_seconds, active_agent_seconds, billed_cost
+        SELECT id, title, project, model_name, created_at, total_steps, total_tokens, duration_seconds, active_agent_seconds, billed_cost, billed_input_tokens, billed_output_tokens
         FROM conversations
         {where_sess}
-        ORDER BY billed_cost DESC, total_tokens DESC
+        ORDER BY billed_cost DESC, (COALESCE(billed_input_tokens, 0) + COALESCE(billed_output_tokens, 0)) DESC, total_tokens DESC
         LIMIT {limit_sessions}
     """, params_sess).fetchall()
 
@@ -291,6 +293,7 @@ def query_cost_by_project(conn, tz=None, project=None, limit_sessions=6):
     target_tz = get_target_tz(tz)
     for sr in sess_rows:
         dt = parse_to_local_dt(sr["created_at"], target_tz)
+        act_tok = (sr["billed_input_tokens"] or 0) + (sr["billed_output_tokens"] or 0)
         top_sessions.append({
             "id": sr["id"],
             "title": sr["title"] or f"Session {sr['id'][:8]}",
@@ -298,7 +301,9 @@ def query_cost_by_project(conn, tz=None, project=None, limit_sessions=6):
             "model_name": sr["model_name"] or "Gemini",
             "created_at": dt.strftime("%Y-%m-%d %H:%M") if dt else (sr["created_at"] or "--"),
             "total_steps": sr["total_steps"] or 0,
-            "total_tokens": sr["total_tokens"] or 0,
+            "tokens": act_tok,
+            "total_tokens": act_tok,
+            "disk_tokens": sr["total_tokens"] or 0,
             "duration_seconds": sr["duration_seconds"] or 0,
             "active_agent_seconds": sr["active_agent_seconds"] or 0,
             "billed_cost": round(sr["billed_cost"] or 0.0, 2)
@@ -332,7 +337,7 @@ def query_timeline_data(conn, days=None, tz=None, project=None):
             substr(created_at, 1, 13) as hour_key,
             conversation_id,
             COUNT(*) as step_count,
-            SUM(est_tokens) as tokens,
+            SUM(COALESCE(billed_input_tokens, 0) + COALESCE(billed_output_tokens, 0)) as tokens,
             SUM(billed_cost) as cost
         FROM steps
         {where_clause}
@@ -681,7 +686,7 @@ def query_conversations_list(conn, limit=200, tz=None, project=None):
             params = (project,)
         
     rows = cur.execute(f"""
-        SELECT id, title, project, model_name, created_at, total_steps, total_tokens, duration_seconds, active_agent_seconds, active_pairing_seconds, billed_cost
+        SELECT id, title, project, model_name, created_at, total_steps, total_tokens, duration_seconds, active_agent_seconds, active_pairing_seconds, billed_cost, billed_input_tokens, billed_output_tokens
         FROM conversations
         {where_clause}
         ORDER BY created_at DESC
@@ -693,6 +698,7 @@ def query_conversations_list(conn, limit=200, tz=None, project=None):
 
     for r in rows:
         dt = parse_to_local_dt(r["created_at"], target_tz)
+        act_tok = (r["billed_input_tokens"] or 0) + (r["billed_output_tokens"] or 0)
         convs.append({
             "id": r["id"],
             "title": r["title"] or f"Conversation {r['id'][:8]}",
@@ -700,7 +706,9 @@ def query_conversations_list(conn, limit=200, tz=None, project=None):
             "model_name": r["model_name"] or "Gemini",
             "created_at": dt.strftime("%Y-%m-%d %H:%M") if dt else r["created_at"],
             "total_steps": r["total_steps"] or 0,
-            "total_tokens": r["total_tokens"] or 0,
+            "tokens": act_tok,
+            "total_tokens": act_tok,
+            "disk_tokens": r["total_tokens"] or 0,
             "duration_seconds": r["duration_seconds"] or 0,
             "active_agent_seconds": r["active_agent_seconds"] or 0,
             "active_pairing_seconds": r["active_pairing_seconds"] or 0,

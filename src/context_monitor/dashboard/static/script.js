@@ -846,7 +846,7 @@
       if (!isStacked) {
         barDatasets = [
           {
-            label: currentProject !== 'all' ? `Tokens (${currentProject})` : 'Tokens Consumed',
+            label: currentProject !== 'all' ? `API Tokens (${currentProject})` : 'API Tokens Consumed',
             data: data.map(d => d.tokens),
             backgroundColor: 'rgba(99, 102, 241, 0.65)',
             borderColor: '#6366f1',
@@ -920,7 +920,7 @@
 
         if (barDatasets.length === 0) {
           barDatasets.push({
-            label: 'Tokens Consumed',
+            label: 'API Tokens Consumed',
             data: data.map(d => d.tokens),
             backgroundColor: 'rgba(99, 102, 241, 0.65)',
             borderColor: '#6366f1',
@@ -1005,13 +1005,13 @@
                     const pct = dayTotal > 0 ? ((ctx.raw / dayTotal) * 100).toFixed(1) : '0.0';
                     return `${ctx.dataset.label}: ${formatTokens(ctx.raw)} (${pct}%)`;
                   }
-                  return `Tokens: ${formatTokens(ctx.raw)}`;
+                  return `API Tokens: ${formatTokens(ctx.raw)}`;
                 },
                 footer: (items) => {
                   if (!isStacked) return '';
                   const idx = items[0]?.dataIndex;
                   const dayTokens = data[idx]?.tokens || 0;
-                  return `Total Tokens: ${formatTokens(dayTokens)}`;
+                  return `Total API Tokens: ${formatTokens(dayTokens)}`;
                 }
               }
             }
@@ -1029,7 +1029,7 @@
               beginAtZero: true,
               grid: { color: '#1f2937' },
               ticks: { color: '#9ca3af', callback: v => formatTokens(v), font: { size: 10 } },
-              title: { display: true, text: 'Tokens', color: '#6b7280', font: { size: 10 } }
+              title: { display: true, text: 'API Tokens', color: '#6b7280', font: { size: 10 } }
             },
             y1: {
               type: 'linear',
@@ -1083,7 +1083,7 @@
             legend: { position: 'bottom', labels: { color: '#9ca3af', boxWidth: 12, font: { size: 10 } } },
             tooltip: {
               callbacks: {
-                label: (ctx) => ` ${ctx.label}: ${formatTokens(ctx.raw)} tokens`
+                label: (ctx) => ` ${ctx.label}: ${formatTokens(ctx.raw)} API tokens`
               }
             }
           },
@@ -1216,10 +1216,10 @@
                     const p = projects[ctx.dataIndex];
                     if (isCost) {
                       const costStr = '$' + ctx.raw.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-                      return ` ${costStr} (${p.percentage}% share • ${p.sessions} sessions • ${formatTokens(p.tokens)} tokens)`;
+                      return ` ${costStr} (${p.percentage}% share • ${p.sessions} sessions • ${formatTokens(p.tokens)} API tokens)`;
                     } else {
                       const tokShare = totalTokens > 0 ? (p.tokens / totalTokens * 100).toFixed(1) : '0';
-                      return ` ${formatTokens(ctx.raw)} tokens (${tokShare}% share • $${p.cost.toFixed(2)} • ${p.sessions} sessions)`;
+                      return ` ${formatTokens(ctx.raw)} API tokens (${tokShare}% share • $${p.cost.toFixed(2)} • ${p.sessions} sessions)`;
                     }
                   }
                 }
@@ -1310,7 +1310,7 @@
               <td class="py-2 px-2 font-medium text-white max-w-[140px] truncate" title="${s.title}">${s.title}</td>
               <td class="py-2 px-2 whitespace-nowrap"><span class="px-1.5 py-0.5 rounded text-[10px] font-mono bg-dark-900 border border-dark-700 text-gray-300">${s.project}</span></td>
               <td class="py-2 px-2 text-purple-300 whitespace-nowrap text-[11px]">${s.model_name}</td>
-              <td class="py-2 px-2 text-right font-semibold text-indigo-400 font-mono text-[11px]">${formatTokens(s.total_tokens)}</td>
+              <td class="py-2 px-2 text-right font-semibold text-indigo-400 font-mono text-[11px]" title="${formatTokens(s.disk_tokens || 0)} disk footprint">${formatTokens(s.tokens || s.total_tokens)}</td>
               <td class="py-2 px-2 text-right font-mono font-bold text-rose-400 text-[11px]">$${s.billed_cost.toFixed(2)}</td>
               <td class="py-2 px-2 text-center">
                 ${isStatic ? '' : `<button onclick="inspectSession('${s.id}')" class="px-2 py-0.5 rounded bg-brand-600/80 hover:bg-brand-600 text-[10px] font-medium text-white transition">Inspect</button>`}
@@ -1720,7 +1720,7 @@
           <td class="py-2.5 px-3 font-medium text-white max-w-sm truncate" title="${c.title}">${c.title}</td>
           <td class="py-2.5 px-3 text-purple-300 whitespace-nowrap">${c.model_name}</td>
           <td class="py-2.5 px-3 text-right text-gray-300">${c.total_steps}</td>
-          <td class="py-2.5 px-3 text-right font-semibold text-indigo-400">${formatTokens(c.total_tokens)}</td>
+          <td class="py-2.5 px-3 text-right font-semibold text-indigo-400" title="${formatTokens(c.disk_tokens || 0)} disk footprint">${formatTokens(c.actual_tokens || c.total_tokens)}</td>
           <td class="py-2.5 px-3 text-right text-gray-300 whitespace-nowrap" title="${timeTitle}">
             <span class="font-medium text-emerald-400">${formatDuration(activeSec)}</span>
             <span class="text-[10px] text-gray-500 block">(${formatDuration(wallSec)})</span>

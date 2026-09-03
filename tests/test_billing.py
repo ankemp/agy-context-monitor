@@ -196,13 +196,13 @@ def test_timeline_fills_gap_days_with_zeros(tmp_path):
     """)
 
     steps = [
-        ('conv-gap', 1, '2026-08-01T10:00:00Z', 'MODEL', 'PLANNER_RESPONSE', 500, 0.01),
-        ('conv-gap', 2, '2026-08-05T10:00:00Z', 'MODEL', 'PLANNER_RESPONSE', 500, 0.01),
+        ('conv-gap', 1, '2026-08-01T10:00:00Z', 'MODEL', 'PLANNER_RESPONSE', 500, 0.01, 450, 50),
+        ('conv-gap', 2, '2026-08-05T10:00:00Z', 'MODEL', 'PLANNER_RESPONSE', 500, 0.01, 450, 50),
     ]
 
     conn.executemany("""
-        INSERT INTO steps (conversation_id, step_index, created_at, source, step_type, est_tokens, billed_cost)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO steps (conversation_id, step_index, created_at, source, step_type, est_tokens, billed_cost, billed_input_tokens, billed_output_tokens)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, steps)
     conn.commit()
 
@@ -264,13 +264,13 @@ def test_timeline_projects_breakdown(tmp_path):
     """)
 
     steps = [
-        ('conv-proj-1', 1, '2026-08-10T10:00:00Z', 'MODEL', 'PLANNER_RESPONSE', 500, 0.01),
-        ('conv-proj-1', 2, '2026-08-10T11:30:00Z', 'MODEL', 'PLANNER_RESPONSE', 300, 0.01),
-        ('conv-proj-2', 1, '2026-08-10T12:00:00Z', 'MODEL', 'PLANNER_RESPONSE', 400, 0.01),
+        ('conv-proj-1', 1, '2026-08-10T10:00:00Z', 'MODEL', 'PLANNER_RESPONSE', 500, 0.01, 400, 100),
+        ('conv-proj-1', 2, '2026-08-10T11:30:00Z', 'MODEL', 'PLANNER_RESPONSE', 300, 0.01, 200, 100),
+        ('conv-proj-2', 1, '2026-08-10T12:00:00Z', 'MODEL', 'PLANNER_RESPONSE', 400, 0.01, 350, 50),
     ]
     conn.executemany("""
-        INSERT INTO steps (conversation_id, step_index, created_at, source, step_type, est_tokens, billed_cost)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO steps (conversation_id, step_index, created_at, source, step_type, est_tokens, billed_cost, billed_input_tokens, billed_output_tokens)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, steps)
     conn.commit()
 
@@ -297,8 +297,8 @@ def test_timeline_unassigned_project(tmp_path):
         VALUES ('conv-no-proj', 'No Project Session', NULL, '2026-08-12T10:00:00Z', '2026-08-12T11:00:00Z', 1, 600)
     """)
     conn.execute("""
-        INSERT INTO steps (conversation_id, step_index, created_at, source, step_type, est_tokens, billed_cost)
-        VALUES ('conv-no-proj', 1, '2026-08-12T10:00:00Z', 'MODEL', 'PLANNER_RESPONSE', 600, 0.01)
+        INSERT INTO steps (conversation_id, step_index, created_at, source, step_type, est_tokens, billed_cost, billed_input_tokens, billed_output_tokens)
+        VALUES ('conv-no-proj', 1, '2026-08-12T10:00:00Z', 'MODEL', 'PLANNER_RESPONSE', 600, 0.01, 500, 100)
     """)
     conn.commit()
 
@@ -327,12 +327,12 @@ def test_timeline_single_project_filter(tmp_path):
     """)
 
     conn.execute("""
-        INSERT INTO steps (conversation_id, step_index, created_at, source, step_type, est_tokens, billed_cost)
-        VALUES ('c1', 1, '2026-08-15T10:00:00Z', 'MODEL', 'PLANNER_RESPONSE', 500, 0.01)
+        INSERT INTO steps (conversation_id, step_index, created_at, source, step_type, est_tokens, billed_cost, billed_input_tokens, billed_output_tokens)
+        VALUES ('c1', 1, '2026-08-15T10:00:00Z', 'MODEL', 'PLANNER_RESPONSE', 500, 0.01, 450, 50)
     """)
     conn.execute("""
-        INSERT INTO steps (conversation_id, step_index, created_at, source, step_type, est_tokens, billed_cost)
-        VALUES ('c2', 1, '2026-08-15T12:00:00Z', 'MODEL', 'PLANNER_RESPONSE', 700, 0.01)
+        INSERT INTO steps (conversation_id, step_index, created_at, source, step_type, est_tokens, billed_cost, billed_input_tokens, billed_output_tokens)
+        VALUES ('c2', 1, '2026-08-15T12:00:00Z', 'MODEL', 'PLANNER_RESPONSE', 700, 0.01, 600, 100)
     """)
     conn.commit()
 
@@ -343,4 +343,43 @@ def test_timeline_single_project_filter(tmp_path):
     assert date_map["2026-08-15"]["tokens"] == 500
     assert date_map["2026-08-15"]["projects"]["target-proj"] == 500
     assert "other-proj" not in date_map["2026-08-15"]["projects"]
+
+def test_timeline_actual_consumption_multi_turn(tmp_path):
+    """
+    Verifies that query_timeline_data reflects cumulative actual consumption
+    (billed_input_tokens + billed_output_tokens) across multi-turn sessions rather than est_tokens.
+    """
+    db_file = tmp_path / "test_actual_consumption.db"
+    init_db(db_file)
+    conn = get_db_connection(db_file)
+
+    conn.execute("""
+        INSERT INTO conversations (id, title, project, created_at, updated_at, total_steps, total_tokens)
+        VALUES ('conv-mt', 'Multi-turn Conv', 'my-repo', '2026-08-20T10:00:00Z', '2026-08-20T10:30:00Z', 3, 300)
+    """)
+
+    # In this session:
+    # Step 1: User prompt (on-disk 100 tokens, 0 billed tokens)
+    # Step 2: Planner response (on-disk 100 tokens, prompt in: 1,000, completion out: 100 -> 1,100 actual tokens)
+    # Step 3: Tool response + Planner response (on-disk 100 tokens, prompt in: 1,500, completion out: 200 -> 1,700 actual tokens)
+    # Total on disk est_tokens = 300
+    # Total actual consumption = 1,100 + 1,700 = 2,800
+    conn.execute("""
+        INSERT INTO steps (conversation_id, step_index, created_at, source, step_type, est_tokens, billed_cost, billed_input_tokens, billed_output_tokens)
+        VALUES 
+        ('conv-mt', 1, '2026-08-20T10:05:00Z', 'USER_INPUT', 'USER_INPUT', 100, 0.0, 0, 0),
+        ('conv-mt', 2, '2026-08-20T10:10:00Z', 'MODEL', 'PLANNER_RESPONSE', 100, 0.005, 1000, 100),
+        ('conv-mt', 3, '2026-08-20T10:20:00Z', 'MODEL', 'PLANNER_RESPONSE', 100, 0.008, 1500, 200)
+    """)
+    conn.commit()
+
+    timeline = query_timeline_data(conn, tz="UTC")
+    conn.close()
+
+    date_map = {item["day"]: item for item in timeline}
+    assert "2026-08-20" in date_map
+    day_item = date_map["2026-08-20"]
+    # Verify that tokens reflect actual API consumption (2,800), NOT on-disk est_tokens (300)
+    assert day_item["tokens"] == 2800
+    assert day_item["projects"]["my-repo"] == 2800
 

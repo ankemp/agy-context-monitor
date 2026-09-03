@@ -235,7 +235,7 @@ def print_summary(conn):
     model_rows = cur.execute("""
         SELECT COALESCE(s.model_name, c.model_name, 'Gemini Flash') as mname,
                COUNT(*) as step_count,
-               SUM(s.est_tokens) as tokens
+               SUM(COALESCE(s.billed_input_tokens, 0) + COALESCE(s.billed_output_tokens, 0)) as tokens
         FROM steps s
         JOIN conversations c ON s.conversation_id = c.id
         GROUP BY mname
@@ -255,16 +255,18 @@ def print_summary(conn):
             COALESCE(NULLIF(project, ''), '(unassigned)') as project_name,
             COUNT(*) as session_count,
             SUM(total_tokens) as total_tokens,
-            SUM(billed_cost) as billed_cost
+            SUM(billed_cost) as billed_cost,
+            SUM(COALESCE(billed_input_tokens, 0) + COALESCE(billed_output_tokens, 0)) as actual_tokens
         FROM conversations
         GROUP BY project_name
-        ORDER BY billed_cost DESC, total_tokens DESC
+        ORDER BY billed_cost DESC, actual_tokens DESC
     """).fetchall()
     tot_proj_cost = sum(r["billed_cost"] or 0.0 for r in proj_rows)
     for r in proj_rows:
         c = r["billed_cost"] or 0.0
         pct = (c / tot_proj_cost * 100) if tot_proj_cost else 0.0
-        print(f"  {(r['project_name']):<28} | ${c:<9.2f}| {pct:5.1f}% | {r['session_count']:<10,}| {format_tokens(r['total_tokens'] or 0):<10}")
+        act_tok = r["actual_tokens"] or 0
+        print(f"  {(r['project_name']):<28} | ${c:<9.2f}| {pct:5.1f}% | {r['session_count']:<10,}| {format_tokens(act_tok):<10}")
     print("=" * 70 + "\n")
 
 def print_mcp(conn):
@@ -505,7 +507,7 @@ def print_timeline(conn, days: int = 14):
     cur = conn.cursor()
 
     rows = cur.execute("""
-        SELECT created_at, conversation_id, est_tokens, billed_cost
+        SELECT created_at, conversation_id, billed_input_tokens, billed_output_tokens, billed_cost
         FROM steps
         WHERE created_at IS NOT NULL AND created_at != ''
     """).fetchall()
@@ -520,7 +522,7 @@ def print_timeline(conn, days: int = 14):
                 daily_map[d_str] = {"sessions": 0, "steps": 0, "tokens": 0, "cost": 0.0}
                 day_sessions[d_str] = set()
             daily_map[d_str]["steps"] += 1
-            daily_map[d_str]["tokens"] += r["est_tokens"] or 0
+            daily_map[d_str]["tokens"] += (r["billed_input_tokens"] or 0) + (r["billed_output_tokens"] or 0)
             daily_map[d_str]["cost"] += r["billed_cost"] or 0.0
             day_sessions[d_str].add(r["conversation_id"])
         except Exception:
@@ -620,14 +622,14 @@ def generate_global_report(conn, output_path: Path = Path(os.path.expanduser("~/
 
     lines.extend([
         "\n## 4. Model Ecosystem Distribution (Step-Level Exact)\n",
-        "| Model Name | Logged Steps | Estimated Tokens | Share |",
+        "| Model Name | Logged Steps | API Tokens Consumed | Share |",
         "| :--- | :--- | :--- | :--- |"
     ])
 
     model_rows = cur.execute("""
         SELECT COALESCE(s.model_name, c.model_name, 'Gemini Flash') as mname,
                COUNT(*) as step_count,
-               SUM(s.est_tokens) as tokens
+               SUM(COALESCE(s.billed_input_tokens, 0) + COALESCE(s.billed_output_tokens, 0)) as tokens
         FROM steps s
         JOIN conversations c ON s.conversation_id = c.id
         GROUP BY mname

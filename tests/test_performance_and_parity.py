@@ -39,11 +39,11 @@ def test_query_parity_and_correctness(tmp_path):
 
     # Insert sample steps across two distinct hours
     cur.execute(f"""
-        INSERT INTO steps (conversation_id, step_index, created_at, source, est_tokens, phase, model_name, category, billed_cost)
+        INSERT INTO steps (conversation_id, step_index, created_at, source, est_tokens, phase, model_name, category, billed_cost, billed_input_tokens, billed_output_tokens)
         VALUES 
-        ('conv-1', 1, '{today_str}T10:15:00Z', 'USER_INPUT', 500, 'discovery', 'Gemini Pro', 'input', 0.001),
-        ('conv-1', 2, '{today_str}T10:30:00Z', 'MODEL', 600, 'execution', 'Gemini Pro', 'code', 0.002),
-        ('conv-1', 3, '{today_str}T11:05:00Z', 'MODEL', 400, 'execution', 'Gemini Pro', 'code', 0.001)
+        ('conv-1', 1, '{today_str}T10:15:00Z', 'USER_INPUT', 500, 'discovery', 'Gemini Pro', 'input', 0.001, 0, 0),
+        ('conv-1', 2, '{today_str}T10:30:00Z', 'MODEL', 600, 'execution', 'Gemini Pro', 'code', 0.002, 500, 100),
+        ('conv-1', 3, '{today_str}T11:05:00Z', 'MODEL', 400, 'execution', 'Gemini Pro', 'code', 0.001, 800, 100)
     """)
 
     # Insert sample tool executions
@@ -66,6 +66,7 @@ def test_query_parity_and_correctness(tmp_path):
     assert len(summary["phases"]) == 2
     assert summary["models"][0]["model_name"] == "Gemini Pro"
     assert summary["models"][0]["steps"] == 3
+    assert summary["models"][0]["tokens"] == 1500
 
     # 2. Test query_timeline_data
     timeline = api_routes.query_timeline_data(conn, days=7)

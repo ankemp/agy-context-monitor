@@ -196,4 +196,40 @@ def test_query_summary_dev_time_saved_breakdown(tmp_path):
     assert summary["saved_edits"] == 1
     assert "saved_hours" in summary
 
+def test_query_cost_by_project_tokens_reflects_actual_api_consumption(tmp_path):
+    """
+    Verifies that query_cost_by_project returns actual API tokens (billed_input_tokens + billed_output_tokens)
+    for projects and top_sessions while retaining disk_tokens.
+    """
+    db_file = tmp_path / "test_proj_actual_tokens.db"
+    init_db(db_file)
+    conn = get_db_connection(db_file)
+
+    # In this conversation:
+    # total_tokens (on-disk) = 15,000
+    # billed_input_tokens = 80,000, billed_output_tokens = 2,000 -> actual API tokens = 82,000
+    conn.execute("""
+        INSERT INTO conversations (
+            id, title, project, model_name, created_at, total_steps, total_tokens,
+            billed_cost, billed_input_tokens, billed_output_tokens
+        )
+        VALUES ('c-act', 'Session Actual', 'my-repo', 'Gemini Pro', '2026-08-25T10:00:00Z', 5, 15000, 1.25, 80000, 2000)
+    """)
+    conn.commit()
+
+    res = query_cost_by_project(conn)
+    conn.close()
+
+    assert len(res["projects"]) == 1
+    proj = res["projects"][0]
+    assert proj["project"] == "my-repo"
+    assert proj["tokens"] == 82000
+    assert proj["disk_tokens"] == 15000
+
+    top_sess = res["top_sessions"][0]
+    assert top_sess["id"] == "c-act"
+    assert top_sess["tokens"] == 82000
+    assert top_sess["disk_tokens"] == 15000
+
+
 
