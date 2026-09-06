@@ -131,3 +131,35 @@ def test_pragma_data_version_cache_invalidation(tmp_path):
     assert data3["total_convs"] == 2
 
     conn.close()
+
+def test_project_filter_url_sync_and_chip_removal(tmp_path):
+    from jinja2 import Environment, FileSystemLoader
+    from context_monitor.dashboard.server import DASHBOARD_DIR, export_standalone_html
+
+    # 1. Verify template rendering
+    env = Environment(loader=FileSystemLoader(str(DASHBOARD_DIR / "templates")))
+    template = env.get_template("index.html")
+    html = template.render(IS_STATIC_EXPORT=False)
+
+    assert "costProjectFilterBadge" not in html
+    assert "costProjectFilterText" not in html
+    assert "Cost by Project" in html
+    assert "costProjectSub" in html
+
+    # 2. Verify script.js contents
+    with open(DASHBOARD_DIR / "static" / "script.js", "r", encoding="utf-8") as f:
+        js = f.read()
+    assert "costProjectFilterBadge" not in js
+    assert "getProjectFromUrl" in js
+    assert "syncProjectToUrl" in js
+    assert "popstate" in js
+
+    # 3. Verify static export generation
+    out_html = tmp_path / "export.html"
+    export_standalone_html(out_html, include_conversations=False, tz="UTC")
+    assert out_html.exists()
+    content = out_html.read_text(encoding="utf-8")
+    assert "costProjectFilterBadge" not in content
+    assert "Cost by Project" in content
+    assert "getProjectFromUrl" in content
+

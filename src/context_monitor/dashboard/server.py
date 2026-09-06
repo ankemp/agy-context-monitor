@@ -243,6 +243,7 @@ def export_standalone_html(output_path: Path, include_conversations: bool = Fals
         if (url.includes('/api/hot-files')) return {{ json: async () => STATIC_DATA.hot_files }};
         if (url.includes('/api/activity-matrix')) return {{ json: async () => STATIC_DATA.activity_matrix }};
         if (url.includes('/api/conversations')) return {{ json: async () => STATIC_DATA.conversations }};
+        if (url.includes('/api/projects')) return {{ json: async () => [] }};
         return {{ json: async () => ({{}}) }};
       }};
     </script>

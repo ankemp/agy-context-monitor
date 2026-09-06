@@ -100,7 +100,67 @@
     let cachedActivityMatrix = null;
     let currentHeatmapMode = 'year';
     let localTimezoneAbbr = Intl.DateTimeFormat().resolvedOptions().timeZone || 'Local';
-    let currentProject = 'all';
+    function getProjectFromUrl() {
+      try {
+        const params = new URLSearchParams(window.location.search);
+        const p = params.get('project');
+        if (p && p.trim() && p.trim().toLowerCase() !== 'all') {
+          return p.trim();
+        }
+      } catch (e) {
+        console.error('Failed to read project from URL', e);
+      }
+      return 'all';
+    }
+
+    function syncProjectToUrl(val) {
+      try {
+        const url = new URL(window.location.href);
+        if (val && val !== 'all') {
+          url.searchParams.set('project', val);
+        } else {
+          url.searchParams.delete('project');
+        }
+        const newUrl = url.pathname + (url.search ? url.search : '') + url.hash;
+        if ((window.location.pathname + window.location.search + window.location.hash) !== newUrl) {
+          window.history.pushState({ project: val }, '', newUrl);
+        }
+      } catch (e) {
+        console.error('Failed to sync project to URL', e);
+      }
+    }
+
+    function updateProjectFilterUI(val) {
+      const filterSelect = document.getElementById('projectFilter');
+      if (filterSelect) {
+        if (val && val !== 'all') {
+          let opt = Array.from(filterSelect.options).find(o => o.value === val);
+          if (!opt) {
+            opt = document.createElement('option');
+            opt.value = val;
+            opt.textContent = val;
+            filterSelect.appendChild(opt);
+          }
+          filterSelect.value = val;
+          filterSelect.classList.remove('hidden');
+        } else {
+          filterSelect.value = 'all';
+        }
+      }
+      const modeGroup = document.getElementById('timelineModeGroup');
+      const divider = document.getElementById('timelineDivider');
+      if (modeGroup) {
+        if (val !== 'all') {
+          modeGroup.classList.add('hidden');
+          if (divider) divider.classList.add('hidden');
+        } else {
+          modeGroup.classList.remove('hidden');
+          if (divider) divider.classList.remove('hidden');
+        }
+      }
+    }
+
+    let currentProject = getProjectFromUrl();
     let currentTimelineViewMode = 'stacked'; // 'stacked' | 'aggregate'
 
     window.setTimelineViewMode = function(mode) {
@@ -116,32 +176,21 @@
       setTimelineRange(currentTimelineDays);
     };
 
-    window.handleProjectChange = function(val) {
-      currentProject = val;
-      const filterSelect = document.getElementById('projectFilter');
-      if (filterSelect && filterSelect.value !== val) {
-        let opt = Array.from(filterSelect.options).find(o => o.value === val);
-        if (!opt && val !== 'all') {
-          opt = document.createElement('option');
-          opt.value = val;
-          opt.textContent = val;
-          filterSelect.appendChild(opt);
-        }
-        filterSelect.value = val;
-      }
-      const modeGroup = document.getElementById('timelineModeGroup');
-      const divider = document.getElementById('timelineDivider');
-      if (modeGroup) {
-        if (val !== 'all') {
-          modeGroup.classList.add('hidden');
-          if (divider) divider.classList.add('hidden');
-        } else {
-          modeGroup.classList.remove('hidden');
-          if (divider) divider.classList.remove('hidden');
-        }
+    window.handleProjectChange = function(val, updateUrl = true) {
+      currentProject = val || 'all';
+      updateProjectFilterUI(currentProject);
+      if (updateUrl) {
+        syncProjectToUrl(currentProject);
       }
       fetchDashboardData();
     };
+
+    window.addEventListener('popstate', () => {
+      const projFromUrl = getProjectFromUrl();
+      if (projFromUrl !== currentProject) {
+        window.handleProjectChange(projFromUrl, false);
+      }
+    });
 
     let currentProjectMetric = 'cost'; // 'cost' | 'tokens'
 
@@ -1097,22 +1146,9 @@
       const projects = costData.projects || [];
       const totalCost = costData.total_cost || 0;
 
-      // Header Filter Badge & Subtitle
-      const filterBadge = document.getElementById('costProjectFilterBadge');
-      const filterText = document.getElementById('costProjectFilterText');
+      // Header Subtitle
       const costSub = document.getElementById('costProjectSub');
       const isFiltered = Boolean(currentProject && currentProject !== 'all');
-
-      if (filterBadge && filterText) {
-        if (isFiltered) {
-          filterText.textContent = currentProject;
-          filterBadge.classList.remove('hidden');
-          filterBadge.classList.add('inline-flex');
-        } else {
-          filterBadge.classList.add('hidden');
-          filterBadge.classList.remove('inline-flex');
-        }
-      }
 
       if (costSub) {
         if (isFiltered) {
@@ -2531,16 +2567,21 @@
     }
 
     document.addEventListener('DOMContentLoaded', async () => {
+      updateProjectFilterUI(currentProject);
+
       try {
         const projects = await fetch('/api/projects').then(r => r.json());
         const filterSelect = document.getElementById('projectFilter');
-        if (filterSelect && projects.length > 0) {
+        if (filterSelect && Array.isArray(projects) && projects.length > 0) {
           projects.forEach(p => {
-            const opt = document.createElement('option');
-            opt.value = p;
-            opt.textContent = p;
-            filterSelect.appendChild(opt);
+            if (!Array.from(filterSelect.options).some(o => o.value === p)) {
+              const opt = document.createElement('option');
+              opt.value = p;
+              opt.textContent = p;
+              filterSelect.appendChild(opt);
+            }
           });
+          filterSelect.value = currentProject;
           filterSelect.classList.remove('hidden');
         }
       } catch (e) {
