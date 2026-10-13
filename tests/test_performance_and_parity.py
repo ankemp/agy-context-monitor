@@ -69,7 +69,7 @@ def test_query_parity_and_correctness(tmp_path):
     assert summary["models"][0]["tokens"] == 1500
 
     # 2. Test query_timeline_data
-    timeline = api_routes.query_timeline_data(conn, days=7)
+    timeline = api_routes.query_timeline_data(conn, days=7, tz="UTC")
     assert len(timeline) == 7
     active_days = [d for d in timeline if d["steps"] > 0]
     assert len(active_days) == 1
@@ -79,7 +79,7 @@ def test_query_parity_and_correctness(tmp_path):
     assert "test-project" in active_days[0]["projects"]
 
     # 3. Test query_activity_matrix
-    matrix = api_routes.query_activity_matrix(conn)
+    matrix = api_routes.query_activity_matrix(conn, tz="UTC")
     assert matrix["streak"]["total_active_days"] == 1
     total_matrix_steps = sum(sum(row) for row in matrix["hourly_aggregate"])
     assert total_matrix_steps == 3
@@ -162,4 +162,86 @@ def test_project_filter_url_sync_and_chip_removal(tmp_path):
     assert "costProjectFilterBadge" not in content
     assert "Cost by Project" in content
     assert "getProjectFromUrl" in content
+
+
+def test_dashboard_compaction_and_modal_metrics(tmp_path):
+    from context_monitor.dashboard.server import DASHBOARD_DIR
+    from jinja2 import Environment, FileSystemLoader
+
+    db_file = tmp_path / "test_compaction.db"
+    init_db(db_file)
+    conn = get_db_connection(db_file)
+    cur = conn.cursor()
+
+    # Insert root conversation with compaction
+    cur.execute("""
+        INSERT INTO conversations (
+            id, title, project, model_name, created_at, total_steps, total_tokens,
+            billed_cost, billed_input_tokens, billed_output_tokens, compaction_count, pruned_tokens
+        )
+        VALUES ('conv-root', 'Root Campaign', 'my-proj', 'Gemini Pro', '2026-10-07T10:00:00Z', 5, 25000, 0.05, 20000, 5000, 2, 45000)
+    """)
+
+    # Insert subagent conversation
+    cur.execute("""
+        INSERT INTO conversations (
+            id, title, project, model_name, created_at, total_steps, total_tokens,
+            billed_cost, billed_input_tokens, billed_output_tokens, parent_id, root_id, depth,
+            subagent_role, subagent_type, invoking_step_index, compaction_count, pruned_tokens
+        )
+        VALUES ('conv-child', 'Sub Worker', 'my-proj', 'Gemini Flash', '2026-10-07T10:05:00Z', 3, 10000, 0.01, 8000, 2000, 'conv-root', 'conv-root', 1, 'Coder', 'self', 2, 1, 15000)
+    """)
+
+    # Insert sample steps
+    cur.execute("""
+        INSERT INTO steps (conversation_id, step_index, created_at, source, est_tokens, phase, model_name, category, billed_cost)
+        VALUES
+        ('conv-root', 1, '2026-10-07T10:01:00Z', 'USER_INPUT', 500, 'discovery', 'Gemini Pro', 'input', 0.001),
+        ('conv-root', 2, '2026-10-07T10:02:00Z', 'SYSTEM', 20000, 'execution', 'Gemini Pro', 'System: Ephemeral Injections', 0.04),
+        ('conv-root', 3, '2026-10-07T10:03:00Z', 'SYSTEM', 500, 'reasoning', 'Gemini Pro', 'System: Checkpoint', 0.001)
+    """)
+    conn.commit()
+
+    # 1. Verify query_conversations_list returns compaction fields and fleet rollups
+    convs = api_routes.query_conversations_list(conn, tz="UTC", view_mode="hierarchy")
+    assert len(convs) == 1
+    root = convs[0]
+    assert root["id"] == "conv-root"
+    assert root["compaction_count"] == 2
+    assert root["pruned_tokens"] == 45000
+    assert root["fleet_compaction_count"] == 3  # 2 root + 1 child
+    assert root["fleet_pruned_tokens"] == 60000  # 45k root + 15k child
+    assert len(root["subagents"]) == 1
+    assert root["subagents"][0]["compaction_count"] == 1
+    assert root["subagents"][0]["pruned_tokens"] == 15000
+
+    # 2. Verify query_session_details returns tokens, total_steps, and compaction metadata
+    details = api_routes.query_session_details(conn, "conv-root", tz="UTC")
+    assert details is not None
+    assert details["conversation"]["tokens"] == 25000
+    assert details["conversation"]["total_steps"] == 5
+    assert details["conversation"]["compaction_count"] == 2
+    assert details["conversation"]["pruned_tokens"] == 45000
+    assert details["compaction"]["has_compaction"] is True
+    assert details["compaction"]["count"] == 2
+    assert details["compaction"]["pruned_tokens"] == 45000
+
+    # 3. Verify index.html template has modalCompactionBanner and modalCompactionCard
+    env = Environment(loader=FileSystemLoader(str(DASHBOARD_DIR / "templates")))
+    template = env.get_template("index.html")
+    html_rendered = template.render(IS_STATIC_EXPORT=False)
+    assert 'id="modalCompactionBanner"' in html_rendered
+    assert 'id="modalCompactionCard"' in html_rendered
+    assert 'id="modalCompactionScore"' in html_rendered
+
+    # 4. Verify script.js handles modalTokens, modalSteps, and compaction
+    with open(DASHBOARD_DIR / "static" / "script.js", "r", encoding="utf-8") as f:
+        js_code = f.read()
+    assert "modalTokensEl" in js_code
+    assert "modalStepsEl" in js_code
+    assert "modalCompactionBanner" in js_code
+    assert "modalCompactionScore" in js_code
+
+    conn.close()
+
 

@@ -176,6 +176,41 @@
       setTimelineRange(currentTimelineDays);
     };
 
+    let currentConvViewMode = 'hierarchy'; // 'hierarchy' | 'flat'
+    let expandedConvs = new Set();
+
+    window.setConvViewMode = async function(mode) {
+      currentConvViewMode = mode;
+      const btnHierarchy = document.getElementById('btnConvHierarchy');
+      const btnFlat = document.getElementById('btnConvFlat');
+      const activeCls = 'px-2.5 py-1 rounded-md bg-brand-600 text-white font-medium shadow transition text-[11px] whitespace-nowrap inline-flex items-center space-x-1.5 shrink-0';
+      const inactiveCls = 'px-2.5 py-1 rounded-md text-gray-400 hover:text-white transition text-[11px] whitespace-nowrap inline-flex items-center space-x-1.5 shrink-0';
+      if (btnHierarchy) btnHierarchy.className = mode === 'hierarchy' ? activeCls : inactiveCls;
+      if (btnFlat) btnFlat.className = mode === 'flat' ? activeCls : inactiveCls;
+
+      try {
+        const clientTz = Intl.DateTimeFormat().resolvedOptions().timeZone || '';
+        let params = [`view=${encodeURIComponent(mode)}`];
+        if (clientTz) params.push(`tz=${encodeURIComponent(clientTz)}`);
+        if (currentProject !== 'all') params.push(`project=${encodeURIComponent(currentProject)}`);
+        const convs = await fetch(`/api/conversations?${params.join('&')}`).then(r => r.json());
+        if (convs) {
+          renderConversations(convs);
+        }
+      } catch (err) {
+        console.error('Failed to switch conversation view mode', err);
+      }
+    };
+
+    window.toggleSubagents = function(convId) {
+      if (expandedConvs.has(convId)) {
+        expandedConvs.delete(convId);
+      } else {
+        expandedConvs.add(convId);
+      }
+      filterConversations();
+    };
+
     window.handleProjectChange = function(val, updateUrl = true) {
       currentProject = val || 'all';
       updateProjectFilterUI(currentProject);
@@ -251,6 +286,9 @@
         if (currentProject !== 'all') baseQuery.push(`project=${encodeURIComponent(currentProject)}`);
         const queryStr = baseQuery.length > 0 ? `?${baseQuery.join('&')}` : '';
 
+        let convQuery = [...baseQuery, `view=${encodeURIComponent(currentConvViewMode)}`];
+        const convQueryStr = convQuery.length > 0 ? `?${convQuery.join('&')}` : '';
+
         const [summaryRes, timelineRes, costProjRes, toolsRes, mcpRes, hotFilesRes, matrixRes, convsRes] = await Promise.all([
           fetch(`/api/summary${queryStr}`).then(r => r.json()),
           fetch(`/api/timeline${queryStr}`).then(r => r.json()),
@@ -259,7 +297,7 @@
           fetch(`/api/mcp${queryStr}`).then(r => r.json()),
           fetch(`/api/hot-files${queryStr}`).then(r => r.json()),
           fetch(`/api/activity-matrix${queryStr}`).then(r => r.json()),
-          fetch(`/api/conversations${queryStr}`).then(r => r.json())
+          fetch(`/api/conversations${convQueryStr}`).then(r => r.json())
         ]);
 
         allTimelineData = timelineRes || [];
@@ -1750,23 +1788,110 @@
         const activeSec = c.active_agent_seconds || c.active_pairing_seconds || c.duration_seconds || 0;
         const wallSec = c.duration_seconds || 0;
         const timeTitle = `Agent Work: ${formatDuration(c.active_agent_seconds || 0)} | Active Pairing: ${formatDuration(c.active_pairing_seconds || 0)} | Total Span: ${formatDuration(wallSec)}`;
+        const isExpanded = expandedConvs.has(c.id);
+
+        let titleHtml = '';
+        let stepsHtml = '';
+        let costHtml = '';
+        let tokensHtml = '';
+
+        let compactionBadge = '';
+        if (c.compaction_count > 0) {
+          compactionBadge = `<span class="px-1.5 py-0.5 rounded text-[10px] font-mono font-medium bg-amber-950/80 text-amber-300 border border-amber-500/40 shrink-0" title="${c.compaction_count} compaction events (~${formatTokens(c.pruned_tokens)} tokens pruned from context)">⚡ ${c.compaction_count} pruned</span>`;
+        } else if (c.fleet_compaction_count > 0) {
+          compactionBadge = `<span class="px-1.5 py-0.5 rounded text-[10px] font-mono font-medium bg-amber-950/60 text-amber-400 border border-amber-500/30 shrink-0" title="${c.fleet_compaction_count} fleet compaction events (~${formatTokens(c.fleet_pruned_tokens)} tokens pruned across swarm)">⚡ ${c.fleet_compaction_count} fleet pruned</span>`;
+        }
+
+        if (currentConvViewMode === 'hierarchy' && c.subagent_count > 0) {
+          titleHtml = `
+            <div class="flex items-center space-x-1.5 max-w-sm flex-wrap gap-y-1">
+              <button onclick="toggleSubagents('${c.id}')" class="p-0.5 rounded hover:bg-dark-700 text-gray-400 hover:text-white transition font-mono text-xs select-none shrink-0" title="Toggle subagents">
+                ${isExpanded ? '▼' : '▶'}
+              </button>
+              <span class="font-medium text-white truncate" title="${c.title}">${c.title}</span>
+              <span class="px-1.5 py-0.5 rounded text-[10px] font-mono bg-pink-950/80 text-pink-300 border border-pink-500/40 shrink-0 font-medium">
+                ${c.subagent_count} sub-agent${c.subagent_count === 1 ? '' : 's'}
+              </span>
+              ${compactionBadge}
+            </div>
+          `;
+          stepsHtml = `<span class="font-mono text-gray-200 text-xs">${c.total_steps}</span> <span class="text-[10px] text-gray-500 font-mono">/ ${c.fleet_steps}</span>`;
+          costHtml = `<span class="font-bold text-rose-400 font-mono text-[11px]">$${(c.billed_cost || 0).toFixed(2)}</span> <span class="text-[10px] text-pink-300 font-mono font-medium">/ $${(c.fleet_cost || 0).toFixed(2)}</span>`;
+          tokensHtml = `<span class="font-semibold text-indigo-400 font-mono text-[11px]">${formatTokens(c.tokens || c.total_tokens)}</span> <span class="text-[10px] text-purple-300 font-mono font-medium">/ ${formatTokens(c.fleet_tokens)}</span>`;
+        } else {
+          let roleBadge = '';
+          if (c.parent_id || c.subagent_role) {
+            roleBadge = `<span class="mr-1.5 px-1.5 py-0.5 rounded text-[10px] font-semibold bg-pink-950/80 text-pink-300 border border-pink-500/40 font-mono shrink-0">${c.subagent_role || 'Sub-Agent'}</span>`;
+          }
+          titleHtml = `
+            <div class="flex items-center space-x-1 max-w-sm flex-wrap gap-y-1">
+              ${roleBadge}
+              <span class="font-medium text-white truncate" title="${c.title}">${c.title}</span>
+              ${compactionBadge}
+            </div>
+          `;
+          stepsHtml = `<span class="text-gray-300 font-mono text-xs">${c.total_steps}</span>`;
+          costHtml = `<span class="font-bold text-rose-400 font-mono text-[11px]">$${(c.billed_cost || 0).toFixed(2)}</span>`;
+          tokensHtml = `<span class="font-semibold text-indigo-400 font-mono text-[11px]" title="${formatTokens(c.disk_tokens || 0)} disk footprint">${formatTokens(c.tokens || c.total_tokens)}</span>`;
+        }
 
         tr.innerHTML = `
           <td class="py-2.5 px-3 text-gray-400 whitespace-nowrap font-mono text-[11px]">${dateStr}</td>
-          <td class="py-2.5 px-3 font-medium text-white max-w-sm truncate" title="${c.title}">${c.title}</td>
-          <td class="py-2.5 px-3 text-purple-300 whitespace-nowrap">${c.model_name}</td>
-          <td class="py-2.5 px-3 text-right text-gray-300">${c.total_steps}</td>
-          <td class="py-2.5 px-3 text-right font-semibold text-indigo-400" title="${formatTokens(c.disk_tokens || 0)} disk footprint">${formatTokens(c.actual_tokens || c.total_tokens)}</td>
+          <td class="py-2.5 px-3">${titleHtml}</td>
+          <td class="py-2.5 px-3 text-purple-300 whitespace-nowrap text-xs">${c.model_name}</td>
+          <td class="py-2.5 px-3 text-right">${stepsHtml}</td>
+          <td class="py-2.5 px-3 text-right">${costHtml}</td>
+          <td class="py-2.5 px-3 text-right">${tokensHtml}</td>
           <td class="py-2.5 px-3 text-right text-gray-300 whitespace-nowrap" title="${timeTitle}">
-            <span class="font-medium text-emerald-400">${formatDuration(activeSec)}</span>
-            <span class="text-[10px] text-gray-500 block">(${formatDuration(wallSec)})</span>
+            <span class="font-medium text-emerald-400 text-xs">${formatDuration(activeSec)}</span>
+            <span class="text-[10px] text-gray-500 block font-mono">(${formatDuration(wallSec)})</span>
           </td>
           <td class="py-2.5 px-3 text-center">
             ${(typeof IS_STATIC_EXPORT !== "undefined" && IS_STATIC_EXPORT) ? "" : `<button onclick="inspectSession('${c.id}')" class="px-2.5 py-1 rounded bg-brand-600/80 hover:bg-brand-600 text-[11px] font-medium text-white transition">Inspect</button>`}
           </td>
         `;
         tbody.appendChild(tr);
+
+        // If expanded in hierarchy view, render child rows
+        if (currentConvViewMode === 'hierarchy' && isExpanded && c.subagents && c.subagents.length > 0) {
+          for (const sub of c.subagents) {
+            const childTr = document.createElement('tr');
+            childTr.className = 'bg-dark-900/40 hover:bg-dark-800/40 transition border-l-2 border-pink-500/50';
+            const childActiveSec = sub.active_agent_seconds || sub.duration_seconds || 0;
+            const childWallSec = sub.duration_seconds || 0;
+            const childTimeTitle = `Agent Work: ${formatDuration(sub.active_agent_seconds || 0)} | Total Span: ${formatDuration(childWallSec)}`;
+
+            let subCompactionBadge = '';
+            if (sub.compaction_count > 0) {
+              subCompactionBadge = `<span class="px-1.5 py-0.5 rounded text-[10px] font-mono font-medium bg-amber-950/80 text-amber-300 border border-amber-500/40 shrink-0" title="${sub.compaction_count} compaction events (~${formatTokens(sub.pruned_tokens)} tokens pruned)">⚡ ${sub.compaction_count} pruned</span>`;
+            }
+
+            childTr.innerHTML = `
+              <td class="py-2 px-3 text-gray-500 whitespace-nowrap font-mono text-[10px] pl-6">${sub.created_at || '--'}</td>
+              <td class="py-2 px-3 pl-8">
+                <div class="flex items-center space-x-2 max-w-sm flex-wrap gap-y-1">
+                  <span class="text-pink-400 font-mono text-xs">↳</span>
+                  <span class="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-pink-950/80 text-pink-300 border border-pink-500/40 font-mono shrink-0">${sub.subagent_role || 'Worker'}</span>
+                  <span class="font-mono text-gray-300 truncate text-xs" title="${sub.title}">${sub.title}</span>
+                  ${subCompactionBadge}
+                </div>
+              </td>
+              <td class="py-2 px-3 text-purple-400/80 whitespace-nowrap text-xs">${sub.model_name || 'inherit'}</td>
+              <td class="py-2 px-3 text-right text-gray-400 font-mono text-xs">${sub.total_steps}</td>
+              <td class="py-2 px-3 text-right font-mono font-medium text-rose-400/80 text-xs">$${(sub.billed_cost || 0).toFixed(2)}</td>
+              <td class="py-2 px-3 text-right font-mono font-medium text-indigo-400/80 text-xs">${formatTokens(sub.tokens || sub.total_tokens)}</td>
+              <td class="py-2 px-3 text-right text-gray-400 whitespace-nowrap text-xs" title="${childTimeTitle}">
+                <span class="text-emerald-400/80">${formatDuration(childActiveSec)}</span>
+              </td>
+              <td class="py-2 px-3 text-center">
+                ${(typeof IS_STATIC_EXPORT !== "undefined" && IS_STATIC_EXPORT) ? "" : `<button onclick="inspectSession('${sub.id}')" class="px-2 py-0.5 rounded bg-pink-600/70 hover:bg-pink-600 text-[10px] font-medium text-white transition">Inspect</button>`}
+              </td>
+            `;
+            tbody.appendChild(childTr);
+          }
+        }
       }
+      lucide.createIcons();
     }
 
     async function inspectSession(cid) {
@@ -1789,6 +1914,59 @@
         const modalWallSpanEl = document.getElementById('modalWallSpan');
         if (modalWallSpanEl) {
           modalWallSpanEl.textContent = `Span: ${formatDuration(conv.duration_seconds || 0)}`;
+        }
+
+        // Fix MIA Total Tokens & Total Steps
+        const modalTokensEl = document.getElementById('modalTokens');
+        if (modalTokensEl) {
+          const tokVal = conv.tokens || conv.total_tokens || 0;
+          modalTokensEl.textContent = formatTokens(tokVal);
+          modalTokensEl.title = `${tokVal.toLocaleString()} active tokens (Disk Footprint: ${(conv.disk_tokens || conv.total_tokens || 0).toLocaleString()} tokens)`;
+        }
+
+        const modalStepsEl = document.getElementById('modalSteps');
+        if (modalStepsEl) {
+          const stepVal = conv.total_steps || (data.steps ? data.steps.length : 0);
+          modalStepsEl.textContent = stepVal.toLocaleString();
+          modalStepsEl.title = `${stepVal.toLocaleString()} logged steps in this conversation`;
+        }
+
+        // Context Compaction & Working Memory Status
+        const compBanner = document.getElementById('modalCompactionBanner');
+        const compCard = document.getElementById('modalCompactionCard');
+        const compScore = document.getElementById('modalCompactionScore');
+        const compStats = document.getElementById('modalCompactionStats');
+        const compTitle = document.getElementById('modalCompactionTitle');
+        const compDesc = document.getElementById('modalCompactionDesc');
+
+        const compCount = conv.compaction_count || (data.compaction ? data.compaction.count : 0) || 0;
+        const prunedTok = conv.pruned_tokens || (data.compaction ? data.compaction.pruned_tokens : 0) || 0;
+
+        if (compCount > 0 || prunedTok > 0) {
+          if (compBanner) {
+            compBanner.className = 'flex rounded-lg p-2.5 text-xs border items-center justify-between bg-amber-950/40 border-amber-500/50 text-amber-300';
+            if (compTitle) compTitle.textContent = 'Context Compaction Detected';
+            if (compDesc) compDesc.textContent = `${compCount} truncation event${compCount === 1 ? '' : 's'} pruned earlier history to respect model limits`;
+            if (compStats) compStats.textContent = `~${formatTokens(prunedTok)} freed (${prunedTok.toLocaleString()} tokens)`;
+          }
+          if (compScore) {
+            compScore.textContent = `⚡ ${compCount} Prunes`;
+            compScore.className = 'font-semibold text-amber-400 font-mono mt-0.5 block';
+          }
+          if (compCard) {
+            compCard.title = `Working memory health: ${compCount} historical compaction event(s) trimmed ~${formatTokens(prunedTok)} (${prunedTok.toLocaleString()} tokens) from active attention window.`;
+          }
+        } else {
+          if (compBanner) {
+            compBanner.className = 'hidden';
+          }
+          if (compScore) {
+            compScore.textContent = '100% Retained';
+            compScore.className = 'font-semibold text-emerald-400 font-mono mt-0.5 block';
+          }
+          if (compCard) {
+            compCard.title = 'Working memory health: 100% of conversation history is currently retained in active attention window with 0 compactions.';
+          }
         }
 
         // Populate Scorecard
@@ -1870,6 +2048,18 @@
             sBody.appendChild(switchTr);
           }
 
+          const sType = s.step_type || s.activity || '';
+          if (sType === 'CHECKPOINT' || sType === 'CONVERSATION_HISTORY' || sType.includes('Compaction')) {
+            const compTr = document.createElement('tr');
+            compTr.className = 'bg-amber-950/60 border-y border-amber-500/50';
+            compTr.innerHTML = `
+              <td colspan="5" class="py-1.5 px-2.5 text-center text-xs font-semibold text-amber-300">
+                ⚡ Memory Compaction Checkpoint #${s.step_index}: Context window was truncated/compacted at this step
+              </td>
+            `;
+            sBody.appendChild(compTr);
+          }
+
           const tr = document.createElement('tr');
           tr.innerHTML = `
             <td class="py-1.5 px-2.5 text-gray-400 font-mono">#${s.step_index}</td>
@@ -1882,8 +2072,46 @@
         }
 
         currentSessionData = data;
+        
+        // Modal breadcrumb lineage trail
+        const breadcrumbsEl = document.getElementById('modalBreadcrumbs');
+        if (breadcrumbsEl) {
+          breadcrumbsEl.innerHTML = '';
+          if (data.ancestors && data.ancestors.length > 0) {
+            for (const a of data.ancestors) {
+              const btn = document.createElement('button');
+              btn.className = 'text-brand-400 hover:text-brand-300 underline transition truncate max-w-[160px] text-xs font-mono';
+              btn.title = a.title;
+              btn.textContent = a.role ? `[${a.role}] ${a.title}` : a.title;
+              btn.onclick = () => inspectSession(a.id);
+              breadcrumbsEl.appendChild(btn);
+
+              const sep = document.createElement('span');
+              sep.className = 'text-gray-600 font-sans text-xs px-0.5';
+              sep.textContent = '>';
+              breadcrumbsEl.appendChild(sep);
+            }
+            const currentSpan = document.createElement('span');
+            currentSpan.className = 'text-gray-300 font-semibold truncate max-w-[200px] text-xs font-mono';
+            currentSpan.textContent = conv.subagent_role ? `[${conv.subagent_role}] ${conv.title || 'Current'}` : (conv.title || 'Current');
+            breadcrumbsEl.appendChild(currentSpan);
+            breadcrumbsEl.classList.remove('hidden');
+          } else {
+            breadcrumbsEl.classList.add('hidden');
+          }
+        }
+
+        const btnSwarmText = document.getElementById('btnViewSwarmText');
+        if (btnSwarmText) {
+          const count = (data.fleet_summary && data.fleet_summary.subagent_count > 0) 
+            ? data.fleet_summary.subagent_count 
+            : (data.children ? data.children.length : 0);
+          btnSwarmText.textContent = count > 0 ? `Swarm Fleet (${count})` : 'Swarm Fleet';
+        }
+
         populateDiffSelectors(data.steps);
         renderFlowSequence(data.steps);
+        renderSwarmView(data);
         setSessionViewMode('flow');
 
         document.getElementById('sessionModal').classList.remove('hidden');
@@ -1898,9 +2126,11 @@
       const btnTable = document.getElementById('btnViewTable');
       const btnFlow = document.getElementById('btnViewFlow');
       const btnDiff = document.getElementById('btnViewDiff');
+      const btnSwarm = document.getElementById('btnViewSwarm');
       const tableContainer = document.getElementById('sessionViewTable');
       const flowContainer = document.getElementById('sessionViewFlow');
       const diffContainer = document.getElementById('sessionViewDiff');
+      const swarmContainer = document.getElementById('sessionViewSwarm');
 
       const activeClass = 'px-2.5 py-1 rounded-md bg-brand-600 text-white font-medium shadow transition whitespace-nowrap';
       const inactiveClass = 'px-2.5 py-1 rounded-md text-gray-400 hover:text-white transition whitespace-nowrap';
@@ -1910,16 +2140,154 @@
       if (btnDiff) {
         btnDiff.className = (mode === 'diff' ? activeClass : inactiveClass) + ' flex items-center space-x-1';
       }
+      if (btnSwarm) {
+        btnSwarm.className = (mode === 'swarm' ? activeClass : inactiveClass) + ' flex items-center space-x-1';
+      }
 
       tableContainer.classList.toggle('hidden', mode !== 'table');
       flowContainer.classList.toggle('hidden', mode !== 'flow');
       if (diffContainer) {
         diffContainer.classList.toggle('hidden', mode !== 'diff');
       }
+      if (swarmContainer) {
+        swarmContainer.classList.toggle('hidden', mode !== 'swarm');
+      }
 
       if (mode === 'diff') {
         onDiffStepChange();
       }
+    }
+
+    function renderSwarmView(data) {
+      const summaryEl = document.getElementById('modalSwarmSummary');
+      const badgeEl = document.getElementById('modalSwarmBadge');
+      const treeEl = document.getElementById('modalSwarmTree');
+      if (!summaryEl || !treeEl) return;
+
+      const conv = data.conversation || {};
+      const summary = data.fleet_summary || {};
+      const totalAgents = summary.subagent_count ? (summary.subagent_count + 1) : ((data.children && data.children.length > 0) ? (data.children.length + 1) : 1);
+      const totalTokens = summary.total_tokens || conv.tokens || conv.total_tokens || 0;
+      const totalCost = summary.total_cost || conv.billed_cost || 0;
+      const totalSteps = summary.total_steps || conv.total_steps || 0;
+      const localTokens = conv.tokens || conv.total_tokens || 0;
+      const shieldedTokens = Math.max(0, totalTokens - localTokens);
+      const shieldingRatio = localTokens > 0 ? (totalTokens / localTokens).toFixed(1) : '1.0';
+
+      summaryEl.innerHTML = `
+        <div class="p-2.5 rounded-lg bg-pink-950/30 border border-pink-500/40">
+          <span class="text-gray-400 block text-[10px] uppercase font-medium">Swarm Fleet</span>
+          <span class="font-bold text-pink-400 font-mono mt-0.5 block text-sm">${totalAgents} Agents</span>
+          <span class="text-[10px] text-gray-400">${(totalAgents > 1 ? (totalAgents - 1) + ' delegated' : 'Standalone')}</span>
+        </div>
+        <div class="p-2.5 rounded-lg bg-indigo-950/30 border border-indigo-500/40">
+          <span class="text-gray-400 block text-[10px] uppercase font-medium">Fleet Tokens</span>
+          <span class="font-bold text-indigo-400 font-mono mt-0.5 block text-sm">${formatTokens(totalTokens)}</span>
+          <span class="text-[10px] text-gray-400">${formatTokens(shieldedTokens)} shielded</span>
+        </div>
+        <div class="p-2.5 rounded-lg bg-rose-950/30 border border-rose-500/40">
+          <span class="text-gray-400 block text-[10px] uppercase font-medium">Fleet Cost</span>
+          <span class="font-bold text-rose-400 font-mono mt-0.5 block text-sm">$${Number(totalCost).toFixed(2)}</span>
+          <span class="text-[10px] text-gray-400">across ${totalSteps} ops</span>
+        </div>
+        <div class="p-2.5 rounded-lg bg-emerald-950/30 border border-emerald-500/40">
+          <span class="text-gray-400 block text-[10px] uppercase font-medium">Context Shielding</span>
+          <span class="font-bold text-emerald-400 font-mono mt-0.5 block text-sm">${shieldingRatio}x</span>
+          <span class="text-[10px] text-gray-400">parent window saved</span>
+        </div>
+      `;
+
+      if (badgeEl) {
+        badgeEl.textContent = `${totalAgents} agent session${totalAgents === 1 ? '' : 's'} in campaign`;
+      }
+
+      treeEl.innerHTML = '';
+
+      function renderTreeNode(node, depth = 0, isLast = false) {
+        const nodeCard = document.createElement('div');
+        const isCurrent = node.is_current;
+        const indentClass = depth === 0 ? '' : depth === 1 ? 'ml-6 border-l-2 border-pink-500/40 pl-3' : 'ml-12 border-l-2 border-purple-500/40 pl-3';
+        
+        nodeCard.className = `p-3 rounded-lg border transition ${indentClass} ${
+          isCurrent 
+            ? 'bg-brand-950/40 border-brand-500 ring-1 ring-brand-500/50 shadow-md' 
+            : 'bg-dark-900/70 border-dark-700 hover:border-dark-600'
+        }`;
+
+        const roleBadgeClass = depth === 0 
+          ? 'bg-brand-500/20 text-brand-300 border-brand-500/40' 
+          : depth === 1 
+            ? 'bg-pink-500/20 text-pink-300 border-pink-500/40' 
+            : 'bg-purple-500/20 text-purple-300 border-purple-500/40';
+
+        nodeCard.innerHTML = `
+          <div class="flex items-center justify-between flex-wrap gap-2">
+            <div class="flex items-center space-x-2">
+              ${depth > 0 ? `<span class="text-pink-400 font-mono text-xs">↳</span>` : ''}
+              <span class="px-2 py-0.5 rounded text-[11px] font-semibold font-mono border ${roleBadgeClass}">
+                ${node.role || (depth === 0 ? 'Root Coordinator' : 'Worker')}
+              </span>
+              <span class="font-medium text-white text-xs truncate max-w-sm" title="${node.title}">
+                ${node.title}
+              </span>
+              ${isCurrent ? `<span class="px-1.5 py-0.2 rounded text-[10px] bg-emerald-500/20 text-emerald-300 font-mono border border-emerald-500/40">Active</span>` : ''}
+            </div>
+            <div class="flex items-center space-x-3 text-xs font-mono">
+              <span class="text-gray-400">${node.steps} steps</span>
+              <span class="text-indigo-400">${formatTokens(node.tokens)} tok</span>
+              <span class="text-rose-400 font-bold">$${Number(node.cost || 0).toFixed(2)}</span>
+              ${node.duration ? `<span class="text-emerald-400">${formatDuration(node.duration)}</span>` : ''}
+              ${!isCurrent ? `
+                <button onclick="inspectSession('${node.id}')" class="px-2 py-0.5 rounded bg-brand-600/80 hover:bg-brand-600 text-[10px] text-white font-sans transition">
+                  Inspect ➔
+                </button>
+              ` : ''}
+            </div>
+          </div>
+        `;
+        treeEl.appendChild(nodeCard);
+
+        if (node.children && node.children.length > 0) {
+          node.children.forEach((child, i) => {
+            renderTreeNode(child, depth + 1, i === node.children.length - 1);
+          });
+        }
+      }
+
+      if (data.fleet_tree) {
+        renderTreeNode(data.fleet_tree, 0, true);
+      } else if (data.children && data.children.length > 0) {
+        renderTreeNode({
+          id: conv.id,
+          title: conv.title,
+          role: conv.subagent_role || 'Root Coordinator',
+          depth: 0,
+          steps: conv.total_steps || 0,
+          tokens: conv.tokens || conv.total_tokens || 0,
+          cost: conv.billed_cost || 0,
+          duration: conv.duration_seconds || 0,
+          is_current: true,
+          children: data.children.map(ch => ({
+            id: ch.id,
+            title: ch.title,
+            role: ch.role,
+            depth: ch.depth || 1,
+            steps: ch.steps,
+            tokens: ch.tokens,
+            cost: ch.cost,
+            duration: 0,
+            is_current: false,
+            children: []
+          }))
+        }, 0, true);
+      } else {
+        treeEl.innerHTML = `
+          <div class="text-center py-6 text-gray-500 font-mono text-xs">
+            This session operated as a standalone agent with no delegated sub-agents.
+          </div>
+        `;
+      }
+      lucide.createIcons();
     }
 
     function populateDiffSelectors(steps) {
@@ -2428,10 +2796,24 @@
                         <span class="px-1.5 py-0.5 rounded bg-dark-800 text-gray-300 text-[10px] font-mono border border-dark-700">model: ${saModel}</span>
                         <span class="px-1.5 py-0.5 rounded bg-dark-800 text-gray-400 text-[10px] font-mono border border-dark-700">type: ${saType}</span>
                       </div>
-                      <span class="text-[10px] text-emerald-400 font-mono font-medium flex items-center space-x-1">
-                        <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
-                        <span>Dispatched</span>
-                      </span>
+                      <div class="flex items-center space-x-2">
+                        ${(() => {
+                          if (currentSessionData && currentSessionData.children) {
+                            const matchedChild = currentSessionData.children.find(ch => 
+                              (ch.step_index === step.step_index) || 
+                              (ch.role && saRole && ch.role.toLowerCase() === saRole.toLowerCase())
+                            );
+                            if (matchedChild) {
+                              return `<button onclick="inspectSession('${matchedChild.id}')" class="px-2 py-0.5 rounded bg-pink-600/80 hover:bg-pink-600 text-white font-mono text-[10px] transition flex items-center space-x-1"><i data-lucide="external-link" class="w-3 h-3"></i><span>Inspect Flow (${matchedChild.steps} ops)</span></button>`;
+                            }
+                          }
+                          return '';
+                        })()}
+                        <span class="text-[10px] text-emerald-400 font-mono font-medium flex items-center space-x-1">
+                          <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
+                          <span>Dispatched</span>
+                        </span>
+                      </div>
                     </div>
                     ${saPrompt ? `
                       <details class="group">

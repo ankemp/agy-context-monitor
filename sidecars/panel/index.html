@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Context Monitor</title>
+  <link rel="stylesheet" href="/styles.css">
+  <!-- Host bridge: synchronizes theme tokens and defines window.sidecar -->
+  <script src="/preload.js"></script>
+</head>
+<body>
+  <main class="panel">
+    <header class="panel-header">
+      <div class="header-main">
+        <h1>Context Monitor</h1>
+        <span id="status-badge" class="badge ok">Live</span>
+      </div>
+      <div class="header-meta">
+        <span id="model-badge" class="badge secondary">Detecting...</span>
+        <span id="cost-badge" class="badge secondary">$0.00</span>
+      </div>
+    </header>
+
+    <!-- Global Aggregate View (visible when no conversation is active) -->
+    <section id="global-card" class="card" aria-labelledby="global-title" hidden>
+      <div class="card-header">
+        <h2 id="global-title">Global Fleet Telemetry</h2>
+        <span id="global-convs" class="badge">0 Sessions</span>
+      </div>
+      <p class="muted small">
+        Overview across all conversations recorded by the Context Monitor plugin.
+      </p>
+      <dl class="facts">
+        <dt>Total Tokens</dt><dd id="global-tokens">0</dd>
+        <dt>Total Value</dt><dd id="global-cost">$0.00</dd>
+        <dt>Compactions</dt><dd id="global-compactions">0 events</dd>
+        <dt>Tokens Pruned</dt><dd id="global-pruned">0</dd>
+      </dl>
+      <p class="muted small hint-text">
+        Select or open any conversation in Antigravity to view live turn-by-turn context capacity.
+      </p>
+    </section>
+
+    <!-- Context Compaction Banner (visible when active conversation has compactions) -->
+    <section id="compaction-banner" class="compaction-banner" hidden>
+      <div class="banner-title">
+        <span class="banner-tag">Memory Compaction</span>
+        <span id="compaction-count" class="badge warning">0 events</span>
+      </div>
+      <p id="compaction-text" class="banner-body">
+        Historical steps pruned to preserve context headroom.
+      </p>
+      <div class="banner-stats">
+        <span id="compaction-pruned" class="small">0 tokens freed</span> · 
+        <span id="compaction-window" class="small">Steps #0–#0 active</span>
+      </div>
+    </section>
+
+    <!-- Active Capacity Card with Multi-Segment Progress Bar -->
+    <section id="capacity-card" class="card" aria-labelledby="capacity-title">
+      <div class="card-header">
+        <h2 id="capacity-title">Active Capacity</h2>
+        <span id="capacity-pct" class="capacity-val">0.0%</span>
+      </div>
+      <div class="capacity-sub muted small" id="capacity-sub">
+        0 / 1.00M tokens
+      </div>
+
+      <!-- Multi-segment capacity bar -->
+      <div class="progress-track" id="capacity-track">
+        <div class="segment-container" id="capacity-bar"></div>
+      </div>
+
+      <div class="section-subtitle muted small">Category Breakdown</div>
+      <div id="category-list" class="category-list">
+        <div class="empty-state small muted">No telemetry recorded yet</div>
+      </div>
+    </section>
+
+    <!-- Top Contributors Card -->
+    <section id="top-steps-card" class="card" aria-labelledby="top-steps-title">
+      <div class="card-header">
+        <h2 id="top-steps-title">Top Context Contributors</h2>
+        <span id="steps-range" class="muted small">Steps #0–#0</span>
+      </div>
+      <div id="top-steps-list" class="step-list">
+        <div class="empty-state small muted">No steps recorded</div>
+      </div>
+    </section>
+
+    <!-- One-Click Agent Actions -->
+    <section id="actions-card" class="card" aria-labelledby="actions-title" hidden>
+      <div class="card-header">
+        <h2 id="actions-title">Agent Actions</h2>
+      </div>
+      <div class="actions">
+        <button id="btn-audit" type="button" class="action-btn">Audit Redundant Reads</button>
+        <button id="btn-plan" type="button" class="action-btn">Plan Context Cleanup</button>
+        <button id="btn-compact" type="button" class="action-btn secondary">Review Compaction</button>
+      </div>
+    </section>
+
+    <p id="toast" class="toast" role="status" aria-live="polite" hidden></p>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>

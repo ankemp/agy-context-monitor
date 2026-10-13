@@ -21,11 +21,18 @@ Activate this skill when the user asks for:
    `<appDataDir>/brain/<conversation-id>/.system_generated/logs/transcript.jsonl`
 
 2. **Check the Live Artifact Report**:
-   If the `context-monitor` plugin is active, view the generated report at:
-   `<appDataDir>/brain/<conversation-id>/context_usage.md`
+   The `context-monitor` plugin automatically generates both:
+   - Clean data report: `<appDataDir>/brain/<conversation-id>/context_usage.md`
+   - Generative UI companion card: `<appDataDir>/brain/<conversation-id>/context_usage.html`
 
-3. **Presenting Findings to User**:
-   - Total Estimated Tokens vs Model Window Limit (e.g. Gemini 3.7 Flash: 1.0M tokens, Gemini Pro: 2.0M tokens).
-   - Percentage of context window consumed.
-   - Breakdown by source (Model, System, User) and step type (`VIEW_FILE`, `RUN_COMMAND`, `PLANNER_RESPONSE`, `SEARCH_WEB`).
-   - Top 3–5 largest context contributors with step indices.
+3. **Presenting Findings to User (Zero Context Bloat)**:
+   To protect the conversation context window from being consumed by large diagnostic tables:
+   - Provide a concise 1–2 sentence headline with the active percentage, model limit, and session cost:
+     `Active Context: **{pct:.1f}%** ({active_tokens} / {max_tokens} tokens) · Model: `{model}` · Value: ${cost}`
+   - Embed the interactive Generative UI card directly inline:
+     ```html
+     <agent-embed src="file:///<appDataDir>/brain/<conversation-id>/context_usage.html"></agent-embed>
+     ```
+   - Surface the one-click native side panel navigation pill:
+     `[Context Monitor](sidecar://context-monitor/panel/)`
+   - **Do NOT** print verbose multi-column markdown tables into the chat response. The inline `<agent-embed>` widget natively presents the multi-segment capacity bar, category breakdown, memory compaction boundary, and interactive action chips without polluting the persistent conversation transcript.

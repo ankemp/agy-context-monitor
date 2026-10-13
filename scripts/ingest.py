@@ -20,14 +20,14 @@ import re
 from pathlib import Path
 from datetime import datetime
 
-import sys
-from pathlib import Path
 _root = Path(__file__).resolve().parent.parent
 if str(_root / "src") not in sys.path:
     sys.path.insert(0, str(_root / "src"))
 
 from context_monitor.db import get_db_connection, init_db, DEFAULT_DB_PATH
 from context_monitor.formats import BlockParser
+from context_monitor.diff import diff_block_lists, DiffResult
+from context_monitor.html_report import generate_html_report
 
 CHARS_PER_TOKEN = 3.8
 
@@ -112,6 +112,12 @@ def classify_phase(step_type: str, tool_name: str) -> str:
     return "reasoning"
 
 def analyze_transcript(transcript_path: Path, initial_model: str = "Gemini 3.7 Flash") -> dict:
+    if transcript_path.is_dir():
+        t_file = transcript_path / ".system_generated" / "logs" / "transcript.jsonl"
+        if not t_file.exists():
+            t_file = transcript_path / "transcript.jsonl"
+        transcript_path = t_file
+
     steps = []
     category_stats = {}
     total_chars = 0
@@ -131,6 +137,9 @@ def analyze_transcript(transcript_path: Path, initial_model: str = "Gemini 3.7 F
     end_time = None
     cur_model = initial_model
     project = None
+    detected_parent_id = None
+    dispatched_subagents = []
+    pending_subagent_specs = []
 
     with open(transcript_path, "r", encoding="utf-8", errors="replace") as f:
         for line in f:
@@ -208,7 +217,18 @@ def analyze_transcript(transcript_path: Path, initial_model: str = "Gemini 3.7 F
                                 project = m.group(1)
                         clean_path = str(target_p).strip("\"'") if target_p else None
                         
-                        if tc_name == "view_file" and clean_path:
+                        if tc_name == "invoke_subagent":
+                            sub_raw = tc_args.get("Subagents", "")
+                            if isinstance(sub_raw, str):
+                                try:
+                                    pending_subagent_specs = json.loads(sub_raw) if sub_raw.strip().startswith("[") else []
+                                except Exception:
+                                    pending_subagent_specs = []
+                            elif isinstance(sub_raw, list):
+                                pending_subagent_specs = sub_raw
+                            else:
+                                pending_subagent_specs = []
+                        elif tc_name == "view_file" and clean_path:
                             norm_path = clean_path.lower()
                             if norm_path in seen_files:
                                 redundant_reads += 1
@@ -283,6 +303,10 @@ def analyze_transcript(transcript_path: Path, initial_model: str = "Gemini 3.7 F
                 category = "System: Background Task Outputs"
                 pending_tool_calls = []
                 detail = extract_system_message_detail(content)
+                if step_idx <= 2 and not detected_parent_id:
+                    m_snd = re.search(r"\[Message\]\s+timestamp=[^\s]+\s+sender=([a-zA-Z0-9_\-]+)", content)
+                    if m_snd:
+                        detected_parent_id = m_snd.group(1)
 
             elif step_type == "EPHEMERAL_MESSAGE":
                 activity = "System Ephemeral Status"
@@ -298,7 +322,25 @@ def analyze_transcript(transcript_path: Path, initial_model: str = "Gemini 3.7 F
                 tool_args = tool_info[1]
                 primary_tool_name = tool_name
                 
-                if tool_name == "view_file" or "File Path:" in content:
+                if (tool_name == "invoke_subagent" or ("Created the following subagents:" in content and pending_subagent_specs)) and tool_name not in ("run_command", "view_file", "search_web", "manage_task"):
+                    activity = "Subagent Dispatched"
+                    tool_or_source = "`invoke_subagent`"
+                    category = "Tool Output: `invoke_subagent`"
+                    found_cids = re.findall(r'conversationId["\':\s]+([a-zA-Z0-9_\-]+)', content)
+                    if not found_cids:
+                        found_cids = re.findall(r'([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})', content)
+                    for c_idx, ch_id in enumerate(found_cids):
+                        spec = pending_subagent_specs[c_idx] if c_idx < len(pending_subagent_specs) else {}
+                        dispatched_subagents.append({
+                            "id": ch_id,
+                            "role": spec.get("Role") or spec.get("role") or "Autonomous Worker",
+                            "type": spec.get("TypeName") or spec.get("type") or "self",
+                            "model": spec.get("Model") or spec.get("model") or "inherit",
+                            "step_index": step_idx
+                        })
+                    pending_subagent_specs = []
+                    detail = f"Dispatched {len(found_cids)} subagent(s)" if found_cids else "Subagent dispatch"
+                elif tool_name == "view_file" or "File Path:" in content:
                     activity = "File Content"
                     tool_or_source = "`view_file`"
                     category = "Tool Output: File Contents (`view_file`)"
@@ -519,26 +561,102 @@ def analyze_transcript(transcript_path: Path, initial_model: str = "Gemini 3.7 F
         "active_context_tokens": running_ctx,
         "category_stats": category_stats,
         "tool_executions": tool_execs,
-        "parsed_blocks": parsed_blocks
+        "parsed_blocks": parsed_blocks,
+        "parent_id": detected_parent_id,
+        "dispatched_subagents": dispatched_subagents
     }
 
 def sync_to_sqlite(cid: str, model_name: str, analysis: dict):
-    """Safely and incrementally syncs session data to SQLite in WAL mode."""
+    """Safely and incrementally syncs session data to SQLite in WAL mode and computes turn diff."""
+    diff_res = None
     try:
         if not DEFAULT_DB_PATH:
-            return
+            return None
         conn = get_db_connection(DEFAULT_DB_PATH, timeout=5.0)
         with conn:
+            cur = conn.cursor()
+
+            # Query existing blocks BEFORE deleting them to compute turn diff
+            prev_blocks = cur.execute("""
+                SELECT step_index, block_type, content, block_hash, call_id
+                FROM transcript_blocks
+                WHERE conversation_id = ?
+                ORDER BY step_index ASC, id ASC
+            """, (cid,)).fetchall()
+
+            curr_blocks = analysis.get("parsed_blocks", [])
+            if curr_blocks and prev_blocks:
+                diff_res = diff_block_lists(prev_blocks, curr_blocks)
+            elif curr_blocks:
+                diff_res = diff_block_lists([], curr_blocks)
+
             active_model = analysis.get("latest_model", model_name)
-            # Upsert conversation record
+            parent_id = analysis.get("parent_id")
+            subagent_role = analysis.get("subagent_role")
+            subagent_type = analysis.get("subagent_type")
+            invoking_step = analysis.get("invoking_step_index")
+            root_id = cid
+            depth = 0
+
+            # Check if an existing row already has lineage from a parent's dispatch
+            existing = cur.execute(
+                "SELECT parent_id, root_id, depth, subagent_role, subagent_type, invoking_step_index, project, title, compaction_count, pruned_tokens FROM conversations WHERE id = ?",
+                (cid,)
+            ).fetchone()
+
+            comp_count = 0
+            pruned_toks = 0
+            if existing:
+                try:
+                    comp_count = existing["compaction_count"] or 0
+                except (IndexError, KeyError):
+                    comp_count = 0
+                try:
+                    pruned_toks = existing["pruned_tokens"] or 0
+                except (IndexError, KeyError):
+                    pruned_toks = 0
+                if not parent_id and existing["parent_id"]:
+                    parent_id = existing["parent_id"]
+                if not subagent_role and existing["subagent_role"]:
+                    subagent_role = existing["subagent_role"]
+                if not subagent_type and existing["subagent_type"]:
+                    subagent_type = existing["subagent_type"]
+                if invoking_step is None and existing["invoking_step_index"] is not None:
+                    invoking_step = existing["invoking_step_index"]
+
+            if diff_res and diff_res.compaction_detected:
+                comp_count += 1
+                pruned_toks += diff_res.removed_tokens
+
+            if parent_id:
+                p_row = cur.execute("SELECT id, root_id, project, depth, title FROM conversations WHERE id = ?", (parent_id,)).fetchone()
+                if p_row:
+                    root_id = p_row["root_id"] or p_row["id"]
+                    depth = (p_row["depth"] or 0) + 1
+                    if not analysis.get("project") and p_row["project"]:
+                        analysis["project"] = p_row["project"]
+                    if (not analysis.get("title") or analysis["title"] in ("Active Session", "")) and p_row["title"]:
+                        role_label = subagent_role or "Worker"
+                        clean_p_title = p_row["title"]
+                        m_sub = re.match(r"^\[.+?\]\s*(.+)", clean_p_title)
+                        if m_sub:
+                            clean_p_title = m_sub.group(1)
+                        analysis["title"] = f"[{role_label}] {clean_p_title[:90]}"
+                else:
+                    root_id = parent_id
+                    depth = 1
+
+            # Upsert conversation record with hierarchy and compaction columns
             conn.execute("""
                 INSERT INTO conversations (
                     id, title, project, model_name, created_at, updated_at, total_steps, total_characters, total_tokens,
                     duration_seconds, active_agent_seconds, active_pairing_seconds, thinking_tokens,
                     user_prompts, tool_calls_count, redundant_file_reads, lines_written, lines_edited, failed_tool_calls,
-                    billed_cost, billed_input_tokens, billed_output_tokens
+                    billed_cost, billed_input_tokens, billed_output_tokens,
+                    parent_id, root_id, depth, subagent_role, subagent_type, invoking_step_index,
+                    compaction_count, pruned_tokens
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     title = excluded.title,
                     project = COALESCE(excluded.project, conversations.project),
@@ -559,7 +677,15 @@ def sync_to_sqlite(cid: str, model_name: str, analysis: dict):
                     failed_tool_calls = excluded.failed_tool_calls,
                     billed_cost = excluded.billed_cost,
                     billed_input_tokens = excluded.billed_input_tokens,
-                    billed_output_tokens = excluded.billed_output_tokens
+                    billed_output_tokens = excluded.billed_output_tokens,
+                    parent_id = COALESCE(excluded.parent_id, conversations.parent_id),
+                    root_id = COALESCE(excluded.root_id, conversations.root_id),
+                    depth = CASE WHEN excluded.parent_id IS NOT NULL THEN excluded.depth ELSE conversations.depth END,
+                    subagent_role = COALESCE(excluded.subagent_role, conversations.subagent_role),
+                    subagent_type = COALESCE(excluded.subagent_type, conversations.subagent_type),
+                    invoking_step_index = COALESCE(excluded.invoking_step_index, conversations.invoking_step_index),
+                    compaction_count = excluded.compaction_count,
+                    pruned_tokens = excluded.pruned_tokens
             """, (
                 cid, analysis["title"], analysis.get("project"), active_model, analysis["start_time"] or datetime.now().isoformat(),
                 analysis["end_time"] or datetime.now().isoformat(), len(analysis["steps"]),
@@ -571,8 +697,47 @@ def sync_to_sqlite(cid: str, model_name: str, analysis: dict):
                 analysis.get("failed_tool_calls", 0),
                 analysis.get("billed_cost", 0.0),
                 analysis.get("billed_input_tokens", 0),
-                analysis.get("billed_output_tokens", 0)
+                analysis.get("billed_output_tokens", 0),
+                parent_id, root_id, depth, subagent_role, subagent_type, invoking_step,
+                comp_count, pruned_toks
             ))
+
+            # Upsert dispatched subagents so child rows have lineage right away
+            for child in analysis.get("dispatched_subagents", []):
+                ch_id = child["id"]
+                ch_role = child.get("role")
+                ch_type = child.get("type")
+                ch_step = child.get("step_index")
+                clean_t = analysis["title"]
+                m_sub = re.match(r"^\[.+?\]\s*(.+)", clean_t)
+                if m_sub:
+                    clean_t = m_sub.group(1)
+                ch_title = f"[{ch_role}] {clean_t[:90]}"
+
+                conn.execute("""
+                    INSERT INTO conversations (
+                        id, title, project, parent_id, root_id, depth, subagent_role, subagent_type, invoking_step_index
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                        parent_id = excluded.parent_id,
+                        root_id = excluded.root_id,
+                        depth = excluded.depth,
+                        subagent_role = COALESCE(excluded.subagent_role, conversations.subagent_role),
+                        subagent_type = COALESCE(excluded.subagent_type, conversations.subagent_type),
+                        invoking_step_index = COALESCE(excluded.invoking_step_index, conversations.invoking_step_index),
+                        project = COALESCE(conversations.project, excluded.project)
+                """, (
+                    ch_id,
+                    ch_title,
+                    analysis.get("project"),
+                    cid,
+                    root_id,
+                    depth + 1,
+                    ch_role,
+                    ch_type,
+                    ch_step
+                ))
 
             # Upsert steps with step-level model_name
             step_params = [
@@ -639,13 +804,15 @@ def sync_to_sqlite(cid: str, model_name: str, analysis: dict):
                 """, block_params)
 
         conn.close()
+        return diff_res
     except Exception:
         # Never break hook execution on db errors
-        pass
+        return diff_res
 
-def generate_artifact_report(cid: str, model_name: str, max_tokens: int, analysis: dict, artifact_dir: Path):
+def generate_artifact_report(cid: str, model_name: str, max_tokens: int, analysis: dict, artifact_dir: Path, diff_res: Any = None):
     try:
         report_file = artifact_dir / "context_usage.md"
+        html_file = artifact_dir / "context_usage.html"
         active_model = analysis.get("latest_model", model_name)
         active_max = analysis.get("latest_max_tokens", max_tokens)
         active_tokens = analysis.get("active_context_tokens", analysis["total_tokens"])
@@ -657,17 +824,51 @@ def generate_artifact_report(cid: str, model_name: str, max_tokens: int, analysi
         
         top_steps = sorted(analysis["steps"], key=lambda s: s["characters"], reverse=True)[:10]
 
+        # Check database for lineage and swarm fleet info
+        parent_info = None
+        fleet_children = []
+        try:
+            if DEFAULT_DB_PATH and DEFAULT_DB_PATH.exists():
+                c_conn = get_db_connection(DEFAULT_DB_PATH, timeout=2.0)
+                with c_conn:
+                    cur_row = c_conn.execute("SELECT parent_id, root_id, depth, subagent_role FROM conversations WHERE id = ?", (cid,)).fetchone()
+                    if cur_row and cur_row["parent_id"]:
+                        p_row = c_conn.execute("SELECT id, title, project FROM conversations WHERE id = ?", (cur_row["parent_id"],)).fetchone()
+                        if p_row:
+                            parent_info = {
+                                "id": p_row["id"],
+                                "title": p_row["title"] or f"Parent ({p_row['id'][:8]})",
+                                "role": cur_row["subagent_role"] or "Worker",
+                                "depth": cur_row["depth"] or 1
+                            }
+
+                    # Fetch children / descendants
+                    ch_rows = c_conn.execute("""
+                        SELECT id, title, subagent_role, depth, total_steps, total_tokens, billed_cost
+                        FROM conversations
+                        WHERE (parent_id = ? OR (root_id = ? AND id != ?))
+                        ORDER BY depth ASC, created_at ASC
+                    """, (cid, cid, cid)).fetchall()
+                    fleet_children = [dict(r) for r in ch_rows]
+                c_conn.close()
+        except Exception:
+            pass
+
         lines = [
             "# Live Context Window Usage Report",
             f"\n> **Conversation**: `{cid}`  ",
             f"> **Model**: `{active_model}` ({format_tokens(active_max)} token window limit)  ",
+        ]
+        if parent_info:
+            lines.append(f"> **Lineage**: Sub-Agent (Role: `{parent_info['role']}`, Tier: {parent_info['depth']}) spawned by [{parent_info['title']}](conversation://{parent_info['id']})  ")
+        lines.extend([
             f"> **Active Context Window**: **{active_pct:.1f}%** ({format_tokens(active_tokens)} / {format_tokens(active_max)} estimated tokens)  ",
             f"> **Cumulative Disk Footprint**: **{format_tokens(used_tokens)} tokens** across {len(analysis['steps'])} logged steps  ",
             f"> **Session API Value**: **${cost:,.4f}** (~{format_tokens(in_toks)} in / {format_tokens(out_toks)} out)\n",
             "## 1. Granular Context Breakdown by Category\n",
             "| Category | Characters | Est. Tokens | Share |",
             "| :--- | :--- | :--- | :--- |"
-        ]
+        ])
 
         for cat, chars in sorted(analysis["category_stats"].items(), key=lambda x: x[1], reverse=True):
             toks = int(chars / CHARS_PER_TOKEN)
@@ -683,13 +884,61 @@ def generate_artifact_report(cid: str, model_name: str, max_tokens: int, analysi
         for s in top_steps:
             lines.append(f"| #{s['step_index']} | {s['activity']} | {s['tool_or_source']} | ~{format_tokens(s['est_tokens'])} | {s['detail']} |")
 
+        sec_num = 3
+        if diff_res and getattr(diff_res, "compaction_detected", False):
+            pruned_indices = getattr(diff_res, "pruned_step_indices", [])
+            p_min = min(pruned_indices) if pruned_indices else 0
+            p_max = max(pruned_indices) if pruned_indices else 0
+            removed_toks = getattr(diff_res, "removed_tokens", 0)
+            steps_list = analysis.get("steps", [])
+            act_min = steps_list[0]["step_index"] if steps_list else 0
+            act_max = steps_list[-1]["step_index"] if steps_list else 0
+
+            lines.extend([
+                f"\n## {sec_num}. Active Context Memory Boundary\n",
+                f"> **Active Memory Window**: Steps #{act_min} to #{act_max} (currently visible to model)  ",
+                f"> **Context Compaction**: {len(pruned_indices)} historical steps pruned (~{format_tokens(removed_toks)} freed across {len(diff_res.removed)} blocks)  ",
+                f"> **Pruned Step Range**: Steps #{p_min} to #{p_max} (older history trimmed to respect context limits)\n",
+            ])
+            sec_num += 1
+
+        if fleet_children:
+            total_fleet_toks = sum(c["total_tokens"] or 0 for c in fleet_children)
+            total_fleet_cost = sum(c["billed_cost"] or 0.0 for c in fleet_children)
+            total_fleet_steps = sum(c["total_steps"] or 0 for c in fleet_children)
+
+            lines.extend([
+                f"\n## {sec_num}. Delegated Swarm Fleet (Context Shielding)\n",
+                f"> **Dispatched Workers**: {len(fleet_children)} sub-agents  ",
+                f"> **Delegated Fleet Work**: ~{format_tokens(total_fleet_toks)} tokens (${total_fleet_cost:,.4f}) across {total_fleet_steps} steps  ",
+                f"> **Context Shielding Benefit**: Delegating tasks avoided injecting ~{format_tokens(total_fleet_toks)} tokens of verbose sub-task output into this active context window.\n",
+                "| Sub-Agent | Role | Tier | Steps | Tokens | Cost |",
+                "| :--- | :--- | :--- | :--- | :--- | :--- |"
+            ])
+            for ch in fleet_children:
+                ch_title = ch.get("title") or f"Sub-Agent {ch['id'][:8]}"
+                ch_role = ch.get("subagent_role") or "Worker"
+                ch_depth = ch.get("depth") or 1
+                ch_steps = ch.get("total_steps") or 0
+                ch_toks = ch.get("total_tokens") or 0
+                ch_c = ch.get("billed_cost") or 0.0
+                lines.append(f"| [{ch_title}](conversation://{ch['id']}) | {ch_role} | Tier {ch_depth} | {ch_steps} | ~{format_tokens(ch_toks)} | ${ch_c:,.2f} |")
+
         lines.extend([
-            "\n---\n*Report generated automatically by the `context-monitor` plugin.*"
+            "\n---\n*Report generated automatically by the `context-monitor` plugin.* · [Context Monitor](sidecar://context-monitor/panel/)"
         ])
 
         report_file.parent.mkdir(parents=True, exist_ok=True)
         with open(report_file, "w", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")
+
+        # Generate companion HTML report (Generative UI card)
+        try:
+            html_content = generate_html_report(cid, active_model, active_max, analysis, diff_res=diff_res)
+            with open(html_file, "w", encoding="utf-8") as f:
+                f.write(html_content)
+        except Exception:
+            pass
     except Exception:
         pass
 
@@ -710,14 +959,52 @@ def main():
     first_model, latest_model, max_tokens = detect_model(transcript_path)
     analysis = analyze_transcript(transcript_path, initial_model=first_model)
 
+    diff_res = sync_to_sqlite(conversation_id, latest_model, analysis)
+
     artifact_dir = Path(os.path.expanduser(f"~/.gemini/antigravity/brain/{conversation_id}"))
     if artifact_dir.exists():
-        generate_artifact_report(conversation_id, latest_model, max_tokens, analysis, artifact_dir)
+        generate_artifact_report(conversation_id, latest_model, max_tokens, analysis, artifact_dir, diff_res=diff_res)
 
-    sync_to_sqlite(conversation_id, latest_model, analysis)
+    # Return transient ephemeral message for Antigravity 2.0 UI
+    # Invariant: Zero context pollution - ephemeralMessage is never written to transcript.jsonl
+    active_tokens = analysis.get("active_context_tokens", analysis.get("total_tokens", 0))
+    active_pct = (active_tokens / max_tokens * 100) if max_tokens else 0.0
+    turn_cost = analysis.get("billed_cost", 0.0)
 
-    # Silent hook response (no context pollution)
-    print(json.dumps({}))
+    if diff_res and getattr(diff_res, "compaction_detected", False):
+        pruned_steps = getattr(diff_res, "pruned_step_indices", [])
+        p_min = min(pruned_steps) if pruned_steps else 0
+        p_max = max(pruned_steps) if pruned_steps else 0
+        rem_toks = getattr(diff_res, "removed_tokens", 0)
+        ephemeral_msg = (
+            f"Context Compaction Detected: Pruned steps #{p_min}–#{p_max} "
+            f"(~{format_tokens(rem_toks)} tokens freed across {len(diff_res.removed)} blocks). "
+            f"Active window: {active_pct:.1f}% ({format_tokens(active_tokens)}/{format_tokens(max_tokens)})."
+        )
+    elif active_pct >= 80.0:
+        ephemeral_msg = (
+            f"Context Warning: Window at {active_pct:.1f}% capacity "
+            f"({format_tokens(active_tokens)} / {format_tokens(max_tokens)} tokens). "
+            f"Consider summarizing or resetting conversation."
+        )
+    else:
+        added_tok = getattr(diff_res, "added_tokens", 0) if diff_res else 0
+        delta_str = f" · +{format_tokens(added_tok)} tok this turn" if added_tok > 0 else ""
+        ephemeral_msg = (
+            f"Context: {active_pct:.1f}% ({format_tokens(active_tokens)} / {format_tokens(max_tokens)} tokens)"
+            f"{delta_str} · Session Value: ${turn_cost:,.2f}"
+        )
+
+    output_payload = {
+        "injectSteps": [
+            {
+                "ephemeralMessage": ephemeral_msg
+            }
+        ]
+    }
+    print(json.dumps(output_payload))
+
 
 if __name__ == "__main__":
     main()
+

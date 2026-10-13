@@ -149,7 +149,8 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                     return api_routes.query_activity_matrix(conn, target_tz, project_param)
                 elif path == "/api/conversations":
                     limit = int(qs.get("limit", [200])[0])
-                    return api_routes.query_conversations_list(conn, limit, target_tz, project_param)
+                    view_mode = qs.get("view", qs.get("mode", ["hierarchy"]))[0]
+                    return api_routes.query_conversations_list(conn, limit, target_tz, project_param, view_mode)
                 elif path.startswith("/api/session/"):
                     session_id = path.split("/")[-1]
                     session_data = api_routes.query_session_details(conn, session_id, target_tz)
@@ -287,10 +288,16 @@ def main():
         sys.exit(0)
 
     try:
-        from db import DEFAULT_DB_PATH
+        from context_monitor.db import DEFAULT_DB_PATH, init_db
         db_path = DEFAULT_DB_PATH
+        init_db(db_path)
     except ImportError:
-        db_path = Path(os.path.expanduser("~/.gemini/antigravity/analytics.db"))
+        try:
+            from db import DEFAULT_DB_PATH, init_db
+            db_path = DEFAULT_DB_PATH
+            init_db(db_path)
+        except ImportError:
+            db_path = Path(os.path.expanduser("~/.gemini/antigravity/analytics.db"))
 
     watcher = sse_stream.DbChangeWatcher(db_path)
     watcher.start()

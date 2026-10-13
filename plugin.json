@@ -1,5 +1,6 @@
 {
   "name": "context-monitor",
   "version": "1.0.0",
-  "description": "Displays real-time context window usage, estimated tokens, and capacity progress bar after each agent response."
+  "description": "Displays real-time context window usage, estimated tokens, and capacity progress bar after each agent response.",
+  "logo": "assets/logo.svg"
 }

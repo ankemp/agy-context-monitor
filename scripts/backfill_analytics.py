@@ -131,6 +131,9 @@ def parse_conversation(conv_dir: Path) -> dict | None:
     failed_tool_calls = 0
     project = None
     cur_model = first_model
+    detected_parent_id = None
+    dispatched_subagents = []
+    pending_subagent_specs = []
 
     with open(transcript_path, "r", encoding="utf-8", errors="replace") as f:
         for line in f:
@@ -215,7 +218,18 @@ def parse_conversation(conv_dir: Path) -> dict | None:
                         clean_cmd = str(cmd_line).strip("\"'") if cmd_line else None
                         
                         # Check redundant file reads
-                        if tc_name == "view_file" and clean_path:
+                        if tc_name == "invoke_subagent":
+                            sub_raw = tc_args.get("Subagents", "")
+                            if isinstance(sub_raw, str):
+                                try:
+                                    pending_subagent_specs = json.loads(sub_raw) if sub_raw.strip().startswith("[") else []
+                                except Exception:
+                                    pending_subagent_specs = []
+                            elif isinstance(sub_raw, list):
+                                pending_subagent_specs = sub_raw
+                            else:
+                                pending_subagent_specs = []
+                        elif tc_name == "view_file" and clean_path:
                             norm_path = clean_path.lower()
                             if norm_path in seen_files:
                                 redundant_reads += 1
@@ -288,6 +302,10 @@ def parse_conversation(conv_dir: Path) -> dict | None:
                 category = "System: Background Task Outputs"
                 pending_tool_calls = []
                 detail = extract_system_message_detail(content)
+                if step_idx <= 2 and not detected_parent_id:
+                    m_snd = re.search(r"\[Message\]\s+timestamp=[^\s]+\s+sender=([a-zA-Z0-9_\-]+)", content)
+                    if m_snd:
+                        detected_parent_id = m_snd.group(1)
 
             elif step_type == "CONVERSATION_HISTORY":
                 activity = "History Compaction"
@@ -302,7 +320,25 @@ def parse_conversation(conv_dir: Path) -> dict | None:
                 tool_args = tool_info[1]
                 primary_tool_name = tool_name
 
-                if tool_name == "view_file" or "File Path:" in content:
+                if (tool_name == "invoke_subagent" or ("Created the following subagents:" in content and pending_subagent_specs)) and tool_name not in ("run_command", "view_file", "search_web", "manage_task"):
+                    activity = "Subagent Dispatched"
+                    tool_or_source = "`invoke_subagent`"
+                    category = "Tool Output: `invoke_subagent`"
+                    found_cids = re.findall(r'conversationId["\':\s]+([a-zA-Z0-9_\-]+)', content)
+                    if not found_cids:
+                        found_cids = re.findall(r'([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})', content)
+                    for c_idx, ch_id in enumerate(found_cids):
+                        spec = pending_subagent_specs[c_idx] if c_idx < len(pending_subagent_specs) else {}
+                        dispatched_subagents.append({
+                            "id": ch_id,
+                            "role": spec.get("Role") or spec.get("role") or "Autonomous Worker",
+                            "type": spec.get("TypeName") or spec.get("type") or "self",
+                            "model": spec.get("Model") or spec.get("model") or "inherit",
+                            "step_index": step_idx
+                        })
+                    pending_subagent_specs = []
+                    detail = f"Dispatched {len(found_cids)} subagent(s)" if found_cids else "Subagent dispatch"
+                elif tool_name == "view_file" or "File Path:" in content:
                     activity = "File Content"
                     tool_or_source = "`view_file`"
                     category = "Tool Output: File Contents (`view_file`)"
@@ -461,6 +497,9 @@ def parse_conversation(conv_dir: Path) -> dict | None:
         if "pro" in m: return "pro"
         return "flash"
 
+    compaction_count = 0
+    pruned_tokens = 0
+
     for s in steps:
         m_name = s.get("model_name", cur_model)
         s_type = s.get("step_type")
@@ -473,6 +512,9 @@ def parse_conversation(conv_dir: Path) -> dict | None:
 
         if s_type == "CHECKPOINT":
             # Context truncation: reset running_ctx to checkpoint tokens
+            compaction_count += 1
+            if running_ctx > tokens:
+                pruned_tokens += (running_ctx - tokens)
             running_ctx = tokens
             current_ephemeral = 0
         elif s_type == "EPHEMERAL_MESSAGE":
@@ -520,7 +562,11 @@ def parse_conversation(conv_dir: Path) -> dict | None:
             "failed_tool_calls": failed_tool_calls,
             "billed_cost": total_billed_cost,
             "billed_input_tokens": total_billed_input_tokens,
-            "billed_output_tokens": total_billed_output_tokens
+            "billed_output_tokens": total_billed_output_tokens,
+            "parent_id": detected_parent_id,
+            "dispatched_subagents": dispatched_subagents,
+            "compaction_count": compaction_count,
+            "pruned_tokens": pruned_tokens
         },
         "steps": steps,
         "tool_executions": tool_execs,
@@ -537,12 +583,36 @@ def run_backfill(brain_dir: Path = Path(os.path.expanduser("~/.gemini/antigravit
     t_start = time.time()
     conv_dirs = [p for p in brain_dir.iterdir() if p.is_dir() and not p.name.startswith(".")]
     total_convs = len(conv_dirs)
-    print(f"\n🚀 Starting Antigravity Analytics Back-Fill (Efficiency & Velocity Edition)...")
-    print(f"📁 Source: {brain_dir}")
-    print(f"📊 Found:  {total_convs} total conversation transcripts")
+    print(f"\n🚀 Starting Antigravity Analytics Back-Fill (Hierarchy & Swarm Edition)...", flush=True)
+    print(f"📁 Source: {brain_dir}", flush=True)
+    print(f"📊 Found:  {total_convs} total conversation transcripts", flush=True)
 
+    # Pass 1: Parse all conversations and build hierarchy maps
+    data_list = []
+    data_by_id = {}
+    parent_map = {}
+    subagent_meta = {}
+
+    print("  [Pass 1/2] Parsing transcripts and discovering agent lineage...", flush=True)
+    for i, cdir in enumerate(conv_dirs, 1):
+        data = parse_conversation(cdir)
+        if not data:
+            continue
+        cid = data["conversation"]["id"]
+        data_list.append(data)
+        data_by_id[cid] = data
+
+        p_id = data["conversation"].get("parent_id")
+        if p_id:
+            parent_map[cid] = p_id
+
+        for ch in data["conversation"].get("dispatched_subagents", []):
+            parent_map[ch["id"]] = cid
+            subagent_meta[ch["id"]] = ch
+
+    # Pass 2: Resolve root_id, depth, project inheritance, semantic titles, and commit to SQLite
+    print("  [Pass 2/2] Resolving swarm graph lineages, inheriting metadata, and writing to SQLite...", flush=True)
     conn = get_db_connection()
-    
     processed_convs = 0
     total_steps_inserted = 0
     total_tools_inserted = 0
@@ -550,24 +620,64 @@ def run_backfill(brain_dir: Path = Path(os.path.expanduser("~/.gemini/antigravit
 
     try:
         with conn:
-            for i, cdir in enumerate(conv_dirs, 1):
-                data = parse_conversation(cdir)
-                if not data:
-                    continue
-
+            for i, data in enumerate(data_list, 1):
                 conv = data["conversation"]
+                cid = conv["id"]
                 steps = data["steps"]
                 tools = data["tool_executions"]
 
-                # Upsert conversation with new metrics
+                # Walk ancestors to determine root_id and depth
+                curr = cid
+                depth = 0
+                visited = set()
+                while curr in parent_map and curr not in visited and depth < 25:
+                    visited.add(curr)
+                    curr = parent_map[curr]
+                    depth += 1
+
+                root_id = curr
+                parent_id = parent_map.get(cid)
+                conv["parent_id"] = parent_id
+                conv["root_id"] = root_id
+                conv["depth"] = depth
+
+                meta = subagent_meta.get(cid, {})
+                conv["subagent_role"] = meta.get("role")
+                conv["subagent_type"] = meta.get("type")
+                conv["invoking_step_index"] = meta.get("step_index")
+
+                # Inherit project from ancestors if missing
+                if not conv.get("project") and depth > 0:
+                    curr_ancestor = parent_id
+                    while curr_ancestor:
+                        anc_data = data_by_id.get(curr_ancestor)
+                        if anc_data and anc_data["conversation"].get("project"):
+                            conv["project"] = anc_data["conversation"]["project"]
+                            break
+                        curr_ancestor = parent_map.get(curr_ancestor)
+
+                # Generate clean semantic title if generic
+                if depth > 0 and (not conv.get("title") or conv["title"] in ("Active Session", "") or conv["title"].startswith("Conversation ")):
+                    role = conv.get("subagent_role") or "Worker"
+                    root_title = "Task"
+                    if root_id in data_by_id:
+                        root_title = data_by_id[root_id]["conversation"].get("title") or "Task"
+                    m_sub = re.match(r"^\[.+?\]\s*(.+)", root_title)
+                    if m_sub:
+                        root_title = m_sub.group(1)
+                    conv["title"] = f"[{role}] {root_title[:90]}"
+
+                # Upsert conversation with hierarchy metrics
                 conn.execute("""
                     INSERT INTO conversations (
                         id, title, project, model_name, created_at, updated_at, total_steps, total_characters, total_tokens,
                         duration_seconds, active_agent_seconds, active_pairing_seconds, thinking_tokens,
                         user_prompts, tool_calls_count, redundant_file_reads, lines_written, lines_edited, failed_tool_calls,
-                        billed_cost, billed_input_tokens, billed_output_tokens
+                        billed_cost, billed_input_tokens, billed_output_tokens,
+                        parent_id, root_id, depth, subagent_role, subagent_type, invoking_step_index,
+                        compaction_count, pruned_tokens
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(id) DO UPDATE SET
                         title = excluded.title,
                         project = excluded.project,
@@ -589,7 +699,15 @@ def run_backfill(brain_dir: Path = Path(os.path.expanduser("~/.gemini/antigravit
                         failed_tool_calls = excluded.failed_tool_calls,
                         billed_cost = excluded.billed_cost,
                         billed_input_tokens = excluded.billed_input_tokens,
-                        billed_output_tokens = excluded.billed_output_tokens
+                        billed_output_tokens = excluded.billed_output_tokens,
+                        parent_id = excluded.parent_id,
+                        root_id = excluded.root_id,
+                        depth = excluded.depth,
+                        subagent_role = excluded.subagent_role,
+                        subagent_type = excluded.subagent_type,
+                        invoking_step_index = excluded.invoking_step_index,
+                        compaction_count = excluded.compaction_count,
+                        pruned_tokens = excluded.pruned_tokens
                 """, (
                     conv["id"], conv["title"], conv["project"], conv["model_name"], conv["created_at"],
                     conv["updated_at"], conv["total_steps"], conv["total_characters"],
@@ -600,7 +718,11 @@ def run_backfill(brain_dir: Path = Path(os.path.expanduser("~/.gemini/antigravit
                     conv["failed_tool_calls"],
                     conv.get("billed_cost", 0.0),
                     conv.get("billed_input_tokens", 0),
-                    conv.get("billed_output_tokens", 0)
+                    conv.get("billed_output_tokens", 0),
+                    conv["parent_id"], conv["root_id"], conv["depth"],
+                    conv["subagent_role"], conv["subagent_type"], conv["invoking_step_index"],
+                    conv.get("compaction_count", 0),
+                    conv.get("pruned_tokens", 0)
                 ))
 
                 # Bulk insert steps (replace existing)
@@ -665,8 +787,9 @@ def run_backfill(brain_dir: Path = Path(os.path.expanduser("~/.gemini/antigravit
                 total_tokens_computed += conv["total_tokens"]
 
                 if i % 25 == 0 or i == total_convs:
+                    conn.commit()
                     pct = (i / total_convs) * 100
-                    print(f"  [{pct:5.1f}%] Processed {i}/{total_convs} conversations ({total_steps_inserted:,} steps)...")
+                    print(f"  [{pct:5.1f}%] Processed {i}/{total_convs} conversations ({total_steps_inserted:,} steps)...", flush=True)
 
     finally:
         conn.close()

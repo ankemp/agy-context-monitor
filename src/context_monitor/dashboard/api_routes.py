@@ -71,6 +71,8 @@ def query_summary_data(conn, tz=None, project=None):
     row = cur.execute(f"""
         SELECT 
             COUNT(*) as total_convs,
+            COUNT(CASE WHEN parent_id IS NULL THEN 1 END) as root_convs,
+            COUNT(CASE WHEN parent_id IS NOT NULL THEN 1 END) as subagent_convs,
             SUM(total_steps) as total_steps,
             SUM(total_tokens) as total_tokens,
             SUM(total_characters) as total_chars,
@@ -194,6 +196,8 @@ def query_summary_data(conn, tz=None, project=None):
 
     return {
         "total_convs": row["total_convs"] or 0,
+        "root_convs": row["root_convs"] or (row["total_convs"] or 0),
+        "subagent_convs": row["subagent_convs"] or 0,
         "total_steps": row["total_steps"] or 0,
         "total_tokens": row["total_tokens"] or 0,
         "total_chars": row["total_chars"] or 0,
@@ -674,45 +678,127 @@ def query_activity_matrix(conn, tz=None, project=None):
         }
     }
 
-def query_conversations_list(conn, limit=200, tz=None, project=None):
+def query_conversations_list(conn, limit=200, tz=None, project=None, view_mode="hierarchy"):
     cur = conn.cursor()
-    where_clause = ""
-    params = ()
+    target_tz = get_target_tz(tz)
+    where_parts = []
+    params = []
     if project:
         if project == "(unassigned)":
-            where_clause = "WHERE (project IS NULL OR project = '')"
+            where_parts.append("(project IS NULL OR project = '')")
         else:
-            where_clause = "WHERE project = ?"
-            params = (project,)
-        
+            where_parts.append("project = ?")
+            params.append(project)
+
+    if view_mode == "hierarchy":
+        where_parts.append("parent_id IS NULL")
+
+    where_clause = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
+
     rows = cur.execute(f"""
-        SELECT id, title, project, model_name, created_at, total_steps, total_tokens, duration_seconds, active_agent_seconds, active_pairing_seconds, billed_cost, billed_input_tokens, billed_output_tokens
+        SELECT id, title, project, model_name, created_at, total_steps, total_tokens,
+               duration_seconds, active_agent_seconds, active_pairing_seconds,
+               billed_cost, billed_input_tokens, billed_output_tokens,
+               parent_id, root_id, depth, subagent_role, subagent_type, invoking_step_index,
+               compaction_count, pruned_tokens
         FROM conversations
         {where_clause}
         ORDER BY created_at DESC
         LIMIT {limit}
-    """, params).fetchall()
+    """, tuple(params)).fetchall()
 
     convs = []
-    target_tz = get_target_tz(tz)
+    root_ids = [r["id"] for r in rows]
+
+    descendants_by_root = {}
+    if view_mode == "hierarchy" and root_ids:
+        placeholders = ",".join("?" for _ in root_ids)
+        desc_rows = cur.execute(f"""
+            SELECT id, title, project, model_name, created_at, total_steps, total_tokens,
+                   duration_seconds, active_agent_seconds, active_pairing_seconds,
+                   billed_cost, billed_input_tokens, billed_output_tokens,
+                   parent_id, root_id, depth, subagent_role, subagent_type, invoking_step_index,
+                   compaction_count, pruned_tokens
+            FROM conversations
+            WHERE root_id IN ({placeholders}) AND id != root_id
+            ORDER BY depth ASC, invoking_step_index ASC, created_at ASC
+        """, tuple(root_ids)).fetchall()
+
+        for dr in desc_rows:
+            rid = dr["root_id"]
+            if rid not in descendants_by_root:
+                descendants_by_root[rid] = []
+            d_dt = parse_to_local_dt(dr["created_at"], target_tz)
+            d_act = (dr["billed_input_tokens"] or 0) + (dr["billed_output_tokens"] or 0)
+            descendants_by_root[rid].append({
+                "id": dr["id"],
+                "title": dr["title"] or f"Subagent {dr['id'][:8]}",
+                "project": dr["project"] or "(unassigned)",
+                "model_name": dr["model_name"] or "Gemini",
+                "created_at": d_dt.strftime("%Y-%m-%d %H:%M") if d_dt else dr["created_at"],
+                "total_steps": dr["total_steps"] or 0,
+                "tokens": d_act,
+                "total_tokens": d_act,
+                "disk_tokens": dr["total_tokens"] or 0,
+                "duration_seconds": dr["duration_seconds"] or 0,
+                "active_agent_seconds": dr["active_agent_seconds"] or 0,
+                "active_pairing_seconds": dr["active_pairing_seconds"] or 0,
+                "billed_cost": round(dr["billed_cost"] or 0.0, 2),
+                "parent_id": dr["parent_id"],
+                "root_id": dr["root_id"],
+                "depth": dr["depth"] or 1,
+                "subagent_role": dr["subagent_role"] or "Worker",
+                "subagent_type": dr["subagent_type"] or "self",
+                "invoking_step_index": dr["invoking_step_index"],
+                "compaction_count": dr["compaction_count"] or 0,
+                "pruned_tokens": dr["pruned_tokens"] or 0
+            })
 
     for r in rows:
         dt = parse_to_local_dt(r["created_at"], target_tz)
         act_tok = (r["billed_input_tokens"] or 0) + (r["billed_output_tokens"] or 0)
+        c_cost = round(r["billed_cost"] or 0.0, 2)
+        c_steps = r["total_steps"] or 0
+        c_id = r["id"]
+        c_compaction = r["compaction_count"] or 0
+        c_pruned = r["pruned_tokens"] or 0
+
+        all_desc = descendants_by_root.get(c_id, [])
+        fleet_cost = round(c_cost + sum(d["billed_cost"] for d in all_desc), 2)
+        fleet_tokens = act_tok + sum(d["tokens"] for d in all_desc)
+        fleet_steps = c_steps + sum(d["total_steps"] for d in all_desc)
+        fleet_compaction = c_compaction + sum(d.get("compaction_count", 0) for d in all_desc)
+        fleet_pruned = c_pruned + sum(d.get("pruned_tokens", 0) for d in all_desc)
+        subagent_count = len(all_desc)
+
         convs.append({
-            "id": r["id"],
+            "id": c_id,
             "title": r["title"] or f"Conversation {r['id'][:8]}",
             "project": r["project"] or "(unassigned)",
             "model_name": r["model_name"] or "Gemini",
             "created_at": dt.strftime("%Y-%m-%d %H:%M") if dt else r["created_at"],
-            "total_steps": r["total_steps"] or 0,
+            "total_steps": c_steps,
             "tokens": act_tok,
             "total_tokens": act_tok,
             "disk_tokens": r["total_tokens"] or 0,
             "duration_seconds": r["duration_seconds"] or 0,
             "active_agent_seconds": r["active_agent_seconds"] or 0,
             "active_pairing_seconds": r["active_pairing_seconds"] or 0,
-            "billed_cost": round(r["billed_cost"] or 0.0, 2)
+            "billed_cost": c_cost,
+            "parent_id": r["parent_id"],
+            "root_id": r["root_id"],
+            "depth": r["depth"] or 0,
+            "subagent_role": r["subagent_role"],
+            "subagent_type": r["subagent_type"],
+            "subagent_count": subagent_count,
+            "fleet_cost": fleet_cost,
+            "fleet_tokens": fleet_tokens,
+            "fleet_steps": fleet_steps,
+            "compaction_count": c_compaction,
+            "pruned_tokens": c_pruned,
+            "fleet_compaction_count": fleet_compaction,
+            "fleet_pruned_tokens": fleet_pruned,
+            "subagents": all_desc
         })
     return convs
 
@@ -895,12 +981,126 @@ def query_session_details(conn, cid, tz=None):
     if dt_c:
         conv_dict["created_at"] = dt_c.strftime("%Y-%m-%d %H:%M:%S")
 
+    c_act = (conv_dict.get("billed_input_tokens") or 0) + (conv_dict.get("billed_output_tokens") or 0)
+    conv_dict["tokens"] = c_act if c_act > 0 else (conv_dict.get("total_tokens") or 0)
+    conv_dict["total_tokens"] = conv_dict.get("total_tokens") or c_act or 0
+    conv_dict["total_steps"] = conv_dict.get("total_steps") or len(steps)
+    conv_dict["compaction_count"] = conv_dict.get("compaction_count") or 0
+    conv_dict["pruned_tokens"] = conv_dict.get("pruned_tokens") or 0
+
+    compaction_meta = {
+        "count": conv_dict["compaction_count"],
+        "pruned_tokens": conv_dict["pruned_tokens"],
+        "has_compaction": bool(conv_dict["compaction_count"] > 0 or conv_dict["pruned_tokens"] > 0)
+    }
+
+    # Ancestor lineage trail
+    ancestors = []
+    curr_pid = conv_dict.get("parent_id")
+    visited_ancestors = set()
+    while curr_pid and curr_pid not in visited_ancestors:
+        visited_ancestors.add(curr_pid)
+        a_row = cur.execute("SELECT id, title, project, model_name, subagent_role, depth, parent_id FROM conversations WHERE id = ?", (curr_pid,)).fetchone()
+        if a_row:
+            a_dict = dict(a_row)
+            ancestors.insert(0, {
+                "id": a_dict["id"],
+                "title": a_dict["title"] or f"Session {a_dict['id'][:8]}",
+                "role": a_dict["subagent_role"] or "Parent",
+                "depth": a_dict["depth"] or 0
+            })
+            curr_pid = a_dict.get("parent_id")
+        else:
+            break
+
+    # Direct children
+    ch_rows = cur.execute("""
+        SELECT id, title, project, model_name, created_at, total_steps, total_tokens,
+               billed_cost, billed_input_tokens, billed_output_tokens,
+               depth, subagent_role, subagent_type, invoking_step_index
+        FROM conversations
+        WHERE parent_id = ?
+        ORDER BY invoking_step_index ASC, created_at ASC
+    """, (cid,)).fetchall()
+    children = []
+    for cr in ch_rows:
+        c_dt = parse_to_local_dt(cr["created_at"], target_tz)
+        c_act = (cr["billed_input_tokens"] or 0) + (cr["billed_output_tokens"] or 0)
+        children.append({
+            "id": cr["id"],
+            "title": cr["title"] or f"Sub-Agent {cr['id'][:8]}",
+            "role": cr["subagent_role"] or "Worker",
+            "type": cr["subagent_type"] or "self",
+            "depth": cr["depth"] or 1,
+            "step_index": cr["invoking_step_index"],
+            "steps": cr["total_steps"] or 0,
+            "tokens": c_act,
+            "cost": round(cr["billed_cost"] or 0.0, 2),
+            "created_at": c_dt.strftime("%Y-%m-%d %H:%M") if c_dt else cr["created_at"]
+        })
+
+    # Swarm fleet rollup for whole tree
+    effective_root = conv_dict.get("root_id") or cid
+    swarm_rows = cur.execute("""
+        SELECT id, title, parent_id, root_id, depth, subagent_role, subagent_type,
+               total_steps, total_tokens, billed_cost, billed_input_tokens, billed_output_tokens,
+               duration_seconds
+        FROM conversations
+        WHERE root_id = ? OR id = ?
+        ORDER BY depth ASC, created_at ASC
+    """, (effective_root, effective_root)).fetchall()
+
+    swarm_nodes = [dict(sr) for sr in swarm_rows]
+    total_swarm_cost = sum(n["billed_cost"] or 0.0 for n in swarm_nodes)
+    total_swarm_tokens = sum((n["billed_input_tokens"] or 0) + (n["billed_output_tokens"] or 0) for n in swarm_nodes)
+    total_swarm_steps = sum(n["total_steps"] or 0 for n in swarm_nodes)
+
+    fleet_summary = {
+        "root_id": effective_root,
+        "is_subagent": bool(conv_dict.get("parent_id")),
+        "subagent_count": max(0, len(swarm_nodes) - 1),
+        "total_cost": round(total_swarm_cost, 2),
+        "total_tokens": total_swarm_tokens,
+        "total_steps": total_swarm_steps
+    }
+
+    # Build nested tree topology for visualization
+    nodes_by_id = {}
+    for n in swarm_nodes:
+        n_id = n["id"]
+        n_act = (n["billed_input_tokens"] or 0) + (n["billed_output_tokens"] or 0)
+        nodes_by_id[n_id] = {
+            "id": n_id,
+            "title": n["title"] or f"Session {n_id[:8]}",
+            "role": n["subagent_role"] or ("Root Coordinator" if (n.get("depth") or 0) == 0 else "Worker"),
+            "type": n["subagent_type"] or "self",
+            "depth": n.get("depth") or 0,
+            "steps": n["total_steps"] or 0,
+            "tokens": n_act,
+            "cost": round(n["billed_cost"] or 0.0, 2),
+            "duration": round(n["duration_seconds"] or 0.0),
+            "is_current": (n_id == cid),
+            "children": []
+        }
+    
+    root_node = nodes_by_id.get(effective_root)
+    for n in swarm_nodes:
+        n_id = n["id"]
+        p_id = n["parent_id"]
+        if p_id and p_id in nodes_by_id and n_id != p_id:
+            nodes_by_id[p_id]["children"].append(nodes_by_id[n_id])
+
     return {
         "conversation": conv_dict,
         "steps": steps,
         "categories": categories,
         "phases": session_phases,
-        "top_consumers": top_consumers
+        "top_consumers": top_consumers,
+        "ancestors": ancestors,
+        "children": children,
+        "fleet_summary": fleet_summary,
+        "fleet_tree": root_node,
+        "compaction": compaction_meta
     }
 
 def query_turn_diff(conn, conv_id: str, step_a: int, step_b: int, cumulative: bool = True, tz=None):

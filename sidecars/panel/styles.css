@@ -1,0 +1,411 @@
+/*
+ * Host theme-adaptive stylesheet for the Context Monitor side panel extension.
+ * Synchronized with Antigravity host tokens via /preload.js.
+ *
+ * Invariant: Static visual updates only. Animations and transitions are suppressed
+ * to eliminate layout jitter and distracting flashes during live turns.
+ */
+
+:root {
+  --radius: 8px;
+  --gap: 10px;
+}
+
+* {
+  box-sizing: border-box;
+  /* Enforce static chart invariant across all elements */
+  transition: none !important;
+  animation: none !important;
+}
+
+[hidden] {
+  display: none !important;
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  background: var(--background, #f8f9fa);
+  color: var(--foreground, #1f1f1f);
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.panel {
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap);
+  padding: 12px;
+  max-width: 600px;
+  margin: 0 auto;
+}
+
+/* Header ------------------------------------------------------------------ */
+
+.panel-header {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-bottom: 6px;
+  border-bottom: 1px solid var(--border, #e0e0e0);
+}
+
+.header-main {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.header-main h1 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 700;
+  letter-spacing: -0.2px;
+}
+
+.header-meta {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+/* Badges ------------------------------------------------------------------ */
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 7px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 500;
+  background: var(--secondary, #eef0f2);
+  color: var(--secondary-foreground, var(--foreground, #1f1f1f));
+}
+
+.badge.ok {
+  background: color-mix(in srgb, #1e8e3e 18%, transparent);
+  color: color-mix(in srgb, #1e8e3e 75%, var(--foreground, #1f1f1f));
+}
+
+.badge.warning {
+  background: color-mix(in srgb, #e37400 18%, transparent);
+  color: color-mix(in srgb, #e37400 80%, var(--foreground, #1f1f1f));
+}
+
+.badge.error {
+  background: color-mix(in srgb, #d93025 18%, transparent);
+  color: color-mix(in srgb, #d93025 80%, var(--foreground, #1f1f1f));
+}
+
+.badge.secondary {
+  background: var(--secondary, #f1f3f4);
+  color: var(--muted-foreground, #5f6368);
+  border: 1px solid var(--border, #e0e0e0);
+}
+
+/* Cards ------------------------------------------------------------------- */
+
+.card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+  background: var(--card, #ffffff);
+  border: 1px solid var(--card-border, var(--border, #e0e0e0));
+  border-radius: var(--radius);
+}
+
+.card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.card h2 {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--foreground, #1f1f1f);
+}
+
+.capacity-val {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--primary, #1a73e8);
+}
+
+.muted {
+  color: var(--muted-foreground, #666666);
+}
+
+.small {
+  font-size: 11px;
+}
+
+.section-subtitle {
+  margin-top: 4px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+}
+
+.hint-text {
+  margin-top: 6px;
+  font-style: italic;
+}
+
+/* Global DL Facts --------------------------------------------------------- */
+
+.facts {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 4px 14px;
+  margin: 0;
+  padding: 4px 0;
+}
+
+.facts dt {
+  color: var(--muted-foreground, #5f6368);
+  font-weight: 500;
+}
+
+.facts dd {
+  margin: 0;
+  font-weight: 600;
+  color: var(--foreground, #1f1f1f);
+}
+
+/* Multi-Segment Progress Bar ---------------------------------------------- */
+
+.progress-track {
+  width: 100%;
+  height: 10px;
+  background: var(--secondary, #e8eaed);
+  border-radius: 5px;
+  overflow: hidden;
+  position: relative;
+}
+
+.segment-container {
+  display: flex;
+  height: 100%;
+  width: 100%;
+  border-radius: 5px;
+  overflow: hidden;
+}
+
+.bar-segment {
+  height: 100%;
+  min-width: 2px;
+}
+
+.bar-segment.reasoning {
+  background: #1a73e8;
+}
+
+.bar-segment.tools {
+  background: #12b5cb;
+}
+
+.bar-segment.system {
+  background: #f9ab00;
+}
+
+.bar-segment.user {
+  background: #34a853;
+}
+
+.bar-segment.summary {
+  background: #a142f4;
+}
+
+.bar-segment.other {
+  background: #9aa0a6;
+}
+
+.bar-segment.alert {
+  background: #d93025;
+}
+
+/* Compaction Banner ------------------------------------------------------- */
+
+.compaction-banner {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 10px;
+  background: color-mix(in srgb, #e37400 12%, var(--card, #ffffff));
+  border: 1px solid color-mix(in srgb, #e37400 35%, var(--border, #e0e0e0));
+  border-radius: var(--radius);
+}
+
+.banner-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.banner-tag {
+  font-weight: 600;
+  font-size: 11px;
+  color: color-mix(in srgb, #e37400 85%, var(--foreground, #1f1f1f));
+}
+
+.banner-body {
+  margin: 0;
+  font-size: 11px;
+  color: var(--foreground, #1f1f1f);
+}
+
+.banner-stats {
+  color: var(--muted-foreground, #666666);
+}
+
+/* Category Breakdown ------------------------------------------------------ */
+
+.category-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.category-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 11px;
+  padding: 2px 0;
+  border-bottom: 1px dashed color-mix(in srgb, var(--border, #e0e0e0) 60%, transparent);
+}
+
+.category-item:last-child {
+  border-bottom: none;
+}
+
+.cat-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cat-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.cat-val {
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+/* Top Steps List ---------------------------------------------------------- */
+
+.step-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.step-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px 8px;
+  background: color-mix(in srgb, var(--secondary, #f1f3f4) 50%, var(--card, #ffffff));
+  border: 1px solid var(--border, #e0e0e0);
+  border-radius: 6px;
+}
+
+.step-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-weight: 600;
+  font-size: 11px;
+}
+
+.step-source {
+  color: var(--primary, #1a73e8);
+}
+
+.step-tokens {
+  font-weight: 600;
+}
+
+.step-detail {
+  font-size: 11px;
+  color: var(--muted-foreground, #666666);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Actions ----------------------------------------------------------------- */
+
+.actions {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+button.action-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 6px 10px;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--primary-foreground, #ffffff);
+  background: var(--primary, #1a73e8);
+  border: 1px solid transparent;
+  border-radius: 6px;
+  cursor: pointer;
+  text-align: center;
+}
+
+button.action-btn:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--primary, #1a73e8) 88%, var(--foreground, #000000));
+}
+
+button.action-btn:active:not(:disabled) {
+  background: color-mix(in srgb, var(--primary, #1a73e8) 76%, var(--foreground, #000000));
+}
+
+button.action-btn.secondary {
+  color: var(--foreground, #1f1f1f);
+  background: transparent;
+  border-color: var(--border, #d0d0d0);
+}
+
+button.action-btn.secondary:hover:not(:disabled) {
+  background: var(--secondary, #f1f3f4);
+}
+
+/* Toast ------------------------------------------------------------------- */
+
+.toast {
+  position: fixed;
+  bottom: 12px;
+  left: 12px;
+  right: 12px;
+  padding: 6px 10px;
+  font-size: 11px;
+  text-align: center;
+  background: var(--card, #ffffff);
+  color: var(--foreground, #1f1f1f);
+  border: 1px solid var(--border, #e0e0e0);
+  border-radius: 6px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+  z-index: 100;
+}
+
+.toast.error {
+  border-color: #d93025;
+  color: #d93025;
+}

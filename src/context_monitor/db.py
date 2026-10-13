@@ -36,7 +36,19 @@ CREATE TABLE IF NOT EXISTS conversations (
     redundant_file_reads INTEGER DEFAULT 0,
     lines_written INTEGER DEFAULT 0,
     lines_edited INTEGER DEFAULT 0,
-    failed_tool_calls INTEGER DEFAULT 0
+    failed_tool_calls INTEGER DEFAULT 0,
+    billed_cost REAL DEFAULT 0.0,
+    billed_input_tokens INTEGER DEFAULT 0,
+    billed_output_tokens INTEGER DEFAULT 0,
+    parent_id TEXT,
+    root_id TEXT,
+    depth INTEGER DEFAULT 0,
+    subagent_role TEXT,
+    subagent_type TEXT,
+    invoking_step_index INTEGER,
+    compaction_count INTEGER DEFAULT 0,
+    pruned_tokens INTEGER DEFAULT 0,
+    FOREIGN KEY (parent_id) REFERENCES conversations(id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS steps (
@@ -91,6 +103,9 @@ CREATE TABLE IF NOT EXISTS transcript_blocks (
 INDEXES_SQL = """
 CREATE INDEX IF NOT EXISTS idx_conversations_created ON conversations(created_at);
 CREATE INDEX IF NOT EXISTS idx_conversations_project ON conversations(project);
+CREATE INDEX IF NOT EXISTS idx_conversations_parent ON conversations(parent_id);
+CREATE INDEX IF NOT EXISTS idx_conversations_root ON conversations(root_id);
+CREATE INDEX IF NOT EXISTS idx_conversations_depth ON conversations(depth);
 CREATE INDEX IF NOT EXISTS idx_steps_created ON steps(created_at);
 CREATE INDEX IF NOT EXISTS idx_steps_conv_step ON steps(conversation_id, step_index);
 CREATE INDEX IF NOT EXISTS idx_steps_category ON steps(category);
@@ -148,7 +163,15 @@ def init_db(db_path: Path = DEFAULT_DB_PATH):
             ("failed_tool_calls", "INTEGER DEFAULT 0"),
             ("billed_cost", "REAL DEFAULT 0.0"),
             ("billed_input_tokens", "INTEGER DEFAULT 0"),
-            ("billed_output_tokens", "INTEGER DEFAULT 0")
+            ("billed_output_tokens", "INTEGER DEFAULT 0"),
+            ("parent_id", "TEXT"),
+            ("root_id", "TEXT"),
+            ("depth", "INTEGER DEFAULT 0"),
+            ("subagent_role", "TEXT"),
+            ("subagent_type", "TEXT"),
+            ("invoking_step_index", "INTEGER"),
+            ("compaction_count", "INTEGER DEFAULT 0"),
+            ("pruned_tokens", "INTEGER DEFAULT 0")
         ]
         for col, ctype in conv_new_cols:
             if col not in conv_cols:
