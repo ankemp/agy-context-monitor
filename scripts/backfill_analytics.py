@@ -28,6 +28,14 @@ if str(_root / "src") not in sys.path:
 
 from context_monitor.db import get_db_connection, init_db, DEFAULT_DB_PATH
 from context_monitor.formats import BlockParser
+from context_monitor.pricing import (
+    DEFAULT_MODEL,
+    PRICING,
+    get_pricing_key,
+    get_model_context_limit,
+    calculate_step_cost,
+    extract_model_switch,
+)
 
 CHARS_PER_TOKEN = 3.8
 
@@ -52,35 +60,30 @@ def extract_system_message_detail(content: str) -> str:
     return f"{sender} {code} {snippet}".strip()
 
 def detect_model_from_transcript(transcript_path: Path) -> tuple[str, str, int]:
-    first_model = "Gemini Flash"
-    latest_model = "Gemini Flash"
+    first_model = DEFAULT_MODEL
+    latest_model = DEFAULT_MODEL
     found_first = False
     try:
         with open(transcript_path, "r", encoding="utf-8", errors="replace") as f:
             for line in f:
-                if "Model Selection" in line:
-                    m = re.search(r"Model Selection\` from (?:.*?) to (.+?)\.\s*(?:No need|$)", line)
-                    if m:
-                        model = m.group(1).strip()
+                if not line.strip():
+                    continue
+                try:
+                    step = json.loads(line)
+                except Exception:
+                    continue
+                if step.get("type") == "USER_INPUT":
+                    content = step.get("content", "")
+                    switched_model = extract_model_switch(content)
+                    if switched_model:
                         if not found_first:
-                            first_model = model
+                            first_model = switched_model
                             found_first = True
-                        latest_model = model
+                        latest_model = switched_model
     except Exception:
         pass
 
-    lower = latest_model.lower()
-    if "pro" in lower:
-        max_tokens = 2_000_000
-    elif "flash" in lower or "gemini" in lower:
-        max_tokens = 1_000_000
-    elif "claude" in lower:
-        max_tokens = 200_000
-    elif "gpt" in lower or "o1" in lower or "o3" in lower:
-        max_tokens = 128_000
-    else:
-        max_tokens = 1_000_000
-
+    max_tokens = get_model_context_limit(latest_model)
     return first_model, latest_model, max_tokens
 
 def classify_phase(step_type: str, tool_name: str) -> str:
@@ -131,6 +134,8 @@ def parse_conversation(conv_dir: Path) -> dict | None:
     failed_tool_calls = 0
     project = None
     cur_model = first_model
+    models_used = [cur_model]
+    model_transitions = [cur_model]
     detected_parent_id = None
     dispatched_subagents = []
     pending_subagent_specs = []
@@ -157,10 +162,14 @@ def parse_conversation(conv_dir: Path) -> dict | None:
             is_error = 1 if (step.get("error") or step.get("status") == "ERROR" or (exit_code is not None and exit_code != 0)) else 0
 
             # Detect mid-session model switch
-            if "Model Selection" in content or (step_type == "USER_INPUT" and "<USER_SETTINGS_CHANGE>" in content):
-                m = re.search(r"Model Selection\` from (?:.*?) to (.+?)\.\s*(?:No need|$)", content)
-                if m:
-                    cur_model = m.group(1).strip()
+            if step_type == "USER_INPUT":
+                switched_model = extract_model_switch(content)
+                if switched_model:
+                    cur_model = switched_model
+                    if not model_transitions or model_transitions[-1] != cur_model:
+                        model_transitions.append(cur_model)
+                    if cur_model not in models_used:
+                        models_used.append(cur_model)
             
             if not project and step_type in ("USER_INPUT", "CHECKPOINT") and "<user_information>" in content:
                 m = re.search(r"(?:/Users/[^\s]+)\s*->\s*[^\s]+/([^\s]+)", content)
@@ -179,7 +188,7 @@ def parse_conversation(conv_dir: Path) -> dict | None:
             thinking_len = len(thinking)
             tool_calls_len = len(json.dumps(tool_calls)) if tool_calls else 0
             step_chars = content_len + thinking_len + tool_calls_len
-            est_tokens = int(step_chars / CHARS_PER_TOKEN)
+            est_tokens = step.get("est_tokens") if step.get("est_tokens") is not None else int(step_chars / CHARS_PER_TOKEN)
             step_thinking_tokens = int(thinking_len / CHARS_PER_TOKEN) if thinking_len else 0
             total_chars += step_chars
             total_thinking_tokens += step_thinking_tokens
@@ -483,20 +492,6 @@ def parse_conversation(conv_dir: Path) -> dict | None:
     running_ctx = 0
     current_ephemeral = 0
     
-    PRICING = {
-        "pro": (1.25, 2.50, 10.00),     # Gemini Pro / 3.1 Pro / 2.5 Pro
-        "flash": (0.075, 0.15, 0.60),   # Gemini Flash / 3.6 / 3.7 Flash
-        "claude": (3.00, 3.00, 15.00),  # Claude 3.5 / 3.7 Sonnet
-        "gpt": (2.50, 2.50, 10.00),     # GPT-4o / o1
-    }
-    
-    def get_pricing_key(m_name):
-        m = (m_name or "").lower()
-        if "claude" in m: return "claude"
-        if "gpt" in m or "o1" in m: return "gpt"
-        if "pro" in m: return "pro"
-        return "flash"
-
     compaction_count = 0
     pruned_tokens = 0
 
@@ -504,8 +499,7 @@ def parse_conversation(conv_dir: Path) -> dict | None:
         m_name = s.get("model_name", cur_model)
         s_type = s.get("step_type")
         tokens = s.get("est_tokens", 0)
-        
-        pkey = get_pricing_key(m_name)
+
         step_cost = 0.0
         step_in_tokens = 0
         step_out_tokens = 0
@@ -521,12 +515,9 @@ def parse_conversation(conv_dir: Path) -> dict | None:
             # Transient injection for immediate turn only
             current_ephemeral = tokens
         elif s_type == "PLANNER_RESPONSE":
-            in_rate_low, in_rate_high, out_rate = PRICING[pkey]
-            actual_in = running_ctx + current_ephemeral
-            in_rate = in_rate_high if actual_in > 128_000 else in_rate_low
-            step_cost = (actual_in / 1_000_000 * in_rate) + (tokens / 1_000_000 * out_rate)
-            step_in_tokens = actual_in
-            step_out_tokens = tokens
+            step_cost, step_in_tokens, step_out_tokens = calculate_step_cost(
+                running_ctx, current_ephemeral, tokens, m_name
+            )
             total_billed_cost += step_cost
             total_billed_input_tokens += step_in_tokens
             total_billed_output_tokens += step_out_tokens
@@ -539,12 +530,31 @@ def parse_conversation(conv_dir: Path) -> dict | None:
         s["billed_input_tokens"] = step_in_tokens
         s["billed_output_tokens"] = step_out_tokens
 
+    if not models_used and cur_model:
+        models_used = [cur_model]
+    if not model_transitions and cur_model:
+        model_transitions = [cur_model]
+
+    if len(model_transitions) > 1:
+        if len(model_transitions) <= 3:
+            conv_model_name = " → ".join(model_transitions)
+        else:
+            conv_model_name = f"{model_transitions[0]} → ... → {model_transitions[-1]}"
+        models_used_str = ", ".join(models_used)
+    elif models_used:
+        conv_model_name = models_used[0]
+        models_used_str = models_used[0]
+    else:
+        conv_model_name = cur_model
+        models_used_str = cur_model
+
     return {
         "conversation": {
             "id": cid,
             "title": title or f"Conversation {cid[:8]}",
             "project": project,
-            "model_name": cur_model,
+            "model_name": conv_model_name,
+            "models_used": models_used_str,
             "created_at": start_time or datetime.now().isoformat(),
             "updated_at": end_time or datetime.now().isoformat(),
             "total_steps": len(steps),
@@ -573,7 +583,11 @@ def parse_conversation(conv_dir: Path) -> dict | None:
         "parsed_blocks": parsed_blocks
     }
 
-def run_backfill(brain_dir: Path = Path(os.path.expanduser("~/.gemini/antigravity/brain"))):
+def run_backfill(
+    brain_dir: Path = Path(os.path.expanduser("~/.gemini/antigravity/brain")),
+    conversation_id: str | None = None,
+    force: bool = False,
+):
     init_db()
     
     if not brain_dir.exists():
@@ -581,7 +595,15 @@ def run_backfill(brain_dir: Path = Path(os.path.expanduser("~/.gemini/antigravit
         return
 
     t_start = time.time()
-    conv_dirs = [p for p in brain_dir.iterdir() if p.is_dir() and not p.name.startswith(".")]
+    if conversation_id:
+        target = brain_dir / conversation_id
+        if not target.exists():
+            print(f"Conversation directory not found: {target}")
+            return
+        conv_dirs = [target]
+    else:
+        conv_dirs = [p for p in brain_dir.iterdir() if p.is_dir() and not p.name.startswith(".")]
+
     total_convs = len(conv_dirs)
     print(f"\n🚀 Starting Antigravity Analytics Back-Fill (Hierarchy & Swarm Edition)...", flush=True)
     print(f"📁 Source: {brain_dir}", flush=True)
@@ -670,18 +692,19 @@ def run_backfill(brain_dir: Path = Path(os.path.expanduser("~/.gemini/antigravit
                 # Upsert conversation with hierarchy metrics
                 conn.execute("""
                     INSERT INTO conversations (
-                        id, title, project, model_name, created_at, updated_at, total_steps, total_characters, total_tokens,
+                        id, title, project, model_name, models_used, created_at, updated_at, total_steps, total_characters, total_tokens,
                         duration_seconds, active_agent_seconds, active_pairing_seconds, thinking_tokens,
                         user_prompts, tool_calls_count, redundant_file_reads, lines_written, lines_edited, failed_tool_calls,
                         billed_cost, billed_input_tokens, billed_output_tokens,
                         parent_id, root_id, depth, subagent_role, subagent_type, invoking_step_index,
                         compaction_count, pruned_tokens
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(id) DO UPDATE SET
                         title = excluded.title,
                         project = excluded.project,
                         model_name = excluded.model_name,
+                        models_used = excluded.models_used,
                         created_at = excluded.created_at,
                         updated_at = excluded.updated_at,
                         total_steps = excluded.total_steps,
@@ -709,7 +732,7 @@ def run_backfill(brain_dir: Path = Path(os.path.expanduser("~/.gemini/antigravit
                         compaction_count = excluded.compaction_count,
                         pruned_tokens = excluded.pruned_tokens
                 """, (
-                    conv["id"], conv["title"], conv["project"], conv["model_name"], conv["created_at"],
+                    conv["id"], conv["title"], conv["project"], conv["model_name"], conv.get("models_used", conv["model_name"]), conv["created_at"],
                     conv["updated_at"], conv["total_steps"], conv["total_characters"],
                     conv["total_tokens"], conv["duration_seconds"],
                     conv["active_agent_seconds"], conv["active_pairing_seconds"],
@@ -805,4 +828,9 @@ def run_backfill(brain_dir: Path = Path(os.path.expanduser("~/.gemini/antigravit
     print(f"-" * 50 + "\n")
 
 if __name__ == "__main__":
-    run_backfill()
+    import argparse
+    parser = argparse.ArgumentParser(description="Antigravity Historical Analytics Backfill")
+    parser.add_argument("--conversation-id", type=str, default=None, help="Backfill a specific conversation ID")
+    parser.add_argument("--force", action="store_true", help="Force re-indexing")
+    args = parser.parse_args()
+    run_backfill(conversation_id=args.conversation_id, force=args.force)

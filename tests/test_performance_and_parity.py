@@ -145,6 +145,9 @@ def test_project_filter_url_sync_and_chip_removal(tmp_path):
     assert "costProjectFilterText" not in html
     assert "Cost by Project" in html
     assert "costProjectSub" in html
+    assert 'id="liveSyncBadge"' in html
+    assert 'id="syncText"' in html
+    assert 'id="liveStatus2"' not in html
 
     # 2. Verify script.js contents
     with open(DASHBOARD_DIR / "static" / "script.js", "r", encoding="utf-8") as f:
@@ -243,5 +246,236 @@ def test_dashboard_compaction_and_modal_metrics(tmp_path):
     assert "modalCompactionScore" in js_code
 
     conn.close()
+
+def test_cache_invalidation_across_separate_request_connections(tmp_path):
+    db_file = tmp_path / "test_multi_conn.db"
+    init_db(db_file)
+
+    conn_w1 = get_db_connection(db_file)
+    conn_w1.execute("INSERT INTO conversations (id, title, created_at, total_steps, total_tokens) VALUES ('c1', 'T1', '2026-08-01T12:00:00Z', 1, 100)")
+    conn_w1.commit()
+    conn_w1.close()
+
+    call_count = 0
+    def compute(c):
+        nonlocal call_count
+        call_count += 1
+        return api_routes.query_summary_data(c)
+
+    # Request 1: Fresh connection
+    conn_r1 = get_db_connection(db_file)
+    res1 = get_cached_api_response(conn_r1, "/api/summary", lambda: compute(conn_r1))
+    conn_r1.close()
+    data1 = json.loads(res1.decode("utf-8"))
+    assert data1["total_convs"] == 1
+    assert call_count == 1
+
+    # Request 1.5: Another fresh connection WITHOUT external write -> must hit cache!
+    conn_r1b = get_db_connection(db_file)
+    res1b = get_cached_api_response(conn_r1b, "/api/summary", lambda: compute(conn_r1b))
+    conn_r1b.close()
+    assert res1b == res1
+    assert call_count == 1, "Fresh connection without DB writes must be served from cache!"
+
+    # External write (e.g. ingest.py)
+    conn_w2 = get_db_connection(db_file)
+    conn_w2.execute("INSERT INTO conversations (id, title, created_at, total_steps, total_tokens) VALUES ('c2', 'T2', '2026-08-01T13:00:00Z', 1, 200)")
+    conn_w2.commit()
+    conn_w2.close()
+
+    # Request 2: Another fresh connection (simulating HTTP request) -> must invalidate and recompute!
+    conn_r2 = get_db_connection(db_file)
+    res2 = get_cached_api_response(conn_r2, "/api/summary", lambda: compute(conn_r2))
+    conn_r2.close()
+    data2 = json.loads(res2.decode("utf-8"))
+    assert data2["total_convs"] == 2
+    assert call_count == 2, "Fresh connection after DB write must invalidate cache and recompute!"
+
+def test_broadcast_sse_clears_api_cache(tmp_path):
+    from context_monitor.dashboard.sse_stream import broadcast_sse
+    from context_monitor.dashboard.server import _API_CACHE
+
+    db_file = tmp_path / "test_sse_cache.db"
+    init_db(db_file)
+    conn = get_db_connection(db_file)
+
+    res = get_cached_api_response(conn, "/api/summary", lambda: {"total_convs": 42})
+    assert b"42" in res
+    assert "/api/summary" in _API_CACHE
+
+    broadcast_sse("db_update", {"timestamp": "2026-10-14T00:00:00Z"})
+    assert "/api/summary" not in _API_CACHE
+    conn.close()
+
+def test_clear_api_cache_directly(tmp_path):
+    from context_monitor.dashboard.server import clear_api_cache, _API_CACHE
+
+    db_file = tmp_path / "test_clear_cache.db"
+    init_db(db_file)
+    conn = get_db_connection(db_file)
+
+    res = get_cached_api_response(conn, "/api/test", lambda: {"status": "ok"})
+    assert b"ok" in res
+    assert "/api/test" in _API_CACHE
+
+    clear_api_cache()
+    assert len(_API_CACHE) == 0
+    conn.close()
+
+def test_multithreaded_cache_access(tmp_path):
+    import concurrent.futures
+
+    db_file = tmp_path / "test_threaded_cache.db"
+    init_db(db_file)
+
+    def worker(i):
+        conn = get_db_connection(db_file)
+        res = get_cached_api_response(conn, "/api/summary", lambda: api_routes.query_summary_data(conn))
+        conn.close()
+        return json.loads(res.decode("utf-8"))
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        futures = [executor.submit(worker, i) for i in range(10)]
+        for f in concurrent.futures.as_completed(futures):
+            res = f.result()
+            assert res["total_convs"] == 0
+
+    # Write from another connection
+    conn_w = get_db_connection(db_file)
+    conn_w.execute("INSERT INTO conversations (id, title, created_at, total_steps, total_tokens) VALUES ('c1', 'T1', '2026-08-01T12:00:00Z', 1, 100)")
+    conn_w.commit()
+    conn_w.close()
+
+    # Re-query across threads
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        futures = [executor.submit(worker, i) for i in range(10)]
+        for f in concurrent.futures.as_completed(futures):
+            res = f.result()
+            assert res["total_convs"] == 1
+
+def test_cache_with_in_memory_db():
+    conn = sqlite3.connect(":memory:")
+    conn.execute("CREATE TABLE t (x int);")
+    
+    count = 0
+    def compute():
+        nonlocal count
+        count += 1
+        return {"count": count}
+
+    res1 = get_cached_api_response(conn, "/api/mem", compute)
+    assert count == 1
+
+    res2 = get_cached_api_response(conn, "/api/mem", compute)
+    assert count == 1
+    assert res1 == res2
+
+    # In-memory database modification must invalidate cache
+    conn.execute("INSERT INTO t VALUES (42);")
+    conn.commit()
+    res3 = get_cached_api_response(conn, "/api/mem", compute)
+    assert count == 2
+    assert res3 != res2
+
+    # In-memory schema change must also invalidate cache
+    conn.execute("CREATE TABLE t2 (y text);")
+    conn.commit()
+    res4 = get_cached_api_response(conn, "/api/mem", compute)
+    assert count == 3
+    assert res4 != res3
+
+    conn.close()
+
+def test_db_change_watcher_string_path_and_lifecycle(tmp_path):
+    from context_monitor.dashboard.sse_stream import DbChangeWatcher, register_change_callback, unregister_change_callback
+    import time
+
+    db_file = tmp_path / "test_watcher.db"
+    init_db(db_file)
+
+    # Verify string path does not raise AttributeError
+    watcher = DbChangeWatcher(str(db_file), check_interval=0.1)
+    triggered = []
+
+    def on_change():
+        triggered.append(time.time())
+
+    register_change_callback(on_change)
+    try:
+        watcher.start()
+        time.sleep(0.15)
+
+        # Modify database
+        conn = get_db_connection(db_file)
+        conn.execute("INSERT INTO conversations (id, title, created_at, total_steps, total_tokens) VALUES ('cw1', 'W', '2026-08-01T12:00:00Z', 1, 10)")
+        conn.commit()
+        conn.close()
+
+        # Wait for watcher to detect change
+        deadline = time.time() + 2.0
+        while not triggered and time.time() < deadline:
+            time.sleep(0.05)
+
+        assert len(triggered) > 0, "DbChangeWatcher must fire callback when DB file changes"
+    finally:
+        watcher.stop()
+        unregister_change_callback(on_change)
+
+def test_monitor_connection_refreshes_on_file_recreation(tmp_path):
+    db_file = tmp_path / "test_recreate.db"
+    init_db(db_file)
+
+    conn = get_db_connection(db_file)
+    conn.execute("INSERT INTO conversations (id, title, created_at, total_steps, total_tokens) VALUES ('c1', 'T1', '2026-08-01T12:00:00Z', 1, 100)")
+    conn.commit()
+    conn.close()
+
+    conn_r1 = get_db_connection(db_file)
+    res1 = get_cached_api_response(conn_r1, "/api/summary", lambda: api_routes.query_summary_data(conn_r1))
+    conn_r1.close()
+    assert json.loads(res1)["total_convs"] == 1
+
+    # Remove file and recreate at exact same path
+    db_file.unlink()
+    init_db(db_file)
+    conn_w = get_db_connection(db_file)
+    conn_w.execute("INSERT INTO conversations (id, title, created_at, total_steps, total_tokens) VALUES ('c2', 'T2', '2026-08-01T13:00:00Z', 1, 200)")
+    conn_w.execute("INSERT INTO conversations (id, title, created_at, total_steps, total_tokens) VALUES ('c3', 'T3', '2026-08-01T14:00:00Z', 1, 300)")
+    conn_w.commit()
+    conn_w.close()
+
+    # Re-querying must detect the replaced inode, refresh monitor, and return fresh count
+    conn_r2 = get_db_connection(db_file)
+    res2 = get_cached_api_response(conn_r2, "/api/summary", lambda: api_routes.query_summary_data(conn_r2))
+    conn_r2.close()
+    assert json.loads(res2)["total_convs"] == 2
+
+def test_concurrent_multi_db_cache_isolation(tmp_path):
+    db1 = tmp_path / "iso1.db"
+    db2 = tmp_path / "iso2.db"
+    init_db(db1)
+    init_db(db2)
+
+    c1 = get_db_connection(db1)
+    c2 = get_db_connection(db2)
+
+    def slow_compute_db1():
+        # While computing DB1, query DB2
+        res_db2 = get_cached_api_response(c2, "/api/iso", lambda: {"db": "db2"})
+        assert json.loads(res_db2)["db"] == "db2"
+        return {"db": "db1"}
+
+    res_db1 = get_cached_api_response(c1, "/api/iso", slow_compute_db1)
+    assert json.loads(res_db1)["db"] == "db1"
+
+    # Query DB2 again — must NOT return DB1's payload
+    res_db2_again = get_cached_api_response(c2, "/api/iso", lambda: {"db": "db2_fresh"})
+    assert json.loads(res_db2_again)["db"] != "db1", "DB2 must not receive DB1's response"
+
+    c1.close()
+    c2.close()
+
+
+
 
 

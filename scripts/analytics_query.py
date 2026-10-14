@@ -36,20 +36,11 @@ if str(_root / "src") not in sys.path:
     sys.path.insert(0, str(_root / "src"))
 
 from context_monitor.db import get_db_connection, DEFAULT_DB_PATH
-
-PRICING = {
-    "pro": (1.25, 2.50, 10.00),     # Gemini Pro / 3.1 Pro / 2.5 Pro
-    "flash": (0.075, 0.15, 0.60),   # Gemini Flash / 3.6 / 3.7 Flash
-    "claude": (3.00, 3.00, 15.00),  # Claude 3.5 / 3.7 Sonnet
-    "gpt": (2.50, 2.50, 10.00),     # GPT-4o / o1
-}
-
-def get_pricing_key(model_name):
-    m = (model_name or "").lower()
-    if "claude" in m: return "claude"
-    if "gpt" in m or "o1" in m: return "gpt"
-    if "pro" in m: return "pro"
-    return "flash"
+from context_monitor.pricing import (
+    PRICING,
+    get_pricing_key,
+    calculate_step_cost,
+)
 
 def format_tokens(n: int) -> str:
     if not n:
@@ -109,12 +100,12 @@ def calculate_billed_cost(conn):
         elif s_type == "EPHEMERAL_MESSAGE":
             current_ephemeral = tokens
         elif s_type == "PLANNER_RESPONSE":
-            in_rate_low, in_rate_high, out_rate = PRICING[cur_pkey]
-            actual_in = running_ctx + current_ephemeral
-            in_rate = in_rate_high if actual_in > 128_000 else in_rate_low
-            total_cost += (actual_in / 1_000_000 * in_rate) + (tokens / 1_000_000 * out_rate)
-            total_in += actual_in
-            total_out += tokens
+            step_cost, step_in, step_out = calculate_step_cost(
+                running_ctx, current_ephemeral, tokens, model_name
+            )
+            total_cost += step_cost
+            total_in += step_in
+            total_out += step_out
             running_ctx += tokens
             current_ephemeral = 0
         else:
@@ -151,6 +142,9 @@ def print_summary(conn):
         FROM conversations
     """).fetchone()
 
+    multi_row = cur.execute("SELECT COUNT(*) FROM conversations WHERE models_used LIKE '%,%' OR model_name LIKE '%→%'").fetchone()
+    multi_convs = multi_row[0] if multi_row else 0
+
     mcp_row = cur.execute("SELECT COUNT(*) as mcp_calls, COUNT(DISTINCT mcp_server) as servers FROM tool_executions WHERE mcp_server IS NOT NULL").fetchone()
     total_mcp_calls = mcp_row["mcp_calls"] or 0
     total_mcp_servers = mcp_row["servers"] or 0
@@ -174,7 +168,7 @@ def print_summary(conn):
 
     autonomy_ratio = total_tools / max(1, total_prompts)
 
-    print(f" Total Conversations Tracked : {total_convs:,}")
+    print(f" Total Conversations Tracked : {total_convs:,} ({multi_convs:,} multi-model)")
     print(f" Total Logged Steps          : {total_steps:,} (avg {avg_steps:.1f} steps/session)")
     print(f" Static Disk Token Footprint : {format_tokens(total_tokens)} (~{total_chars:,} chars)")
     print(f" Cumulative Multi-Turn Input : {format_tokens(total_in)} tokens (area under curve)")

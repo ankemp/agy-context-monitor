@@ -133,9 +133,9 @@
         <select id="projectFilter" class="bg-dark-800 text-white text-xs px-3 py-1.5 rounded-lg border border-dark-700 outline-none hover:border-brand-500 transition-colors hidden cursor-pointer" onchange="window.handleProjectChange(this.value)">
           <option value="all">All Projects</option>
         </select>
-        <div class="flex items-center space-x-2 text-xs text-gray-400 bg-dark-800 px-3 py-1.5 rounded-lg border border-dark-700">
+        <div id="liveSyncBadge" class="flex items-center space-x-2 text-xs text-gray-400 bg-dark-800 px-3 py-1.5 rounded-lg border border-dark-700">
           <div class="w-2 h-2 rounded-full bg-green-500 animate-pulse"></div>
-          <span id="liveStatus2">Analytics Active</span>
+          <span id="syncText">Analytics Active</span>
         </div>
       </div>
 {% endif %}

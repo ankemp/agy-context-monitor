@@ -28,6 +28,15 @@ from context_monitor.db import get_db_connection, init_db, DEFAULT_DB_PATH
 from context_monitor.formats import BlockParser
 from context_monitor.diff import diff_block_lists, DiffResult
 from context_monitor.html_report import generate_html_report
+from context_monitor.settings import should_generate_artifacts
+from context_monitor.pricing import (
+    DEFAULT_MODEL,
+    PRICING,
+    get_pricing_key,
+    get_model_context_limit,
+    calculate_step_cost,
+    extract_model_switch,
+)
 
 CHARS_PER_TOKEN = 3.8
 
@@ -39,37 +48,31 @@ def format_tokens(n: int | float) -> str:
     return str(int(n))
 
 def detect_model(transcript_path: Path) -> tuple[str, str, int]:
-    first_model = "Gemini 3.7 Flash"
-    latest_model = "Gemini 3.7 Flash"
+    first_model = DEFAULT_MODEL
+    latest_model = DEFAULT_MODEL
     found_first = False
     try:
         with open(transcript_path, "r", encoding="utf-8", errors="replace") as f:
             for line in f:
-                if "Model Selection" in line:
-                    m = re.search(r"Model Selection\` from (?:.*?) to (.+?)\.\s*(?:No need|$)", line)
-                    if m:
-                        model = m.group(1).strip()
+                if not line.strip():
+                    continue
+                try:
+                    step = json.loads(line)
+                except Exception:
+                    continue
+                if step.get("type") == "USER_INPUT":
+                    content = step.get("content", "")
+                    switched_model = extract_model_switch(content)
+                    if switched_model:
                         if not found_first:
-                            first_model = model
+                            first_model = switched_model
                             found_first = True
-                        latest_model = model
+                        latest_model = switched_model
     except Exception:
         pass
 
     max_tokens = get_model_context_limit(latest_model)
     return first_model, latest_model, max_tokens
-
-def get_model_context_limit(model_name: str) -> int:
-    lower = (model_name or "").lower()
-    if "pro" in lower:
-        return 2_000_000
-    elif "flash" in lower or "gemini" in lower:
-        return 1_000_000
-    elif "claude" in lower:
-        return 200_000
-    elif "gpt" in lower or "o1" in lower or "o3" in lower:
-        return 128_000
-    return 1_000_000
 
 def extract_file_basename(content: str) -> str:
     m = re.search(r"File Path:\s*`?(?:file://)?([^`\r\n]+)`?", content)
@@ -111,7 +114,7 @@ def classify_phase(step_type: str, tool_name: str) -> str:
 
     return "reasoning"
 
-def analyze_transcript(transcript_path: Path, initial_model: str = "Gemini 3.7 Flash") -> dict:
+def analyze_transcript(transcript_path: Path, initial_model: str | None = None) -> dict:
     if transcript_path.is_dir():
         t_file = transcript_path / ".system_generated" / "logs" / "transcript.jsonl"
         if not t_file.exists():
@@ -135,7 +138,13 @@ def analyze_transcript(transcript_path: Path, initial_model: str = "Gemini 3.7 F
     title = ""
     start_time = None
     end_time = None
-    cur_model = initial_model
+    if initial_model is None:
+        first_m, _, _ = detect_model(transcript_path)
+        cur_model = first_m
+    else:
+        cur_model = initial_model
+    models_used = [cur_model]
+    model_transitions = [cur_model]
     project = None
     detected_parent_id = None
     dispatched_subagents = []
@@ -163,10 +172,14 @@ def analyze_transcript(transcript_path: Path, initial_model: str = "Gemini 3.7 F
             is_error = 1 if (step.get("error") or step.get("status") == "ERROR" or (exit_code is not None and exit_code != 0)) else 0
 
             # Detect mid-session model switch
-            if "Model Selection" in content or (step_type == "USER_INPUT" and "<USER_SETTINGS_CHANGE>" in content):
-                m = re.search(r"Model Selection\` from (?:.*?) to (.+?)\.\s*(?:No need|$)", content)
-                if m:
-                    cur_model = m.group(1).strip()
+            if step_type == "USER_INPUT":
+                switched_model = extract_model_switch(content)
+                if switched_model:
+                    cur_model = switched_model
+                    if not model_transitions or model_transitions[-1] != cur_model:
+                        model_transitions.append(cur_model)
+                    if cur_model not in models_used:
+                        models_used.append(cur_model)
 
             if not project and step_type in ("USER_INPUT", "CHECKPOINT") and "<user_information>" in content:
                 m = re.search(r"(?:/Users/[^\s]+)\s*->\s*[^\s]+/([^\s]+)", content)
@@ -185,7 +198,7 @@ def analyze_transcript(transcript_path: Path, initial_model: str = "Gemini 3.7 F
             thinking_len = len(thinking)
             tool_calls_len = len(json.dumps(tool_calls)) if tool_calls else 0
             step_chars = content_len + thinking_len + tool_calls_len
-            est_tokens = int(step_chars / CHARS_PER_TOKEN)
+            est_tokens = step.get("est_tokens") if step.get("est_tokens") is not None else int(step_chars / CHARS_PER_TOKEN)
             step_thinking_tokens = int(thinking_len / CHARS_PER_TOKEN) if thinking_len else 0
             total_chars += step_chars
             total_thinking_tokens += step_thinking_tokens
@@ -484,27 +497,11 @@ def analyze_transcript(transcript_path: Path, initial_model: str = "Gemini 3.7 F
     running_ctx = 0
     current_ephemeral = 0
     
-    # We need pricing for the cost calculation
-    PRICING = {
-        "pro": (1.25, 2.50, 10.00),     # Gemini Pro / 3.1 Pro / 2.5 Pro
-        "flash": (0.075, 0.15, 0.60),   # Gemini Flash / 3.6 / 3.7 Flash
-        "claude": (3.00, 3.00, 15.00),  # Claude 3.5 / 3.7 Sonnet
-        "gpt": (2.50, 2.50, 10.00),     # GPT-4o / o1
-    }
-    
-    def get_pricing_key(m_name):
-        m = (m_name or "").lower()
-        if "claude" in m: return "claude"
-        if "gpt" in m or "o1" in m: return "gpt"
-        if "pro" in m: return "pro"
-        return "flash"
-
     for s in steps:
         m_name = s.get("model_name", cur_model)
         s_type = s.get("step_type")
         tokens = s.get("est_tokens", 0)
         
-        pkey = get_pricing_key(m_name)
         step_cost = 0.0
         step_in_tokens = 0
         step_out_tokens = 0
@@ -517,12 +514,9 @@ def analyze_transcript(transcript_path: Path, initial_model: str = "Gemini 3.7 F
             # Transient injection for immediate turn only
             current_ephemeral = tokens
         elif s_type == "PLANNER_RESPONSE":
-            in_rate_low, in_rate_high, out_rate = PRICING[pkey]
-            actual_in = running_ctx + current_ephemeral
-            in_rate = in_rate_high if actual_in > 128_000 else in_rate_low
-            step_cost = (actual_in / 1_000_000 * in_rate) + (tokens / 1_000_000 * out_rate)
-            step_in_tokens = actual_in
-            step_out_tokens = tokens
+            step_cost, step_in_tokens, step_out_tokens = calculate_step_cost(
+                running_ctx, current_ephemeral, tokens, m_name
+            )
             total_billed_cost += step_cost
             total_billed_input_tokens += step_in_tokens
             total_billed_output_tokens += step_out_tokens
@@ -553,6 +547,8 @@ def analyze_transcript(transcript_path: Path, initial_model: str = "Gemini 3.7 F
         "billed_input_tokens": total_billed_input_tokens,
         "billed_output_tokens": total_billed_output_tokens,
         "latest_model": cur_model,
+        "models_used": models_used,
+        "model_transitions": model_transitions,
         "latest_max_tokens": get_model_context_limit(cur_model),
         "project": project,
         "steps": steps,
@@ -646,21 +642,42 @@ def sync_to_sqlite(cid: str, model_name: str, analysis: dict):
                     root_id = parent_id
                     depth = 1
 
+            models_used_list = analysis.get("models_used", [])
+            model_transitions = analysis.get("model_transitions", [])
+            if not models_used_list and active_model:
+                models_used_list = [active_model]
+            if not model_transitions:
+                model_transitions = models_used_list
+
+            if len(model_transitions) > 1:
+                if len(model_transitions) <= 3:
+                    conv_model_name = " → ".join(model_transitions)
+                else:
+                    conv_model_name = f"{model_transitions[0]} → ... → {model_transitions[-1]}"
+                models_used_str = ", ".join(models_used_list)
+            elif models_used_list:
+                conv_model_name = models_used_list[0]
+                models_used_str = models_used_list[0]
+            else:
+                conv_model_name = active_model
+                models_used_str = active_model
+
             # Upsert conversation record with hierarchy and compaction columns
             conn.execute("""
                 INSERT INTO conversations (
-                    id, title, project, model_name, created_at, updated_at, total_steps, total_characters, total_tokens,
+                    id, title, project, model_name, models_used, created_at, updated_at, total_steps, total_characters, total_tokens,
                     duration_seconds, active_agent_seconds, active_pairing_seconds, thinking_tokens,
                     user_prompts, tool_calls_count, redundant_file_reads, lines_written, lines_edited, failed_tool_calls,
                     billed_cost, billed_input_tokens, billed_output_tokens,
                     parent_id, root_id, depth, subagent_role, subagent_type, invoking_step_index,
                     compaction_count, pruned_tokens
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     title = excluded.title,
                     project = COALESCE(excluded.project, conversations.project),
                     model_name = excluded.model_name,
+                    models_used = excluded.models_used,
                     updated_at = excluded.updated_at,
                     total_steps = excluded.total_steps,
                     total_characters = excluded.total_characters,
@@ -687,7 +704,7 @@ def sync_to_sqlite(cid: str, model_name: str, analysis: dict):
                     compaction_count = excluded.compaction_count,
                     pruned_tokens = excluded.pruned_tokens
             """, (
-                cid, analysis["title"], analysis.get("project"), active_model, analysis["start_time"] or datetime.now().isoformat(),
+                cid, analysis["title"], analysis.get("project"), conv_model_name, models_used_str, analysis["start_time"] or datetime.now().isoformat(),
                 analysis["end_time"] or datetime.now().isoformat(), len(analysis["steps"]),
                 analysis["total_chars"], analysis["total_tokens"], analysis["duration_seconds"],
                 analysis.get("active_agent_seconds", 0.0), analysis.get("active_pairing_seconds", 0.0),
@@ -961,14 +978,18 @@ def main():
 
     diff_res = sync_to_sqlite(conversation_id, latest_model, analysis)
 
+    # Artifact reports (context_usage.md / .html) are deprecated in favor of the native
+    # Antigravity side panel extension. They are disabled by default and only generated
+    # if explicitly enabled in ~/.gemini/antigravity/context_monitor_settings.json
     artifact_dir = Path(os.path.expanduser(f"~/.gemini/antigravity/brain/{conversation_id}"))
-    if artifact_dir.exists():
+    if artifact_dir.exists() and should_generate_artifacts():
         generate_artifact_report(conversation_id, latest_model, max_tokens, analysis, artifact_dir, diff_res=diff_res)
 
     # Return transient ephemeral message for Antigravity 2.0 UI
     # Invariant: Zero context pollution - ephemeralMessage is never written to transcript.jsonl
     active_tokens = analysis.get("active_context_tokens", analysis.get("total_tokens", 0))
-    active_pct = (active_tokens / max_tokens * 100) if max_tokens else 0.0
+    active_max = analysis.get("latest_max_tokens", max_tokens)
+    active_pct = (active_tokens / active_max * 100) if active_max else 0.0
     turn_cost = analysis.get("billed_cost", 0.0)
 
     if diff_res and getattr(diff_res, "compaction_detected", False):
@@ -979,19 +1000,19 @@ def main():
         ephemeral_msg = (
             f"Context Compaction Detected: Pruned steps #{p_min}–#{p_max} "
             f"(~{format_tokens(rem_toks)} tokens freed across {len(diff_res.removed)} blocks). "
-            f"Active window: {active_pct:.1f}% ({format_tokens(active_tokens)}/{format_tokens(max_tokens)})."
+            f"Active window: {active_pct:.1f}% ({format_tokens(active_tokens)}/{format_tokens(active_max)})."
         )
     elif active_pct >= 80.0:
         ephemeral_msg = (
             f"Context Warning: Window at {active_pct:.1f}% capacity "
-            f"({format_tokens(active_tokens)} / {format_tokens(max_tokens)} tokens). "
+            f"({format_tokens(active_tokens)} / {format_tokens(active_max)} tokens). "
             f"Consider summarizing or resetting conversation."
         )
     else:
         added_tok = getattr(diff_res, "added_tokens", 0) if diff_res else 0
         delta_str = f" · +{format_tokens(added_tok)} tok this turn" if added_tok > 0 else ""
         ephemeral_msg = (
-            f"Context: {active_pct:.1f}% ({format_tokens(active_tokens)} / {format_tokens(max_tokens)} tokens)"
+            f"Context: {active_pct:.1f}% ({format_tokens(active_tokens)} / {format_tokens(active_max)} tokens)"
             f"{delta_str} · Session Value: ${turn_cost:,.2f}"
         )
 

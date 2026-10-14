@@ -8,19 +8,7 @@ from zoneinfo import ZoneInfo
 
 CHARS_PER_TOKEN = 3.8
 
-PRICING = {
-    "pro": (1.25, 2.50, 10.00),     # Gemini Pro / 3.1 Pro / 2.5 Pro
-    "flash": (0.075, 0.15, 0.60),   # Gemini Flash / 3.6 / 3.7 Flash
-    "claude": (3.00, 3.00, 15.00),  # Claude 3.5 / 3.7 Sonnet
-    "gpt": (2.50, 2.50, 10.00),     # GPT-4o / o1
-}
-
-def get_pricing_key(model_name):
-    m = (model_name or "").lower()
-    if "claude" in m: return "claude"
-    if "gpt" in m or "o1" in m: return "gpt"
-    if "pro" in m: return "pro"
-    return "flash"
+from context_monitor.pricing import PRICING, get_pricing_key
 
 def get_target_tz(tz_name=None):
     if tz_name:
@@ -285,24 +273,40 @@ def query_cost_by_project(conn, tz=None, project=None, limit_sessions=6):
             where_sess = "WHERE project = ?"
             params_sess = (project,)
 
-    sess_rows = cur.execute(f"""
-        SELECT id, title, project, model_name, created_at, total_steps, total_tokens, duration_seconds, active_agent_seconds, billed_cost, billed_input_tokens, billed_output_tokens
-        FROM conversations
-        {where_sess}
-        ORDER BY billed_cost DESC, (COALESCE(billed_input_tokens, 0) + COALESCE(billed_output_tokens, 0)) DESC, total_tokens DESC
-        LIMIT {limit_sessions}
-    """, params_sess).fetchall()
+    try:
+        sess_rows = cur.execute(f"""
+            SELECT id, title, project, model_name, models_used, created_at, total_steps, total_tokens, duration_seconds, active_agent_seconds, billed_cost, billed_input_tokens, billed_output_tokens
+            FROM conversations
+            {where_sess}
+            ORDER BY billed_cost DESC, (COALESCE(billed_input_tokens, 0) + COALESCE(billed_output_tokens, 0)) DESC, total_tokens DESC
+            LIMIT {limit_sessions}
+        """, params_sess).fetchall()
+    except Exception:
+        sess_rows = cur.execute(f"""
+            SELECT id, title, project, model_name, created_at, total_steps, total_tokens, duration_seconds, active_agent_seconds, billed_cost, billed_input_tokens, billed_output_tokens
+            FROM conversations
+            {where_sess}
+            ORDER BY billed_cost DESC, (COALESCE(billed_input_tokens, 0) + COALESCE(billed_output_tokens, 0)) DESC, total_tokens DESC
+            LIMIT {limit_sessions}
+        """, params_sess).fetchall()
 
     top_sessions = []
     target_tz = get_target_tz(tz)
     for sr in sess_rows:
         dt = parse_to_local_dt(sr["created_at"], target_tz)
         act_tok = (sr["billed_input_tokens"] or 0) + (sr["billed_output_tokens"] or 0)
+        models_used_val = sr["model_name"] or "Gemini"
+        try:
+            if "models_used" in sr.keys() and sr["models_used"]:
+                models_used_val = sr["models_used"]
+        except Exception:
+            pass
         top_sessions.append({
             "id": sr["id"],
             "title": sr["title"] or f"Session {sr['id'][:8]}",
             "project": sr["project"] or "(unassigned)",
             "model_name": sr["model_name"] or "Gemini",
+            "models_used": models_used_val,
             "created_at": dt.strftime("%Y-%m-%d %H:%M") if dt else (sr["created_at"] or "--"),
             "total_steps": sr["total_steps"] or 0,
             "tokens": act_tok,
@@ -695,17 +699,30 @@ def query_conversations_list(conn, limit=200, tz=None, project=None, view_mode="
 
     where_clause = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
 
-    rows = cur.execute(f"""
-        SELECT id, title, project, model_name, created_at, total_steps, total_tokens,
-               duration_seconds, active_agent_seconds, active_pairing_seconds,
-               billed_cost, billed_input_tokens, billed_output_tokens,
-               parent_id, root_id, depth, subagent_role, subagent_type, invoking_step_index,
-               compaction_count, pruned_tokens
-        FROM conversations
-        {where_clause}
-        ORDER BY created_at DESC
-        LIMIT {limit}
-    """, tuple(params)).fetchall()
+    try:
+        rows = cur.execute(f"""
+            SELECT id, title, project, model_name, models_used, created_at, total_steps, total_tokens,
+                   duration_seconds, active_agent_seconds, active_pairing_seconds,
+                   billed_cost, billed_input_tokens, billed_output_tokens,
+                   parent_id, root_id, depth, subagent_role, subagent_type, invoking_step_index,
+                   compaction_count, pruned_tokens
+            FROM conversations
+            {where_clause}
+            ORDER BY created_at DESC
+            LIMIT {limit}
+        """, tuple(params)).fetchall()
+    except Exception:
+        rows = cur.execute(f"""
+            SELECT id, title, project, model_name, created_at, total_steps, total_tokens,
+                   duration_seconds, active_agent_seconds, active_pairing_seconds,
+                   billed_cost, billed_input_tokens, billed_output_tokens,
+                   parent_id, root_id, depth, subagent_role, subagent_type, invoking_step_index,
+                   compaction_count, pruned_tokens
+            FROM conversations
+            {where_clause}
+            ORDER BY created_at DESC
+            LIMIT {limit}
+        """, tuple(params)).fetchall()
 
     convs = []
     root_ids = [r["id"] for r in rows]
@@ -713,16 +730,28 @@ def query_conversations_list(conn, limit=200, tz=None, project=None, view_mode="
     descendants_by_root = {}
     if view_mode == "hierarchy" and root_ids:
         placeholders = ",".join("?" for _ in root_ids)
-        desc_rows = cur.execute(f"""
-            SELECT id, title, project, model_name, created_at, total_steps, total_tokens,
-                   duration_seconds, active_agent_seconds, active_pairing_seconds,
-                   billed_cost, billed_input_tokens, billed_output_tokens,
-                   parent_id, root_id, depth, subagent_role, subagent_type, invoking_step_index,
-                   compaction_count, pruned_tokens
-            FROM conversations
-            WHERE root_id IN ({placeholders}) AND id != root_id
-            ORDER BY depth ASC, invoking_step_index ASC, created_at ASC
-        """, tuple(root_ids)).fetchall()
+        try:
+            desc_rows = cur.execute(f"""
+                SELECT id, title, project, model_name, models_used, created_at, total_steps, total_tokens,
+                       duration_seconds, active_agent_seconds, active_pairing_seconds,
+                       billed_cost, billed_input_tokens, billed_output_tokens,
+                       parent_id, root_id, depth, subagent_role, subagent_type, invoking_step_index,
+                       compaction_count, pruned_tokens
+                FROM conversations
+                WHERE root_id IN ({placeholders}) AND id != root_id
+                ORDER BY depth ASC, invoking_step_index ASC, created_at ASC
+            """, tuple(root_ids)).fetchall()
+        except Exception:
+            desc_rows = cur.execute(f"""
+                SELECT id, title, project, model_name, created_at, total_steps, total_tokens,
+                       duration_seconds, active_agent_seconds, active_pairing_seconds,
+                       billed_cost, billed_input_tokens, billed_output_tokens,
+                       parent_id, root_id, depth, subagent_role, subagent_type, invoking_step_index,
+                       compaction_count, pruned_tokens
+                FROM conversations
+                WHERE root_id IN ({placeholders}) AND id != root_id
+                ORDER BY depth ASC, invoking_step_index ASC, created_at ASC
+            """, tuple(root_ids)).fetchall()
 
         for dr in desc_rows:
             rid = dr["root_id"]
@@ -730,11 +759,18 @@ def query_conversations_list(conn, limit=200, tz=None, project=None, view_mode="
                 descendants_by_root[rid] = []
             d_dt = parse_to_local_dt(dr["created_at"], target_tz)
             d_act = (dr["billed_input_tokens"] or 0) + (dr["billed_output_tokens"] or 0)
+            dr_m_used = dr["model_name"] or "Gemini"
+            try:
+                if "models_used" in dr.keys() and dr["models_used"]:
+                    dr_m_used = dr["models_used"]
+            except Exception:
+                pass
             descendants_by_root[rid].append({
                 "id": dr["id"],
                 "title": dr["title"] or f"Subagent {dr['id'][:8]}",
                 "project": dr["project"] or "(unassigned)",
                 "model_name": dr["model_name"] or "Gemini",
+                "models_used": dr_m_used,
                 "created_at": d_dt.strftime("%Y-%m-%d %H:%M") if d_dt else dr["created_at"],
                 "total_steps": dr["total_steps"] or 0,
                 "tokens": d_act,
@@ -771,11 +807,19 @@ def query_conversations_list(conn, limit=200, tz=None, project=None, view_mode="
         fleet_pruned = c_pruned + sum(d.get("pruned_tokens", 0) for d in all_desc)
         subagent_count = len(all_desc)
 
+        r_m_used = r["model_name"] or "Gemini"
+        try:
+            if "models_used" in r.keys() and r["models_used"]:
+                r_m_used = r["models_used"]
+        except Exception:
+            pass
+
         convs.append({
             "id": c_id,
             "title": r["title"] or f"Conversation {r['id'][:8]}",
             "project": r["project"] or "(unassigned)",
             "model_name": r["model_name"] or "Gemini",
+            "models_used": r_m_used,
             "created_at": dt.strftime("%Y-%m-%d %H:%M") if dt else r["created_at"],
             "total_steps": c_steps,
             "tokens": act_tok,

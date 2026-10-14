@@ -6,6 +6,7 @@
 import os
 import sys
 import json
+import sqlite3
 import argparse
 import webbrowser
 import threading
@@ -21,7 +22,7 @@ _src = Path(__file__).resolve().parent.parent.parent
 if str(_src) not in sys.path:
     sys.path.insert(0, str(_src))
 
-from context_monitor.db import get_db_connection
+from context_monitor.db import get_db_connection, init_db
 from context_monitor.dashboard import api_routes, sse_stream
 
 DASHBOARD_DIR = Path(__file__).resolve().parent
@@ -30,16 +31,104 @@ env = Environment(loader=FileSystemLoader(DASHBOARD_DIR / 'templates'))
 # In-memory API response cache invalidated automatically via SQLite PRAGMA data_version
 _API_CACHE_LOCK = threading.Lock()
 _API_CACHE = {}
-_LAST_DATA_VERSION = -1
+_MONITOR_CONNS = {}
+_MONITOR_INOS = {}
+_LAST_DATA_VERSIONS = {}
+_ACTIVE_DB = None
+
+def clear_api_cache():
+    """Explicitly clears the in-memory API cache and resets tracked data versions."""
+    global _ACTIVE_DB
+    with _API_CACHE_LOCK:
+        _API_CACHE.clear()
+        _LAST_DATA_VERSIONS.clear()
+        _ACTIVE_DB = None
+
+# Hook clear_api_cache into SSE change notification stream
+sse_stream.register_change_callback(clear_api_cache)
+
+def _extract_db_path(conn: sqlite3.Connection) -> str | None:
+    try:
+        rows = conn.execute("PRAGMA database_list;").fetchall()
+        for row in rows:
+            name = row["name"] if hasattr(row, "keys") and "name" in row.keys() else row[1]
+            if name == "main":
+                f = row["file"] if hasattr(row, "keys") and "file" in row.keys() else row[2]
+                if f and str(f).strip():
+                    return str(Path(f).resolve())
+    except Exception:
+        pass
+    return None
 
 def get_cached_api_response(conn, cache_key: str, compute_fn):
-    global _LAST_DATA_VERSION
-    cur = conn.cursor()
-    dv = cur.execute("PRAGMA data_version;").fetchone()[0]
+    global _ACTIVE_DB
+    db_path = _extract_db_path(conn)
+
     with _API_CACHE_LOCK:
-        if dv != _LAST_DATA_VERSION:
+        if db_path:
+            cur_ino = None
+            try:
+                cur_ino = Path(db_path).stat().st_ino
+            except OSError:
+                pass
+
+            mon_conn = _MONITOR_CONNS.get(db_path)
+            last_ino = _MONITOR_INOS.get(db_path)
+
+            # If file was replaced or recreated at the same path, reconnect monitor
+            if mon_conn is not None and (cur_ino is None or cur_ino != last_ino):
+                try:
+                    mon_conn.close()
+                except Exception:
+                    pass
+                mon_conn = None
+                _MONITOR_CONNS.pop(db_path, None)
+                _MONITOR_INOS.pop(db_path, None)
+                _LAST_DATA_VERSIONS.pop(db_path, None)
+
+            if mon_conn is None and cur_ino is not None:
+                try:
+                    mon_conn = sqlite3.connect(db_path, timeout=30.0, check_same_thread=False)
+                    mon_conn.execute("PRAGMA busy_timeout = 5000;")
+                    _MONITOR_CONNS[db_path] = mon_conn
+                    _MONITOR_INOS[db_path] = cur_ino
+                except Exception:
+                    mon_conn = None
+
+            if mon_conn is not None:
+                try:
+                    dv = mon_conn.execute("PRAGMA data_version;").fetchone()[0]
+                except Exception:
+                    try:
+                        mon_conn.close()
+                    except Exception:
+                        pass
+                    try:
+                        mon_conn = sqlite3.connect(db_path, timeout=30.0, check_same_thread=False)
+                        mon_conn.execute("PRAGMA busy_timeout = 5000;")
+                        _MONITOR_CONNS[db_path] = mon_conn
+                        dv = mon_conn.execute("PRAGMA data_version;").fetchone()[0]
+                    except Exception:
+                        dv = conn.execute("PRAGMA data_version;").fetchone()[0]
+            else:
+                dv = conn.execute("PRAGMA data_version;").fetchone()[0]
+            target_key = db_path
+        else:
+            try:
+                base_dv = conn.execute("PRAGMA data_version;").fetchone()[0]
+                schema_v = conn.execute("PRAGMA schema_version;").fetchone()[0]
+                changes = getattr(conn, "total_changes", 0)
+                dv = (base_dv, schema_v, changes)
+            except Exception:
+                dv = id(conn)
+            target_key = f"in_memory_{id(conn)}"
+
+        last_dv = _LAST_DATA_VERSIONS.get(target_key)
+        if target_key != _ACTIVE_DB or last_dv is None or dv != last_dv:
             _API_CACHE.clear()
-            _LAST_DATA_VERSION = dv
+            _ACTIVE_DB = target_key
+            _LAST_DATA_VERSIONS[target_key] = dv
+
         if cache_key in _API_CACHE:
             return _API_CACHE[cache_key]
 
@@ -49,9 +138,10 @@ def get_cached_api_response(conn, cache_key: str, compute_fn):
 
     serialized = json.dumps(data).encode("utf-8")
     with _API_CACHE_LOCK:
-        if dv == _LAST_DATA_VERSION:
+        if _ACTIVE_DB == target_key and _LAST_DATA_VERSIONS.get(target_key) == dv:
             _API_CACHE[cache_key] = serialized
     return serialized
+
 
 class DashboardHTTPHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -207,6 +297,7 @@ class DashboardServer(ThreadingHTTPServer):
             super().handle_error(request, client_address)
 
 def export_standalone_html(output_path: Path, include_conversations: bool = False, tz: str = None):
+    init_db()
     conn = get_db_connection()
     target_tz = api_routes.get_target_tz(tz)
     try:

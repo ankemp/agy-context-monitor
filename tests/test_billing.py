@@ -1,19 +1,11 @@
-import pytest
 import sqlite3
-from pathlib import Path
-from datetime import datetime
-from zoneinfo import ZoneInfo
 
-from context_monitor.db import get_db_connection, init_db, DEFAULT_DB_PATH
-from context_monitor.dashboard.api_routes import query_timeline_data, query_summary_data
-from context_monitor.formats import BlockParser
+import pytest
 
-PRICING = {
-    "pro": (1.25, 2.50, 10.00),     # Gemini Pro
-    "flash": (0.075, 0.15, 0.60),   # Gemini Flash
-    "claude": (3.00, 3.00, 15.00),  # Claude 3.5
-    "gpt": (2.50, 2.50, 10.00),     # GPT-4o
-}
+from context_monitor.dashboard.api_routes import query_timeline_data
+from context_monitor.db import get_db_connection, init_db
+from context_monitor.pricing import PRICING
+
 
 def test_database_schema_and_migration(tmp_path):
     db_file = tmp_path / "test_analytics.db"
@@ -382,4 +374,200 @@ def test_timeline_actual_consumption_multi_turn(tmp_path):
     # Verify that tokens reflect actual API consumption (2,800), NOT on-disk est_tokens (300)
     assert day_item["tokens"] == 2800
     assert day_item["projects"]["my-repo"] == 2800
+
+def test_argon_pricing_and_context_limit():
+    from context_monitor.pricing import (
+        PRICING,
+        calculate_step_cost,
+        get_model_context_limit,
+        get_pricing_key,
+    )
+    
+    assert "argon" in PRICING
+    assert PRICING["argon"] == (2.00, 2.00, 10.00)
+    
+    for name in ["Gemini 4 Argon (High)", "Gemini 4 Argon (Medium)", "Gemini 4 Argon (Low)", "gemini-4-argon-high", "Gemini 4 Argo (High)"]:
+        assert get_pricing_key(name) == "argon"
+        assert get_model_context_limit(name) == 1_000_000
+
+    # 100k input tokens + 2k output tokens on Argon:
+    # (100_000 / 1M * 2.00) + (2_000 / 1M * 10.00) = 0.20 + 0.02 = 0.22
+    cost, in_tok, out_tok = calculate_step_cost(100_000, 0, 2_000, "Gemini 4 Argon (High)")
+    assert cost == pytest.approx(0.22)
+    assert in_tok == 100_000
+    assert out_tok == 2_000
+
+def test_models_used_column_migration(tmp_path):
+    from context_monitor.db import get_db_connection, init_db
+    db_file = tmp_path / "test_migration.db"
+    init_db(db_file)
+    with get_db_connection(db_file) as conn:
+        cols = [c[1] for c in conn.execute("PRAGMA table_info(conversations)").fetchall()]
+        assert "models_used" in cols
+
+def test_tool_output_does_not_trigger_model_switch(tmp_path):
+    """Verifies that viewing a file or running a shell command containing 'Model Selection' does NOT alter the model."""
+    import json
+
+    from scripts.ingest import analyze_transcript
+    
+    t_file = tmp_path / "transcript.jsonl"
+    lines = [
+        {"step_index": 0, "type": "USER_INPUT", "content": "<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from None to Gemini 3.8 Flash (High).\n</USER_SETTINGS_CHANGE>"},
+        {"step_index": 1, "type": "PLANNER_RESPONSE", "content": "", "tool_calls": [{"name": "view_file", "args": {"AbsolutePath": "/some/log.jsonl"}}]},
+        {"step_index": 2, "type": "GENERIC", "content": 'File Path: /some/log.jsonl\n{"Model Selection": "Gemini 4 Argon (High)"}'},
+        {"step_index": 3, "type": "PLANNER_RESPONSE", "content": "Done viewing file."},
+    ]
+    with open(t_file, "w") as f:
+        f.writelines(json.dumps(l) + "\n" for l in lines)
+            
+    res = analyze_transcript(t_file)
+    assert res["latest_model"] == "Gemini 3.8 Flash (High)"
+    assert res["models_used"] == ["Gemini 3.8 Flash (High)"]
+    assert res["steps"][3]["model_name"] == "Gemini 3.8 Flash (High)"
+
+def test_legitimate_multi_model_thread_pricing(tmp_path):
+    """Verifies that a real mid-session model switch prices each step under its active model and records all models used."""
+    import json
+
+    from scripts.ingest import analyze_transcript
+    
+    t_file = tmp_path / "transcript.jsonl"
+    lines = [
+        {"step_index": 0, "type": "USER_INPUT", "content": "<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from None to Gemini 4 Argon (High).\n</USER_SETTINGS_CHANGE>", "est_tokens": 1000},
+        {"step_index": 1, "type": "PLANNER_RESPONSE", "content": "Argon response", "est_tokens": 500},
+        {"step_index": 2, "type": "USER_INPUT", "content": "<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from Gemini 4 Argon (High) to Gemini 3.8 Flash (High).\n</USER_SETTINGS_CHANGE>", "est_tokens": 1000},
+        {"step_index": 3, "type": "PLANNER_RESPONSE", "content": "Flash response", "est_tokens": 500},
+    ]
+    with open(t_file, "w") as f:
+        f.writelines(json.dumps(l) + "\n" for l in lines)
+            
+    res = analyze_transcript(t_file)
+    assert res["models_used"] == ["Gemini 4 Argon (High)", "Gemini 3.8 Flash (High)"]
+    assert res["steps"][1]["model_name"] == "Gemini 4 Argon (High)"
+    assert res["steps"][3]["model_name"] == "Gemini 3.8 Flash (High)"
+    # Step 1 (Argon): input 1000 @ $2.00/M, output 500 @ $10.00/M = 0.002 + 0.005 = 0.007
+    assert res["steps"][1]["billed_cost"] == pytest.approx(0.007)
+    # Step 3 (Flash): input (1000+500+1000=2500) @ $0.075/M, output 500 @ $0.60/M = 0.0001875 + 0.0003 = 0.0004875
+    assert res["steps"][3]["billed_cost"] == pytest.approx(0.0004875)
+
+def test_extract_model_switch_variations():
+    from context_monitor.pricing import extract_model_switch
+
+    assert extract_model_switch("<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from None to Gemini 4 Argon (High). No need to comment on this change if the user doesn't ask about it.\n</USER_SETTINGS_CHANGE>") == "Gemini 4 Argon (High)"
+    assert extract_model_switch("<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from None to Gemini 3.8 Flash (High)</USER_SETTINGS_CHANGE>") == "Gemini 3.8 Flash (High)"
+    assert extract_model_switch("The user changed setting Model Selection from None to Gemini 4 Argon (Medium).") == "Gemini 4 Argon (Medium)"
+    assert extract_model_switch("The user changed setting `Model Selection` from None to 'Gemini 4 Argo (Low)'.") == "Gemini 4 Argo (Low)"
+    assert extract_model_switch('{"Model Selection": "Gemini 4 Argon (High)"}') is None
+    assert extract_model_switch("") is None
+
+    # Prompt text in USER_REQUEST should NOT override settings change
+    prompt_with_quote = """<USER_REQUEST>
+Why did "The user changed setting `Model Selection` from None to Gemini 4 Argon (High)" fail?
+</USER_REQUEST>
+<USER_SETTINGS_CHANGE>
+The user changed setting `Model Selection` from None to Gemini 3.8 Flash (High). No need to comment...
+</USER_SETTINGS_CHANGE>"""
+    assert extract_model_switch(prompt_with_quote) == "Gemini 3.8 Flash (High)"
+
+def test_leading_system_message_does_not_poison_models_used(tmp_path):
+    """Verifies that transcripts starting with SYSTEM_MESSAGE (e.g. subagents) do not falsely prepend default model."""
+    import json
+
+    from scripts.ingest import analyze_transcript
+
+    t_file = tmp_path / "subagent_transcript.jsonl"
+    lines = [
+        {"step_index": 0, "type": "SYSTEM_MESSAGE", "content": "Initializing subagent environment task."},
+        {"step_index": 1, "type": "USER_INPUT", "content": "<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from None to Gemini 4 Argon (High).\n</USER_SETTINGS_CHANGE>", "est_tokens": 1000},
+        {"step_index": 2, "type": "PLANNER_RESPONSE", "content": "I am working on Argon", "est_tokens": 500},
+    ]
+    with open(t_file, "w") as f:
+        f.writelines(json.dumps(l) + "\n" for l in lines)
+
+    res = analyze_transcript(t_file)
+    assert res["latest_model"] == "Gemini 4 Argon (High)"
+    assert res["models_used"] == ["Gemini 4 Argon (High)"]
+    assert res["steps"][0]["model_name"] == "Gemini 4 Argon (High)"
+    assert res["steps"][2]["model_name"] == "Gemini 4 Argon (High)"
+
+def test_multi_model_transitions_sequence_and_switch_back(tmp_path):
+    """Verifies that switching from Argon -> Flash -> Argon is accurately tracked in model_transitions and model_name."""
+    import json
+
+    from context_monitor.db import get_db_connection, init_db
+    from scripts.ingest import analyze_transcript, sync_to_sqlite
+
+    t_file = tmp_path / "multi_switch.jsonl"
+    lines = [
+        {"step_index": 0, "type": "USER_INPUT", "content": "<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from None to Gemini 4 Argon (High).\n</USER_SETTINGS_CHANGE>", "est_tokens": 1000},
+        {"step_index": 1, "type": "PLANNER_RESPONSE", "content": "Argon phase 1", "est_tokens": 500},
+        {"step_index": 2, "type": "USER_INPUT", "content": "<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from Gemini 4 Argon (High) to Gemini 3.8 Flash (High).\n</USER_SETTINGS_CHANGE>", "est_tokens": 1000},
+        {"step_index": 3, "type": "PLANNER_RESPONSE", "content": "Flash phase", "est_tokens": 500},
+        {"step_index": 4, "type": "USER_INPUT", "content": "<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from Gemini 3.8 Flash (High) to Gemini 4 Argon (High).\n</USER_SETTINGS_CHANGE>", "est_tokens": 1000},
+        {"step_index": 5, "type": "PLANNER_RESPONSE", "content": "Argon phase 2", "est_tokens": 500},
+    ]
+    with open(t_file, "w") as f:
+        f.writelines(json.dumps(l) + "\n" for l in lines)
+
+    res = analyze_transcript(t_file)
+    assert res["latest_model"] == "Gemini 4 Argon (High)"
+    assert res["models_used"] == ["Gemini 4 Argon (High)", "Gemini 3.8 Flash (High)"]
+    assert res["model_transitions"] == ["Gemini 4 Argon (High)", "Gemini 3.8 Flash (High)", "Gemini 4 Argon (High)"]
+
+    # Test sync_to_sqlite
+    test_db = tmp_path / "test_multi.db"
+    init_db(test_db)
+    import scripts.ingest as ingest_mod
+    orig_db = ingest_mod.DEFAULT_DB_PATH
+    try:
+        ingest_mod.DEFAULT_DB_PATH = test_db
+        sync_to_sqlite("conv-123", res["latest_model"], res)
+    finally:
+        ingest_mod.DEFAULT_DB_PATH = orig_db
+
+    with get_db_connection(test_db) as conn:
+        row = conn.execute("SELECT model_name, models_used FROM conversations WHERE id = 'conv-123'").fetchone()
+        assert row["model_name"] == "Gemini 4 Argon (High) → Gemini 3.8 Flash (High) → Gemini 4 Argon (High)"
+        assert row["models_used"] == "Gemini 4 Argon (High), Gemini 3.8 Flash (High)"
+
+def test_models_used_backfill_migration_in_init_db(tmp_path):
+    """Verifies that init_db() automatically populates models_used for existing unmigrated conversations."""
+    db_file = tmp_path / "test_legacy.db"
+    conn = sqlite3.connect(db_file)
+    conn.execute("""
+        CREATE TABLE conversations (
+            id TEXT PRIMARY KEY,
+            title TEXT,
+            model_name TEXT
+        );
+    """)
+    conn.execute("""
+        CREATE TABLE steps (
+            conversation_id TEXT,
+            step_index INTEGER,
+            model_name TEXT,
+            PRIMARY KEY(conversation_id, step_index)
+        );
+    """)
+    conn.execute("INSERT INTO conversations VALUES ('c1', 'Conv 1', 'Gemini Flash');")
+    conn.execute("INSERT INTO conversations VALUES ('c2', 'Conv 2', 'Gemini 3.8 Flash (High)');")
+    conn.execute("INSERT INTO steps VALUES ('c1', 0, 'Gemini Flash');")
+    conn.execute("INSERT INTO steps VALUES ('c2', 0, 'Gemini 4 Argon (High)');")
+    conn.execute("INSERT INTO steps VALUES ('c2', 1, 'Gemini 3.8 Flash (High)');")
+    conn.commit()
+    conn.close()
+
+    # Run init_db on the legacy DB
+    init_db(db_file)
+
+    with get_db_connection(db_file) as conn:
+        r1 = conn.execute("SELECT model_name, models_used FROM conversations WHERE id = 'c1'").fetchone()
+        assert r1["models_used"] == "Gemini Flash"
+
+        r2 = conn.execute("SELECT model_name, models_used FROM conversations WHERE id = 'c2'").fetchone()
+        assert "Gemini 4 Argon (High)" in r2["models_used"]
+        assert "Gemini 3.8 Flash (High)" in r2["models_used"]
+
+
 

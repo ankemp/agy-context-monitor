@@ -22,6 +22,7 @@ CREATE TABLE IF NOT EXISTS conversations (
     title TEXT,
     project TEXT,
     model_name TEXT,
+    models_used TEXT,
     created_at TEXT,
     updated_at TEXT,
     total_steps INTEGER DEFAULT 0,
@@ -103,6 +104,7 @@ CREATE TABLE IF NOT EXISTS transcript_blocks (
 INDEXES_SQL = """
 CREATE INDEX IF NOT EXISTS idx_conversations_created ON conversations(created_at);
 CREATE INDEX IF NOT EXISTS idx_conversations_project ON conversations(project);
+CREATE INDEX IF NOT EXISTS idx_conversations_models_used ON conversations(models_used);
 CREATE INDEX IF NOT EXISTS idx_conversations_parent ON conversations(parent_id);
 CREATE INDEX IF NOT EXISTS idx_conversations_root ON conversations(root_id);
 CREATE INDEX IF NOT EXISTS idx_conversations_depth ON conversations(depth);
@@ -152,6 +154,12 @@ def init_db(db_path: Path = DEFAULT_DB_PATH):
         conv_cols = [c[1] for c in cur.execute("PRAGMA table_info(conversations)").fetchall()]
         conv_new_cols = [
             ("project", "TEXT"),
+            ("created_at", "TEXT"),
+            ("updated_at", "TEXT"),
+            ("total_steps", "INTEGER DEFAULT 0"),
+            ("total_characters", "INTEGER DEFAULT 0"),
+            ("total_tokens", "INTEGER DEFAULT 0"),
+            ("duration_seconds", "REAL DEFAULT 0.0"),
             ("active_agent_seconds", "REAL DEFAULT 0.0"),
             ("active_pairing_seconds", "REAL DEFAULT 0.0"),
             ("thinking_tokens", "INTEGER DEFAULT 0"),
@@ -171,7 +179,8 @@ def init_db(db_path: Path = DEFAULT_DB_PATH):
             ("subagent_type", "TEXT"),
             ("invoking_step_index", "INTEGER"),
             ("compaction_count", "INTEGER DEFAULT 0"),
-            ("pruned_tokens", "INTEGER DEFAULT 0")
+            ("pruned_tokens", "INTEGER DEFAULT 0"),
+            ("models_used", "TEXT")
         ]
         for col, ctype in conv_new_cols:
             if col not in conv_cols:
@@ -221,8 +230,30 @@ def init_db(db_path: Path = DEFAULT_DB_PATH):
         except Exception:
             pass
 
+        # Backfill models_used for existing conversations if NULL
+        try:
+            conn.execute("""
+                UPDATE conversations
+                SET models_used = COALESCE(
+                    (SELECT group_concat(m, ', ') FROM (SELECT DISTINCT model_name AS m FROM steps WHERE conversation_id = conversations.id AND model_name IS NOT NULL ORDER BY step_index ASC)),
+                    model_name,
+                    'Gemini Flash'
+                )
+                WHERE models_used IS NULL;
+            """)
+        except Exception:
+            pass
+
         # Now create indexes after migrations ensure columns exist
-        conn.executescript(INDEXES_SQL)
+        try:
+            conn.executescript(INDEXES_SQL)
+        except Exception:
+            for stmt in INDEXES_SQL.strip().split(";"):
+                if stmt.strip():
+                    try:
+                        conn.execute(stmt)
+                    except Exception:
+                        pass
         conn.commit()
 
 if __name__ == "__main__":
