@@ -14,7 +14,7 @@ import sqlite3
 from dataclasses import asdict, dataclass, field
 from typing import Any, Sequence
 
-from context_monitor.formats import BlockType, ContentBlock
+from context_monitor.formats import ContentBlock
 
 __all__ = ["DiffResult", "diff_block_lists", "get_turn_diff_from_db", "normalize_block"]
 
@@ -73,7 +73,9 @@ def normalize_block(b: Any) -> dict[str, Any]:
         content_val = d.get("content") or d.get("text") or ""
         hash_val = d.get("block_hash") or d.get("hash")
         if not hash_val:
-            hash_val = hashlib.sha1(f"{kind_val}:{content_val}".encode("utf-8")).hexdigest()
+            hash_val = hashlib.sha1(
+                f"{kind_val}:{content_val}".encode("utf-8")
+            ).hexdigest()
         tokens = d.get("est_tokens")
         if tokens is None:
             tokens = estimate_tokens(content_val)
@@ -136,7 +138,9 @@ def diff_block_lists(
     net_token_delta = added_tokens - removed_tokens
 
     compaction_detected = len(removed) > 0
-    pruned_step_indices = sorted(list({x["step_index"] for x in removed})) if removed else []
+    pruned_step_indices = (
+        sorted(list({x["step_index"] for x in removed})) if removed else []
+    )
     pruned_kinds: dict[str, int] = {}
     for x in removed:
         k = x["kind"]

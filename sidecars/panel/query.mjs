@@ -461,27 +461,85 @@ export function getGlobalData(db) {
     // compaction columns might not exist
   }
 
+  let geminiWindowStart = null;
+  let threePWindowStart = null;
   try {
-    const breakdown = db.prepare(`
-      SELECT
-        COALESCE(SUM(CASE
-          WHEN LOWER(model_name) LIKE '%claude%'
-            OR LOWER(model_name) LIKE '%sonnet%'
-            OR LOWER(model_name) LIKE '%opus%'
-            OR LOWER(model_name) LIKE '%gpt%'
-            OR LOWER(model_name) LIKE '%o1%'
-            OR LOWER(model_name) LIKE '%o3%'
-          THEN billed_cost ELSE 0 END), 0.0) as cost_3p,
-        COALESCE(SUM(CASE
-          WHEN NOT (LOWER(model_name) LIKE '%claude%'
-            OR LOWER(model_name) LIKE '%sonnet%'
-            OR LOWER(model_name) LIKE '%opus%'
-            OR LOWER(model_name) LIKE '%gpt%'
-            OR LOWER(model_name) LIKE '%o1%'
-            OR LOWER(model_name) LIKE '%o3%')
-          THEN billed_cost ELSE 0 END), 0.0) as cost_gemini
-      FROM conversations
-    `).get();
+    const qRows = db.prepare(`
+      SELECT bucket_id, reset_time FROM quota_state
+      WHERE reset_time IS NOT NULL AND reset_time != ''
+        AND (window = 'weekly' OR bucket_id LIKE '%weekly%')
+    `).all();
+    for (const r of qRows) {
+      let str = String(r.reset_time).trim();
+      if (!str.endsWith('Z') && !/[+-]\d{2}(:?\d{2})?$/.test(str)) {
+        str = str.replace(' ', 'T') + 'Z';
+      }
+      const resetDate = new Date(str);
+      if (!isNaN(resetDate.getTime())) {
+        const startDate = new Date(resetDate.getTime() - 7 * 24 * 60 * 60 * 1000);
+        const ws = startDate.toISOString().replace(/\.\d{3}Z$/, 'Z');
+        if (r.bucket_id && (r.bucket_id.startsWith('3p') || r.bucket_id.startsWith('claude') || r.bucket_id.startsWith('gpt'))) {
+          threePWindowStart = ws;
+        } else {
+          geminiWindowStart = ws;
+        }
+      }
+    }
+  } catch {
+    // quota_state table missing or query failed
+  }
+
+  const defaultWindowStart = geminiWindowStart || threePWindowStart;
+  const gStart = geminiWindowStart || defaultWindowStart;
+  const pStart = threePWindowStart || defaultWindowStart;
+
+  try {
+    let breakdown;
+    if (gStart && pStart) {
+      breakdown = db.prepare(`
+        SELECT
+          COALESCE(SUM(CASE
+            WHEN (LOWER(model_name) LIKE '%claude%'
+              OR LOWER(model_name) LIKE '%sonnet%'
+              OR LOWER(model_name) LIKE '%opus%'
+              OR LOWER(model_name) LIKE '%gpt%'
+              OR LOWER(model_name) LIKE '%o1%'
+              OR LOWER(model_name) LIKE '%o3%')
+              AND datetime(created_at) >= datetime(?)
+            THEN billed_cost ELSE 0 END), 0.0) as cost_3p,
+          COALESCE(SUM(CASE
+            WHEN NOT (LOWER(model_name) LIKE '%claude%'
+              OR LOWER(model_name) LIKE '%sonnet%'
+              OR LOWER(model_name) LIKE '%opus%'
+              OR LOWER(model_name) LIKE '%gpt%'
+              OR LOWER(model_name) LIKE '%o1%'
+              OR LOWER(model_name) LIKE '%o3%')
+              AND datetime(created_at) >= datetime(?)
+            THEN billed_cost ELSE 0 END), 0.0) as cost_gemini
+        FROM conversations
+      `).get(pStart, gStart);
+    } else {
+      breakdown = db.prepare(`
+        SELECT
+          COALESCE(SUM(CASE
+            WHEN LOWER(model_name) LIKE '%claude%'
+              OR LOWER(model_name) LIKE '%sonnet%'
+              OR LOWER(model_name) LIKE '%opus%'
+              OR LOWER(model_name) LIKE '%gpt%'
+              OR LOWER(model_name) LIKE '%o1%'
+              OR LOWER(model_name) LIKE '%o3%'
+            THEN billed_cost ELSE 0 END), 0.0) as cost_3p,
+          COALESCE(SUM(CASE
+            WHEN NOT (LOWER(model_name) LIKE '%claude%'
+              OR LOWER(model_name) LIKE '%sonnet%'
+              OR LOWER(model_name) LIKE '%opus%'
+              OR LOWER(model_name) LIKE '%gpt%'
+              OR LOWER(model_name) LIKE '%o1%'
+              OR LOWER(model_name) LIKE '%o3%')
+            THEN billed_cost ELSE 0 END), 0.0) as cost_gemini
+        FROM conversations
+      `).get();
+    }
 
     if (breakdown) {
       costGemini = Number(breakdown.cost_gemini) || 0.0;
@@ -491,13 +549,15 @@ export function getGlobalData(db) {
     costGemini = totalCost;
   }
 
+  const weeklyCost = costGemini + cost3p;
   const costMap = { gemini: costGemini, '3p': cost3p };
-  const quotaSummary = getQuotaSummary(db, 'Gemini 3.7 Flash', totalCost, costMap);
+  const quotaSummary = getQuotaSummary(db, 'Gemini 3.7 Flash', weeklyCost, costMap);
 
   return {
     total_conversations: totalConversations,
     total_tokens: totalTokens,
     total_cost: totalCost,
+    weekly_cost: weeklyCost,
     total_compactions: totalCompactions,
     total_pruned_tokens: totalPrunedTokens,
     weekly_quota_pct: quotaSummary.session_weekly_pct,

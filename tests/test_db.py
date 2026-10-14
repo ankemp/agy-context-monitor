@@ -1,8 +1,12 @@
 import sqlite3
 import pytest
-from pathlib import Path
 
-from context_monitor.db import get_db_connection, init_db, upsert_quota_state, get_quota_state
+from context_monitor.db import (
+    get_db_connection,
+    init_db,
+    upsert_quota_state,
+    get_quota_state,
+)
 from context_monitor.settings import (
     DEFAULT_GEMINI_WEEKLY_CAPACITY,
     DEFAULT_GEMINI_5H_CAPACITY,
@@ -26,7 +30,9 @@ def test_init_db_creates_quota_state_table(tmp_path):
 
     with get_db_connection(db_file) as conn:
         cur = conn.cursor()
-        cols = {c[1]: c[2] for c in cur.execute("PRAGMA table_info(quota_state)").fetchall()}
+        cols = {
+            c[1]: c[2] for c in cur.execute("PRAGMA table_info(quota_state)").fetchall()
+        }
 
     expected_cols = {
         "bucket_id": "TEXT",
@@ -39,7 +45,9 @@ def test_init_db_creates_quota_state_table(tmp_path):
     }
     for col, col_type in expected_cols.items():
         assert col in cols, f"Column '{col}' missing in quota_state"
-        assert cols[col].upper() == col_type, f"Column '{col}' type mismatch: {cols[col]} != {col_type}"
+        assert cols[col].upper() == col_type, (
+            f"Column '{col}' type mismatch: {cols[col]} != {col_type}"
+        )
 
 
 def test_init_db_accepts_connection_directly():
@@ -47,7 +55,12 @@ def test_init_db_accepts_connection_directly():
     init_db(conn)
 
     cur = conn.cursor()
-    tables = [r[0] for r in cur.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+    tables = [
+        r[0]
+        for r in cur.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    ]
     assert "quota_state" in tables
     assert "conversations" in tables
     assert "steps" in tables
@@ -60,7 +73,12 @@ def test_init_db_idempotent():
     # Calling init_db second time should be completely safe and idempotent
     init_db(conn)
     cur = conn.cursor()
-    tables = [r[0] for r in cur.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+    tables = [
+        r[0]
+        for r in cur.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    ]
     assert "quota_state" in tables
     conn.close()
 
@@ -177,15 +195,18 @@ def test_upsert_quota_state_edge_cases():
     assert get_quota_state(conn) == []
 
     # Single dict instead of list
-    upsert_quota_state(conn, {
-        "bucket_id": "3p-weekly",
-        "group_name": "Third Party Models",
-        "window": "weekly",
-        "remaining_fraction": 1.0,
-        "reset_time": "2026-10-21T00:00:00Z",
-        "calibrated_capacity": 200.0,
-        "fetched_at": "2026-10-14T12:00:00Z",
-    })
+    upsert_quota_state(
+        conn,
+        {
+            "bucket_id": "3p-weekly",
+            "group_name": "Third Party Models",
+            "window": "weekly",
+            "remaining_fraction": 1.0,
+            "reset_time": "2026-10-21T00:00:00Z",
+            "calibrated_capacity": 200.0,
+            "fetched_at": "2026-10-14T12:00:00Z",
+        },
+    )
     res = get_quota_state(conn)
     assert len(res) == 1
     assert res[0]["bucket_id"] == "3p-weekly"
@@ -249,13 +270,18 @@ def test_upsert_quota_state_none_and_missing_values():
     # 1. Null remaining_fraction and calibrated_capacity should not raise TypeError
     # 2. Null reset_time should not store literal "None" string
     # 3. Null fetched_at should default to current UTC ISO timestamp
-    upsert_quota_state(conn, [{
-        "bucket_id": "test-nulls",
-        "remaining_fraction": None,
-        "calibrated_capacity": None,
-        "reset_time": None,
-        "fetched_at": None,
-    }])
+    upsert_quota_state(
+        conn,
+        [
+            {
+                "bucket_id": "test-nulls",
+                "remaining_fraction": None,
+                "calibrated_capacity": None,
+                "reset_time": None,
+                "fetched_at": None,
+            }
+        ],
+    )
     stored = get_quota_state(conn, bucket_id="test-nulls")
     assert len(stored) == 1
     assert stored[0]["remaining_fraction"] == 1.0
@@ -266,11 +292,16 @@ def test_upsert_quota_state_none_and_missing_values():
     assert "T" in stored[0]["fetched_at"]  # Valid ISO timestamp
 
     # 4. Zero (0.0) remaining_fraction should NOT be replaced by 1.0 default
-    upsert_quota_state(conn, [{
-        "bucket_id": "test-zero",
-        "remaining_fraction": 0.0,
-        "calibrated_capacity": 0.0,
-    }])
+    upsert_quota_state(
+        conn,
+        [
+            {
+                "bucket_id": "test-zero",
+                "remaining_fraction": 0.0,
+                "calibrated_capacity": 0.0,
+            }
+        ],
+    )
     stored_zero = get_quota_state(conn, bucket_id="test-zero")
     assert stored_zero[0]["remaining_fraction"] == 0.0
 
@@ -317,12 +348,17 @@ def test_quota_state_updated_at_bidirectional_compatibility():
     init_db(conn)
 
     # Upsert with updated_at instead of fetched_at
-    upsert_quota_state(conn, [{
-        "bucket_id": "3p-weekly",
-        "window": "weekly",
-        "remaining_fraction": 0.5,
-        "updated_at": "2026-10-14T13:30:00Z",
-    }])
+    upsert_quota_state(
+        conn,
+        [
+            {
+                "bucket_id": "3p-weekly",
+                "window": "weekly",
+                "remaining_fraction": 0.5,
+                "updated_at": "2026-10-14T13:30:00Z",
+            }
+        ],
+    )
 
     stored = get_quota_state(conn, bucket_id="3p-weekly")
     assert len(stored) == 1
@@ -350,8 +386,8 @@ def test_settings_context_monitor_prefix_overrides(monkeypatch):
 
 def test_context_monitor_package_exports():
     import context_monitor
+
     assert hasattr(context_monitor, "upsert_quota_state")
     assert hasattr(context_monitor, "get_quota_state")
     assert callable(context_monitor.upsert_quota_state)
     assert callable(context_monitor.get_quota_state)
-

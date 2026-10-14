@@ -18,6 +18,7 @@ import pytest
 from context_monitor.db import get_db_connection, init_db
 from scripts.backfill_analytics import run_backfill
 from scripts.ingest import (
+    _extract_bucket_view,
     format_ephemeral_status,
     generate_artifact_report,
     generate_context_usage_report,
@@ -596,3 +597,143 @@ def test_generate_context_usage_report_multi_step_tool_reversed_cost():
     )
     # Turn Cost should reflect the $2.50 planner response, NOT $0.00 from step 2
     assert "- Turn Cost: `$2.50` (`0.37%` of weekly quota)" in report_md
+
+
+def test_extract_bucket_view_helper():
+    """Verifies _extract_bucket_view parses snake_case, camelCase, and fallbacks."""
+    buckets = {
+        "gemini-weekly": {
+            "calibrated_capacity": 672.0,
+            "remaining_fraction": 0.85,
+            "reset_time": "2026-10-21T02:27:22Z",
+        },
+        "3p-weekly": {
+            "calibratedCapacity": 250.0,
+            "remainingFraction": 0.90,
+            "resetTime": "2026-10-21T02:27:22Z",
+        },
+    }
+
+    v_gem = _extract_bucket_view(buckets, "gemini-weekly", 672.0)
+    assert v_gem["capacity"] == 672.0
+    assert v_gem["remaining_pct"] == 85.0
+    assert "to reset" in v_gem["countdown_str"]
+
+    v_3p = _extract_bucket_view(buckets, "3p-weekly", 200.0)
+    assert v_3p["capacity"] == 250.0
+    assert v_3p["remaining_pct"] == 90.0
+
+    v_fallback = _extract_bucket_view(buckets, "nonexistent", 100.0)
+    assert v_fallback["capacity"] == 100.0
+    assert v_fallback["remaining_pct"] == 100.0
+    assert v_fallback["countdown_str"] == "no reset scheduled"
+
+    # Test None input robustness
+    v_none = _extract_bucket_view(None, "gemini-weekly", 672.0)
+    assert v_none["capacity"] == 672.0
+    assert v_none["remaining_pct"] == 100.0
+    assert v_none["countdown_str"] == "no reset scheduled"
+
+    # Test list input robustness (snake_case and camelCase)
+    list_buckets = [
+        {
+            "bucket_id": "gemini-weekly",
+            "calibrated_capacity": 600.0,
+            "remaining_fraction": 0.80,
+            "reset_time": "2026-10-21T02:27:22Z",
+        },
+        {
+            "bucketId": "3p-weekly",
+            "calibratedCapacity": 180.0,
+            "remainingFraction": 0.75,
+            "resetTime": "2026-10-21T02:27:22Z",
+        },
+    ]
+    v_list_gem = _extract_bucket_view(list_buckets, "gemini-weekly")
+    assert v_list_gem["capacity"] == 600.0
+    assert v_list_gem["remaining_pct"] == 80.0
+
+    v_list_3p = _extract_bucket_view(list_buckets, "3p-weekly")
+    assert v_list_3p["capacity"] == 180.0
+    assert v_list_3p["remaining_pct"] == 75.0
+
+
+def test_generate_context_usage_report_top_steps_and_fleet_weekly_quota_columns(
+    tmp_path: Path,
+):
+    """Verifies % Wk Quota columns in both Top Context Consumers and Delegated Swarm Fleet tables."""
+    db_file = tmp_path / "analytics.db"
+    init_db(db_file)
+    with get_db_connection(db_file) as conn:
+        conn.execute(
+            """
+            INSERT INTO conversations (id, title, model_name, created_at, total_steps, total_tokens, billed_cost)
+            VALUES ('parent-100', 'Parent Task', 'Gemini 3.8 Flash (High)', '2026-10-14T10:00:00Z', 10, 50000, 6.72)
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO conversations (id, title, model_name, created_at, parent_id, root_id, depth, subagent_role, total_steps, total_tokens, billed_cost)
+            VALUES ('sub-101', 'Subagent 1', 'Gemini 3.8 Flash (High)', '2026-10-14T10:05:00Z', 'parent-100', 'parent-100', 1, 'worker', 5, 20000, 3.36)
+            """
+        )
+        conn.commit()
+
+    analysis = {
+        "title": "Quota Table Test",
+        "total_chars": 20000,
+        "total_tokens": 5000,
+        "active_context_tokens": 5000,
+        "billed_cost": 6.72,
+        "latest_model": "Gemini 3.8 Flash (High)",
+        "latest_max_tokens": 1000000,
+        "steps": [
+            {
+                "step_index": 1,
+                "created_at": "2026-10-14T10:00:00Z",
+                "source": "AI",
+                "step_type": "PLANNER_RESPONSE",
+                "category": "AI Generation",
+                "activity": "Response",
+                "tool_or_source": "Model",
+                "characters": 15000,
+                "est_tokens": 3000,
+                "detail": "Large output step",
+                "billed_cost": 6.72,
+            },
+        ],
+        "quota_state": {
+            "gemini-weekly": {
+                "bucket_id": "gemini-weekly",
+                "remaining_fraction": 0.90,
+                "reset_time": "2026-10-21T00:00:00Z",
+                "calibrated_capacity": 672.0,
+            }
+        },
+    }
+
+    with patch("scripts.ingest.DEFAULT_DB_PATH", db_file):
+        report_md = generate_context_usage_report(
+            cid="parent-100",
+            model_name="Gemini 3.8 Flash (High)",
+            max_tokens=1000000,
+            analysis=analysis,
+        )
+
+    # 1. Top Context Consumers has % Wk Quota
+    assert (
+        "| Step # | Activity | Source / Tool | Est. Tokens | % Wk Quota | Detail |"
+        in report_md
+    )
+    # $6.72 / $672.0 * 100 = 1.00%
+    assert "| #1 | Response | Model | ~3.0k | 1.00% | Large output step |" in report_md
+
+    # 2. Delegated Swarm Fleet has % Wk Quota
+    assert (
+        "| Sub-Agent | Role | Tier | Steps | Tokens | Cost | % Wk Quota |" in report_md
+    )
+    # Subagent cost: $3.36 / $672.0 * 100 = 0.50%
+    assert (
+        "| [Subagent 1](conversation://sub-101) | worker | Tier 1 | 5 | ~20.0k | $3.36 | 0.50% |"
+        in report_md
+    )

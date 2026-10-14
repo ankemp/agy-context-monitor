@@ -3,6 +3,7 @@ import subprocess
 import sqlite3
 from pathlib import Path
 
+
 def test_sidecar_query_logic(tmp_path):
     # Create a temporary SQLite database mimicking analytics.db
     db_path = tmp_path / "test_analytics.db"
@@ -112,7 +113,7 @@ def test_sidecar_query_logic(tmp_path):
         ["node", "--input-type=module", "-e", node_code],
         capture_output=True,
         text=True,
-        cwd=Path.cwd()
+        cwd=Path.cwd(),
     )
     assert res.returncode == 0, f"Node script failed: {res.stderr}"
     data = json.loads(res.stdout)
@@ -144,6 +145,7 @@ def test_sidecar_query_logic(tmp_path):
     assert "quota_remaining_5h_pct" in session
     assert session["quota"]["calibrated_weekly_capacity"] == 672.0
     assert "weekly_quota_pct" in session["top_steps"][0]
+
 
 def test_sidecar_quota_integration(tmp_path):
     db_path = tmp_path / "test_analytics_quota.db"
@@ -189,15 +191,50 @@ def test_sidecar_quota_integration(tmp_path):
     );
     """)
 
-    cur.executemany("""
+    cur.executemany(
+        """
     INSERT INTO quota_state (bucket_id, group_name, window, remaining_fraction, reset_time, calibrated_capacity, fetched_at)
     VALUES (?, ?, ?, ?, ?, ?, ?)
-    """, [
-        ("gemini-weekly", "Gemini Models", "weekly", 0.85, "2026-10-21T02:27:22Z", 672.0, "2026-10-14T10:00:00Z"),
-        ("gemini-5h", "Gemini Models", "5h", 0.90, "2026-10-14T18:00:00Z", 236.7, "2026-10-14T10:00:00Z"),
-        ("3p-weekly", "Claude and GPT models", "weekly", 0.95, "2026-10-21T02:27:22Z", 200.0, "2026-10-14T10:00:00Z"),
-        ("3p-5h", "Claude and GPT models", "5h", 0.98, "2026-10-14T18:00:00Z", 70.0, "2026-10-14T10:00:00Z"),
-    ])
+    """,
+        [
+            (
+                "gemini-weekly",
+                "Gemini Models",
+                "weekly",
+                0.85,
+                "2026-10-21T02:27:22Z",
+                672.0,
+                "2026-10-14T10:00:00Z",
+            ),
+            (
+                "gemini-5h",
+                "Gemini Models",
+                "5h",
+                0.90,
+                "2026-10-14T18:00:00Z",
+                236.7,
+                "2026-10-14T10:00:00Z",
+            ),
+            (
+                "3p-weekly",
+                "Claude and GPT models",
+                "weekly",
+                0.95,
+                "2026-10-21T02:27:22Z",
+                200.0,
+                "2026-10-14T10:00:00Z",
+            ),
+            (
+                "3p-5h",
+                "Claude and GPT models",
+                "5h",
+                0.98,
+                "2026-10-14T18:00:00Z",
+                70.0,
+                "2026-10-14T10:00:00Z",
+            ),
+        ],
+    )
 
     # Insert Gemini conversation with billed_cost = $6.72 (exactly 1.0% of $672)
     cur.execute("""
@@ -232,7 +269,7 @@ def test_sidecar_quota_integration(tmp_path):
         ["node", "--input-type=module", "-e", node_code],
         capture_output=True,
         text=True,
-        cwd=Path.cwd()
+        cwd=Path.cwd(),
     )
     assert res.returncode == 0, f"Node script failed: {res.stderr}"
     data = json.loads(res.stdout)
@@ -269,6 +306,7 @@ def test_sidecar_quota_integration(tmp_path):
     assert quota_c["buckets"]["gemini-weekly"]["session_impact_pct"] == 0.0
     assert abs(quota_c["buckets"]["3p-weekly"]["session_impact_pct"] - 1.0) < 0.01
 
+
 def test_sidecar_quota_missing_table_fallback(tmp_path):
     # Tests that query.mjs falls back gracefully when quota_state table does not exist
     db_path = tmp_path / "test_analytics_no_quota_table.db"
@@ -298,7 +336,7 @@ def test_sidecar_quota_missing_table_fallback(tmp_path):
         ["node", "--input-type=module", "-e", node_code],
         capture_output=True,
         text=True,
-        cwd=Path.cwd()
+        cwd=Path.cwd(),
     )
     assert res.returncode == 0, f"Node script failed: {res.stderr}"
     data = json.loads(res.stdout)
@@ -306,6 +344,7 @@ def test_sidecar_quota_missing_table_fallback(tmp_path):
     assert session["quota"]["calibrated_weekly_capacity"] == 672.0
     assert session["quota_remaining_weekly_pct"] == 100.0
     assert abs(session["weekly_quota_pct"] - 0.5) < 0.01
+
 
 def test_sidecar_no_cross_conversation_leakage(tmp_path):
     # If a specific cid is requested that is not yet in the DB, it must NOT leak conv-existing
@@ -356,7 +395,7 @@ def test_sidecar_no_cross_conversation_leakage(tmp_path):
         ["node", "--input-type=module", "-e", node_code],
         capture_output=True,
         text=True,
-        cwd=Path.cwd()
+        cwd=Path.cwd(),
     )
     assert res.returncode == 0, f"Node script failed: {res.stderr}"
     session = json.loads(res.stdout)
@@ -364,15 +403,15 @@ def test_sidecar_no_cross_conversation_leakage(tmp_path):
     assert session["active_tokens"] == 0
     assert "Secret" not in session["title"]
 
+
 def test_main_mjs_exists_and_syntax():
     main_mjs = Path("sidecars/panel/main.mjs")
     assert main_mjs.exists(), "sidecars/panel/main.mjs must exist"
     res = subprocess.run(
-        ["node", "--check", str(main_mjs)],
-        capture_output=True,
-        text=True
+        ["node", "--check", str(main_mjs)], capture_output=True, text=True
     )
     assert res.returncode == 0, f"Syntax check failed: {res.stderr}"
+
 
 def test_sidecar_quota_indexing_session_uses_cached_quota(tmp_path):
     # Verifies that when a conversation is indexing, getSessionData reads cached quota_state
@@ -406,13 +445,14 @@ def test_sidecar_quota_indexing_session_uses_cached_quota(tmp_path):
         ["node", "--input-type=module", "-e", node_code],
         capture_output=True,
         text=True,
-        cwd=Path.cwd()
+        cwd=Path.cwd(),
     )
     assert res.returncode == 0, f"Node script failed: {res.stderr}"
     session = json.loads(res.stdout)
     assert session["cid"] == "indexing-conv-id"
     assert session["quota_remaining_weekly_pct"] == 50.0
     assert session["quota"]["weekly_remaining_pct"] == 50.0
+
 
 def test_sidecar_model_detection_and_naive_utc_countdown():
     # Verifies model context limit / prefix detection and UTC naive countdown
@@ -436,7 +476,7 @@ def test_sidecar_model_detection_and_naive_utc_countdown():
         ["node", "--input-type=module", "-e", node_code],
         capture_output=True,
         text=True,
-        cwd=Path.cwd()
+        cwd=Path.cwd(),
     )
     assert res.returncode == 0, f"Node script failed: {res.stderr}"
     data = json.loads(res.stdout)
@@ -448,6 +488,7 @@ def test_sidecar_model_detection_and_naive_utc_countdown():
     assert data["argonPrefix"] == "gemini"
     assert data["utcZ"] == "2h 0m"
     assert data["naive"] == "2h 0m"
+
 
 def test_sidecar_global_cost_breakdown_by_model_family(tmp_path):
     db_path = tmp_path / "test_analytics_global_family.db"
@@ -484,15 +525,19 @@ def test_sidecar_global_cost_breakdown_by_model_family(tmp_path):
         ["node", "--input-type=module", "-e", node_code],
         capture_output=True,
         text=True,
-        cwd=Path.cwd()
+        cwd=Path.cwd(),
     )
     assert res.returncode == 0, f"Node script failed: {res.stderr}"
     data = json.loads(res.stdout)
     assert abs(data["total_cost"] - 8.72) < 0.01
     # Gemini bucket should calculate against Gemini cost ($6.72 / $672 = 1.0%)
-    assert abs(data["quota"]["buckets"]["gemini-weekly"]["session_impact_pct"] - 1.0) < 0.01
+    assert (
+        abs(data["quota"]["buckets"]["gemini-weekly"]["session_impact_pct"] - 1.0)
+        < 0.01
+    )
     # 3P bucket should calculate against 3P cost ($2.00 / $200 = 1.0%)
     assert abs(data["quota"]["buckets"]["3p-weekly"]["session_impact_pct"] - 1.0) < 0.01
+
 
 def test_sidecar_missing_conversations_table_graceful(tmp_path):
     db_path = tmp_path / "test_analytics_no_conversations.db"
@@ -519,7 +564,7 @@ def test_sidecar_missing_conversations_table_graceful(tmp_path):
         ["node", "--input-type=module", "-e", node_code],
         capture_output=True,
         text=True,
-        cwd=Path.cwd()
+        cwd=Path.cwd(),
     )
     assert res.returncode == 0, f"Node script failed: {res.stderr}"
     data = json.loads(res.stdout)
@@ -527,3 +572,60 @@ def test_sidecar_missing_conversations_table_graceful(tmp_path):
     assert data["g"]["total_conversations"] == 0
 
 
+def test_sidecar_get_global_data_filters_older_conversations(tmp_path):
+    db_path = tmp_path / "test_analytics_window.db"
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    cur.executescript("""
+    CREATE TABLE conversations (
+        id TEXT PRIMARY KEY, title TEXT, project TEXT, model_name TEXT,
+        created_at TEXT, updated_at TEXT, total_steps INTEGER DEFAULT 0,
+        total_tokens INTEGER DEFAULT 0, billed_cost REAL DEFAULT 0.0
+    );
+    CREATE TABLE quota_state (
+        bucket_id TEXT PRIMARY KEY, group_name TEXT, window TEXT,
+        remaining_fraction REAL, reset_time TEXT, calibrated_capacity REAL, fetched_at TEXT
+    );
+    INSERT INTO quota_state VALUES
+        ('gemini-weekly', 'Gemini Models', 'weekly', 0.90, '2026-10-21T02:27:22Z', 672.0, '2026-10-14T10:00:00Z'),
+        ('3p-weekly', 'Claude Models', 'weekly', 0.90, '2026-10-21T02:27:22Z', 200.0, '2026-10-14T10:00:00Z');
+    INSERT INTO conversations VALUES
+        ('c-recent-gem', 'Recent Gemini', 'p', 'Gemini 3.8 Flash', '2026-10-14T10:00:00Z', '2026-10-14T10:00:00Z', 1, 1000, 6.72),
+        ('c-recent-3p', 'Recent Claude', 'p', 'Claude 3.7 Sonnet', '2026-10-14T10:00:00Z', '2026-10-14T10:00:00Z', 1, 1000, 2.00),
+        ('c-sameday-gem', 'Same Day Space Gemini', 'p', 'Gemini 3.8 Flash', '2026-10-14 05:00:00', '2026-10-14 05:00:00', 1, 1000, 3.36),
+        ('c-micro-3p', 'Microsecond Claude', 'p', 'Claude 3.7 Sonnet', '2026-10-14T03:00:00.123456', '2026-10-14T03:00:00.123456', 1, 1000, 1.00),
+        ('c-tz-gem', 'Timezone Offset Gemini', 'p', 'Gemini 3.8 Flash', '2026-10-14T01:00:00-04:00', '2026-10-14T01:00:00-04:00', 1, 1000, 3.36),
+        ('c-old-gem', 'Old Gemini', 'p', 'Gemini 3.8 Flash', '2026-09-01T10:00:00Z', '2026-09-01T10:00:00Z', 1, 1000, 50.00);
+    """)
+    conn.commit()
+    conn.close()
+
+    node_code = f"""
+    import {{ openDatabase, getGlobalData }} from './sidecars/panel/query.mjs';
+    const db = openDatabase('{db_path}');
+    const g = getGlobalData(db);
+    console.log(JSON.stringify(g));
+    """
+
+    res = subprocess.run(
+        ["node", "--input-type=module", "-e", node_code],
+        capture_output=True,
+        text=True,
+        cwd=Path.cwd(),
+    )
+    assert res.returncode == 0, f"Node script failed: {res.stderr}"
+    data = json.loads(res.stdout)
+
+    # All-time total includes the old conversation ($50 + $6.72 + $2.00 + $3.36 + $1.00 + $3.36 = $66.44)
+    assert abs(data["total_cost"] - 66.44) < 0.01
+    assert data["total_conversations"] == 6
+
+    # Weekly cost includes recent conversations ($6.72 + $2.00 + $3.36 + $1.00 + $3.36 = $16.44)
+    assert abs(data["weekly_cost"] - 16.44) < 0.01
+    # Gemini weekly cost = $6.72 + $3.36 + $3.36 = $13.44 => $13.44 / $672 = 2.0%
+    assert (
+        abs(data["quota"]["buckets"]["gemini-weekly"]["session_impact_pct"] - 2.0)
+        < 0.01
+    )
+    # 3P weekly cost = $2.00 + $1.00 = $3.00 => $3.00 / $200 = 1.5%
+    assert abs(data["quota"]["buckets"]["3p-weekly"]["session_impact_pct"] - 1.5) < 0.01

@@ -36,25 +36,22 @@ def generate_html_report(
     """
     active_model = analysis.get("latest_model", model_name)
     active_max = analysis.get("latest_max_tokens", max_tokens) or 1_000_000
-    active_tokens = analysis.get("active_context_tokens", analysis.get("total_tokens", 0))
+    active_tokens = analysis.get(
+        "active_context_tokens", analysis.get("total_tokens", 0)
+    )
     active_pct = min(100.0, (active_tokens / active_max * 100)) if active_max else 0.0
     cost = analysis.get("billed_cost", 0.0)
-    in_toks = analysis.get("billed_input_tokens", 0)
-    out_toks = analysis.get("billed_output_tokens", 0)
 
     # Status level & colors
     if active_pct >= 80.0:
         status_label = "Critical"
         status_badge_class = "bg-rose-500/20 text-rose-400 border-rose-500/30"
-        bar_accent_class = "bg-rose-500"
     elif active_pct >= 60.0:
         status_label = "Elevated"
         status_badge_class = "bg-amber-500/20 text-amber-400 border-amber-500/30"
-        bar_accent_class = "bg-amber-500"
     else:
         status_label = "Optimal"
         status_badge_class = "bg-emerald-500/20 text-emerald-400 border-emerald-500/30"
-        bar_accent_class = "bg-emerald-500"
 
     # Category segments for stacked capacity bar
     cat_stats = analysis.get("category_stats", {})
@@ -62,11 +59,11 @@ def generate_html_report(
 
     # Aggregate categories into core buckets
     bucket_colors = {
-        "Tools & Results": ("#f59e0b", 0),      # amber
-        "Agent Response": ("#6366f1", 0),       # indigo
-        "Thinking": ("#a855f7", 0),             # purple
-        "User Input": ("#06b6d4", 0),           # cyan
-        "System & Other": ("#64748b", 0),       # slate
+        "Tools & Results": ("#f59e0b", 0),  # amber
+        "Agent Response": ("#6366f1", 0),  # indigo
+        "Thinking": ("#a855f7", 0),  # purple
+        "User Input": ("#06b6d4", 0),  # cyan
+        "System & Other": ("#64748b", 0),  # slate
     }
 
     for cat_name, chars in cat_stats.items():
@@ -91,18 +88,16 @@ def generate_html_report(
     steps = analysis.get("steps", [])
     active_step_min = steps[0]["step_index"] if steps else 0
     active_step_max = steps[-1]["step_index"] if steps else 0
-    
+
     compaction_detected = False
     pruned_count = 0
     pruned_tokens = 0
-    pruned_summary = ""
 
     if diff_res is not None:
         compaction_detected = getattr(diff_res, "compaction_detected", False)
         pruned_steps = getattr(diff_res, "pruned_step_indices", [])
         pruned_count = len(pruned_steps)
         pruned_tokens = getattr(diff_res, "removed_tokens", 0)
-        pruned_summary = getattr(diff_res, "summary", "")
 
     # Top consumers
     top_steps = sorted(steps, key=lambda s: s.get("characters", 0), reverse=True)[:3]
@@ -110,7 +105,7 @@ def generate_html_report(
     # Generate segments HTML
     bar_segments_html = []
     legend_html = []
-    
+
     for bucket_name, (color, chars) in bucket_colors.items():
         if chars <= 0:
             continue
@@ -125,7 +120,7 @@ def generate_html_report(
             f'<span class="w-2 h-2 rounded-full shrink-0" style="background-color: {color};"></span>'
             f'<span class="truncate">{bucket_name}</span>'
             f'<span class="font-mono text-[var(--foreground)] ml-auto">~{format_tokens(toks)}</span>'
-            f'</div>'
+            f"</div>"
         )
 
     # Top steps HTML
@@ -140,10 +135,10 @@ def generate_html_report(
             f'<div class="flex items-center gap-1.5 truncate">'
             f'<span class="font-mono text-[var(--muted-foreground)]">#{s_idx}</span>'
             f'<span class="font-medium text-[var(--foreground)] truncate">{s_tool}</span>'
-            f'{f"<span class=\"text-[var(--muted-foreground)] truncate\">({s_detail})</span>" if s_detail else ""}'
-            f'</div>'
+            f"{f'<span class="text-[var(--muted-foreground)] truncate">({s_detail})</span>' if s_detail else ''}"
+            f"</div>"
             f'<span class="font-mono font-medium text-[var(--foreground)] ml-2 shrink-0">~{s_toks}</span>'
-            f'</div>'
+            f"</div>"
         )
 
     # Compaction banner HTML

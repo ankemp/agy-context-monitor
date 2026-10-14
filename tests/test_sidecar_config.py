@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 
+
 def test_plugin_manifest():
     plugin_path = Path("plugin.json")
     assert plugin_path.exists(), "plugin.json must exist"
@@ -8,6 +9,7 @@ def test_plugin_manifest():
     assert data.get("name") == "context-monitor"
     assert data.get("logo") == "assets/logo.svg"
     assert Path(data["logo"]).exists(), "logo referenced in plugin.json must exist"
+
 
 def test_sidecar_manifest():
     sidecar_json = Path("sidecars/panel/sidecar.json")
@@ -22,6 +24,7 @@ def test_sidecar_manifest():
     assert len(views) > 0
     assert views[0].get("entrypoint") == "SIDECAR_UI_ENTRYPOINT_AUX_PANE"
     assert views[0].get("path") == "/"
+
 
 def test_sidecar_package():
     pkg_json = Path("sidecars/panel/package.json")

@@ -1,4 +1,3 @@
-import pytest
 from context_monitor.html_report import generate_html_report, format_tokens
 from context_monitor.diff import DiffResult
 
@@ -71,7 +70,13 @@ def test_generate_html_report_structure():
     assert "animation: none !important;" in html_out
 
     # 4. Must use Antigravity host semantic theme variables
-    for var_name in ["var(--card)", "var(--foreground)", "var(--border)", "var(--muted-foreground)", "var(--sidebar)"]:
+    for var_name in [
+        "var(--card)",
+        "var(--foreground)",
+        "var(--border)",
+        "var(--muted-foreground)",
+        "var(--sidebar)",
+    ]:
         assert var_name in html_out
 
     # 5. Must contain prompt action buttons and triggerPrompt function
@@ -122,8 +127,18 @@ def test_generate_html_report_compaction_banner():
         "total_tokens": 80_000,
         "total_chars": 304_000,
         "steps": [
-            {"step_index": 10, "tool_or_source": "User", "characters": 10_000, "est_tokens": 2600},
-            {"step_index": 11, "tool_or_source": "Agent", "characters": 20_000, "est_tokens": 5200},
+            {
+                "step_index": 10,
+                "tool_or_source": "User",
+                "characters": 10_000,
+                "est_tokens": 2600,
+            },
+            {
+                "step_index": 11,
+                "tool_or_source": "Agent",
+                "characters": 20_000,
+                "est_tokens": 5200,
+            },
         ],
         "category_stats": {},
     }
@@ -140,7 +155,9 @@ def test_generate_html_report_compaction_banner():
         summary="Pruned 4 steps",
     )
 
-    html_out = generate_html_report("cid", "Claude 3.7 Sonnet", 200_000, analysis, diff_res=diff_res)
+    html_out = generate_html_report(
+        "cid", "Claude 3.7 Sonnet", 200_000, analysis, diff_res=diff_res
+    )
 
     assert "Memory Compaction" in html_out
     assert "Pruned 4 historical steps (~45.0k freed)" in html_out

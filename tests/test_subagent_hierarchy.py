@@ -1,6 +1,5 @@
 import unittest
 import tempfile
-import sqlite3
 import json
 from pathlib import Path
 
@@ -8,7 +7,7 @@ from context_monitor.db import get_db_connection, init_db
 from context_monitor.dashboard.api_routes import (
     query_conversations_list,
     query_session_details,
-    query_summary_data
+    query_summary_data,
 )
 import scripts.ingest as ingest
 
@@ -24,7 +23,9 @@ class TestSubagentHierarchy(unittest.TestCase):
             cur = conn.cursor()
 
             # Verify column existence
-            cols = {c[1] for c in cur.execute("PRAGMA table_info(conversations)").fetchall()}
+            cols = {
+                c[1] for c in cur.execute("PRAGMA table_info(conversations)").fetchall()
+            }
             self.assertIn("parent_id", cols)
             self.assertIn("root_id", cols)
             self.assertIn("depth", cols)
@@ -33,7 +34,12 @@ class TestSubagentHierarchy(unittest.TestCase):
             self.assertIn("invoking_step_index", cols)
 
             # Verify indexes
-            indexes = {r[1] for r in cur.execute("SELECT type, name FROM sqlite_master WHERE type='index'").fetchall()}
+            indexes = {
+                r[1]
+                for r in cur.execute(
+                    "SELECT type, name FROM sqlite_master WHERE type='index'"
+                ).fetchall()
+            }
             self.assertIn("idx_conversations_parent", indexes)
             self.assertIn("idx_conversations_root", indexes)
             self.assertIn("idx_conversations_depth", indexes)
@@ -47,14 +53,14 @@ class TestSubagentHierarchy(unittest.TestCase):
             parent_dir = tmp_path / "parent-123"
             parent_logs = parent_dir / ".system_generated" / "logs"
             parent_logs.mkdir(parents=True)
-            
+
             parent_transcript = [
                 {
                     "step_index": 1,
                     "type": "USER_INPUT",
                     "source": "USER_EXPLICIT",
                     "content": "Please implement feature X with subagents",
-                    "created_at": "2026-10-06T10:00:00Z"
+                    "created_at": "2026-10-06T10:00:00Z",
                 },
                 {
                     "step_index": 2,
@@ -66,20 +72,24 @@ class TestSubagentHierarchy(unittest.TestCase):
                             "name": "invoke_subagent",
                             "args": {
                                 "Subagents": [
-                                    {"Role": "DeepCoder Coordinator", "TypeName": "self", "Prompt": "Coordinate workers"}
+                                    {
+                                        "Role": "DeepCoder Coordinator",
+                                        "TypeName": "self",
+                                        "Prompt": "Coordinate workers",
+                                    }
                                 ]
-                            }
+                            },
                         }
                     ],
-                    "created_at": "2026-10-06T10:00:05Z"
+                    "created_at": "2026-10-06T10:00:05Z",
                 },
                 {
                     "step_index": 3,
                     "type": "GENERIC",
                     "source": "SYSTEM",
-                    "content": 'Created the following subagents:\n- DeepCoder Coordinator (conversationId: child-456, type: self)\n\nNow communicate with them.',
-                    "created_at": "2026-10-06T10:00:06Z"
-                }
+                    "content": "Created the following subagents:\n- DeepCoder Coordinator (conversationId: child-456, type: self)\n\nNow communicate with them.",
+                    "created_at": "2026-10-06T10:00:06Z",
+                },
             ]
             with open(parent_logs / "transcript.jsonl", "w") as f:
                 for entry in parent_transcript:
@@ -104,16 +114,16 @@ class TestSubagentHierarchy(unittest.TestCase):
                     "step_index": 1,
                     "type": "SYSTEM_MESSAGE",
                     "source": "SYSTEM",
-                    "content": '[Message] timestamp=2026-10-06T10:00:06Z sender=parent-123 recipient=child-456\nCoordinate workers for feature X',
-                    "created_at": "2026-10-06T10:00:07Z"
+                    "content": "[Message] timestamp=2026-10-06T10:00:06Z sender=parent-123 recipient=child-456\nCoordinate workers for feature X",
+                    "created_at": "2026-10-06T10:00:07Z",
                 },
                 {
                     "step_index": 2,
                     "type": "PLANNER_RESPONSE",
                     "source": "MODEL",
                     "content": "Starting coordination...",
-                    "created_at": "2026-10-06T10:00:10Z"
-                }
+                    "created_at": "2026-10-06T10:00:10Z",
+                },
             ]
             with open(child_logs / "transcript.jsonl", "w") as f:
                 for entry in child_transcript:
@@ -152,7 +162,7 @@ class TestSubagentHierarchy(unittest.TestCase):
             # 1. Hierarchy view (default)
             hier_convs = query_conversations_list(conn, view_mode="hierarchy")
             self.assertEqual(len(hier_convs), 2)  # Only root-1 and indep-1
-            
+
             root_conv = next(c for c in hier_convs if c["id"] == "root-1")
             self.assertEqual(root_conv["subagent_count"], 2)
             self.assertEqual(root_conv["fleet_cost"], 6.50)  # 2.00 + 1.00 + 3.50
@@ -229,7 +239,7 @@ class TestSubagentHierarchy(unittest.TestCase):
             self.assertEqual(tree["id"], "root-1")
             self.assertFalse(tree["is_current"])
             self.assertEqual(len(tree["children"]), 1)
-            
+
             coord_node = tree["children"][0]
             self.assertEqual(coord_node["id"], "coord-1")
             self.assertTrue(coord_node["is_current"])  # Active target!

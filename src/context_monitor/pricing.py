@@ -20,11 +20,11 @@ DEFAULT_MODEL: str = "Gemini 3.8 Flash (High)"
 
 # Rates per 1,000,000 tokens: (input_rate_low, input_rate_high_tier_over_128k, output_rate)
 PRICING: dict[str, tuple[float, float, float]] = {
-    "argon": (2.00, 2.00, 10.00),   # Gemini 4 Argon ($2.00/M in, $10.00/M out flat)
-    "pro": (1.25, 2.50, 10.00),     # Gemini Pro / 3.1 Pro / 2.5 Pro
-    "flash": (0.075, 0.15, 0.60),   # Gemini Flash / 3.6 / 3.7 / 3.8 Flash
+    "argon": (2.00, 2.00, 10.00),  # Gemini 4 Argon ($2.00/M in, $10.00/M out flat)
+    "pro": (1.25, 2.50, 10.00),  # Gemini Pro / 3.1 Pro / 2.5 Pro
+    "flash": (0.075, 0.15, 0.60),  # Gemini Flash / 3.6 / 3.7 / 3.8 Flash
     "claude": (3.00, 3.00, 15.00),  # Claude 3.5 / 3.7 Sonnet / Opus
-    "gpt": (2.50, 2.50, 10.00),     # GPT-4o / o1 / o3
+    "gpt": (2.50, 2.50, 10.00),  # GPT-4o / o1 / o3
 }
 
 MODEL_CONTEXT_LIMITS: dict[str, int] = {
@@ -34,6 +34,7 @@ MODEL_CONTEXT_LIMITS: dict[str, int] = {
     "claude": 200_000,
     "gpt": 128_000,
 }
+
 
 def get_pricing_key(model_name: str) -> str:
     """Resolves a model name string to its canonical pricing key."""
@@ -48,10 +49,12 @@ def get_pricing_key(model_name: str) -> str:
         return "pro"
     return "flash"
 
+
 def get_model_context_limit(model_name: str) -> int:
     """Returns the maximum context token window limit for the given model."""
     pkey = get_pricing_key(model_name)
     return MODEL_CONTEXT_LIMITS.get(pkey, 1_000_000)
+
 
 def calculate_step_cost(
     running_ctx: int,
@@ -73,18 +76,23 @@ def calculate_step_cost(
     step_cost = (actual_in / 1_000_000 * in_rate) + (safe_out / 1_000_000 * out_rate)
     return step_cost, actual_in, safe_out
 
+
 def extract_model_switch(content: str) -> str | None:
     """
     Extracts the newly selected model name from a USER_INPUT step's content.
     Safely scopes to <USER_SETTINGS_CHANGE>...</USER_SETTINGS_CHANGE> if present,
     and handles standard Antigravity setting change phrasings and formatting variations.
     """
-    if not content or ("Model Selection" not in content and "<USER_SETTINGS_CHANGE>" not in content):
+    if not content or (
+        "Model Selection" not in content and "<USER_SETTINGS_CHANGE>" not in content
+    ):
         return None
 
     search_text = content
     if "<USER_SETTINGS_CHANGE>" in content:
-        blocks = re.findall(r"<USER_SETTINGS_CHANGE>(.*?)</USER_SETTINGS_CHANGE>", content, re.DOTALL)
+        blocks = re.findall(
+            r"<USER_SETTINGS_CHANGE>(.*?)</USER_SETTINGS_CHANGE>", content, re.DOTALL
+        )
         if blocks:
             search_text = "\n".join(blocks)
 

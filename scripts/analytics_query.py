@@ -124,6 +124,48 @@ def calculate_billed_cost(conn):
     return total_cost, total_in, total_out
 
 
+def _get_weekly_project_costs(
+    cur, gw: dict
+) -> tuple[dict[str, float], float, str | None]:
+    """Computes project costs filtered to current weekly reset window."""
+    weekly_capacity = float(
+        gw.get("calibrated_capacity") or DEFAULT_GEMINI_WEEKLY_CAPACITY
+    )
+    if weekly_capacity <= 0:
+        weekly_capacity = DEFAULT_GEMINI_WEEKLY_CAPACITY
+
+    gw_reset = gw.get("reset_time") or ""
+    window_start = None
+    if gw_reset:
+        try:
+            r_dt = datetime.fromisoformat(gw_reset.replace("Z", "+00:00"))
+            w_start_dt = r_dt - timedelta(days=7)
+            window_start = w_start_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        except Exception:
+            window_start = None
+
+    weekly_cost_by_proj = {}
+    if window_start:
+        try:
+            w_rows = cur.execute(
+                """
+                SELECT 
+                    COALESCE(NULLIF(project, ''), '(unassigned)') as project_name,
+                    SUM(billed_cost) as weekly_cost
+                FROM conversations
+                WHERE datetime(created_at) >= datetime(?)
+                GROUP BY project_name
+            """,
+                (window_start,),
+            ).fetchall()
+            for wr in w_rows:
+                weekly_cost_by_proj[wr["project_name"]] = wr["weekly_cost"] or 0.0
+        except Exception:
+            pass
+
+    return weekly_cost_by_proj, weekly_capacity, window_start
+
+
 def print_summary(conn):
     print("\n" + "=" * 70)
     print(" 🚀 GOOGLE ANTIGRAVITY — GLOBAL AGGREGATE ANALYTICS")
@@ -312,11 +354,15 @@ def print_summary(conn):
             f"  {(r['mname'] or 'Unknown'):<30} | {r['step_count']:<10,}| {format_tokens(toks):<12} | {share:5.1f}%"
         )
 
+    weekly_cost_by_proj, weekly_capacity, window_start = _get_weekly_project_costs(
+        cur, gw
+    )
+
     print("\n[4] Cost & Context by Project:")
     print(
-        f"  {'Project':<28} | {'Cost':<10} | {'Share':<7} | {'Sessions':<10} | {'Tokens':<10}"
+        f"  {'Project':<24} | {'Cost':<9} | {'% Wk Quota':<11} | {'Share':<7} | {'Sessions':<10} | {'Tokens':<10}"
     )
-    print("  " + "-" * 72)
+    print("  " + "-" * 86)
     proj_rows = cur.execute("""
         SELECT 
             COALESCE(NULLIF(project, ''), '(unassigned)') as project_name,
@@ -333,8 +379,13 @@ def print_summary(conn):
         c = r["billed_cost"] or 0.0
         pct = (c / tot_proj_cost * 100) if tot_proj_cost else 0.0
         act_tok = r["actual_tokens"] or 0
+        p_name = r["project_name"]
+        p_wk_cost = weekly_cost_by_proj.get(p_name, c if not window_start else 0.0)
+        wk_quota_pct = (
+            (p_wk_cost / weekly_capacity * 100.0) if weekly_capacity > 0 else 0.0
+        )
         print(
-            f"  {(r['project_name']):<28} | ${c:<9.2f}| {pct:5.1f}% | {r['session_count']:<10,}| {format_tokens(act_tok):<10}"
+            f"  {p_name:<24} | ${c:<8.2f}| {wk_quota_pct:6.2f}%   | {pct:5.1f}% | {r['session_count']:<10,}| {format_tokens(act_tok):<10}"
         )
     print("=" * 70 + "\n")
 
@@ -1032,6 +1083,42 @@ def generate_global_report(
             f"| Claude / 3P Models | 5-Hour | {tp5.get('quota_remaining_pct', 100):.1f}% | {tp5.get('reset_countdown') or 'n/a'} | ${tp5.get('calibrated_capacity', DEFAULT_3P_5H_CAPACITY):.2f} |",
         ]
     )
+
+    weekly_cost_by_proj, weekly_capacity, window_start = _get_weekly_project_costs(
+        cur, gw
+    )
+
+    lines.extend(
+        [
+            "\n## 6. Cost & Context by Project\n",
+            "| Project | Cost | % Wk Quota | Share | Sessions | Tokens |",
+            "| :--- | :--- | :--- | :--- | :--- | :--- |",
+        ]
+    )
+    proj_rows = cur.execute("""
+        SELECT 
+            COALESCE(NULLIF(project, ''), '(unassigned)') as project_name,
+            COUNT(*) as session_count,
+            SUM(total_tokens) as total_tokens,
+            SUM(billed_cost) as billed_cost,
+            SUM(COALESCE(billed_input_tokens, 0) + COALESCE(billed_output_tokens, 0)) as actual_tokens
+        FROM conversations
+        GROUP BY project_name
+        ORDER BY billed_cost DESC, actual_tokens DESC
+    """).fetchall()
+    tot_proj_cost = sum(r["billed_cost"] or 0.0 for r in proj_rows)
+    for r in proj_rows:
+        c = r["billed_cost"] or 0.0
+        pct = (c / tot_proj_cost * 100) if tot_proj_cost else 0.0
+        act_tok = r["actual_tokens"] or 0
+        p_name = r["project_name"]
+        p_wk_cost = weekly_cost_by_proj.get(p_name, c if not window_start else 0.0)
+        wk_quota_pct = (
+            (p_wk_cost / weekly_capacity * 100.0) if weekly_capacity > 0 else 0.0
+        )
+        lines.append(
+            f"| `{p_name}` | ${c:,.2f} | {wk_quota_pct:.2f}% | {pct:.1f}% | {r['session_count']:,} | {format_tokens(act_tok)} |"
+        )
 
     with open(output_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")

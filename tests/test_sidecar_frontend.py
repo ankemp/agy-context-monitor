@@ -1,5 +1,6 @@
 from pathlib import Path
 
+
 def test_frontend_files_exist_and_invariants():
     html_path = Path("sidecars/panel/index.html")
     css_path = Path("sidecars/panel/styles.css")
@@ -48,8 +49,11 @@ def test_frontend_files_exist_and_invariants():
     assert "renderQuota" in js
     assert "quota-weekly-pct" in js
     assert "quota-tab-gemini" in js
-    assert "visibilitychange" in js, "Must guard polling with visibility change listener"
+    assert "visibilitychange" in js, (
+        "Must guard polling with visibility change listener"
+    )
     assert "sidecar.agent.sendMessage" in js or "agent.sendMessage" in js
+
 
 def test_sidecar_frontend_render_quota_execution():
     """Executes app.js in Node with a simulated DOM to deeply verify quota rendering and tab switching."""
@@ -198,10 +202,7 @@ def test_sidecar_frontend_render_quota_execution():
     """
 
     res = subprocess.run(
-        ["node", "-e", node_script],
-        capture_output=True,
-        text=True,
-        cwd=Path.cwd()
+        ["node", "-e", node_script], capture_output=True, text=True, cwd=Path.cwd()
     )
     assert res.returncode == 0, f"Node DOM execution failed: {res.stderr}"
     data = json.loads(res.stdout)
@@ -222,6 +223,7 @@ def test_sidecar_frontend_render_quota_execution():
     assert after["quotaBadge"] == "1.00% wk"
     assert after["geminiTabSelected"] == "false"
     assert after["threepTabSelected"] == "true"
+
 
 def test_sidecar_frontend_global_mode_execution():
     """Verifies that in global mode (no active conversation), quota card displays fleet total."""
@@ -346,10 +348,7 @@ def test_sidecar_frontend_global_mode_execution():
     """
 
     res = subprocess.run(
-        ["node", "-e", node_script],
-        capture_output=True,
-        text=True,
-        cwd=Path.cwd()
+        ["node", "-e", node_script], capture_output=True, text=True, cwd=Path.cwd()
     )
     assert res.returncode == 0, f"Node DOM global execution failed: {res.stderr}"
     data = json.loads(res.stdout)
@@ -357,4 +356,3 @@ def test_sidecar_frontend_global_mode_execution():
     assert "fleet total" in data["sessionImpact"]
     assert "fleet" in data["quotaBadge"]
     assert "2.00% wk" in data["globalQuota"]
-

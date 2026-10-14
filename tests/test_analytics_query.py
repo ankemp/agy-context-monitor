@@ -353,3 +353,64 @@ def test_quota_capacity_defaults_fallback(
             assert "$48.00" not in report_text
             assert "$168.00" not in report_text
             assert "$12.00" not in report_text
+
+
+def test_project_weekly_quota_summary_and_report(
+    analytics_test_db: Path, tmp_path: Path, capsys: pytest.CaptureFixture
+):
+    """Verifies that both --summary and --report include % Wk Quota for projects with proper weekly window filtering."""
+    with patch(
+        "context_monitor.quota.discover_language_server_credentials",
+        return_value=(None, None),
+    ):
+        with get_db_connection(analytics_test_db) as conn:
+            # Add a second project with an old conversation ($50) and a recent same-day space conversation ($3.50)
+            conn.execute(
+                """
+                INSERT INTO conversations (
+                    id, title, project, model_name, created_at, updated_at,
+                    total_steps, total_tokens, billed_cost
+                ) VALUES (
+                    'conv-legacy-old', 'Old Task', 'legacy-proj', 'Gemini 3.8 Flash',
+                    '2026-09-01T10:00:00Z', '2026-09-01T10:10:00Z', 5, 20000, 50.00
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO conversations (
+                    id, title, project, model_name, created_at, updated_at,
+                    total_steps, total_tokens, billed_cost
+                ) VALUES (
+                    'conv-legacy-new', 'New Task Space Time', 'legacy-proj', 'Gemini 3.8 Flash',
+                    '2026-10-14 05:00:00', '2026-10-14 05:10:00', 5, 20000, 3.50
+                )
+                """
+            )
+            conn.commit()
+
+            # 1. Test print_summary
+            analytics_query.print_summary(conn)
+            out_summary = capsys.readouterr().out
+            assert "[4] Cost & Context by Project:" in out_summary
+            assert "% Wk Quota" in out_summary
+            # Project 'agy-monitor' cost is $10.50, weekly is $10.50, capacity is $700.0 => 1.50%
+            assert "1.50%" in out_summary
+            assert "agy-monitor" in out_summary
+            # Project 'legacy-proj' total cost is $53.50, but weekly is $3.50 => 0.50%
+            assert "0.50%" in out_summary
+            assert "legacy-proj" in out_summary
+            assert "$53.50" in out_summary
+
+            # 2. Test generate_global_report
+            report_file = tmp_path / "global_analytics.md"
+            analytics_query.generate_global_report(conn, output_path=report_file)
+            content = report_file.read_text(encoding="utf-8")
+
+            assert "## 6. Cost & Context by Project" in content
+            assert (
+                "| Project | Cost | % Wk Quota | Share | Sessions | Tokens |" in content
+            )
+            assert "| `agy-monitor` | $10.50 | 1.50% |" in content
+            assert "| `legacy-proj` | $53.50 | 0.50% |" in content
+            assert not EMOJI_PATTERN.search(content)

@@ -568,12 +568,13 @@ def sync_and_get_quota_state(
 
 def calculate_quota_metrics(
     turn_cost: float = 0.0,
-    thread_cost_or_model: float | str = 0.0,
+    thread_cost: float = 0.0,
     quota_state: list[dict] | dict[str, dict] | None = None,
-    *,
-    thread_cost: float | None = None,
     model_name: str | None = None,
+    *,
     billed_cost: float | None = None,
+    session_cost: float | None = None,
+    **kwargs,
 ) -> dict[str, Any]:
     """
     Calculates percentage of weekly and 5-hour quota consumed by a turn and thread.
@@ -587,26 +588,38 @@ def calculate_quota_metrics(
         dict containing per-bucket metrics ('gemini-weekly', 'gemini-5h', '3p-weekly', '3p-5h')
         as well as top-level convenience keys ('weekly_pct', 'five_hour_pct', 'weekly_remaining_pct', etc.)
     """
+    if "thread_cost_or_model" in kwargs:
+        tcom = kwargs["thread_cost_or_model"]
+        if isinstance(tcom, str):
+            model_name = tcom
+        else:
+            thread_cost = float(tcom)
+
     if billed_cost is not None:
         turn_cost = billed_cost
 
-    # If quota_state was passed as model_name string (e.g. calculate_quota_metrics(turn, thread, "Gemini Pro"))
+    eff_model = model_name or "Gemini 3.8 Flash (High)"
+    if isinstance(thread_cost, str):
+        eff_model = thread_cost
+        billed_val = float(turn_cost)
+        eff_thread_cost = session_cost if session_cost is not None else billed_val
+    else:
+        billed_val = float(turn_cost)
+        if session_cost is not None:
+            eff_thread_cost = float(session_cost)
+        elif thread_cost != 0.0:
+            eff_thread_cost = float(thread_cost)
+        elif billed_cost is not None:
+            eff_thread_cost = billed_val
+        else:
+            eff_thread_cost = float(thread_cost)
+
     if isinstance(quota_state, str):
         eff_model = quota_state
         quota_state = None
-    else:
-        eff_model = model_name or "Gemini 3.8 Flash (High)"
 
-    if isinstance(thread_cost_or_model, str):
-        billed_val = float(turn_cost)
-        eff_model = thread_cost_or_model
-        eff_thread_cost = thread_cost if thread_cost is not None else billed_val
-    else:
-        billed_val = float(turn_cost)
-        if thread_cost is not None:
-            eff_thread_cost = float(thread_cost)
-        else:
-            eff_thread_cost = float(thread_cost_or_model)
+    if "model_name" in kwargs and kwargs["model_name"]:
+        eff_model = kwargs["model_name"]
 
     state_by_bucket: dict[str, dict] = {}
     if quota_state is not None:

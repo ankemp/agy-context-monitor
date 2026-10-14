@@ -148,12 +148,15 @@ CREATE INDEX IF NOT EXISTS idx_blocks_conv_hash ON transcript_blocks(conversatio
 CREATE INDEX IF NOT EXISTS idx_blocks_conv_step ON transcript_blocks(conversation_id, step_index);
 """
 
-def get_db_connection(db_path: Path = DEFAULT_DB_PATH, timeout: float = 30.0) -> sqlite3.Connection:
+
+def get_db_connection(
+    db_path: Path = DEFAULT_DB_PATH, timeout: float = 30.0
+) -> sqlite3.Connection:
     """Returns an initialized SQLite connection configured for concurrent WAL-mode access."""
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(db_path), timeout=timeout)
     conn.row_factory = sqlite3.Row
-    
+
     # Configure WAL mode & concurrency safeguards
     conn.execute("PRAGMA journal_mode = WAL;")
     conn.execute(f"PRAGMA busy_timeout = {int(timeout * 1000)};")
@@ -162,12 +165,13 @@ def get_db_connection(db_path: Path = DEFAULT_DB_PATH, timeout: float = 30.0) ->
     conn.execute("PRAGMA cache_size = -64000;")
     conn.execute("PRAGMA mmap_size = 268435456;")
     conn.execute("PRAGMA temp_store = MEMORY;")
-    
+
     return conn
+
 
 def init_db(db_or_conn: Path | str | sqlite3.Connection = DEFAULT_DB_PATH):
     """Initializes the database schema and performs automatic column migrations if needed.
-    
+
     Accepts either a database file path (Path or str) or an existing sqlite3.Connection.
     """
     if isinstance(db_or_conn, sqlite3.Connection):
@@ -182,9 +186,11 @@ def _init_db_conn(conn: sqlite3.Connection) -> None:
     """Executes schema initialization and migrations on the provided connection."""
     conn.executescript(TABLES_SQL)
     cur = conn.cursor()
-    
+
     # Conversations column migrations
-    conv_cols = [c[1] for c in cur.execute("PRAGMA table_info(conversations)").fetchall()]
+    conv_cols = [
+        c[1] for c in cur.execute("PRAGMA table_info(conversations)").fetchall()
+    ]
     conv_new_cols = [
         ("project", "TEXT"),
         ("created_at", "TEXT"),
@@ -213,7 +219,7 @@ def _init_db_conn(conn: sqlite3.Connection) -> None:
         ("invoking_step_index", "INTEGER"),
         ("compaction_count", "INTEGER DEFAULT 0"),
         ("pruned_tokens", "INTEGER DEFAULT 0"),
-        ("models_used", "TEXT")
+        ("models_used", "TEXT"),
     ]
     for col, ctype in conv_new_cols:
         if col not in conv_cols:
@@ -230,7 +236,7 @@ def _init_db_conn(conn: sqlite3.Connection) -> None:
         ("model_name", "TEXT"),
         ("billed_cost", "REAL DEFAULT 0.0"),
         ("billed_input_tokens", "INTEGER DEFAULT 0"),
-        ("billed_output_tokens", "INTEGER DEFAULT 0")
+        ("billed_output_tokens", "INTEGER DEFAULT 0"),
     ]
     for col, ctype in step_new_cols:
         if col not in step_cols:
@@ -240,11 +246,10 @@ def _init_db_conn(conn: sqlite3.Connection) -> None:
                 pass
 
     # Tool executions column migrations
-    tool_cols = [c[1] for c in cur.execute("PRAGMA table_info(tool_executions)").fetchall()]
-    tool_new_cols = [
-        ("mcp_server", "TEXT"),
-        ("mcp_tool", "TEXT")
+    tool_cols = [
+        c[1] for c in cur.execute("PRAGMA table_info(tool_executions)").fetchall()
     ]
+    tool_new_cols = [("mcp_server", "TEXT"), ("mcp_tool", "TEXT")]
     for col, ctype in tool_new_cols:
         if col not in tool_cols:
             try:
@@ -253,7 +258,9 @@ def _init_db_conn(conn: sqlite3.Connection) -> None:
                 pass
 
     # Quota state column migrations
-    quota_cols = [c[1] for c in cur.execute("PRAGMA table_info(quota_state)").fetchall()]
+    quota_cols = [
+        c[1] for c in cur.execute("PRAGMA table_info(quota_state)").fetchall()
+    ]
     quota_new_cols = [
         ("group_name", "TEXT NOT NULL DEFAULT ''"),
         ("window", "TEXT NOT NULL DEFAULT ''"),
@@ -309,10 +316,10 @@ def _init_db_conn(conn: sqlite3.Connection) -> None:
 
 def upsert_quota_state(conn: sqlite3.Connection, quota_rows: list[dict] | dict) -> None:
     """Upserts quota state records into the quota_state table.
-    
+
     Supports both snake_case and Language Server ConnectRPC camelCase keys.
     Gracefully handles None, omitted fields, and type conversions.
-    
+
     Args:
         conn: An open SQLite connection.
         quota_rows: A list of dicts (or a single dict) containing quota state fields:
@@ -358,7 +365,9 @@ def upsert_quota_state(conn: sqlite3.Connection, quota_rows: list[dict] | dict) 
             if raw_bid is None:
                 raw_bid = row.get("bucketId")
             if not raw_bid or not str(raw_bid).strip():
-                raise ValueError("bucket_id is required and cannot be empty for quota_state upsert")
+                raise ValueError(
+                    "bucket_id is required and cannot be empty for quota_state upsert"
+                )
             bucket_id = str(raw_bid).strip()
 
             raw_grp = row.get("group_name")
@@ -392,27 +401,36 @@ def upsert_quota_state(conn: sqlite3.Connection, quota_rows: list[dict] | dict) 
 
             raw_fetched = row.get("fetched_at")
             if raw_fetched is None:
-                raw_fetched = row.get("fetchedAt") or row.get("updated_at") or row.get("updatedAt")
+                raw_fetched = (
+                    row.get("fetchedAt")
+                    or row.get("updated_at")
+                    or row.get("updatedAt")
+                )
             fetched_at = str(raw_fetched) if raw_fetched else now_iso
 
-            conn.execute(sql, {
-                "bucket_id": bucket_id,
-                "group_name": group_name,
-                "window": window,
-                "remaining_fraction": remaining_fraction,
-                "reset_time": reset_time,
-                "calibrated_capacity": calibrated_capacity,
-                "fetched_at": fetched_at,
-            })
+            conn.execute(
+                sql,
+                {
+                    "bucket_id": bucket_id,
+                    "group_name": group_name,
+                    "window": window,
+                    "remaining_fraction": remaining_fraction,
+                    "reset_time": reset_time,
+                    "calibrated_capacity": calibrated_capacity,
+                    "fetched_at": fetched_at,
+                },
+            )
 
 
-def get_quota_state(conn: sqlite3.Connection, bucket_id: str | None = None) -> list[dict]:
+def get_quota_state(
+    conn: sqlite3.Connection, bucket_id: str | None = None
+) -> list[dict]:
     """Retrieves cached quota state records as a list of dictionaries.
-    
+
     Args:
         conn: An open SQLite connection.
         bucket_id: Optional bucket_id to filter by.
-        
+
     Returns:
         List of dictionaries with keys:
         bucket_id, group_name, window, remaining_fraction, reset_time,
@@ -422,7 +440,7 @@ def get_quota_state(conn: sqlite3.Connection, bucket_id: str | None = None) -> l
         cursor = conn.execute(
             "SELECT bucket_id, group_name, window, remaining_fraction, reset_time, calibrated_capacity, fetched_at "
             "FROM quota_state WHERE bucket_id = ? ORDER BY bucket_id ASC",
-            (bucket_id,)
+            (bucket_id,),
         )
     else:
         cursor = conn.execute(
@@ -432,20 +450,25 @@ def get_quota_state(conn: sqlite3.Connection, bucket_id: str | None = None) -> l
     rows = cursor.fetchall()
     result = []
     for r in rows:
-        row_dict = dict(r) if isinstance(r, sqlite3.Row) else {
-            "bucket_id": r[0],
-            "group_name": r[1],
-            "window": r[2],
-            "remaining_fraction": float(r[3]),
-            "reset_time": r[4],
-            "calibrated_capacity": float(r[5]),
-            "fetched_at": r[6],
-        }
+        row_dict = (
+            dict(r)
+            if isinstance(r, sqlite3.Row)
+            else {
+                "bucket_id": r[0],
+                "group_name": r[1],
+                "window": r[2],
+                "remaining_fraction": float(r[3]),
+                "reset_time": r[4],
+                "calibrated_capacity": float(r[5]),
+                "fetched_at": r[6],
+            }
+        )
         # Provide updated_at alias for bidirectional compatibility
         if "updated_at" not in row_dict:
             row_dict["updated_at"] = row_dict.get("fetched_at", "")
         result.append(row_dict)
     return result
+
 
 if __name__ == "__main__":
     init_db()

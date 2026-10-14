@@ -780,3 +780,45 @@ def test_sync_and_get_quota_state_default_connection_and_payload_variants(
     )
     assert "gemini-weekly" in state
     assert state["gemini-weekly"]["remaining_fraction"] == 0.88
+
+
+def test_calculate_quota_metrics_cleaned_signature():
+    """Verifies calculate_quota_metrics with new clean signature and backwards compatibility."""
+    state = {
+        "gemini-weekly": {
+            "calibrated_capacity": 672.0,
+            "remaining_fraction": 0.90,
+            "reset_time": "2026-10-21T02:27:22Z",
+        },
+        "3p-weekly": {
+            "calibrated_capacity": 200.0,
+            "remaining_fraction": 0.95,
+            "reset_time": "2026-10-21T02:27:22Z",
+        },
+    }
+
+    # 1. Clean positional signature: (turn_cost, thread_cost, quota_state, model_name)
+    m1 = calculate_quota_metrics(6.72, 13.44, state, "Gemini 3.8 Flash")
+    assert abs(m1["turn_pct"] - 1.00) < 0.01  # 6.72 / 672 = 1.0%
+    assert abs(m1["thread_pct"] - 2.00) < 0.01  # 13.44 / 672 = 2.0%
+    assert m1["model_name"] == "Gemini 3.8 Flash"
+
+    # 2. Clean keyword-only signature: billed_cost, session_cost
+    m2 = calculate_quota_metrics(
+        billed_cost=2.00,
+        session_cost=4.00,
+        model_name="Claude 3.7 Sonnet",
+        quota_state=state,
+    )
+    assert abs(m2["turn_pct"] - 1.00) < 0.01  # 2.00 / 200 = 1.0%
+    assert abs(m2["thread_pct"] - 2.00) < 0.01  # 4.00 / 200 = 2.0%
+    assert m2["bucket_prefix"] == "3p"
+
+    # 3. Backwards compatibility: thread_cost_or_model in kwargs
+    m3 = calculate_quota_metrics(
+        turn_cost=3.36,
+        thread_cost_or_model=6.72,
+        quota_state=state,
+    )
+    assert abs(m3["turn_pct"] - 0.50) < 0.01
+    assert abs(m3["thread_pct"] - 1.00) < 0.01

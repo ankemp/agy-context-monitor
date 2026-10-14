@@ -1158,6 +1158,45 @@ def sync_to_sqlite(cid: str, model_name: str, analysis: dict):
         return diff_res
 
 
+def _extract_bucket_view(
+    buckets: dict[str, dict] | list[dict] | None,
+    bucket_id: str,
+    default_cap: float = 672.0,
+) -> dict[str, Any]:
+    b = {}
+    if isinstance(buckets, dict):
+        b = buckets.get(bucket_id) or {}
+    elif isinstance(buckets, list):
+        for item in buckets:
+            if isinstance(item, dict) and (
+                item.get("bucket_id") == bucket_id or item.get("bucketId") == bucket_id
+            ):
+                b = item
+                break
+
+    cap = float(
+        b.get("calibrated_capacity")
+        if b.get("calibrated_capacity") is not None
+        else (b.get("calibratedCapacity") or default_cap)
+    )
+    rem_raw = (
+        b.get("remaining_fraction")
+        if b.get("remaining_fraction") is not None
+        else b.get("remainingFraction", 1.0)
+    )
+    rem_pct = float(rem_raw if rem_raw is not None else 1.0) * 100.0
+    r_time = str(b.get("reset_time") or b.get("resetTime") or "")
+    cd = format_reset_countdown(r_time)
+    cd_str = f"`{cd}` to reset" if cd else "no reset scheduled"
+    return {
+        "capacity": cap,
+        "remaining_pct": rem_pct,
+        "reset_time": r_time,
+        "countdown": cd,
+        "countdown_str": cd_str,
+    }
+
+
 def generate_context_usage_report(
     cid: str,
     model_name: str,
@@ -1278,55 +1317,37 @@ def generate_context_usage_report(
             else 0.0
         )
 
-        gw = state_dict.get("gemini-weekly", {})
-        g5 = state_dict.get("gemini-5h", {})
-        pw = state_dict.get("3p-weekly", {})
-        p5 = state_dict.get("3p-5h", {})
+        gw_view = _extract_bucket_view(state_dict, "gemini-weekly", 672.0)
+        g5_view = _extract_bucket_view(state_dict, "gemini-5h", 236.7)
+        pw_view = _extract_bucket_view(state_dict, "3p-weekly", 200.0)
+        p5_view = _extract_bucket_view(state_dict, "3p-5h", 70.0)
 
-        gw_cap = float(
-            gw.get("calibrated_capacity")
-            if gw.get("calibrated_capacity") is not None
-            else (gw.get("calibratedCapacity") or 672.0)
-        )
-        gw_rem_raw = (
-            gw.get("remaining_fraction")
-            if gw.get("remaining_fraction") is not None
-            else gw.get("remainingFraction", 1.0)
-        )
-        gw_rem = float(gw_rem_raw if gw_rem_raw is not None else 1.0) * 100.0
-        gw_time = str(gw.get("reset_time") or gw.get("resetTime") or "")
-        gw_cd = format_reset_countdown(gw_time)
-        gw_cd_str = f"`{gw_cd}` to reset" if gw_cd else "no reset scheduled"
+        gw_cap = gw_view["capacity"]
+        gw_rem = gw_view["remaining_pct"]
+        gw_cd_str = gw_view["countdown_str"]
 
-        g5_rem_raw = (
-            g5.get("remaining_fraction")
-            if g5.get("remaining_fraction") is not None
-            else g5.get("remainingFraction", 1.0)
-        )
-        g5_rem = float(g5_rem_raw if g5_rem_raw is not None else 1.0) * 100.0
-        g5_time = str(g5.get("reset_time") or g5.get("resetTime") or "")
-        g5_cd = format_reset_countdown(g5_time)
-        g5_cd_str = f"`{g5_cd}` to reset" if g5_cd else "no reset scheduled"
+        g5_rem = g5_view["remaining_pct"]
+        g5_cd_str = g5_view["countdown_str"]
 
-        pw_rem_raw = (
-            pw.get("remaining_fraction")
-            if pw.get("remaining_fraction") is not None
-            else pw.get("remainingFraction", 1.0)
-        )
-        pw_rem = float(pw_rem_raw if pw_rem_raw is not None else 1.0) * 100.0
-        pw_time = str(pw.get("reset_time") or pw.get("resetTime") or "")
-        pw_cd = format_reset_countdown(pw_time)
-        pw_cd_str = f"`{pw_cd}` to reset" if pw_cd else "no reset scheduled"
+        pw_rem = pw_view["remaining_pct"]
+        pw_cd_str = pw_view["countdown_str"]
 
-        p5_rem_raw = (
-            p5.get("remaining_fraction")
-            if p5.get("remaining_fraction") is not None
-            else p5.get("remainingFraction", 1.0)
+        p5_rem = p5_view["remaining_pct"]
+        p5_cd_str = p5_view["countdown_str"]
+
+        weekly_capacity = (
+            float(quota_metrics.get("calibrated_weekly_capacity") or 0.0)
+            if quota_metrics
+            else 0.0
         )
-        p5_rem = float(p5_rem_raw if p5_rem_raw is not None else 1.0) * 100.0
-        p5_time = str(p5.get("reset_time") or p5.get("resetTime") or "")
-        p5_cd = format_reset_countdown(p5_time)
-        p5_cd_str = f"`{p5_cd}` to reset" if p5_cd else "no reset scheduled"
+        if weekly_capacity <= 0:
+            weekly_capacity = (
+                pw_view["capacity"]
+                if ("claude" in active_model.lower() or "gpt" in active_model.lower())
+                else gw_view["capacity"]
+            )
+        if weekly_capacity <= 0:
+            weekly_capacity = 672.0
 
         lines = [
             "# Live Context Window Usage Report",
@@ -1372,14 +1393,18 @@ def generate_context_usage_report(
         lines.extend(
             [
                 "\n## 2. Top Context-Consuming Steps\n",
-                "| Step # | Activity | Source / Tool | Est. Tokens | Detail |",
-                "| :--- | :--- | :--- | :--- | :--- |",
+                "| Step # | Activity | Source / Tool | Est. Tokens | % Wk Quota | Detail |",
+                "| :--- | :--- | :--- | :--- | :--- | :--- |",
             ]
         )
 
         for s in top_steps:
+            step_cost = float(s.get("billed_cost") or s.get("cost") or 0.0)
+            step_wk_quota = (
+                (step_cost / weekly_capacity * 100.0) if weekly_capacity > 0 else 0.0
+            )
             lines.append(
-                f"| #{s['step_index']} | {s['activity']} | {s['tool_or_source']} | ~{format_tokens(s['est_tokens'])} | {s['detail']} |"
+                f"| #{s['step_index']} | {s['activity']} | {s['tool_or_source']} | ~{format_tokens(s['est_tokens'])} | {step_wk_quota:.2f}% | {s['detail']} |"
             )
 
         sec_num = 3
@@ -1413,8 +1438,8 @@ def generate_context_usage_report(
                     f"> **Dispatched Workers**: {len(fleet_children)} sub-agents  ",
                     f"> **Delegated Fleet Work**: ~{format_tokens(total_fleet_toks)} tokens (${total_fleet_cost:,.4f}) across {total_fleet_steps} steps  ",
                     f"> **Context Shielding Benefit**: Delegating tasks avoided injecting ~{format_tokens(total_fleet_toks)} tokens of verbose sub-task output into this active context window.\n",
-                    "| Sub-Agent | Role | Tier | Steps | Tokens | Cost |",
-                    "| :--- | :--- | :--- | :--- | :--- | :--- |",
+                    "| Sub-Agent | Role | Tier | Steps | Tokens | Cost | % Wk Quota |",
+                    "| :--- | :--- | :--- | :--- | :--- | :--- | :--- |",
                 ]
             )
             for ch in fleet_children:
@@ -1424,8 +1449,11 @@ def generate_context_usage_report(
                 ch_steps = ch.get("total_steps") or 0
                 ch_toks = ch.get("total_tokens") or 0
                 ch_c = ch.get("billed_cost") or 0.0
+                subagent_wk_quota = (
+                    (ch_c / weekly_capacity * 100.0) if weekly_capacity > 0 else 0.0
+                )
                 lines.append(
-                    f"| [{ch_title}](conversation://{ch['id']}) | {ch_role} | Tier {ch_depth} | {ch_steps} | ~{format_tokens(ch_toks)} | ${ch_c:,.2f} |"
+                    f"| [{ch_title}](conversation://{ch['id']}) | {ch_role} | Tier {ch_depth} | {ch_steps} | ~{format_tokens(ch_toks)} | ${ch_c:,.2f} | {subagent_wk_quota:.2f}% |"
                 )
 
         lines.extend(
