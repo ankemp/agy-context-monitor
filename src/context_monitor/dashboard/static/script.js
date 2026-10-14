@@ -100,10 +100,10 @@
     function updateWeeklyQuotaCapacity(quota) {
       if (!quota) return;
       const buckets = quota.buckets || quota;
-      const gw = buckets['gemini-weekly'] || quota['gemini-weekly'] || quota.gemini_weekly;
-      const cap = gw?.calibrated_capacity || quota.calibrated_weekly_capacity;
-      if (Number(cap) > 0) {
-        const newCap = Number(cap);
+      const geminiWeeklyBucket = buckets['gemini-weekly'] || quota['gemini-weekly'] || quota.gemini_weekly;
+      const weeklyCalibratedCapacity = geminiWeeklyBucket?.calibrated_capacity || quota.calibrated_weekly_capacity;
+      if (Number(weeklyCalibratedCapacity) > 0) {
+        const newCap = Number(weeklyCalibratedCapacity);
         if (newCap !== currentWeeklyQuotaCapacity) {
           currentWeeklyQuotaCapacity = newCap;
           if (typeof timelineChart !== 'undefined' && timelineChart) {

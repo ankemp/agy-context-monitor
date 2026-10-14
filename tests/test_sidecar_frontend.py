@@ -56,6 +56,7 @@ def test_frontend_files_exist_and_invariants():
     assert "/api/global" in js
     assert "renderMultiSegmentBar" in js
     assert "renderQuota" in js
+    assert "updateQuotaHeaderBadge" in js
     assert "quota-weekly-pct" in js
     assert "quota-tab-gemini" in js
     assert "visibilitychange" in js, (
@@ -205,6 +206,7 @@ def test_sidecar_frontend_render_quota_execution():
         sessionImpact: elements['quota-session-impact'].textContent,
         quotaBadge: elements['quota-badge'].textContent,
         quotaBadgeTitle: elements['quota-badge'].title,
+        quotaBadgeClass: elements['quota-badge'].className,
         geminiTabSelected: elements['quota-tab-gemini'].attributes['aria-selected'],
         threepTabSelected: elements['quota-tab-3p'].attributes['aria-selected']
       };
@@ -237,6 +239,8 @@ def test_sidecar_frontend_render_quota_execution():
     assert "$200.00" in after["weeklyCapSub"]
     assert after["sessionImpact"] == "0.00% session share"
     assert after["quotaBadge"] == "1.00% wk"
+    assert after["quotaBadgeTitle"] == "Session Quota Impact"
+    assert "ok" in after["quotaBadgeClass"]
     assert after["geminiTabSelected"] == "false"
     assert after["threepTabSelected"] == "true"
 
@@ -361,6 +365,16 @@ def test_sidecar_frontend_global_mode_execution():
         globalQuota: elements['global-quota'].textContent
       };
 
+      // Click 3P Tab in global mode - badge should stay pinned to fleet total
+      elements['quota-tab-3p'].dispatchEvent('click');
+
+      results.afterClick3p = {
+        sessionImpact: elements['quota-session-impact'].textContent,
+        quotaBadge: elements['quota-badge'].textContent,
+        quotaBadgeTitle: elements['quota-badge'].title,
+        quotaBadgeClass: elements['quota-badge'].className
+      };
+
       console.log(JSON.stringify(results));
       process.exit(0);
     }, 50);
@@ -378,3 +392,109 @@ def test_sidecar_frontend_global_mode_execution():
     assert data["quotaBadgeTitle"] == "Fleet Quota Impact"
     assert "ok" in data["quotaBadgeClass"]
     assert "2.00% wk" in data["globalQuota"]
+
+    # Verify quota-badge stays pinned to fleet total after clicking 3P tab in global mode
+    after = data["afterClick3p"]
+    assert after["quotaBadge"] == "2.00% fleet"
+    assert after["quotaBadgeTitle"] == "Fleet Quota Impact"
+    assert "ok" in after["quotaBadgeClass"]
+    assert "0.00% fleet total" in after["sessionImpact"]
+
+
+def test_sidecar_frontend_update_quota_header_badge_unit():
+    """Directly verifies updateQuotaHeaderBadge threshold classification, formatting, and edge cases."""
+    import json
+    import subprocess
+
+    node_script = """
+    const fs = require('fs');
+    const code = fs.readFileSync('sidecars/panel/app.js', 'utf8');
+
+    let badgeEl = { textContent: '', className: '', title: '' };
+    const elements = { 'quota-badge': badgeEl };
+    const $ = (id) => elements[id];
+
+    eval(code.slice(code.indexOf('function updateQuotaHeaderBadge'), code.indexOf('let toastTimer;')));
+
+    const runs = {};
+
+    updateQuotaHeaderBadge(0, false);
+    runs.zeroSession = { ...badgeEl };
+
+    updateQuotaHeaderBadge(4.99, false);
+    runs.underWarnSession = { ...badgeEl };
+
+    updateQuotaHeaderBadge(5.0, false);
+    runs.warnSession = { ...badgeEl };
+
+    updateQuotaHeaderBadge(9.99, true);
+    runs.warnGlobal = { ...badgeEl };
+
+    updateQuotaHeaderBadge(10.0, true);
+    runs.errorGlobal = { ...badgeEl };
+
+    updateQuotaHeaderBadge(15.556, true);
+    runs.highErrorGlobal = { ...badgeEl };
+
+    updateQuotaHeaderBadge(null, false);
+    runs.nullSession = { ...badgeEl };
+
+    updateQuotaHeaderBadge(undefined, true);
+    runs.undefinedGlobal = { ...badgeEl };
+
+    updateQuotaHeaderBadge('not-a-number', false);
+    runs.nanSession = { ...badgeEl };
+
+    // Graceful no-op when badge element is missing
+    elements['quota-badge'] = null;
+    let missingNoError = true;
+    try {
+      updateQuotaHeaderBadge(5.0, false);
+    } catch (e) {
+      missingNoError = false;
+    }
+    runs.missingNoError = missingNoError;
+
+    console.log(JSON.stringify(runs));
+    """
+
+    res = subprocess.run(
+        ["node", "-e", node_script], capture_output=True, text=True, cwd=Path.cwd()
+    )
+    assert res.returncode == 0, f"Node script failed: {res.stderr}"
+    data = json.loads(res.stdout)
+
+    assert data["zeroSession"]["textContent"] == "0.00% wk"
+    assert data["zeroSession"]["title"] == "Session Quota Impact"
+    assert data["zeroSession"]["className"] == "badge ok"
+
+    assert data["underWarnSession"]["textContent"] == "4.99% wk"
+    assert data["underWarnSession"]["title"] == "Session Quota Impact"
+    assert data["underWarnSession"]["className"] == "badge ok"
+
+    assert data["warnSession"]["textContent"] == "5.00% wk"
+    assert data["warnSession"]["title"] == "Session Quota Impact"
+    assert data["warnSession"]["className"] == "badge warning"
+
+    assert data["warnGlobal"]["textContent"] == "9.99% fleet"
+    assert data["warnGlobal"]["title"] == "Fleet Quota Impact"
+    assert data["warnGlobal"]["className"] == "badge warning"
+
+    assert data["errorGlobal"]["textContent"] == "10.00% fleet"
+    assert data["errorGlobal"]["title"] == "Fleet Quota Impact"
+    assert data["errorGlobal"]["className"] == "badge error"
+
+    assert data["highErrorGlobal"]["textContent"] == "15.56% fleet"
+    assert data["highErrorGlobal"]["title"] == "Fleet Quota Impact"
+    assert data["highErrorGlobal"]["className"] == "badge error"
+
+    assert data["nullSession"]["textContent"] == "0.00% wk"
+    assert data["nullSession"]["className"] == "badge ok"
+
+    assert data["undefinedGlobal"]["textContent"] == "0.00% fleet"
+    assert data["undefinedGlobal"]["className"] == "badge ok"
+
+    assert data["nanSession"]["textContent"] == "0.00% wk"
+    assert data["nanSession"]["className"] == "badge ok"
+
+    assert data["missingNoError"] is True

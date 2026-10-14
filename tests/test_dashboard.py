@@ -387,6 +387,8 @@ def test_dashboard_frontend_invariants():
     assert "currentWeeklyQuotaCapacity" in js_content
     assert "% of weekly quota" in js_content
     assert "wk quota" in js_content
+    assert "geminiWeeklyBucket" in js_content
+    assert "weeklyCalibratedCapacity" in js_content
 
 
 def test_standalone_html_export_quota(test_db: Path, tmp_path: Path):

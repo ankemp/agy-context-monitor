@@ -26,6 +26,18 @@ function formatCost(n) {
   return `$${num.toFixed(2)}`;
 }
 
+function updateQuotaHeaderBadge(pct, isGlobal) {
+  const badge = $('quota-badge');
+  if (!badge) return;
+  const num = Number(pct) || 0;
+  const suffix = isGlobal ? 'fleet' : 'wk';
+  const title = isGlobal ? 'Fleet Quota Impact' : 'Session Quota Impact';
+  const cssClass = num >= 10 ? 'error' : (num >= 5 ? 'warning' : 'ok');
+  badge.textContent = `${num.toFixed(2)}% ${suffix}`;
+  badge.title = title;
+  badge.className = `badge ${cssClass}`;
+}
+
 let toastTimer;
 function toast(message, isError = false) {
   const el = $('toast');
@@ -120,20 +132,12 @@ function renderQuota(quotaData, sessionImpactPct) {
 
   const sessionImpact = weeklyBucket?.session_impact_pct ?? sessionImpactPct ?? quotaData.session_weekly_pct ?? 0.0;
 
-  // Session impact badge & header badge
+  // Session impact badge
   const impactEl = $('quota-session-impact');
   if (impactEl) {
     const label = isGlobalMode ? 'fleet total' : 'session share';
     impactEl.textContent = `${Number(sessionImpact).toFixed(2)}% ${label}`;
     impactEl.className = `badge ${sessionImpact >= 10 ? 'error' : sessionImpact >= 5 ? 'warning' : 'ok'}`;
-  }
-  const quotaBadge = $('quota-badge');
-  if (quotaBadge) {
-    const headerPct = isGlobalMode ? sessionImpact : (quotaData.session_weekly_pct ?? sessionImpact);
-    const suffix = isGlobalMode ? 'fleet' : 'wk';
-    quotaBadge.textContent = `${Number(headerPct).toFixed(2)}% ${suffix}`;
-    quotaBadge.title = isGlobalMode ? 'Fleet Quota Impact' : 'Session Quota Impact';
-    quotaBadge.className = `badge ${headerPct >= 10 ? 'error' : headerPct >= 5 ? 'warning' : 'ok'}`;
   }
 
   // Weekly bucket
@@ -254,12 +258,7 @@ async function refreshTelemetry() {
       $('model-badge').textContent = 'Global Overview';
       $('cost-badge').textContent = formatCost(globalData.total_cost);
       const globalQuotaPct = globalData.weekly_quota_pct ?? (globalData.quota?.session_weekly_pct ?? 0);
-      const gQuotaBadge = $('quota-badge');
-      if (gQuotaBadge) {
-        gQuotaBadge.textContent = `${Number(globalQuotaPct).toFixed(2)}% fleet`;
-        gQuotaBadge.title = 'Fleet Quota Impact';
-        gQuotaBadge.className = `badge ${globalQuotaPct >= 10 ? 'error' : globalQuotaPct >= 5 ? 'warning' : 'ok'}`;
-      }
+      updateQuotaHeaderBadge(globalQuotaPct, true);
 
       if (globalCard) globalCard.hidden = false;
       if (capacityCard) capacityCard.hidden = true;
@@ -300,12 +299,7 @@ async function refreshTelemetry() {
     $('model-badge').textContent = sessionData.model_name || 'Gemini 3.7 Flash';
     $('cost-badge').textContent = formatCost(sessionData.billed_cost);
     const sessionQuotaPct = sessionData.weekly_quota_pct ?? (sessionData.quota?.session_weekly_pct ?? 0);
-    const sQuotaBadge = $('quota-badge');
-    if (sQuotaBadge) {
-      sQuotaBadge.textContent = `${Number(sessionQuotaPct).toFixed(2)}% wk`;
-      sQuotaBadge.title = 'Session Quota Impact';
-      sQuotaBadge.className = `badge ${sessionQuotaPct >= 10 ? 'error' : sessionQuotaPct >= 5 ? 'warning' : 'ok'}`;
-    }
+    updateQuotaHeaderBadge(sessionQuotaPct, false);
 
     $('capacity-pct').textContent = `${(sessionData.pct || 0).toFixed(1)}%`;
     $('capacity-sub').textContent = `${formatTokens(sessionData.active_tokens)} / ${formatTokens(sessionData.max_tokens)} tokens`;
