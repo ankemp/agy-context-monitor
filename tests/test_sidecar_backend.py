@@ -134,6 +134,173 @@ def test_sidecar_query_logic(tmp_path):
     assert global_data["total_conversations"] == 1
     assert global_data["total_tokens"] == 25000
     assert global_data["total_compactions"] == 1
+    assert "quota" in global_data
+    assert "weekly_quota_pct" in global_data
+
+    # Quota payload in session
+    assert "quota" in session
+    assert "weekly_quota_pct" in session
+    assert "five_hour_quota_pct" in session
+    assert "quota_remaining_weekly_pct" in session
+    assert "quota_remaining_5h_pct" in session
+    assert session["quota"]["calibrated_weekly_capacity"] == 672.0
+    assert "weekly_quota_pct" in session["top_steps"][0]
+
+def test_sidecar_quota_integration(tmp_path):
+    db_path = tmp_path / "test_analytics_quota.db"
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    cur.executescript("""
+    CREATE TABLE conversations (
+        id TEXT PRIMARY KEY,
+        title TEXT,
+        project TEXT,
+        model_name TEXT,
+        created_at TEXT,
+        updated_at TEXT,
+        total_steps INTEGER DEFAULT 0,
+        total_tokens INTEGER DEFAULT 0,
+        billed_cost REAL DEFAULT 0.0,
+        compaction_count INTEGER DEFAULT 0,
+        pruned_tokens INTEGER DEFAULT 0
+    );
+
+    CREATE TABLE steps (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        conversation_id TEXT NOT NULL,
+        step_index INTEGER NOT NULL,
+        created_at TEXT,
+        step_type TEXT,
+        category TEXT,
+        activity TEXT,
+        tool_or_source TEXT,
+        est_tokens INTEGER DEFAULT 0,
+        billed_cost REAL DEFAULT 0.0,
+        detail TEXT
+    );
+
+    CREATE TABLE quota_state (
+        bucket_id TEXT PRIMARY KEY,
+        group_name TEXT NOT NULL,
+        window TEXT NOT NULL,
+        remaining_fraction REAL NOT NULL,
+        reset_time TEXT NOT NULL,
+        calibrated_capacity REAL NOT NULL,
+        fetched_at TEXT NOT NULL
+    );
+    """)
+
+    cur.executemany("""
+    INSERT INTO quota_state (bucket_id, group_name, window, remaining_fraction, reset_time, calibrated_capacity, fetched_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, [
+        ("gemini-weekly", "Gemini Models", "weekly", 0.85, "2026-10-21T02:27:22Z", 672.0, "2026-10-14T10:00:00Z"),
+        ("gemini-5h", "Gemini Models", "5h", 0.90, "2026-10-14T18:00:00Z", 236.7, "2026-10-14T10:00:00Z"),
+        ("3p-weekly", "Claude and GPT models", "weekly", 0.95, "2026-10-21T02:27:22Z", 200.0, "2026-10-14T10:00:00Z"),
+        ("3p-5h", "Claude and GPT models", "5h", 0.98, "2026-10-14T18:00:00Z", 70.0, "2026-10-14T10:00:00Z"),
+    ])
+
+    # Insert Gemini conversation with billed_cost = $6.72 (exactly 1.0% of $672)
+    cur.execute("""
+    INSERT INTO conversations (id, title, model_name, billed_cost, total_tokens, updated_at)
+    VALUES ('conv-gemini', 'Gemini Chat', 'Gemini 3.8 Flash', 6.72, 50000, '2026-10-14T11:00:00Z')
+    """)
+    cur.execute("""
+    INSERT INTO steps (conversation_id, step_index, step_type, activity, est_tokens, billed_cost)
+    VALUES ('conv-gemini', 1, 'USER_INPUT', 'Prompt', 1000, 1.344)
+    """)
+
+    # Insert Claude conversation with billed_cost = $2.00 (exactly 1.0% of $200)
+    cur.execute("""
+    INSERT INTO conversations (id, title, model_name, billed_cost, total_tokens, updated_at)
+    VALUES ('conv-claude', 'Claude Chat', 'Claude 3.7 Sonnet', 2.00, 30000, '2026-10-14T11:05:00Z')
+    """)
+    conn.commit()
+    conn.close()
+
+    node_code = f"""
+    import {{ openDatabase, getSessionData, getQuotaSummary, getGlobalData }} from './sidecars/panel/query.mjs';
+    const db = openDatabase('{db_path}');
+    const geminiSession = getSessionData(db, 'conv-gemini');
+    const claudeSession = getSessionData(db, 'conv-claude');
+    const quotaGemini = getQuotaSummary(db, 'Gemini 3.8 Flash', 6.72);
+    const quotaClaude = getQuotaSummary(db, 'Claude 3.7 Sonnet', 2.00);
+    const globalData = getGlobalData(db);
+    console.log(JSON.stringify({{ geminiSession, claudeSession, quotaGemini, quotaClaude, globalData }}));
+    """
+
+    res = subprocess.run(
+        ["node", "--input-type=module", "-e", node_code],
+        capture_output=True,
+        text=True,
+        cwd=Path.cwd()
+    )
+    assert res.returncode == 0, f"Node script failed: {res.stderr}"
+    data = json.loads(res.stdout)
+
+    gemini_s = data["geminiSession"]
+    assert abs(gemini_s["weekly_quota_pct"] - 1.0) < 0.01
+    assert abs(gemini_s["quota_remaining_weekly_pct"] - 85.0) < 0.1
+    assert abs(gemini_s["quota_remaining_5h_pct"] - 90.0) < 0.1
+    assert gemini_s["quota"]["prefix"] == "gemini"
+    assert gemini_s["quota"]["calibrated_weekly_capacity"] == 672.0
+    assert gemini_s["quota"]["weekly_reset_countdown"] != ""
+    assert gemini_s["top_steps"][0]["billed_cost"] == 1.344
+    assert abs(gemini_s["top_steps"][0]["weekly_quota_pct"] - 0.2) < 0.01
+
+    claude_s = data["claudeSession"]
+    assert abs(claude_s["weekly_quota_pct"] - 1.0) < 0.01
+    assert abs(claude_s["quota_remaining_weekly_pct"] - 95.0) < 0.1
+    assert abs(claude_s["quota_remaining_5h_pct"] - 98.0) < 0.1
+    assert claude_s["quota"]["prefix"] == "3p"
+    assert claude_s["quota"]["calibrated_weekly_capacity"] == 200.0
+
+    quota_g = data["quotaGemini"]
+    assert quota_g["is_3p"] is False
+    assert quota_g["buckets"]["gemini-weekly"]["remaining_pct"] == 85.0
+    assert quota_g["buckets"]["3p-weekly"]["remaining_pct"] == 95.0
+
+    quota_c = data["quotaClaude"]
+    assert quota_c["is_3p"] is True
+    assert quota_c["calibrated_weekly_capacity"] == 200.0
+
+def test_sidecar_quota_missing_table_fallback(tmp_path):
+    # Tests that query.mjs falls back gracefully when quota_state table does not exist
+    db_path = tmp_path / "test_analytics_no_quota_table.db"
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    cur.executescript("""
+    CREATE TABLE conversations (
+        id TEXT PRIMARY KEY, title TEXT, project TEXT, model_name TEXT,
+        created_at TEXT, updated_at TEXT, total_steps INTEGER DEFAULT 0,
+        total_tokens INTEGER DEFAULT 0, billed_cost REAL DEFAULT 0.0
+    );
+    INSERT INTO conversations (id, title, model_name, billed_cost, total_tokens)
+    VALUES ('c1', 'Test', 'Gemini 3.7 Flash', 3.36, 1000);
+    """)
+    conn.commit()
+    conn.close()
+
+    node_code = f"""
+    import {{ openDatabase, getSessionData, getQuotaSummary }} from './sidecars/panel/query.mjs';
+    const db = openDatabase('{db_path}');
+    const session = getSessionData(db, 'c1');
+    const quota = getQuotaSummary(db, 'Gemini 3.7 Flash', 3.36);
+    console.log(JSON.stringify({{ session, quota }}));
+    """
+
+    res = subprocess.run(
+        ["node", "--input-type=module", "-e", node_code],
+        capture_output=True,
+        text=True,
+        cwd=Path.cwd()
+    )
+    assert res.returncode == 0, f"Node script failed: {res.stderr}"
+    data = json.loads(res.stdout)
+    session = data["session"]
+    assert session["quota"]["calibrated_weekly_capacity"] == 672.0
+    assert session["quota_remaining_weekly_pct"] == 100.0
+    assert abs(session["weekly_quota_pct"] - 0.5) < 0.01
 
 def test_sidecar_no_cross_conversation_leakage(tmp_path):
     # If a specific cid is requested that is not yet in the DB, it must NOT leak conv-existing
@@ -201,3 +368,4 @@ def test_main_mjs_exists_and_syntax():
         text=True
     )
     assert res.returncode == 0, f"Syntax check failed: {res.stderr}"
+

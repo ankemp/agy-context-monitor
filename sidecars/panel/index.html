@@ -18,6 +18,7 @@
       <div class="header-meta">
         <span id="model-badge" class="badge secondary">Detecting...</span>
         <span id="cost-badge" class="badge secondary">$0.00</span>
+        <span id="quota-badge" class="badge secondary" title="Session Quota Impact">0.00% wk</span>
       </div>
     </header>
 
@@ -33,6 +34,7 @@
       <dl class="facts">
         <dt>Total Tokens</dt><dd id="global-tokens">0</dd>
         <dt>Total Value</dt><dd id="global-cost">$0.00</dd>
+        <dt>Weekly Quota</dt><dd id="global-quota">0.00% wk</dd>
         <dt>Compactions</dt><dd id="global-compactions">0 events</dd>
         <dt>Tokens Pruned</dt><dd id="global-pruned">0</dd>
       </dl>
@@ -53,6 +55,54 @@
       <div class="banner-stats">
         <span id="compaction-pruned" class="small">0 tokens freed</span> · 
         <span id="compaction-window" class="small">Steps #0–#0 active</span>
+      </div>
+    </section>
+
+    <!-- Subscription Quota Card -->
+    <section id="quota-card" class="card" aria-labelledby="quota-title">
+      <div class="card-header">
+        <div class="quota-header-title">
+          <h2 id="quota-title">Subscription Quota</h2>
+          <span id="quota-session-impact" class="badge ok">0.00% session share</span>
+        </div>
+        <div class="quota-tabs" role="tablist" aria-label="Model Family Quota">
+          <button type="button" id="quota-tab-gemini" class="tab-btn active" role="tab" aria-selected="true">Gemini</button>
+          <button type="button" id="quota-tab-3p" class="tab-btn" role="tab" aria-selected="false">Claude / 3P</button>
+        </div>
+      </div>
+
+      <!-- Weekly Quota Bucket -->
+      <div class="quota-bucket" id="quota-weekly-bucket">
+        <div class="quota-row">
+          <span class="quota-name">Weekly Quota</span>
+          <div class="quota-meta">
+            <span id="quota-weekly-pct" class="quota-val">100.0% remaining</span>
+            <span id="quota-weekly-reset" class="quota-reset muted small">resets in --</span>
+          </div>
+        </div>
+        <div class="progress-track" id="quota-weekly-track">
+          <div class="quota-bar ok" id="quota-weekly-bar" style="width: 100%;"></div>
+        </div>
+        <div class="quota-sub muted small" id="quota-weekly-sub">
+          Calibrated capacity: $672.00
+        </div>
+      </div>
+
+      <!-- 5-Hour Quota Bucket -->
+      <div class="quota-bucket" id="quota-5h-bucket">
+        <div class="quota-row">
+          <span class="quota-name">5-Hour Limit</span>
+          <div class="quota-meta">
+            <span id="quota-5h-pct" class="quota-val">100.0% remaining</span>
+            <span id="quota-5h-reset" class="quota-reset muted small">resets in --</span>
+          </div>
+        </div>
+        <div class="progress-track" id="quota-5h-track">
+          <div class="quota-bar ok" id="quota-5h-bar" style="width: 100%;"></div>
+        </div>
+        <div class="quota-sub muted small" id="quota-5h-sub">
+          Calibrated capacity: $236.70
+        </div>
       </div>
     </section>
 

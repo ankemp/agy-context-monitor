@@ -8,6 +8,9 @@ const $ = (id) => document.getElementById(id);
 
 let isInitialized = false;
 let pollTimer = null;
+let activeQuota = null;
+let activeQuotaFamily = 'gemini';
+let userSelectedQuotaFamily = false;
 
 function formatTokens(n) {
   const num = Number(n) || 0;
@@ -80,6 +83,88 @@ function renderMultiSegmentBar(container, categories, maxTokens, totalPct) {
   }
 }
 
+function renderQuota(quotaData, sessionImpactPct) {
+  if (!quotaData) return;
+  activeQuota = quotaData;
+
+  // Auto-switch to model's prefix if user hasn't explicitly clicked a tab
+  if (!userSelectedQuotaFamily && quotaData.prefix) {
+    activeQuotaFamily = quotaData.prefix;
+  }
+
+  const tabGemini = $('quota-tab-gemini');
+  const tab3p = $('quota-tab-3p');
+  if (tabGemini) {
+    tabGemini.classList.toggle('active', activeQuotaFamily === 'gemini');
+    tabGemini.setAttribute('aria-selected', String(activeQuotaFamily === 'gemini'));
+  }
+  if (tab3p) {
+    tab3p.classList.toggle('active', activeQuotaFamily === '3p');
+    tab3p.setAttribute('aria-selected', String(activeQuotaFamily === '3p'));
+  }
+
+  const weeklyBucket = quotaData.buckets ? quotaData.buckets[`${activeQuotaFamily}-weekly`] : null;
+  const fiveHBucket = quotaData.buckets ? quotaData.buckets[`${activeQuotaFamily}-5h`] : null;
+
+  const remWk = weeklyBucket?.remaining_pct ?? quotaData.weekly_remaining_pct ?? 100.0;
+  const resetWk = weeklyBucket?.reset_countdown ?? quotaData.weekly_reset_countdown ?? '';
+  const capWk = weeklyBucket?.calibrated_capacity ?? quotaData.calibrated_weekly_capacity ?? (activeQuotaFamily === 'gemini' ? 672.0 : 200.0);
+
+  const rem5h = fiveHBucket?.remaining_pct ?? quotaData.five_hour_remaining_pct ?? 100.0;
+  const reset5h = fiveHBucket?.reset_countdown ?? quotaData.five_hour_reset_countdown ?? '';
+  const cap5h = fiveHBucket?.calibrated_capacity ?? quotaData.calibrated_5h_capacity ?? (activeQuotaFamily === 'gemini' ? 236.7 : 70.0);
+
+  const sessionImpact = weeklyBucket?.session_impact_pct ?? sessionImpactPct ?? quotaData.session_weekly_pct ?? 0.0;
+
+  // Session impact badge & header badge
+  const impactEl = $('quota-session-impact');
+  if (impactEl) {
+    impactEl.textContent = `${Number(sessionImpact).toFixed(2)}% session share`;
+  }
+  const quotaBadge = $('quota-badge');
+  if (quotaBadge) {
+    quotaBadge.textContent = `${Number(sessionImpact).toFixed(2)}% wk`;
+  }
+
+  // Weekly bucket
+  const wkPctEl = $('quota-weekly-pct');
+  if (wkPctEl) {
+    wkPctEl.textContent = `${Number(remWk).toFixed(1)}% remaining`;
+  }
+  const wkResetEl = $('quota-weekly-reset');
+  if (wkResetEl) {
+    wkResetEl.textContent = resetWk ? `resets in ${resetWk}` : '';
+  }
+  const wkSubEl = $('quota-weekly-sub');
+  if (wkSubEl) {
+    wkSubEl.textContent = `Calibrated capacity: $${Number(capWk).toFixed(2)}`;
+  }
+  const wkBarEl = $('quota-weekly-bar');
+  if (wkBarEl) {
+    wkBarEl.style.width = `${Math.min(100, Math.max(0, remWk))}%`;
+    wkBarEl.className = `quota-bar ${remWk <= 10 ? 'error' : remWk <= 25 ? 'warning' : 'ok'}`;
+  }
+
+  // 5-Hour bucket
+  const fhPctEl = $('quota-5h-pct');
+  if (fhPctEl) {
+    fhPctEl.textContent = `${Number(rem5h).toFixed(1)}% remaining`;
+  }
+  const fhResetEl = $('quota-5h-reset');
+  if (fhResetEl) {
+    fhResetEl.textContent = reset5h ? `resets in ${reset5h}` : '';
+  }
+  const fhSubEl = $('quota-5h-sub');
+  if (fhSubEl) {
+    fhSubEl.textContent = `Calibrated capacity: $${Number(cap5h).toFixed(2)}`;
+  }
+  const fhBarEl = $('quota-5h-bar');
+  if (fhBarEl) {
+    fhBarEl.style.width = `${Math.min(100, Math.max(0, rem5h))}%`;
+    fhBarEl.className = `quota-bar ${rem5h <= 10 ? 'error' : rem5h <= 25 ? 'warning' : 'ok'}`;
+  }
+}
+
 function renderCategories(container, categories) {
   if (!container) return;
   if (!categories || categories.length === 0) {
@@ -111,15 +196,20 @@ function renderTopSteps(container, topSteps, rangeSpan, minStep, maxStep) {
     return;
   }
 
-  container.innerHTML = topSteps.map(s => `
-    <div class="step-item">
-      <div class="step-header">
-        <span class="step-source">#${s.step_index} · ${escapeHtml(s.activity || s.tool_or_source)}</span>
-        <span class="step-tokens">~${formatTokens(s.est_tokens)} tok</span>
+  container.innerHTML = topSteps.map(s => {
+    const quotaStr = (s.weekly_quota_pct !== undefined && s.weekly_quota_pct !== null && s.weekly_quota_pct > 0)
+      ? ` · ${Number(s.weekly_quota_pct).toFixed(2)}% wk`
+      : '';
+    return `
+      <div class="step-item">
+        <div class="step-header">
+          <span class="step-source">#${s.step_index} · ${escapeHtml(s.activity || s.tool_or_source)}</span>
+          <span class="step-tokens">~${formatTokens(s.est_tokens)} tok${quotaStr}</span>
+        </div>
+        <div class="step-detail small" title="${escapeHtml(s.detail || '')}">${escapeHtml(s.detail || 'Step details')}</div>
       </div>
-      <div class="step-detail small" title="${escapeHtml(s.detail || '')}">${escapeHtml(s.detail || 'Step details')}</div>
-    </div>
-  `).join('');
+    `;
+  }).join('');
 }
 
 async function refreshTelemetry() {
@@ -133,6 +223,7 @@ async function refreshTelemetry() {
   const topStepsCard = $('top-steps-card');
   const banner = $('compaction-banner');
   const actionsCard = $('actions-card');
+  const quotaCard = $('quota-card');
 
   try {
     if (!cid) {
@@ -150,12 +241,25 @@ async function refreshTelemetry() {
       if (topStepsCard) topStepsCard.hidden = true;
       if (banner) banner.hidden = true;
       if (actionsCard) actionsCard.hidden = true;
+      if (quotaCard) quotaCard.hidden = false;
 
       $('global-convs').textContent = `${globalData.total_conversations} Sessions`;
       $('global-tokens').textContent = formatTokens(globalData.total_tokens);
       $('global-cost').textContent = formatCost(globalData.total_cost);
+      const globalQuotaEl = $('global-quota');
+      if (globalQuotaEl) {
+        globalQuotaEl.textContent = `${(globalData.weekly_quota_pct || 0).toFixed(2)}% wk`;
+      }
       $('global-compactions').textContent = `${globalData.total_compactions} events`;
       $('global-pruned').textContent = `~${formatTokens(globalData.total_pruned_tokens)} tokens`;
+
+      if (globalData.quota) {
+        renderQuota(globalData.quota, globalData.weekly_quota_pct);
+        const impactEl = $('quota-session-impact');
+        if (impactEl) {
+          impactEl.textContent = `${Number(globalData.weekly_quota_pct || 0).toFixed(2)}% fleet total`;
+        }
+      }
       return;
     }
 
@@ -164,6 +268,7 @@ async function refreshTelemetry() {
     if (capacityCard) capacityCard.hidden = false;
     if (topStepsCard) topStepsCard.hidden = false;
     if (actionsCard) actionsCard.hidden = false;
+    if (quotaCard) quotaCard.hidden = false;
 
     const sessionData = await callApi(`/api/session?cid=${encodeURIComponent(cid)}`);
 
@@ -179,6 +284,11 @@ async function refreshTelemetry() {
 
     // Multi-segment capacity bar
     renderMultiSegmentBar($('capacity-bar'), sessionData.categories, sessionData.max_tokens, sessionData.pct);
+
+    // Subscription Quota rendering
+    if (sessionData.quota) {
+      renderQuota(sessionData.quota, sessionData.weekly_quota_pct);
+    }
 
     // Compaction banner
     if (banner) {
@@ -260,6 +370,24 @@ function init() {
         'Summarize recent context compaction events, how many tokens were pruned, and explain the current active memory boundary.',
         'Compaction review'
       );
+    });
+  }
+
+  const tabGemini = $('quota-tab-gemini');
+  if (tabGemini) {
+    tabGemini.addEventListener('click', () => {
+      userSelectedQuotaFamily = true;
+      activeQuotaFamily = 'gemini';
+      if (activeQuota) renderQuota(activeQuota);
+    });
+  }
+
+  const tab3p = $('quota-tab-3p');
+  if (tab3p) {
+    tab3p.addEventListener('click', () => {
+      userSelectedQuotaFamily = true;
+      activeQuotaFamily = '3p';
+      if (activeQuota) renderQuota(activeQuota);
     });
   }
 
