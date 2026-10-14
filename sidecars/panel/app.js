@@ -11,6 +11,8 @@ let pollTimer = null;
 let activeQuota = null;
 let activeQuotaFamily = 'gemini';
 let userSelectedQuotaFamily = false;
+let lastCid = undefined;
+let isGlobalMode = false;
 
 function formatTokens(n) {
   const num = Number(n) || 0;
@@ -106,11 +108,13 @@ function renderQuota(quotaData, sessionImpactPct) {
   const weeklyBucket = quotaData.buckets ? quotaData.buckets[`${activeQuotaFamily}-weekly`] : null;
   const fiveHBucket = quotaData.buckets ? quotaData.buckets[`${activeQuotaFamily}-5h`] : null;
 
-  const remWk = weeklyBucket?.remaining_pct ?? quotaData.weekly_remaining_pct ?? 100.0;
+  const rawRemWk = weeklyBucket?.remaining_pct ?? quotaData.weekly_remaining_pct ?? 100.0;
+  const remWk = Number.isFinite(rawRemWk) ? rawRemWk : 100.0;
   const resetWk = weeklyBucket?.reset_countdown ?? quotaData.weekly_reset_countdown ?? '';
   const capWk = weeklyBucket?.calibrated_capacity ?? quotaData.calibrated_weekly_capacity ?? (activeQuotaFamily === 'gemini' ? 672.0 : 200.0);
 
-  const rem5h = fiveHBucket?.remaining_pct ?? quotaData.five_hour_remaining_pct ?? 100.0;
+  const rawRem5h = fiveHBucket?.remaining_pct ?? quotaData.five_hour_remaining_pct ?? 100.0;
+  const rem5h = Number.isFinite(rawRem5h) ? rawRem5h : 100.0;
   const reset5h = fiveHBucket?.reset_countdown ?? quotaData.five_hour_reset_countdown ?? '';
   const cap5h = fiveHBucket?.calibrated_capacity ?? quotaData.calibrated_5h_capacity ?? (activeQuotaFamily === 'gemini' ? 236.7 : 70.0);
 
@@ -119,17 +123,23 @@ function renderQuota(quotaData, sessionImpactPct) {
   // Session impact badge & header badge
   const impactEl = $('quota-session-impact');
   if (impactEl) {
-    impactEl.textContent = `${Number(sessionImpact).toFixed(2)}% session share`;
+    const label = isGlobalMode ? 'fleet total' : 'session share';
+    impactEl.textContent = `${Number(sessionImpact).toFixed(2)}% ${label}`;
+    impactEl.className = `badge ${sessionImpact >= 10 ? 'error' : sessionImpact >= 5 ? 'warning' : 'ok'}`;
   }
   const quotaBadge = $('quota-badge');
   if (quotaBadge) {
-    quotaBadge.textContent = `${Number(sessionImpact).toFixed(2)}% wk`;
+    const headerPct = isGlobalMode ? sessionImpact : (quotaData.session_weekly_pct ?? sessionImpact);
+    const suffix = isGlobalMode ? 'fleet' : 'wk';
+    quotaBadge.textContent = `${Number(headerPct).toFixed(2)}% ${suffix}`;
+    quotaBadge.className = `badge ${headerPct >= 10 ? 'error' : headerPct >= 5 ? 'warning' : 'secondary'}`;
   }
 
   // Weekly bucket
   const wkPctEl = $('quota-weekly-pct');
   if (wkPctEl) {
     wkPctEl.textContent = `${Number(remWk).toFixed(1)}% remaining`;
+    wkPctEl.className = `quota-val ${remWk <= 10 ? 'error' : remWk <= 25 ? 'warning' : 'ok'}`;
   }
   const wkResetEl = $('quota-weekly-reset');
   if (wkResetEl) {
@@ -149,6 +159,7 @@ function renderQuota(quotaData, sessionImpactPct) {
   const fhPctEl = $('quota-5h-pct');
   if (fhPctEl) {
     fhPctEl.textContent = `${Number(rem5h).toFixed(1)}% remaining`;
+    fhPctEl.className = `quota-val ${rem5h <= 10 ? 'error' : rem5h <= 25 ? 'warning' : 'ok'}`;
   }
   const fhResetEl = $('quota-5h-reset');
   if (fhResetEl) {
@@ -217,6 +228,12 @@ async function refreshTelemetry() {
   if (document.hidden) return;
 
   const cid = sidecar ? sidecar.conversationId : null;
+  if (lastCid !== cid) {
+    lastCid = cid;
+    userSelectedQuotaFamily = false;
+  }
+  isGlobalMode = !cid;
+
   const statusBadge = $('status-badge');
   const globalCard = $('global-card');
   const capacityCard = $('capacity-card');
@@ -255,10 +272,6 @@ async function refreshTelemetry() {
 
       if (globalData.quota) {
         renderQuota(globalData.quota, globalData.weekly_quota_pct);
-        const impactEl = $('quota-session-impact');
-        if (impactEl) {
-          impactEl.textContent = `${Number(globalData.weekly_quota_pct || 0).toFixed(2)}% fleet total`;
-        }
       }
       return;
     }
@@ -323,7 +336,8 @@ function escapeHtml(str) {
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }
 
 async function sendPrompt(promptText, actionName) {

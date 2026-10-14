@@ -2,7 +2,6 @@ import json
 import subprocess
 import sqlite3
 from pathlib import Path
-import pytest
 
 def test_sidecar_query_logic(tmp_path):
     # Create a temporary SQLite database mimicking analytics.db
@@ -259,10 +258,16 @@ def test_sidecar_quota_integration(tmp_path):
     assert quota_g["is_3p"] is False
     assert quota_g["buckets"]["gemini-weekly"]["remaining_pct"] == 85.0
     assert quota_g["buckets"]["3p-weekly"]["remaining_pct"] == 95.0
+    # Gemini conversation should have 0% impact on 3P bucket and 1% on Gemini bucket
+    assert quota_g["buckets"]["3p-weekly"]["session_impact_pct"] == 0.0
+    assert abs(quota_g["buckets"]["gemini-weekly"]["session_impact_pct"] - 1.0) < 0.01
 
     quota_c = data["quotaClaude"]
     assert quota_c["is_3p"] is True
     assert quota_c["calibrated_weekly_capacity"] == 200.0
+    # Claude conversation should have 0% impact on Gemini bucket and 1% on 3P bucket
+    assert quota_c["buckets"]["gemini-weekly"]["session_impact_pct"] == 0.0
+    assert abs(quota_c["buckets"]["3p-weekly"]["session_impact_pct"] - 1.0) < 0.01
 
 def test_sidecar_quota_missing_table_fallback(tmp_path):
     # Tests that query.mjs falls back gracefully when quota_state table does not exist
@@ -368,4 +373,157 @@ def test_main_mjs_exists_and_syntax():
         text=True
     )
     assert res.returncode == 0, f"Syntax check failed: {res.stderr}"
+
+def test_sidecar_quota_indexing_session_uses_cached_quota(tmp_path):
+    # Verifies that when a conversation is indexing, getSessionData reads cached quota_state
+    db_path = tmp_path / "test_analytics_indexing.db"
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    cur.executescript("""
+    CREATE TABLE conversations (
+        id TEXT PRIMARY KEY, title TEXT, project TEXT, model_name TEXT,
+        created_at TEXT, updated_at TEXT, total_steps INTEGER DEFAULT 0,
+        total_tokens INTEGER DEFAULT 0, billed_cost REAL DEFAULT 0.0
+    );
+    CREATE TABLE quota_state (
+        bucket_id TEXT PRIMARY KEY, group_name TEXT, window TEXT,
+        remaining_fraction REAL, reset_time TEXT, calibrated_capacity REAL, fetched_at TEXT
+    );
+    INSERT INTO quota_state VALUES
+        ('gemini-weekly', 'Gemini Models', 'weekly', 0.50, '2026-10-21T02:27:22Z', 672.0, '2026-10-14T10:00:00Z');
+    """)
+    conn.commit()
+    conn.close()
+
+    node_code = f"""
+    import {{ openDatabase, getSessionData }} from './sidecars/panel/query.mjs';
+    const db = openDatabase('{db_path}');
+    const session = getSessionData(db, 'indexing-conv-id');
+    console.log(JSON.stringify(session));
+    """
+
+    res = subprocess.run(
+        ["node", "--input-type=module", "-e", node_code],
+        capture_output=True,
+        text=True,
+        cwd=Path.cwd()
+    )
+    assert res.returncode == 0, f"Node script failed: {res.stderr}"
+    session = json.loads(res.stdout)
+    assert session["cid"] == "indexing-conv-id"
+    assert session["quota_remaining_weekly_pct"] == 50.0
+    assert session["quota"]["weekly_remaining_pct"] == 50.0
+
+def test_sidecar_model_detection_and_naive_utc_countdown():
+    # Verifies model context limit / prefix detection and UTC naive countdown
+    node_code = """
+    import { getModelContextLimit, getModelQuotaPrefix, formatResetCountdown } from './sidecars/panel/query.mjs';
+    const sonnetLimit = getModelContextLimit('Sonnet 3.7');
+    const sonnetPrefix = getModelQuotaPrefix('Sonnet 3.7');
+    const opusLimit = getModelContextLimit('Claude 3 Opus');
+    const opusPrefix = getModelQuotaPrefix('Claude 3 Opus');
+    const argonLimit = getModelContextLimit('Gemini 4 Argon');
+    const argonPrefix = getModelQuotaPrefix('Gemini 4 Argon');
+
+    const now = new Date('2026-10-14T12:00:00Z');
+    const utcZ = formatResetCountdown('2026-10-14T14:00:00Z', now);
+    const naive = formatResetCountdown('2026-10-14T14:00:00', now);
+
+    console.log(JSON.stringify({ sonnetLimit, sonnetPrefix, opusLimit, opusPrefix, argonLimit, argonPrefix, utcZ, naive }));
+    """
+
+    res = subprocess.run(
+        ["node", "--input-type=module", "-e", node_code],
+        capture_output=True,
+        text=True,
+        cwd=Path.cwd()
+    )
+    assert res.returncode == 0, f"Node script failed: {res.stderr}"
+    data = json.loads(res.stdout)
+    assert data["sonnetLimit"] == 200000
+    assert data["sonnetPrefix"] == "3p"
+    assert data["opusLimit"] == 200000
+    assert data["opusPrefix"] == "3p"
+    assert data["argonLimit"] == 1000000
+    assert data["argonPrefix"] == "gemini"
+    assert data["utcZ"] == "2h 0m"
+    assert data["naive"] == "2h 0m"
+
+def test_sidecar_global_cost_breakdown_by_model_family(tmp_path):
+    db_path = tmp_path / "test_analytics_global_family.db"
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    cur.executescript("""
+    CREATE TABLE conversations (
+        id TEXT PRIMARY KEY, title TEXT, project TEXT, model_name TEXT,
+        created_at TEXT, updated_at TEXT, total_steps INTEGER DEFAULT 0,
+        total_tokens INTEGER DEFAULT 0, billed_cost REAL DEFAULT 0.0
+    );
+    CREATE TABLE quota_state (
+        bucket_id TEXT PRIMARY KEY, group_name TEXT, window TEXT,
+        remaining_fraction REAL, reset_time TEXT, calibrated_capacity REAL, fetched_at TEXT
+    );
+    INSERT INTO quota_state VALUES
+        ('gemini-weekly', 'Gemini Models', 'weekly', 0.90, '2026-10-21T02:27:22Z', 672.0, '2026-10-14T10:00:00Z'),
+        ('3p-weekly', 'Claude Models', 'weekly', 0.90, '2026-10-21T02:27:22Z', 200.0, '2026-10-14T10:00:00Z');
+    INSERT INTO conversations VALUES
+        ('c-gem', 'Gemini', 'p', 'Gemini 3.8 Flash', '2026-10-14T10:00:00Z', '2026-10-14T10:00:00Z', 1, 1000, 6.72),
+        ('c-3p', 'Claude', 'p', 'Claude 3.7 Sonnet', '2026-10-14T10:00:00Z', '2026-10-14T10:00:00Z', 1, 1000, 2.00);
+    """)
+    conn.commit()
+    conn.close()
+
+    node_code = f"""
+    import {{ openDatabase, getGlobalData }} from './sidecars/panel/query.mjs';
+    const db = openDatabase('{db_path}');
+    const g = getGlobalData(db);
+    console.log(JSON.stringify(g));
+    """
+
+    res = subprocess.run(
+        ["node", "--input-type=module", "-e", node_code],
+        capture_output=True,
+        text=True,
+        cwd=Path.cwd()
+    )
+    assert res.returncode == 0, f"Node script failed: {res.stderr}"
+    data = json.loads(res.stdout)
+    assert abs(data["total_cost"] - 8.72) < 0.01
+    # Gemini bucket should calculate against Gemini cost ($6.72 / $672 = 1.0%)
+    assert abs(data["quota"]["buckets"]["gemini-weekly"]["session_impact_pct"] - 1.0) < 0.01
+    # 3P bucket should calculate against 3P cost ($2.00 / $200 = 1.0%)
+    assert abs(data["quota"]["buckets"]["3p-weekly"]["session_impact_pct"] - 1.0) < 0.01
+
+def test_sidecar_missing_conversations_table_graceful(tmp_path):
+    db_path = tmp_path / "test_analytics_no_conversations.db"
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    cur.execute("""
+    CREATE TABLE quota_state (
+        bucket_id TEXT PRIMARY KEY, group_name TEXT, window TEXT,
+        remaining_fraction REAL, reset_time TEXT, calibrated_capacity REAL, fetched_at TEXT
+    )
+    """)
+    conn.commit()
+    conn.close()
+
+    node_code = f"""
+    import {{ openDatabase, getSessionData, getGlobalData }} from './sidecars/panel/query.mjs';
+    const db = openDatabase('{db_path}');
+    const s = getSessionData(db, 'any-id');
+    const g = getGlobalData(db);
+    console.log(JSON.stringify({{ s, g }}));
+    """
+
+    res = subprocess.run(
+        ["node", "--input-type=module", "-e", node_code],
+        capture_output=True,
+        text=True,
+        cwd=Path.cwd()
+    )
+    assert res.returncode == 0, f"Node script failed: {res.stderr}"
+    data = json.loads(res.stdout)
+    assert data["s"]["cid"] == "any-id"
+    assert data["g"]["total_conversations"] == 0
+
 

@@ -232,6 +232,18 @@ body {
   color: var(--primary, #1a73e8);
 }
 
+.quota-val.ok {
+  color: #1e8e3e;
+}
+
+.quota-val.warning {
+  color: #e37400;
+}
+
+.quota-val.error {
+  color: #d93025;
+}
+
 .quota-reset {
   font-size: 10px;
 }

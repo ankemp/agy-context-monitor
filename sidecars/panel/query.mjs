@@ -5,8 +5,8 @@ import { DatabaseSync } from 'node:sqlite';
 
 const MODEL_LIMIT_RULES = [
   { match: ['pro'], limit: 2000000 },
-  { match: ['flash', 'gemini'], limit: 1000000 },
-  { match: ['claude'], limit: 200000 },
+  { match: ['argon', 'flash', 'gemini'], limit: 1000000 },
+  { match: ['claude', 'sonnet', 'opus'], limit: 200000 },
   { match: ['gpt', 'o1', 'o3'], limit: 128000 }
 ];
 
@@ -29,15 +29,25 @@ export function getModelContextLimit(modelName) {
 
 export function getModelQuotaPrefix(modelName) {
   const lower = (modelName || '').toLowerCase();
-  const is3p = lower.includes('claude') || lower.includes('gpt') || lower.includes('o1') || lower.includes('o3');
+  const is3p = lower.includes('claude')
+    || lower.includes('sonnet')
+    || lower.includes('opus')
+    || lower.includes('gpt')
+    || lower.includes('o1')
+    || lower.includes('o3');
   return is3p ? '3p' : 'gemini';
 }
 
 export function formatResetCountdown(resetTimeIso, now = new Date()) {
   if (!resetTimeIso) return '';
   try {
-    const resetDate = new Date(resetTimeIso);
-    const diffMs = resetDate.getTime() - now.getTime();
+    let str = String(resetTimeIso).trim();
+    if (!str.endsWith('Z') && !/[+-]\d{2}(:?\d{2})?$/.test(str)) {
+      str = str.replace(' ', 'T') + 'Z';
+    }
+    const resetDate = new Date(str);
+    const nowDate = (now instanceof Date) ? now : new Date(now);
+    const diffMs = resetDate.getTime() - nowDate.getTime();
     if (isNaN(diffMs)) return '';
     const diffSec = Math.floor(diffMs / 1000);
     if (diffSec <= 0) return '0m';
@@ -54,7 +64,7 @@ export function formatResetCountdown(resetTimeIso, now = new Date()) {
   }
 }
 
-export function getQuotaSummary(db, modelName = 'Gemini 3.7 Flash', sessionCost = 0) {
+export function getQuotaSummary(db, modelName = 'Gemini 3.7 Flash', sessionCost = 0, costMap = null) {
   let dbRows = [];
   if (db) {
     try {
@@ -76,7 +86,7 @@ export function getQuotaSummary(db, modelName = 'Gemini 3.7 Flash', sessionCost 
   }
 
   const prefix = getModelQuotaPrefix(modelName);
-  const costNum = Number(sessionCost) || 0;
+  const costNum = Math.max(0, Number(sessionCost) || 0);
 
   const standardBuckets = [
     { bucket_id: 'gemini-weekly', group_name: 'Gemini Models', window: 'weekly' },
@@ -97,8 +107,24 @@ export function getQuotaSummary(db, modelName = 'Gemini 3.7 Flash', sessionCost 
     const resetCountdown = formatResetCountdown(resetTime);
     const cap = (r && r.calibrated_capacity && Number(r.calibrated_capacity) > 0)
       ? Number(r.calibrated_capacity)
-      : DEFAULT_CAPACITIES[def.bucket_id];
-    const sessionImpactPct = cap > 0 ? Number(((costNum / cap) * 100).toFixed(4)) : 0;
+      : (DEFAULT_CAPACITIES[def.bucket_id] || (def.bucket_id.startsWith('3p') ? 200.0 : 672.0));
+
+    // Determine applicable cost for this bucket:
+    // If costMap is provided (e.g. from getGlobalData):
+    //   gemini buckets use costMap.gemini, 3p buckets use costMap['3p']
+    // Otherwise in session mode:
+    //   only buckets matching the model prefix attribute the session cost;
+    //   cross-model family buckets have 0 session impact.
+    let applicableCost = 0;
+    if (costMap && typeof costMap === 'object') {
+      applicableCost = def.bucket_id.startsWith('3p')
+        ? (Number(costMap['3p']) || 0)
+        : (Number(costMap.gemini) || 0);
+    } else {
+      applicableCost = def.bucket_id.startsWith(prefix) ? costNum : 0;
+    }
+
+    const sessionImpactPct = cap > 0 ? Number(((applicableCost / cap) * 100).toFixed(4)) : 0;
 
     buckets[def.bucket_id] = {
       bucket_id: def.bucket_id,
@@ -115,11 +141,55 @@ export function getQuotaSummary(db, modelName = 'Gemini 3.7 Flash', sessionCost 
     };
   }
 
+  // Also include any extra custom buckets from quota_state
+  for (const [bid, r] of rowMap.entries()) {
+    if (!buckets[bid]) {
+      const remFrac = (r && r.remaining_fraction !== null && r.remaining_fraction !== undefined)
+        ? Number(r.remaining_fraction)
+        : 1.0;
+      const remPct = Math.round(remFrac * 1000) / 10;
+      const usedPct = Math.round((1 - remFrac) * 1000) / 10;
+      const resetTime = r?.reset_time || '';
+      const cap = (r && r.calibrated_capacity && Number(r.calibrated_capacity) > 0)
+        ? Number(r.calibrated_capacity)
+        : (DEFAULT_CAPACITIES[bid] || 672.0);
+      const isMatching = bid.startsWith(prefix);
+      const applicableCost = isMatching ? costNum : 0;
+      const sessionImpactPct = cap > 0 ? Number(((applicableCost / cap) * 100).toFixed(4)) : 0;
+
+      buckets[bid] = {
+        bucket_id: bid,
+        group_name: r?.group_name || 'Custom Quota',
+        window: r?.window || 'custom',
+        remaining_fraction: remFrac,
+        remaining_pct: remPct,
+        used_pct: Math.max(0, usedPct),
+        reset_time: resetTime,
+        reset_countdown: formatResetCountdown(resetTime),
+        calibrated_capacity: cap,
+        session_impact_pct: sessionImpactPct,
+        fetched_at: r?.fetched_at || ''
+      };
+    }
+  }
+
   const weeklyKey = `${prefix}-weekly`;
   const fiveHKey = `${prefix}-5h`;
 
-  const activeWeekly = buckets[weeklyKey];
-  const active5h = buckets[fiveHKey];
+  const activeWeekly = buckets[weeklyKey] || {
+    remaining_pct: 100.0,
+    reset_time: '',
+    reset_countdown: '',
+    calibrated_capacity: prefix === '3p' ? 200.0 : 672.0,
+    session_impact_pct: 0
+  };
+  const active5h = buckets[fiveHKey] || {
+    remaining_pct: 100.0,
+    reset_time: '',
+    reset_countdown: '',
+    calibrated_capacity: prefix === '3p' ? 70.0 : 236.7,
+    session_impact_pct: 0
+  };
 
   return {
     prefix,
@@ -165,9 +235,9 @@ export function getDatabase(customPath) {
   return cachedDb;
 }
 
-export function createDefaultSession(cid = null, title = 'No conversation records', modelName = 'Gemini 3.7 Flash') {
+export function createDefaultSession(cid = null, title = 'No conversation records', modelName = 'Gemini 3.7 Flash', db = null) {
   const maxTokens = getModelContextLimit(modelName);
-  const quotaSummary = getQuotaSummary(null, modelName, 0);
+  const quotaSummary = getQuotaSummary(db, modelName, 0);
   return {
     cid,
     title,
@@ -197,34 +267,39 @@ export function createDefaultSession(cid = null, title = 'No conversation record
 
 export function getSessionData(db, cid) {
   if (!db) {
-    return createDefaultSession(cid, 'No analytics database', 'Unknown');
+    return createDefaultSession(cid, 'No analytics database', 'Unknown', null);
   }
 
   let conv = null;
-  if (cid) {
-    conv = db.prepare(`
-      SELECT *
-      FROM conversations
-      WHERE id = ?
-    `).get(cid);
+  try {
+    if (cid) {
+      conv = db.prepare(`
+        SELECT *
+        FROM conversations
+        WHERE id = ?
+      `).get(cid);
 
-    // If a specific conversation was requested but is not found yet in SQLite,
-    // do NOT fall back to another conversation (prevents cross-session data leakage).
-    if (!conv) {
-      return createDefaultSession(cid, 'Active Session (indexing...)', 'Gemini 3.7 Flash');
-    }
-  } else {
-    // No specific cid passed; fetch latest active conversation
-    conv = db.prepare(`
-      SELECT *
-      FROM conversations
-      ORDER BY updated_at DESC
-      LIMIT 1
-    `).get();
+      // If a specific conversation was requested but is not found yet in SQLite,
+      // do NOT fall back to another conversation (prevents cross-session data leakage).
+      if (!conv) {
+        return createDefaultSession(cid, 'Active Session (indexing...)', 'Gemini 3.7 Flash', db);
+      }
+    } else {
+      // No specific cid passed; fetch latest active conversation
+      conv = db.prepare(`
+        SELECT *
+        FROM conversations
+        ORDER BY updated_at DESC
+        LIMIT 1
+      `).get();
 
-    if (!conv) {
-      return createDefaultSession(null, 'No conversation records', 'Gemini 3.7 Flash');
+      if (!conv) {
+        return createDefaultSession(null, 'No conversation records', 'Gemini 3.7 Flash', db);
+      }
     }
+  } catch {
+    // conversations table might not exist yet
+    return createDefaultSession(cid, 'No analytics database', 'Gemini 3.7 Flash', db);
   }
 
   const resolvedCid = conv.id;
@@ -346,24 +421,85 @@ export function getGlobalData(db) {
     };
   }
 
-  const row = db.prepare(`
-    SELECT COUNT(*) as total_conversations,
-           SUM(total_tokens) as total_tokens,
-           SUM(billed_cost) as total_cost,
-           SUM(compaction_count) as total_compactions,
-           SUM(pruned_tokens) as total_pruned_tokens
-    FROM conversations
-  `).get();
+  let totalConversations = 0;
+  let totalTokens = 0;
+  let totalCost = 0.0;
+  let totalCompactions = 0;
+  let totalPrunedTokens = 0;
+  let costGemini = 0.0;
+  let cost3p = 0.0;
 
-  const totalCost = row?.total_cost || 0.0;
-  const quotaSummary = getQuotaSummary(db, 'Gemini 3.7 Flash', totalCost);
+  try {
+    const baseRow = db.prepare(`
+      SELECT COUNT(*) as total_conversations,
+             COALESCE(SUM(total_tokens), 0) as total_tokens,
+             COALESCE(SUM(billed_cost), 0.0) as total_cost
+      FROM conversations
+    `).get();
+
+    if (baseRow) {
+      totalConversations = Number(baseRow.total_conversations) || 0;
+      totalTokens = Number(baseRow.total_tokens) || 0;
+      totalCost = Number(baseRow.total_cost) || 0.0;
+    }
+  } catch {
+    // conversations table missing or empty
+  }
+
+  try {
+    const compRow = db.prepare(`
+      SELECT COALESCE(SUM(compaction_count), 0) as total_compactions,
+             COALESCE(SUM(pruned_tokens), 0) as total_pruned_tokens
+      FROM conversations
+    `).get();
+
+    if (compRow) {
+      totalCompactions = Number(compRow.total_compactions) || 0;
+      totalPrunedTokens = Number(compRow.total_pruned_tokens) || 0;
+    }
+  } catch {
+    // compaction columns might not exist
+  }
+
+  try {
+    const breakdown = db.prepare(`
+      SELECT
+        COALESCE(SUM(CASE
+          WHEN LOWER(model_name) LIKE '%claude%'
+            OR LOWER(model_name) LIKE '%sonnet%'
+            OR LOWER(model_name) LIKE '%opus%'
+            OR LOWER(model_name) LIKE '%gpt%'
+            OR LOWER(model_name) LIKE '%o1%'
+            OR LOWER(model_name) LIKE '%o3%'
+          THEN billed_cost ELSE 0 END), 0.0) as cost_3p,
+        COALESCE(SUM(CASE
+          WHEN NOT (LOWER(model_name) LIKE '%claude%'
+            OR LOWER(model_name) LIKE '%sonnet%'
+            OR LOWER(model_name) LIKE '%opus%'
+            OR LOWER(model_name) LIKE '%gpt%'
+            OR LOWER(model_name) LIKE '%o1%'
+            OR LOWER(model_name) LIKE '%o3%')
+          THEN billed_cost ELSE 0 END), 0.0) as cost_gemini
+      FROM conversations
+    `).get();
+
+    if (breakdown) {
+      costGemini = Number(breakdown.cost_gemini) || 0.0;
+      cost3p = Number(breakdown.cost_3p) || 0.0;
+    }
+  } catch {
+    costGemini = totalCost;
+  }
+
+  const costMap = { gemini: costGemini, '3p': cost3p };
+  const quotaSummary = getQuotaSummary(db, 'Gemini 3.7 Flash', totalCost, costMap);
 
   return {
-    total_conversations: row?.total_conversations || 0,
-    total_tokens: row?.total_tokens || 0,
+    total_conversations: totalConversations,
+    total_tokens: totalTokens,
     total_cost: totalCost,
-    total_compactions: row?.total_compactions || 0,
-    total_pruned_tokens: row?.total_pruned_tokens || 0,
+    total_compactions: totalCompactions,
+    total_pruned_tokens: totalPrunedTokens,
     weekly_quota_pct: quotaSummary.session_weekly_pct,
     quota: quotaSummary
   };
