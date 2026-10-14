@@ -20,24 +20,22 @@ from pathlib import Path
 from datetime import datetime
 
 # Import db layer
-import sys
-from pathlib import Path
 _root = Path(__file__).resolve().parent.parent
 if str(_root / "src") not in sys.path:
     sys.path.insert(0, str(_root / "src"))
 
-from context_monitor.db import get_db_connection, init_db, DEFAULT_DB_PATH
-from context_monitor.formats import BlockParser
-from context_monitor.pricing import (
+from context_monitor.db import DEFAULT_DB_PATH, get_db_connection, init_db  # noqa: E402
+from context_monitor.formats import BlockParser  # noqa: E402
+from context_monitor.pricing import (  # noqa: E402
     DEFAULT_MODEL,
-    PRICING,
-    get_pricing_key,
-    get_model_context_limit,
     calculate_step_cost,
     extract_model_switch,
+    get_model_context_limit,
 )
+from context_monitor.quota import sync_and_get_quota_state  # noqa: E402
 
 CHARS_PER_TOKEN = 3.8
+
 
 def extract_file_basename(content: str) -> str:
     m = re.search(r"File Path:\s*`?(?:file://)?([^`\r\n]+)`?", content)
@@ -45,19 +43,23 @@ def extract_file_basename(content: str) -> str:
         return Path(m.group(1).strip()).name
     return "File view"
 
+
 def extract_system_message_detail(content: str) -> str:
     m_task = re.search(r"sender=([^\s]+)", content)
     m_code = re.search(r"exited with code (\d+)", content)
     sender = m_task.group(1).split("/")[-1] if m_task else "Task"
     code = f"(exit {m_code.group(1)})" if m_code else ""
     lines = [
-        line.strip() for line in content.splitlines()
-        if line.strip() and not line.strip().startswith("<")
+        line.strip()
+        for line in content.splitlines()
+        if line.strip()
+        and not line.strip().startswith("<")
         and not line.strip().startswith("The following")
         and not line.strip().startswith("[Message]")
     ]
     snippet = lines[0][:40] if lines else ""
     return f"{sender} {code} {snippet}".strip()
+
 
 def detect_model_from_transcript(transcript_path: Path) -> tuple[str, str, int]:
     first_model = DEFAULT_MODEL
@@ -86,30 +88,67 @@ def detect_model_from_transcript(transcript_path: Path) -> tuple[str, str, int]:
     max_tokens = get_model_context_limit(latest_model)
     return first_model, latest_model, max_tokens
 
+
 def classify_phase(step_type: str, tool_name: str) -> str:
     """Categorizes a step into one of 4 development phases."""
     s_upper = step_type.upper()
     t_lower = tool_name.lower() if tool_name else ""
 
-    if t_lower in ("view_file", "grep_search", "find_by_name", "list_dir", "search_web", "read_url_content", "read_resource", "list_resources") or \
-       s_upper in ("VIEW_FILE", "GREP_SEARCH", "FIND", "LIST_DIRECTORY", "SEARCH_WEB", "READ_URL_CONTENT"):
+    if t_lower in (
+        "view_file",
+        "grep_search",
+        "find_by_name",
+        "list_dir",
+        "search_web",
+        "read_url_content",
+        "read_resource",
+        "list_resources",
+    ) or s_upper in (
+        "VIEW_FILE",
+        "GREP_SEARCH",
+        "FIND",
+        "LIST_DIRECTORY",
+        "SEARCH_WEB",
+        "READ_URL_CONTENT",
+    ):
         return "discovery"
-    
-    if t_lower in ("write_to_file", "replace_file_content", "multi_replace_file_content", "generate_image", "create_or_update_file", "push_files") or \
-       s_upper in ("CODE_ACTION", "GENERATE_IMAGE"):
+
+    if t_lower in (
+        "write_to_file",
+        "replace_file_content",
+        "multi_replace_file_content",
+        "generate_image",
+        "create_or_update_file",
+        "push_files",
+    ) or s_upper in ("CODE_ACTION", "GENERATE_IMAGE"):
         return "execution"
 
-    if t_lower in ("run_command", "manage_task", "command_status", "invoke_subagent", "send_message", "manage_subagents") or \
-       t_lower.startswith("mcp_") or \
-       s_upper in ("RUN_COMMAND", "INVOKE_SUBAGENT", "SYSTEM_MESSAGE"):
+    if (
+        t_lower
+        in (
+            "run_command",
+            "manage_task",
+            "command_status",
+            "invoke_subagent",
+            "send_message",
+            "manage_subagents",
+        )
+        or t_lower.startswith("mcp_")
+        or s_upper in ("RUN_COMMAND", "INVOKE_SUBAGENT", "SYSTEM_MESSAGE")
+    ):
         return "verification"
 
     return "reasoning"
 
+
 def parse_conversation(conv_dir: Path) -> dict | None:
     transcript_path = conv_dir / ".system_generated" / "logs" / "transcript.jsonl"
     if not transcript_path.exists():
-        transcript_path = conv_dir / ".system_generated" / "logs" / "transcript_full.jsonl"
+        transcript_path = (
+            conv_dir / ".system_generated" / "logs" / "transcript_full.jsonl"
+        )
+    if not transcript_path.exists():
+        transcript_path = conv_dir / "transcript.jsonl"
     if not transcript_path.exists():
         return None
 
@@ -151,7 +190,7 @@ def parse_conversation(conv_dir: Path) -> dict | None:
 
             step_idx = step.get("step_index", len(steps))
             parsed_blocks.extend(block_parser.parse_step(step, step_idx))
-            
+
             source = step.get("source", "UNKNOWN")
             step_type = step.get("type", "UNKNOWN")
             created_at = step.get("created_at", "")
@@ -159,7 +198,15 @@ def parse_conversation(conv_dir: Path) -> dict | None:
             thinking = step.get("thinking", "")
             tool_calls = step.get("tool_calls", [])
             exit_code = step.get("exit_code")
-            is_error = 1 if (step.get("error") or step.get("status") == "ERROR" or (exit_code is not None and exit_code != 0)) else 0
+            is_error = (
+                1
+                if (
+                    step.get("error")
+                    or step.get("status") == "ERROR"
+                    or (exit_code is not None and exit_code != 0)
+                )
+                else 0
+            )
 
             # Detect mid-session model switch
             if step_type == "USER_INPUT":
@@ -170,8 +217,12 @@ def parse_conversation(conv_dir: Path) -> dict | None:
                         model_transitions.append(cur_model)
                     if cur_model not in models_used:
                         models_used.append(cur_model)
-            
-            if not project and step_type in ("USER_INPUT", "CHECKPOINT") and "<user_information>" in content:
+
+            if (
+                not project
+                and step_type in ("USER_INPUT", "CHECKPOINT")
+                and "<user_information>" in content
+            ):
                 m = re.search(r"(?:/Users/[^\s]+)\s*->\s*[^\s]+/([^\s]+)", content)
                 if m:
                     project = m.group(1)
@@ -188,8 +239,14 @@ def parse_conversation(conv_dir: Path) -> dict | None:
             thinking_len = len(thinking)
             tool_calls_len = len(json.dumps(tool_calls)) if tool_calls else 0
             step_chars = content_len + thinking_len + tool_calls_len
-            est_tokens = step.get("est_tokens") if step.get("est_tokens") is not None else int(step_chars / CHARS_PER_TOKEN)
-            step_thinking_tokens = int(thinking_len / CHARS_PER_TOKEN) if thinking_len else 0
+            est_tokens = (
+                step.get("est_tokens")
+                if step.get("est_tokens") is not None
+                else int(step_chars / CHARS_PER_TOKEN)
+            )
+            step_thinking_tokens = (
+                int(thinking_len / CHARS_PER_TOKEN) if thinking_len else 0
+            )
             total_chars += step_chars
             total_thinking_tokens += step_thinking_tokens
 
@@ -206,32 +263,49 @@ def parse_conversation(conv_dir: Path) -> dict | None:
                 if tool_calls:
                     pending_tool_calls = [
                         (tc.get("name", ""), tc.get("args", {}))
-                        for tc in tool_calls if isinstance(tc, dict)
+                        for tc in tool_calls
+                        if isinstance(tc, dict)
                     ]
                     tool_names = [tc[0] for tc in pending_tool_calls]
                     primary_tool_name = tool_names[0] if tool_names else ""
                     detail = f"Tools called: {', '.join(tool_names)}"
-                    
+
                     # Record tool executions and volume metrics
                     for tc_name, tc_args in pending_tool_calls:
-                        target_p = tc_args.get("TargetFile") or tc_args.get("AbsolutePath") or tc_args.get("SearchPath") or tc_args.get("DirectoryPath") or ""
-                        
+                        target_p = (
+                            tc_args.get("TargetFile")
+                            or tc_args.get("AbsolutePath")
+                            or tc_args.get("SearchPath")
+                            or tc_args.get("DirectoryPath")
+                            or ""
+                        )
+
                         proj_path = target_p or tc_args.get("Cwd") or ""
-                        if not project and proj_path and "/Users/akemp/Workspace/" in proj_path:
-                            m = re.search(r"/Users/akemp/Workspace/([^/\"\'\s]+)", proj_path)
+                        if (
+                            not project
+                            and proj_path
+                            and "/Users/akemp/Workspace/" in proj_path
+                        ):
+                            m = re.search(
+                                r"/Users/akemp/Workspace/([^/\"\'\s]+)", proj_path
+                            )
                             if m:
                                 project = m.group(1)
-                        
+
                         cmd_line = tc_args.get("CommandLine", "")
                         clean_path = str(target_p).strip("\"'") if target_p else None
                         clean_cmd = str(cmd_line).strip("\"'") if cmd_line else None
-                        
+
                         # Check redundant file reads
                         if tc_name == "invoke_subagent":
                             sub_raw = tc_args.get("Subagents", "")
                             if isinstance(sub_raw, str):
                                 try:
-                                    pending_subagent_specs = json.loads(sub_raw) if sub_raw.strip().startswith("[") else []
+                                    pending_subagent_specs = (
+                                        json.loads(sub_raw)
+                                        if sub_raw.strip().startswith("[")
+                                        else []
+                                    )
                                 except Exception:
                                     pending_subagent_specs = []
                             elif isinstance(sub_raw, list):
@@ -247,7 +321,10 @@ def parse_conversation(conv_dir: Path) -> dict | None:
                         elif tc_name == "write_to_file":
                             code = tc_args.get("CodeContent", "")
                             lines_written += len(code.splitlines())
-                        elif tc_name in ("replace_file_content", "multi_replace_file_content"):
+                        elif tc_name in (
+                            "replace_file_content",
+                            "multi_replace_file_content",
+                        ):
                             rep = tc_args.get("ReplacementContent", "")
                             lines_edited += len(rep.splitlines())
 
@@ -270,17 +347,19 @@ def parse_conversation(conv_dir: Path) -> dict | None:
                             mcp_tool = parts[2] if len(parts) > 2 else tc_name
                             stored_tool_name = tc_name
 
-                        tool_execs.append({
-                            "conversation_id": cid,
-                            "step_index": step_idx,
-                            "tool_name": stored_tool_name,
-                            "mcp_server": mcp_server,
-                            "mcp_tool": mcp_tool,
-                            "target_path": clean_path,
-                            "command_line": clean_cmd,
-                            "exit_code": exit_code,
-                            "is_error": is_error
-                        })
+                        tool_execs.append(
+                            {
+                                "conversation_id": cid,
+                                "step_index": step_idx,
+                                "tool_name": stored_tool_name,
+                                "mcp_server": mcp_server,
+                                "mcp_tool": mcp_tool,
+                                "target_path": clean_path,
+                                "command_line": clean_cmd,
+                                "exit_code": exit_code,
+                                "is_error": is_error,
+                            }
+                        )
                 else:
                     pending_tool_calls = []
                     clean = re.sub(r"\s+", " ", content).strip()
@@ -312,7 +391,10 @@ def parse_conversation(conv_dir: Path) -> dict | None:
                 pending_tool_calls = []
                 detail = extract_system_message_detail(content)
                 if step_idx <= 2 and not detected_parent_id:
-                    m_snd = re.search(r"\[Message\]\s+timestamp=[^\s]+\s+sender=([a-zA-Z0-9_\-]+)", content)
+                    m_snd = re.search(
+                        r"\[Message\]\s+timestamp=[^\s]+\s+sender=([a-zA-Z0-9_\-]+)",
+                        content,
+                    )
                     if m_snd:
                         detected_parent_id = m_snd.group(1)
 
@@ -329,30 +411,62 @@ def parse_conversation(conv_dir: Path) -> dict | None:
                 tool_args = tool_info[1]
                 primary_tool_name = tool_name
 
-                if (tool_name == "invoke_subagent" or ("Created the following subagents:" in content and pending_subagent_specs)) and tool_name not in ("run_command", "view_file", "search_web", "manage_task"):
+                if (
+                    tool_name == "invoke_subagent"
+                    or (
+                        "Created the following subagents:" in content
+                        and pending_subagent_specs
+                    )
+                ) and tool_name not in (
+                    "run_command",
+                    "view_file",
+                    "search_web",
+                    "manage_task",
+                ):
                     activity = "Subagent Dispatched"
                     tool_or_source = "`invoke_subagent`"
                     category = "Tool Output: `invoke_subagent`"
-                    found_cids = re.findall(r'conversationId["\':\s]+([a-zA-Z0-9_\-]+)', content)
+                    found_cids = re.findall(
+                        r'conversationId["\':\s]+([a-zA-Z0-9_\-]+)', content
+                    )
                     if not found_cids:
-                        found_cids = re.findall(r'([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})', content)
+                        found_cids = re.findall(
+                            r"([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})",
+                            content,
+                        )
                     for c_idx, ch_id in enumerate(found_cids):
-                        spec = pending_subagent_specs[c_idx] if c_idx < len(pending_subagent_specs) else {}
-                        dispatched_subagents.append({
-                            "id": ch_id,
-                            "role": spec.get("Role") or spec.get("role") or "Autonomous Worker",
-                            "type": spec.get("TypeName") or spec.get("type") or "self",
-                            "model": spec.get("Model") or spec.get("model") or "inherit",
-                            "step_index": step_idx
-                        })
+                        spec = (
+                            pending_subagent_specs[c_idx]
+                            if c_idx < len(pending_subagent_specs)
+                            else {}
+                        )
+                        dispatched_subagents.append(
+                            {
+                                "id": ch_id,
+                                "role": spec.get("Role")
+                                or spec.get("role")
+                                or "Autonomous Worker",
+                                "type": spec.get("TypeName")
+                                or spec.get("type")
+                                or "self",
+                                "model": spec.get("Model")
+                                or spec.get("model")
+                                or "inherit",
+                                "step_index": step_idx,
+                            }
+                        )
                     pending_subagent_specs = []
-                    detail = f"Dispatched {len(found_cids)} subagent(s)" if found_cids else "Subagent dispatch"
+                    detail = (
+                        f"Dispatched {len(found_cids)} subagent(s)"
+                        if found_cids
+                        else "Subagent dispatch"
+                    )
                 elif tool_name == "view_file" or "File Path:" in content:
                     activity = "File Content"
                     tool_or_source = "`view_file`"
                     category = "Tool Output: File Contents (`view_file`)"
                     if "AbsolutePath" in tool_args:
-                        target = str(tool_args['AbsolutePath']).strip("\"'")
+                        target = str(tool_args["AbsolutePath"]).strip("\"'")
                         detail = f"File: {Path(target).name}"
                     else:
                         target = extract_file_basename(content)
@@ -362,14 +476,27 @@ def parse_conversation(conv_dir: Path) -> dict | None:
                     tool_or_source = "`run_command`"
                     category = "Tool Output: Shell Execution (`run_command`)"
                     cmd = str(tool_args.get("CommandLine", "")).strip("\"' ")
-                    detail = f"Cmd: {cmd[:40]}..." if len(cmd) > 40 else (f"Cmd: {cmd}" if cmd else "Shell stdout/stderr")
-                elif tool_name == "list_dir" or "Summary: This directory contains" in content:
+                    detail = (
+                        f"Cmd: {cmd[:40]}..."
+                        if len(cmd) > 40
+                        else (f"Cmd: {cmd}" if cmd else "Shell stdout/stderr")
+                    )
+                elif (
+                    tool_name == "list_dir"
+                    or "Summary: This directory contains" in content
+                ):
                     activity = "Directory Listing"
                     tool_or_source = "`list_dir`"
                     category = "Tool Output: Directory Listings (`list_dir`)"
                     dir_path = str(tool_args.get("DirectoryPath", "")).strip("\"' ")
-                    detail = f"Dir: {Path(dir_path).name or dir_path}" if dir_path else "Directory listing"
-                elif tool_name == "find_by_name" or ("Found " in content and "results" in content):
+                    detail = (
+                        f"Dir: {Path(dir_path).name or dir_path}"
+                        if dir_path
+                        else "Directory listing"
+                    )
+                elif tool_name == "find_by_name" or (
+                    "Found " in content and "results" in content
+                ):
                     activity = "File Search"
                     tool_or_source = "`find_by_name`"
                     category = "Tool Output: File Search (`find_by_name`)"
@@ -386,23 +513,30 @@ def parse_conversation(conv_dir: Path) -> dict | None:
                     tool_or_source = "`write_to_file`"
                     category = "Tool Output: `write_to_file`"
                     target = str(tool_args.get("TargetFile", "")).strip("\"' ")
-                    detail = f"File: {Path(target).name}" if target else "Write confirmation"
-                elif tool_name == "replace_file_content" or "The following changes were made" in content:
+                    detail = (
+                        f"File: {Path(target).name}" if target else "Write confirmation"
+                    )
+                elif (
+                    tool_name == "replace_file_content"
+                    or "The following changes were made" in content
+                ):
                     activity = "File Edit"
                     tool_or_source = "`replace_file_content`"
                     category = "Tool Output: `replace_file_content`"
                     target = str(tool_args.get("TargetFile", "")).strip("\"' ")
-                    detail = f"Edit: {Path(target).name}" if target else "Edit diff block"
+                    detail = (
+                        f"Edit: {Path(target).name}" if target else "Edit diff block"
+                    )
                 elif tool_name.startswith("mcp_"):
                     activity = f"MCP Tool ({tool_name})"
                     tool_or_source = f"`{tool_name}`"
-                    category = f"Tool Output: MCP Tools"
+                    category = "Tool Output: MCP Tools"
                     clean = re.sub(r"\s+", " ", content).strip()
                     detail = clean[:60] + ("..." if len(clean) > 60 else "")
                 else:
                     activity = f"Tool: {tool_name}"
                     tool_or_source = f"`{tool_name}`"
-                    category = f"Tool Output: Other"
+                    category = "Tool Output: Other"
                     clean = re.sub(r"\s+", " ", content).strip()
                     detail = clean[:60] + ("..." if len(clean) > 60 else "")
             else:
@@ -415,27 +549,29 @@ def parse_conversation(conv_dir: Path) -> dict | None:
 
             phase = classify_phase(step_type, primary_tool_name)
 
-            steps.append({
-                "conversation_id": cid,
-                "step_index": step_idx,
-                "created_at": created_at,
-                "source": source,
-                "step_type": step_type,
-                "category": category,
-                "activity": activity,
-                "tool_or_source": tool_or_source,
-                "characters": step_chars,
-                "est_tokens": est_tokens,
-                "thinking_tokens": step_thinking_tokens,
-                "phase": phase,
-                "model_name": cur_model,
-                "detail": detail
-            })
+            steps.append(
+                {
+                    "conversation_id": cid,
+                    "step_index": step_idx,
+                    "created_at": created_at,
+                    "source": source,
+                    "step_type": step_type,
+                    "category": category,
+                    "activity": activity,
+                    "tool_or_source": tool_or_source,
+                    "characters": step_chars,
+                    "est_tokens": est_tokens,
+                    "thinking_tokens": step_thinking_tokens,
+                    "phase": phase,
+                    "model_name": cur_model,
+                    "detail": detail,
+                }
+            )
 
     duration_seconds = 0.0
     active_agent_seconds = 0.0
     active_pairing_seconds = 0.0
-    
+
     start_dt = None
     end_dt = None
     prev_dt = None
@@ -491,7 +627,7 @@ def parse_conversation(conv_dir: Path) -> dict | None:
     total_billed_output_tokens = 0
     running_ctx = 0
     current_ephemeral = 0
-    
+
     compaction_count = 0
     pruned_tokens = 0
 
@@ -508,7 +644,7 @@ def parse_conversation(conv_dir: Path) -> dict | None:
             # Context truncation: reset running_ctx to checkpoint tokens
             compaction_count += 1
             if running_ctx > tokens:
-                pruned_tokens += (running_ctx - tokens)
+                pruned_tokens += running_ctx - tokens
             running_ctx = tokens
             current_ephemeral = 0
         elif s_type == "EPHEMERAL_MESSAGE":
@@ -576,20 +712,23 @@ def parse_conversation(conv_dir: Path) -> dict | None:
             "parent_id": detected_parent_id,
             "dispatched_subagents": dispatched_subagents,
             "compaction_count": compaction_count,
-            "pruned_tokens": pruned_tokens
+            "pruned_tokens": pruned_tokens,
         },
         "steps": steps,
         "tool_executions": tool_execs,
-        "parsed_blocks": parsed_blocks
+        "parsed_blocks": parsed_blocks,
     }
+
 
 def run_backfill(
     brain_dir: Path = Path(os.path.expanduser("~/.gemini/antigravity/brain")),
     conversation_id: str | None = None,
     force: bool = False,
+    db_path: Path | None = None,
 ):
-    init_db()
-    
+    target_db = Path(db_path) if db_path else DEFAULT_DB_PATH
+    init_db(target_db)
+
     if not brain_dir.exists():
         print(f"Brain directory not found at {brain_dir}")
         return
@@ -602,10 +741,15 @@ def run_backfill(
             return
         conv_dirs = [target]
     else:
-        conv_dirs = [p for p in brain_dir.iterdir() if p.is_dir() and not p.name.startswith(".")]
+        conv_dirs = [
+            p for p in brain_dir.iterdir() if p.is_dir() and not p.name.startswith(".")
+        ]
 
     total_convs = len(conv_dirs)
-    print(f"\n🚀 Starting Antigravity Analytics Back-Fill (Hierarchy & Swarm Edition)...", flush=True)
+    print(
+        "\n🚀 Starting Antigravity Analytics Back-Fill (Hierarchy & Swarm Edition)...",
+        flush=True,
+    )
     print(f"📁 Source: {brain_dir}", flush=True)
     print(f"📊 Found:  {total_convs} total conversation transcripts", flush=True)
 
@@ -615,7 +759,9 @@ def run_backfill(
     parent_map = {}
     subagent_meta = {}
 
-    print("  [Pass 1/2] Parsing transcripts and discovering agent lineage...", flush=True)
+    print(
+        "  [Pass 1/2] Parsing transcripts and discovering agent lineage...", flush=True
+    )
     for i, cdir in enumerate(conv_dirs, 1):
         data = parse_conversation(cdir)
         if not data:
@@ -633,8 +779,11 @@ def run_backfill(
             subagent_meta[ch["id"]] = ch
 
     # Pass 2: Resolve root_id, depth, project inheritance, semantic titles, and commit to SQLite
-    print("  [Pass 2/2] Resolving swarm graph lineages, inheriting metadata, and writing to SQLite...", flush=True)
-    conn = get_db_connection()
+    print(
+        "  [Pass 2/2] Resolving swarm graph lineages, inheriting metadata, and writing to SQLite...",
+        flush=True,
+    )
+    conn = get_db_connection(target_db)
     processed_convs = 0
     total_steps_inserted = 0
     total_tools_inserted = 0
@@ -679,18 +828,25 @@ def run_backfill(
                         curr_ancestor = parent_map.get(curr_ancestor)
 
                 # Generate clean semantic title if generic
-                if depth > 0 and (not conv.get("title") or conv["title"] in ("Active Session", "") or conv["title"].startswith("Conversation ")):
+                if depth > 0 and (
+                    not conv.get("title")
+                    or conv["title"] in ("Active Session", "")
+                    or conv["title"].startswith("Conversation ")
+                ):
                     role = conv.get("subagent_role") or "Worker"
                     root_title = "Task"
                     if root_id in data_by_id:
-                        root_title = data_by_id[root_id]["conversation"].get("title") or "Task"
+                        root_title = (
+                            data_by_id[root_id]["conversation"].get("title") or "Task"
+                        )
                     m_sub = re.match(r"^\[.+?\]\s*(.+)", root_title)
                     if m_sub:
                         root_title = m_sub.group(1)
                     conv["title"] = f"[{role}] {root_title[:90]}"
 
                 # Upsert conversation with hierarchy metrics
-                conn.execute("""
+                conn.execute(
+                    """
                     INSERT INTO conversations (
                         id, title, project, model_name, models_used, created_at, updated_at, total_steps, total_characters, total_tokens,
                         duration_seconds, active_agent_seconds, active_pairing_seconds, thinking_tokens,
@@ -731,25 +887,45 @@ def run_backfill(
                         invoking_step_index = excluded.invoking_step_index,
                         compaction_count = excluded.compaction_count,
                         pruned_tokens = excluded.pruned_tokens
-                """, (
-                    conv["id"], conv["title"], conv["project"], conv["model_name"], conv.get("models_used", conv["model_name"]), conv["created_at"],
-                    conv["updated_at"], conv["total_steps"], conv["total_characters"],
-                    conv["total_tokens"], conv["duration_seconds"],
-                    conv["active_agent_seconds"], conv["active_pairing_seconds"],
-                    conv["thinking_tokens"], conv["user_prompts"], conv["tool_calls_count"],
-                    conv["redundant_file_reads"], conv["lines_written"], conv["lines_edited"],
-                    conv["failed_tool_calls"],
-                    conv.get("billed_cost", 0.0),
-                    conv.get("billed_input_tokens", 0),
-                    conv.get("billed_output_tokens", 0),
-                    conv["parent_id"], conv["root_id"], conv["depth"],
-                    conv["subagent_role"], conv["subagent_type"], conv["invoking_step_index"],
-                    conv.get("compaction_count", 0),
-                    conv.get("pruned_tokens", 0)
-                ))
+                """,
+                    (
+                        conv["id"],
+                        conv["title"],
+                        conv["project"],
+                        conv["model_name"],
+                        conv.get("models_used", conv["model_name"]),
+                        conv["created_at"],
+                        conv["updated_at"],
+                        conv["total_steps"],
+                        conv["total_characters"],
+                        conv["total_tokens"],
+                        conv["duration_seconds"],
+                        conv["active_agent_seconds"],
+                        conv["active_pairing_seconds"],
+                        conv["thinking_tokens"],
+                        conv["user_prompts"],
+                        conv["tool_calls_count"],
+                        conv["redundant_file_reads"],
+                        conv["lines_written"],
+                        conv["lines_edited"],
+                        conv["failed_tool_calls"],
+                        conv.get("billed_cost", 0.0),
+                        conv.get("billed_input_tokens", 0),
+                        conv.get("billed_output_tokens", 0),
+                        conv["parent_id"],
+                        conv["root_id"],
+                        conv["depth"],
+                        conv["subagent_role"],
+                        conv["subagent_type"],
+                        conv["invoking_step_index"],
+                        conv.get("compaction_count", 0),
+                        conv.get("pruned_tokens", 0),
+                    ),
+                )
 
                 # Bulk insert steps (replace existing)
-                conn.executemany("""
+                conn.executemany(
+                    """
                     INSERT INTO steps (
                         conversation_id, step_index, created_at, source, step_type, category, activity,
                         tool_or_source, characters, est_tokens, thinking_tokens, phase, model_name, detail,
@@ -774,35 +950,57 @@ def run_backfill(
                         billed_cost = excluded.billed_cost,
                         billed_input_tokens = excluded.billed_input_tokens,
                         billed_output_tokens = excluded.billed_output_tokens
-                """, steps)
+                """,
+                    steps,
+                )
 
                 # Insert tool executions
-                conn.execute("DELETE FROM tool_executions WHERE conversation_id = ?", (conv["id"],))
-                conn.executemany("""
+                conn.execute(
+                    "DELETE FROM tool_executions WHERE conversation_id = ?",
+                    (conv["id"],),
+                )
+                conn.executemany(
+                    """
                     INSERT INTO tool_executions (conversation_id, step_index, tool_name, mcp_server, mcp_tool, target_path, command_line, exit_code, is_error)
                     VALUES (:conversation_id, :step_index, :tool_name, :mcp_server, :mcp_tool, :target_path, :command_line, :exit_code, :is_error)
-                """, tools)
+                """,
+                    tools,
+                )
 
                 # Insert transcript blocks
                 if data.get("parsed_blocks"):
-                    conn.execute("DELETE FROM transcript_blocks WHERE conversation_id = ?", (conv["id"],))
+                    conn.execute(
+                        "DELETE FROM transcript_blocks WHERE conversation_id = ?",
+                        (conv["id"],),
+                    )
                     block_params = []
                     for b in data["parsed_blocks"]:
                         content_str = b.text
                         if b.arguments is not None:
                             import json
+
                             content_str += "\n" + json.dumps(b.arguments)
 
-                        block_params.append((
-                            conv["id"], b.step_index, b.kind.value, content_str, b.hash, b.call_id
-                        ))
-                    
-                    conn.executemany("""
+                        block_params.append(
+                            (
+                                conv["id"],
+                                b.step_index,
+                                b.kind.value,
+                                content_str,
+                                b.hash,
+                                b.call_id,
+                            )
+                        )
+
+                    conn.executemany(
+                        """
                         INSERT INTO transcript_blocks (
                             conversation_id, step_index, block_type, content, block_hash, call_id
                         )
                         VALUES (?, ?, ?, ?, ?, ?)
-                    """, block_params)
+                    """,
+                        block_params,
+                    )
 
                 processed_convs += 1
                 total_steps_inserted += len(steps)
@@ -812,25 +1010,51 @@ def run_backfill(
                 if i % 25 == 0 or i == total_convs:
                     conn.commit()
                     pct = (i / total_convs) * 100
-                    print(f"  [{pct:5.1f}%] Processed {i}/{total_convs} conversations ({total_steps_inserted:,} steps)...", flush=True)
+                    print(
+                        f"  [{pct:5.1f}%] Processed {i}/{total_convs} conversations ({total_steps_inserted:,} steps)...",
+                        flush=True,
+                    )
 
+        # Calibrate and initialize quota state for historical backfill
+        try:
+            sync_and_get_quota_state(conn, force_refresh=True)
+            conn.commit()
+        except Exception:
+            pass
     finally:
         conn.close()
 
     elapsed = time.time() - t_start
     print(f"\n✅ Back-fill complete in {elapsed:.2f}s!")
-    print(f"-" * 50)
+    print("-" * 50)
     print(f"  Total Conversations Stored : {processed_convs:,}")
     print(f"  Total Steps Logged         : {total_steps_inserted:,}")
     print(f"  Total Tool Calls Tracked   : {total_tools_inserted:,}")
     print(f"  Total Estimated Tokens     : {total_tokens_computed:,}")
-    print(f"  Database Location          : {DEFAULT_DB_PATH}")
-    print(f"-" * 50 + "\n")
+    print(f"  Database Location          : {target_db}")
+    print("-" * 50 + "\n")
+
 
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser(description="Antigravity Historical Analytics Backfill")
-    parser.add_argument("--conversation-id", type=str, default=None, help="Backfill a specific conversation ID")
+
+    parser = argparse.ArgumentParser(
+        description="Antigravity Historical Analytics Backfill"
+    )
+    parser.add_argument(
+        "--conversation-id",
+        type=str,
+        default=None,
+        help="Backfill a specific conversation ID",
+    )
     parser.add_argument("--force", action="store_true", help="Force re-indexing")
+    parser.add_argument(
+        "--db-path",
+        type=Path,
+        default=None,
+        help="Target SQLite database file path",
+    )
     args = parser.parse_args()
-    run_backfill(conversation_id=args.conversation_id, force=args.force)
+    run_backfill(
+        conversation_id=args.conversation_id, force=args.force, db_path=args.db_path
+    )

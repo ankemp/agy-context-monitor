@@ -2,13 +2,16 @@ from pathlib import Path
 import os
 import json
 import re
-from datetime import datetime, date, timedelta
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
+from context_monitor.quota import (
+    calculate_quota_metrics,
+    sync_and_get_quota_state,
+)
 
 CHARS_PER_TOKEN = 3.8
 
-from context_monitor.pricing import PRICING, get_pricing_key
 
 def get_target_tz(tz_name=None):
     if tz_name:
@@ -25,6 +28,7 @@ def get_target_tz(tz_name=None):
     # Default to system local timezone
     return datetime.now().astimezone().tzinfo
 
+
 def parse_to_local_dt(iso_str, tz=None):
     if not iso_str:
         return None
@@ -35,9 +39,34 @@ def parse_to_local_dt(iso_str, tz=None):
     except Exception:
         return None
 
+
+def query_quota_data(
+    conn, model_name: str | None = None, billed_cost: float = 0.0
+) -> dict:
+    quota_state = sync_and_get_quota_state(conn)
+    metrics = calculate_quota_metrics(
+        billed_cost=billed_cost,
+        model_name=model_name or "Gemini 3.8 Flash (High)",
+        quota_state=quota_state,
+    )
+    res = dict(metrics)
+    res["quota_state"] = [dict(r) for r in quota_state]
+    res["gemini_weekly"] = metrics.get("gemini-weekly")
+    res["gemini_5h"] = metrics.get("gemini-5h")
+    res["threep_weekly"] = metrics.get("3p-weekly")
+    res["threep_5h"] = metrics.get("3p-5h")
+    res["buckets"] = {
+        "gemini-weekly": metrics.get("gemini-weekly"),
+        "gemini-5h": metrics.get("gemini-5h"),
+        "3p-weekly": metrics.get("3p-weekly"),
+        "3p-5h": metrics.get("3p-5h"),
+    }
+    return res
+
+
 def query_summary_data(conn, tz=None, project=None):
     cur = conn.cursor()
-    
+
     where_conv = ""
     params_conv = ()
     where_tool = ""
@@ -55,8 +84,9 @@ def query_summary_data(conn, tz=None, project=None):
             where_step_and = "AND conversation_id IN (SELECT id FROM conversations WHERE project = ?)"
             where_step_join = "AND c.project = ?"
             params_conv = (project,)
-        
-    row = cur.execute(f"""
+
+    row = cur.execute(
+        f"""
         SELECT 
             COUNT(*) as total_convs,
             COUNT(CASE WHEN parent_id IS NULL THEN 1 END) as root_convs,
@@ -83,18 +113,23 @@ def query_summary_data(conn, tz=None, project=None):
             MAX(updated_at) as latest
         FROM conversations
         {where_conv}
-    """, params_conv).fetchone()
+    """,
+        params_conv,
+    ).fetchone()
 
     total_prompts = row["total_prompts"] or 0
     total_tools = row["total_tools"] or 0
     autonomy_multiplier = round(total_tools / max(1, total_prompts), 1)
     total_code_lines = (row["total_written"] or 0) + (row["total_edited"] or 0)
     total_fails = row["total_fails"] or 0
-    resilience_rate = round(((total_tools - total_fails) / max(1, total_tools)) * 100, 1)
+    resilience_rate = round(
+        ((total_tools - total_fails) / max(1, total_tools)) * 100, 1
+    )
 
     # Consolidated single query for tool execution counts
     where_tool_clause = f"WHERE 1=1 {where_tool}"
-    tool_counts = cur.execute(f"""
+    tool_counts = cur.execute(
+        f"""
         SELECT 
             COUNT(CASE WHEN tool_name = 'view_file' THEN 1 END) as view_cnt,
             COUNT(CASE WHEN tool_name IN ('view_file', 'grep_search', 'find_by_name', 'list_dir') THEN 1 END) as reads_cnt,
@@ -102,7 +137,9 @@ def query_summary_data(conn, tz=None, project=None):
             COUNT(CASE WHEN tool_name IN ('write_to_file', 'replace_file_content', 'multi_replace_file_content') THEN 1 END) as edits_cnt
         FROM tool_executions
         {where_tool_clause}
-    """, params_conv).fetchone()
+    """,
+        params_conv,
+    ).fetchone()
 
     total_views = tool_counts["view_cnt"] or 0
     reads_cnt = tool_counts["reads_cnt"] or 0
@@ -115,24 +152,42 @@ def query_summary_data(conn, tz=None, project=None):
     saved_hours = round(((reads_cnt * 30) + (cmds_cnt * 45) + (edits_cnt * 120)) / 3600)
 
     # Phase breakdown
-    phase_rows = cur.execute(f"""
+    phase_rows = cur.execute(
+        f"""
         SELECT phase, COUNT(*) as steps, SUM(est_tokens) as tokens
         FROM steps
         WHERE phase IS NOT NULL {where_step_and}
         GROUP BY phase
         ORDER BY tokens DESC
-    """, params_conv).fetchall()
-    phases = [{"phase": r["phase"], "steps": r["steps"], "tokens": r["tokens"] or 0} for r in phase_rows]
+    """,
+        params_conv,
+    ).fetchall()
+    phases = [
+        {"phase": r["phase"], "steps": r["steps"], "tokens": r["tokens"] or 0}
+        for r in phase_rows
+    ]
 
     # Top bloat steps
-    bloat_rows = cur.execute(f"""
+    bloat_rows = cur.execute(
+        f"""
         SELECT step_index, phase, tool_or_source, est_tokens, detail
         FROM steps
         WHERE est_tokens > 2000 {where_step_and}
         ORDER BY est_tokens DESC
         LIMIT 8
-    """, params_conv).fetchall()
-    bloat_steps = [{"step_index": r["step_index"], "phase": r["phase"] or "other", "tool_or_source": r["tool_or_source"], "est_tokens": r["est_tokens"], "detail": r["detail"]} for r in bloat_rows]
+    """,
+        params_conv,
+    ).fetchall()
+    bloat_steps = [
+        {
+            "step_index": r["step_index"],
+            "phase": r["phase"] or "other",
+            "tool_or_source": r["tool_or_source"],
+            "est_tokens": r["est_tokens"],
+            "detail": r["detail"],
+        }
+        for r in bloat_rows
+    ]
 
     total_billed_cost = row["total_billed_cost"] or 0.0
     total_billed_input_tokens = row["total_billed_input_tokens"] or 0
@@ -163,18 +218,20 @@ def query_summary_data(conn, tz=None, project=None):
         model_params = ()
 
     for r in cur.execute(model_sql, model_params):
-        models.append({
-            "model_name": r["mname"] or "Unknown",
-            "steps": r["steps"],
-            "tokens": r["tokens"] or 0
-        })
+        models.append(
+            {
+                "model_name": r["mname"] or "Unknown",
+                "steps": r["steps"],
+                "tokens": r["tokens"] or 0,
+            }
+        )
 
     categories = []
-    for r in cur.execute(f"SELECT category, SUM(est_tokens) as tokens FROM steps WHERE category IS NOT NULL {where_step_and} GROUP BY category ORDER BY tokens DESC LIMIT 10", params_conv):
-        categories.append({
-            "category": r["category"],
-            "tokens": r["tokens"] or 0
-        })
+    for r in cur.execute(
+        f"SELECT category, SUM(est_tokens) as tokens FROM steps WHERE category IS NOT NULL {where_step_and} GROUP BY category ORDER BY tokens DESC LIMIT 10",
+        params_conv,
+    ):
+        categories.append({"category": r["category"], "tokens": r["tokens"] or 0})
 
     earliest_local = parse_to_local_dt(row["earliest"], tz)
     latest_local = parse_to_local_dt(row["latest"], tz)
@@ -215,13 +272,18 @@ def query_summary_data(conn, tz=None, project=None):
         "total_billed_output_tokens": total_billed_output_tokens,
         "avg_steps": round(row["avg_steps"] or 0, 1),
         "avg_tokens": int(row["avg_tokens"] or 0),
-        "earliest": earliest_local.strftime("%Y-%m-%d %H:%M") if earliest_local else None,
+        "earliest": earliest_local.strftime("%Y-%m-%d %H:%M")
+        if earliest_local
+        else None,
         "latest": latest_local.strftime("%Y-%m-%d %H:%M") if latest_local else None,
         "timezone": str(tz_info),
         "timezone_label": tz_label,
         "models": models,
-        "categories": categories
+        "categories": categories,
+        "quota": query_quota_data(conn, billed_cost=total_billed_cost),
+        "quota_summary": query_quota_data(conn, billed_cost=total_billed_cost),
     }
+
 
 def query_cost_by_project(conn, tz=None, project=None, limit_sessions=6):
     cur = conn.cursor()
@@ -247,21 +309,26 @@ def query_cost_by_project(conn, tz=None, project=None, limit_sessions=6):
         cost = round(r["billed_cost"] or 0.0, 2)
         pct = round((cost / total_cost * 100), 1) if total_cost > 0 else 0.0
         p_name = r["project_name"]
-        if project and (p_name == project or (project == "(unassigned)" and p_name == "(unassigned)")):
+        if project and (
+            p_name == project
+            or (project == "(unassigned)" and p_name == "(unassigned)")
+        ):
             filtered_project_cost = cost
         act_tokens = (r["billed_input_tokens"] or 0) + (r["billed_output_tokens"] or 0)
-        projects.append({
-            "project": p_name,
-            "raw_project": None if p_name == "(unassigned)" else p_name,
-            "cost": cost,
-            "percentage": pct,
-            "sessions": r["session_count"],
-            "tokens": act_tokens,
-            "disk_tokens": r["total_tokens"] or 0,
-            "steps": r["total_steps"] or 0,
-            "billed_input_tokens": r["billed_input_tokens"] or 0,
-            "billed_output_tokens": r["billed_output_tokens"] or 0
-        })
+        projects.append(
+            {
+                "project": p_name,
+                "raw_project": None if p_name == "(unassigned)" else p_name,
+                "cost": cost,
+                "percentage": pct,
+                "sessions": r["session_count"],
+                "tokens": act_tokens,
+                "disk_tokens": r["total_tokens"] or 0,
+                "steps": r["total_steps"] or 0,
+                "billed_input_tokens": r["billed_input_tokens"] or 0,
+                "billed_output_tokens": r["billed_output_tokens"] or 0,
+            }
+        )
 
     # Query top expensive sessions (narrowed to project if filtered)
     where_sess = ""
@@ -274,21 +341,27 @@ def query_cost_by_project(conn, tz=None, project=None, limit_sessions=6):
             params_sess = (project,)
 
     try:
-        sess_rows = cur.execute(f"""
+        sess_rows = cur.execute(
+            f"""
             SELECT id, title, project, model_name, models_used, created_at, total_steps, total_tokens, duration_seconds, active_agent_seconds, billed_cost, billed_input_tokens, billed_output_tokens
             FROM conversations
             {where_sess}
             ORDER BY billed_cost DESC, (COALESCE(billed_input_tokens, 0) + COALESCE(billed_output_tokens, 0)) DESC, total_tokens DESC
             LIMIT {limit_sessions}
-        """, params_sess).fetchall()
+        """,
+            params_sess,
+        ).fetchall()
     except Exception:
-        sess_rows = cur.execute(f"""
+        sess_rows = cur.execute(
+            f"""
             SELECT id, title, project, model_name, created_at, total_steps, total_tokens, duration_seconds, active_agent_seconds, billed_cost, billed_input_tokens, billed_output_tokens
             FROM conversations
             {where_sess}
             ORDER BY billed_cost DESC, (COALESCE(billed_input_tokens, 0) + COALESCE(billed_output_tokens, 0)) DESC, total_tokens DESC
             LIMIT {limit_sessions}
-        """, params_sess).fetchall()
+        """,
+            params_sess,
+        ).fetchall()
 
     top_sessions = []
     target_tz = get_target_tz(tz)
@@ -301,35 +374,44 @@ def query_cost_by_project(conn, tz=None, project=None, limit_sessions=6):
                 models_used_val = sr["models_used"]
         except Exception:
             pass
-        top_sessions.append({
-            "id": sr["id"],
-            "title": sr["title"] or f"Session {sr['id'][:8]}",
-            "project": sr["project"] or "(unassigned)",
-            "model_name": sr["model_name"] or "Gemini",
-            "models_used": models_used_val,
-            "created_at": dt.strftime("%Y-%m-%d %H:%M") if dt else (sr["created_at"] or "--"),
-            "total_steps": sr["total_steps"] or 0,
-            "tokens": act_tok,
-            "total_tokens": act_tok,
-            "disk_tokens": sr["total_tokens"] or 0,
-            "duration_seconds": sr["duration_seconds"] or 0,
-            "active_agent_seconds": sr["active_agent_seconds"] or 0,
-            "billed_cost": round(sr["billed_cost"] or 0.0, 2)
-        })
+        top_sessions.append(
+            {
+                "id": sr["id"],
+                "title": sr["title"] or f"Session {sr['id'][:8]}",
+                "project": sr["project"] or "(unassigned)",
+                "model_name": sr["model_name"] or "Gemini",
+                "models_used": models_used_val,
+                "created_at": dt.strftime("%Y-%m-%d %H:%M")
+                if dt
+                else (sr["created_at"] or "--"),
+                "total_steps": sr["total_steps"] or 0,
+                "tokens": act_tok,
+                "total_tokens": act_tok,
+                "disk_tokens": sr["total_tokens"] or 0,
+                "duration_seconds": sr["duration_seconds"] or 0,
+                "active_agent_seconds": sr["active_agent_seconds"] or 0,
+                "billed_cost": round(sr["billed_cost"] or 0.0, 2),
+            }
+        )
 
     return {
         "total_cost": round(total_cost, 2),
         "projects": projects,
         "top_sessions": top_sessions,
         "filtered_project": project if (project and project != "all") else None,
-        "filtered_project_cost": filtered_project_cost
+        "filtered_project_cost": filtered_project_cost,
     }
+
 
 def query_timeline_data(conn, days=None, tz=None, project=None):
     cur = conn.cursor()
     target_tz = get_target_tz(tz)
 
-    conv_proj = dict(cur.execute('SELECT id, COALESCE(NULLIF(project, ""), "(unassigned)") FROM conversations').fetchall())
+    conv_proj = dict(
+        cur.execute(
+            'SELECT id, COALESCE(NULLIF(project, ""), "(unassigned)") FROM conversations'
+        ).fetchall()
+    )
 
     where_clause = "WHERE created_at IS NOT NULL AND created_at != ''"
     params = ()
@@ -340,7 +422,8 @@ def query_timeline_data(conn, days=None, tz=None, project=None):
             where_clause += " AND conversation_id IN (SELECT id FROM conversations WHERE project = ?)"
             params = (project,)
 
-    rows = cur.execute(f"""
+    rows = cur.execute(
+        f"""
         SELECT 
             substr(created_at, 1, 13) as hour_key,
             conversation_id,
@@ -350,7 +433,9 @@ def query_timeline_data(conn, days=None, tz=None, project=None):
         FROM steps
         {where_clause}
         GROUP BY hour_key, conversation_id
-    """, params).fetchall()
+    """,
+        params,
+    ).fetchall()
 
     daily_map = {}
     day_sessions = {}
@@ -372,12 +457,12 @@ def query_timeline_data(conn, days=None, tz=None, project=None):
 
         if day_str not in daily_map:
             daily_map[day_str] = {
-                "day": day_str, 
-                "sessions": 0, 
-                "steps": 0, 
-                "tokens": 0, 
+                "day": day_str,
+                "sessions": 0,
+                "steps": 0,
+                "tokens": 0,
                 "cost": 0.0,
-                "projects": {}
+                "projects": {},
             }
             day_sessions[day_str] = set()
 
@@ -387,7 +472,9 @@ def query_timeline_data(conn, days=None, tz=None, project=None):
         day_sessions[day_str].add(cid)
 
         proj = conv_proj.get(cid, "(unassigned)")
-        daily_map[day_str]["projects"][proj] = daily_map[day_str]["projects"].get(proj, 0) + tokens
+        daily_map[day_str]["projects"][proj] = (
+            daily_map[day_str]["projects"].get(proj, 0) + tokens
+        )
 
     for day_str, s_set in day_sessions.items():
         daily_map[day_str]["sessions"] = len(s_set)
@@ -400,8 +487,12 @@ def query_timeline_data(conn, days=None, tz=None, project=None):
         end_date = today
     else:
         if daily_map:
-            min_date = min(datetime.strptime(d, "%Y-%m-%d").date() for d in daily_map.keys())
-            max_date = max(datetime.strptime(d, "%Y-%m-%d").date() for d in daily_map.keys())
+            min_date = min(
+                datetime.strptime(d, "%Y-%m-%d").date() for d in daily_map.keys()
+            )
+            max_date = max(
+                datetime.strptime(d, "%Y-%m-%d").date() for d in daily_map.keys()
+            )
             start_date = min(min_date, today - timedelta(days=29))
             end_date = max(max_date, today)
         else:
@@ -417,17 +508,20 @@ def query_timeline_data(conn, days=None, tz=None, project=None):
             item["cost"] = round(item["cost"], 2)
             timeline.append(item)
         else:
-            timeline.append({
-                "day": d_str,
-                "sessions": 0,
-                "steps": 0,
-                "tokens": 0,
-                "cost": 0.0,
-                "projects": {}
-            })
+            timeline.append(
+                {
+                    "day": d_str,
+                    "sessions": 0,
+                    "steps": 0,
+                    "tokens": 0,
+                    "cost": 0.0,
+                    "projects": {},
+                }
+            )
         curr += timedelta(days=1)
 
     return timeline
+
 
 def query_tools_data(conn, project=None):
     cur = conn.cursor()
@@ -441,7 +535,8 @@ def query_tools_data(conn, project=None):
             where_clause = "WHERE conversation_id IN (SELECT id FROM conversations WHERE project = ?)"
             params = (project,)
 
-    rows = cur.execute(f"""
+    rows = cur.execute(
+        f"""
         SELECT 
             tool_name, 
             mcp_server,
@@ -452,18 +547,23 @@ def query_tools_data(conn, project=None):
         GROUP BY tool_name
         ORDER BY total_calls DESC
         LIMIT 50
-    """, params).fetchall()
+    """,
+        params,
+    ).fetchall()
 
     tools = []
     for r in rows:
-        tools.append({
-            "tool_name": r["tool_name"],
-            "mcp_server": r["mcp_server"],
-            "is_mcp": 1 if r["mcp_server"] else 0,
-            "total_calls": r["total_calls"],
-            "distinct_sessions": r["distinct_sessions"]
-        })
+        tools.append(
+            {
+                "tool_name": r["tool_name"],
+                "mcp_server": r["mcp_server"],
+                "is_mcp": 1 if r["mcp_server"] else 0,
+                "total_calls": r["total_calls"],
+                "distinct_sessions": r["distinct_sessions"],
+            }
+        )
     return tools
+
 
 def query_mcp_data(conn, project=None):
     cur = conn.cursor()
@@ -477,7 +577,8 @@ def query_mcp_data(conn, project=None):
             where_clause += " AND conversation_id IN (SELECT id FROM conversations WHERE project = ?)"
             params = (project,)
 
-    server_rows = cur.execute(f"""
+    server_rows = cur.execute(
+        f"""
         SELECT 
             mcp_server,
             COUNT(*) as total_calls,
@@ -487,11 +588,14 @@ def query_mcp_data(conn, project=None):
         {where_clause}
         GROUP BY mcp_server
         ORDER BY total_calls DESC
-    """, params).fetchall()
+    """,
+        params,
+    ).fetchall()
 
     servers = []
     for s in server_rows:
-        tool_rows = cur.execute("""
+        tool_rows = cur.execute(
+            """
             SELECT 
                 mcp_tool,
                 COUNT(*) as calls,
@@ -501,19 +605,32 @@ def query_mcp_data(conn, project=None):
             WHERE mcp_server = ? AND mcp_tool IS NOT NULL
             GROUP BY mcp_tool
             ORDER BY calls DESC
-        """, (s["mcp_server"],)).fetchall()
-        servers.append({
-            "server": s["mcp_server"],
-            "calls": s["total_calls"],
-            "sessions": s["sessions"],
-            "error_rate": round(s["error_rate"] or 0, 1),
-            "tools": [{"tool": tr["mcp_tool"], "calls": tr["calls"], "sessions": tr["sessions"], "error_rate": round(tr["error_rate"] or 0, 1)} for tr in tool_rows]
-        })
+        """,
+            (s["mcp_server"],),
+        ).fetchall()
+        servers.append(
+            {
+                "server": s["mcp_server"],
+                "calls": s["total_calls"],
+                "sessions": s["sessions"],
+                "error_rate": round(s["error_rate"] or 0, 1),
+                "tools": [
+                    {
+                        "tool": tr["mcp_tool"],
+                        "calls": tr["calls"],
+                        "sessions": tr["sessions"],
+                        "error_rate": round(tr["error_rate"] or 0, 1),
+                    }
+                    for tr in tool_rows
+                ],
+            }
+        )
     return servers
+
 
 def query_hot_files_data(conn, project=None):
     cur = conn.cursor()
-    
+
     where_clause = "WHERE target_path IS NOT NULL AND target_path != ''"
     params = ()
     if project:
@@ -523,7 +640,8 @@ def query_hot_files_data(conn, project=None):
             where_clause += " AND conversation_id IN (SELECT id FROM conversations WHERE project = ?)"
             params = (project,)
 
-    rows = cur.execute(f"""
+    rows = cur.execute(
+        f"""
         SELECT 
             target_path,
             COUNT(*) as total_touches,
@@ -536,7 +654,9 @@ def query_hot_files_data(conn, project=None):
         GROUP BY target_path
         ORDER BY total_touches DESC
         LIMIT 150
-    """, params).fetchall()
+    """,
+        params,
+    ).fetchall()
 
     items = []
     for r in rows:
@@ -560,23 +680,26 @@ def query_hot_files_data(conn, project=None):
             is_dir = False
             type_label = "file"
 
-        items.append({
-            "name": name,
-            "path": raw_path,
-            "type": type_label,
-            "is_dir": is_dir,
-            "touches": touches,
-            "views": views,
-            "edits": edits,
-            "searches": searches,
-            "sessions": r["sessions"]
-        })
+        items.append(
+            {
+                "name": name,
+                "path": raw_path,
+                "type": type_label,
+                "is_dir": is_dir,
+                "touches": touches,
+                "views": views,
+                "edits": edits,
+                "searches": searches,
+                "sessions": r["sessions"],
+            }
+        )
     return items
+
 
 def query_activity_matrix(conn, tz=None, project=None):
     cur = conn.cursor()
     target_tz = get_target_tz(tz)
-    
+
     where_clause = "WHERE created_at IS NOT NULL AND created_at != ''"
     params = ()
     if project:
@@ -585,8 +708,9 @@ def query_activity_matrix(conn, tz=None, project=None):
         else:
             where_clause += " AND conversation_id IN (SELECT id FROM conversations WHERE project = ?)"
             params = (project,)
-        
-    rows = cur.execute(f"""
+
+    rows = cur.execute(
+        f"""
         SELECT 
             substr(created_at, 1, 13) as hour_key,
             conversation_id,
@@ -595,12 +719,14 @@ def query_activity_matrix(conn, tz=None, project=None):
         FROM steps
         {where_clause}
         GROUP BY hour_key, conversation_id
-    """, params).fetchall()
+    """,
+        params,
+    ).fetchall()
 
     daily_map = {}
     hourly_aggregate = [[0 for _ in range(24)] for _ in range(7)]
     past_30_days_hourly = {}
-    
+
     today = datetime.now(target_tz).date()
     for i in range(30):
         d_str = (today - timedelta(days=29 - i)).isoformat()
@@ -678,11 +804,14 @@ def query_activity_matrix(conn, tz=None, project=None):
         "streak": {
             "current": cur_streak,
             "longest": max(longest_streak, cur_streak),
-            "total_active_days": len(active_days)
-        }
+            "total_active_days": len(active_days),
+        },
     }
 
-def query_conversations_list(conn, limit=200, tz=None, project=None, view_mode="hierarchy"):
+
+def query_conversations_list(
+    conn, limit=200, tz=None, project=None, view_mode="hierarchy"
+):
     cur = conn.cursor()
     target_tz = get_target_tz(tz)
     where_parts = []
@@ -700,7 +829,8 @@ def query_conversations_list(conn, limit=200, tz=None, project=None, view_mode="
     where_clause = f"WHERE {' AND '.join(where_parts)}" if where_parts else ""
 
     try:
-        rows = cur.execute(f"""
+        rows = cur.execute(
+            f"""
             SELECT id, title, project, model_name, models_used, created_at, total_steps, total_tokens,
                    duration_seconds, active_agent_seconds, active_pairing_seconds,
                    billed_cost, billed_input_tokens, billed_output_tokens,
@@ -710,9 +840,12 @@ def query_conversations_list(conn, limit=200, tz=None, project=None, view_mode="
             {where_clause}
             ORDER BY created_at DESC
             LIMIT {limit}
-        """, tuple(params)).fetchall()
+        """,
+            tuple(params),
+        ).fetchall()
     except Exception:
-        rows = cur.execute(f"""
+        rows = cur.execute(
+            f"""
             SELECT id, title, project, model_name, created_at, total_steps, total_tokens,
                    duration_seconds, active_agent_seconds, active_pairing_seconds,
                    billed_cost, billed_input_tokens, billed_output_tokens,
@@ -722,7 +855,11 @@ def query_conversations_list(conn, limit=200, tz=None, project=None, view_mode="
             {where_clause}
             ORDER BY created_at DESC
             LIMIT {limit}
-        """, tuple(params)).fetchall()
+        """,
+            tuple(params),
+        ).fetchall()
+
+    quota_state = sync_and_get_quota_state(conn)
 
     convs = []
     root_ids = [r["id"] for r in rows]
@@ -731,7 +868,8 @@ def query_conversations_list(conn, limit=200, tz=None, project=None, view_mode="
     if view_mode == "hierarchy" and root_ids:
         placeholders = ",".join("?" for _ in root_ids)
         try:
-            desc_rows = cur.execute(f"""
+            desc_rows = cur.execute(
+                f"""
                 SELECT id, title, project, model_name, models_used, created_at, total_steps, total_tokens,
                        duration_seconds, active_agent_seconds, active_pairing_seconds,
                        billed_cost, billed_input_tokens, billed_output_tokens,
@@ -740,9 +878,12 @@ def query_conversations_list(conn, limit=200, tz=None, project=None, view_mode="
                 FROM conversations
                 WHERE root_id IN ({placeholders}) AND id != root_id
                 ORDER BY depth ASC, invoking_step_index ASC, created_at ASC
-            """, tuple(root_ids)).fetchall()
+            """,
+                tuple(root_ids),
+            ).fetchall()
         except Exception:
-            desc_rows = cur.execute(f"""
+            desc_rows = cur.execute(
+                f"""
                 SELECT id, title, project, model_name, created_at, total_steps, total_tokens,
                        duration_seconds, active_agent_seconds, active_pairing_seconds,
                        billed_cost, billed_input_tokens, billed_output_tokens,
@@ -751,7 +892,9 @@ def query_conversations_list(conn, limit=200, tz=None, project=None, view_mode="
                 FROM conversations
                 WHERE root_id IN ({placeholders}) AND id != root_id
                 ORDER BY depth ASC, invoking_step_index ASC, created_at ASC
-            """, tuple(root_ids)).fetchall()
+            """,
+                tuple(root_ids),
+            ).fetchall()
 
         for dr in desc_rows:
             rid = dr["root_id"]
@@ -765,30 +908,40 @@ def query_conversations_list(conn, limit=200, tz=None, project=None, view_mode="
                     dr_m_used = dr["models_used"]
             except Exception:
                 pass
-            descendants_by_root[rid].append({
-                "id": dr["id"],
-                "title": dr["title"] or f"Subagent {dr['id'][:8]}",
-                "project": dr["project"] or "(unassigned)",
-                "model_name": dr["model_name"] or "Gemini",
-                "models_used": dr_m_used,
-                "created_at": d_dt.strftime("%Y-%m-%d %H:%M") if d_dt else dr["created_at"],
-                "total_steps": dr["total_steps"] or 0,
-                "tokens": d_act,
-                "total_tokens": d_act,
-                "disk_tokens": dr["total_tokens"] or 0,
-                "duration_seconds": dr["duration_seconds"] or 0,
-                "active_agent_seconds": dr["active_agent_seconds"] or 0,
-                "active_pairing_seconds": dr["active_pairing_seconds"] or 0,
-                "billed_cost": round(dr["billed_cost"] or 0.0, 2),
-                "parent_id": dr["parent_id"],
-                "root_id": dr["root_id"],
-                "depth": dr["depth"] or 1,
-                "subagent_role": dr["subagent_role"] or "Worker",
-                "subagent_type": dr["subagent_type"] or "self",
-                "invoking_step_index": dr["invoking_step_index"],
-                "compaction_count": dr["compaction_count"] or 0,
-                "pruned_tokens": dr["pruned_tokens"] or 0
-            })
+            d_cost = round(dr["billed_cost"] or 0.0, 2)
+            d_quota = calculate_quota_metrics(
+                billed_cost=d_cost, model_name=dr_m_used, quota_state=quota_state
+            )
+            descendants_by_root[rid].append(
+                {
+                    "id": dr["id"],
+                    "title": dr["title"] or f"Subagent {dr['id'][:8]}",
+                    "project": dr["project"] or "(unassigned)",
+                    "model_name": dr["model_name"] or "Gemini",
+                    "models_used": dr_m_used,
+                    "created_at": d_dt.strftime("%Y-%m-%d %H:%M")
+                    if d_dt
+                    else dr["created_at"],
+                    "total_steps": dr["total_steps"] or 0,
+                    "tokens": d_act,
+                    "total_tokens": d_act,
+                    "disk_tokens": dr["total_tokens"] or 0,
+                    "duration_seconds": dr["duration_seconds"] or 0,
+                    "active_agent_seconds": dr["active_agent_seconds"] or 0,
+                    "active_pairing_seconds": dr["active_pairing_seconds"] or 0,
+                    "billed_cost": d_cost,
+                    "weekly_quota_pct": d_quota["weekly_pct"],
+                    "five_hour_quota_pct": d_quota["five_hour_pct"],
+                    "parent_id": dr["parent_id"],
+                    "root_id": dr["root_id"],
+                    "depth": dr["depth"] or 1,
+                    "subagent_role": dr["subagent_role"] or "Worker",
+                    "subagent_type": dr["subagent_type"] or "self",
+                    "invoking_step_index": dr["invoking_step_index"],
+                    "compaction_count": dr["compaction_count"] or 0,
+                    "pruned_tokens": dr["pruned_tokens"] or 0,
+                }
+            )
 
     for r in rows:
         dt = parse_to_local_dt(r["created_at"], target_tz)
@@ -803,7 +956,9 @@ def query_conversations_list(conn, limit=200, tz=None, project=None, view_mode="
         fleet_cost = round(c_cost + sum(d["billed_cost"] for d in all_desc), 2)
         fleet_tokens = act_tok + sum(d["tokens"] for d in all_desc)
         fleet_steps = c_steps + sum(d["total_steps"] for d in all_desc)
-        fleet_compaction = c_compaction + sum(d.get("compaction_count", 0) for d in all_desc)
+        fleet_compaction = c_compaction + sum(
+            d.get("compaction_count", 0) for d in all_desc
+        )
         fleet_pruned = c_pruned + sum(d.get("pruned_tokens", 0) for d in all_desc)
         subagent_count = len(all_desc)
 
@@ -814,37 +969,51 @@ def query_conversations_list(conn, limit=200, tz=None, project=None, view_mode="
         except Exception:
             pass
 
-        convs.append({
-            "id": c_id,
-            "title": r["title"] or f"Conversation {r['id'][:8]}",
-            "project": r["project"] or "(unassigned)",
-            "model_name": r["model_name"] or "Gemini",
-            "models_used": r_m_used,
-            "created_at": dt.strftime("%Y-%m-%d %H:%M") if dt else r["created_at"],
-            "total_steps": c_steps,
-            "tokens": act_tok,
-            "total_tokens": act_tok,
-            "disk_tokens": r["total_tokens"] or 0,
-            "duration_seconds": r["duration_seconds"] or 0,
-            "active_agent_seconds": r["active_agent_seconds"] or 0,
-            "active_pairing_seconds": r["active_pairing_seconds"] or 0,
-            "billed_cost": c_cost,
-            "parent_id": r["parent_id"],
-            "root_id": r["root_id"],
-            "depth": r["depth"] or 0,
-            "subagent_role": r["subagent_role"],
-            "subagent_type": r["subagent_type"],
-            "subagent_count": subagent_count,
-            "fleet_cost": fleet_cost,
-            "fleet_tokens": fleet_tokens,
-            "fleet_steps": fleet_steps,
-            "compaction_count": c_compaction,
-            "pruned_tokens": c_pruned,
-            "fleet_compaction_count": fleet_compaction,
-            "fleet_pruned_tokens": fleet_pruned,
-            "subagents": all_desc
-        })
+        c_quota = calculate_quota_metrics(
+            billed_cost=c_cost, model_name=r_m_used, quota_state=quota_state
+        )
+        fleet_quota = calculate_quota_metrics(
+            billed_cost=fleet_cost, model_name=r_m_used, quota_state=quota_state
+        )
+
+        convs.append(
+            {
+                "id": c_id,
+                "title": r["title"] or f"Conversation {r['id'][:8]}",
+                "project": r["project"] or "(unassigned)",
+                "model_name": r["model_name"] or "Gemini",
+                "models_used": r_m_used,
+                "created_at": dt.strftime("%Y-%m-%d %H:%M") if dt else r["created_at"],
+                "total_steps": c_steps,
+                "tokens": act_tok,
+                "total_tokens": act_tok,
+                "disk_tokens": r["total_tokens"] or 0,
+                "duration_seconds": r["duration_seconds"] or 0,
+                "active_agent_seconds": r["active_agent_seconds"] or 0,
+                "active_pairing_seconds": r["active_pairing_seconds"] or 0,
+                "billed_cost": c_cost,
+                "weekly_quota_pct": c_quota["weekly_pct"],
+                "five_hour_quota_pct": c_quota["five_hour_pct"],
+                "parent_id": r["parent_id"],
+                "root_id": r["root_id"],
+                "depth": r["depth"] or 0,
+                "subagent_role": r["subagent_role"],
+                "subagent_type": r["subagent_type"],
+                "subagent_count": subagent_count,
+                "fleet_cost": fleet_cost,
+                "fleet_tokens": fleet_tokens,
+                "fleet_steps": fleet_steps,
+                "fleet_weekly_quota_pct": fleet_quota["weekly_pct"],
+                "fleet_5h_quota_pct": fleet_quota["five_hour_pct"],
+                "compaction_count": c_compaction,
+                "pruned_tokens": c_pruned,
+                "fleet_compaction_count": fleet_compaction,
+                "fleet_pruned_tokens": fleet_pruned,
+                "subagents": all_desc,
+            }
+        )
     return convs
+
 
 def query_session_details(conn, cid, tz=None):
     cur = conn.cursor()
@@ -852,21 +1021,27 @@ def query_session_details(conn, cid, tz=None):
     if not conv:
         return None
 
-    steps_rows = cur.execute("""
+    steps_rows = cur.execute(
+        """
         SELECT step_index, created_at, source, activity, tool_or_source, category, est_tokens, thinking_tokens, phase, model_name, detail,
                billed_cost, billed_input_tokens, billed_output_tokens
         FROM steps
         WHERE conversation_id = ?
         ORDER BY step_index ASC
-    """, (cid,)).fetchall()
+    """,
+        (cid,),
+    ).fetchall()
 
     # 1. Fetch tool executions for tool name mapping
-    tool_rows = cur.execute("""
+    tool_rows = cur.execute(
+        """
         SELECT step_index, tool_name, mcp_server, mcp_tool, target_path, command_line, is_error
         FROM tool_executions
         WHERE conversation_id = ?
         ORDER BY id ASC
-    """, (cid,)).fetchall()
+    """,
+        (cid,),
+    ).fetchall()
 
     tool_execs_by_step = {}
     for tr in tool_rows:
@@ -876,20 +1051,33 @@ def query_session_details(conn, cid, tz=None):
         tool_execs_by_step[s_idx].append(dict(tr))
 
     # 2. Fetch transcript blocks
-    blocks_rows = cur.execute("""
+    blocks_rows = cur.execute(
+        """
         SELECT step_index, block_type, content, call_id
         FROM transcript_blocks
         WHERE conversation_id = ?
         ORDER BY step_index ASC, id ASC
-    """, (cid,)).fetchall()
-    
+    """,
+        (cid,),
+    ).fetchall()
+
     TOOL_PALETTE = [
-        "#f87171", "#fb923c", "#fbbf24", "#a3e635", "#34d399",
-        "#22d3ee", "#38bdf8", "#818cf8", "#a78bfa", "#e879f9",
-        "#f43f5e", "#2dd4bf"
+        "#f87171",
+        "#fb923c",
+        "#fbbf24",
+        "#a3e635",
+        "#34d399",
+        "#22d3ee",
+        "#38bdf8",
+        "#818cf8",
+        "#a78bfa",
+        "#e879f9",
+        "#f43f5e",
+        "#2dd4bf",
     ]
 
     import hashlib
+
     def get_color(cid_str):
         if not cid_str:
             return "#6b7280"
@@ -910,9 +1098,17 @@ def query_session_details(conn, cid, tz=None):
             b_dict["color"] = get_color(call_id)
 
         if b_type == "tool_use":
-            current_tool_idx = sum(1 for prev_b in blocks_by_step[idx] if prev_b.get("block_type") == "tool_use")
+            current_tool_idx = sum(
+                1
+                for prev_b in blocks_by_step[idx]
+                if prev_b.get("block_type") == "tool_use"
+            )
             exec_list = tool_execs_by_step.get(idx, [])
-            matched_exec = exec_list[current_tool_idx] if current_tool_idx < len(exec_list) else None
+            matched_exec = (
+                exec_list[current_tool_idx]
+                if current_tool_idx < len(exec_list)
+                else None
+            )
 
             tool_name = matched_exec["tool_name"] if matched_exec else "Tool"
             target_path = matched_exec["target_path"] if matched_exec else ""
@@ -929,7 +1125,9 @@ def query_session_details(conn, cid, tz=None):
                 b_dict["is_subagent"] = True
                 try:
                     raw_content = b_dict.get("content", "").strip()
-                    parsed_args = json.loads(raw_content) if raw_content.startswith("{") else {}
+                    parsed_args = (
+                        json.loads(raw_content) if raw_content.startswith("{") else {}
+                    )
                     subagents_raw = parsed_args.get("Subagents", "")
                     if isinstance(subagents_raw, str) and subagents_raw.startswith("["):
                         subagents_list = json.loads(subagents_raw)
@@ -965,7 +1163,7 @@ def query_session_details(conn, cid, tz=None):
                     "skill_name": b_dict.get("skill_name"),
                     "subagents": b_dict.get("subagents"),
                     "color": b_dict.get("color"),
-                    "use_block": b_dict
+                    "use_block": b_dict,
                 }
 
         elif b_type == "tool_result":
@@ -984,13 +1182,19 @@ def query_session_details(conn, cid, tz=None):
 
             # Extract subagent conversation ID from result content
             content_str = b_dict.get("content", "")
-            cid_match = re.search(r"([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})", content_str)
+            cid_match = re.search(
+                r"([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})",
+                content_str,
+            )
             if cid_match:
                 b_dict["subagent_conversation_id"] = cid_match.group(1)
 
         blocks_by_step[idx].append(b_dict)
 
     target_tz = get_target_tz(tz)
+    quota_state = sync_and_get_quota_state(conn)
+    conv_model = conv["model_name"] or "Gemini"
+
     steps = []
     for r in steps_rows:
         d = dict(r)
@@ -998,24 +1202,37 @@ def query_session_details(conn, cid, tz=None):
         if dt:
             d["created_at"] = dt.strftime("%Y-%m-%d %H:%M:%S")
         d["blocks"] = blocks_by_step.get(d["step_index"], [])
+        s_cost = d.get("billed_cost") or 0.0
+        s_m = d.get("model_name") or conv_model
+        s_q = calculate_quota_metrics(
+            billed_cost=s_cost, model_name=s_m, quota_state=quota_state
+        )
+        d["weekly_quota_pct"] = s_q["weekly_pct"]
+        d["five_hour_quota_pct"] = s_q["five_hour_pct"]
         steps.append(d)
 
-    cat_rows = cur.execute("""
+    cat_rows = cur.execute(
+        """
         SELECT category, SUM(est_tokens) as tokens
         FROM steps
         WHERE conversation_id = ?
         GROUP BY category
         ORDER BY tokens DESC
-    """, (cid,)).fetchall()
+    """,
+        (cid,),
+    ).fetchall()
     categories = [dict(r) for r in cat_rows]
 
-    phase_rows = cur.execute("""
+    phase_rows = cur.execute(
+        """
         SELECT phase, SUM(est_tokens) as tokens
         FROM steps
         WHERE conversation_id = ? AND phase IS NOT NULL
         GROUP BY phase
         ORDER BY tokens DESC
-    """, (cid,)).fetchall()
+    """,
+        (cid,),
+    ).fetchall()
     session_phases = [dict(r) for r in phase_rows]
 
     top_consumers = sorted(steps, key=lambda s: s["est_tokens"], reverse=True)[:8]
@@ -1025,17 +1242,29 @@ def query_session_details(conn, cid, tz=None):
     if dt_c:
         conv_dict["created_at"] = dt_c.strftime("%Y-%m-%d %H:%M:%S")
 
-    c_act = (conv_dict.get("billed_input_tokens") or 0) + (conv_dict.get("billed_output_tokens") or 0)
+    c_act = (conv_dict.get("billed_input_tokens") or 0) + (
+        conv_dict.get("billed_output_tokens") or 0
+    )
     conv_dict["tokens"] = c_act if c_act > 0 else (conv_dict.get("total_tokens") or 0)
     conv_dict["total_tokens"] = conv_dict.get("total_tokens") or c_act or 0
     conv_dict["total_steps"] = conv_dict.get("total_steps") or len(steps)
     conv_dict["compaction_count"] = conv_dict.get("compaction_count") or 0
     conv_dict["pruned_tokens"] = conv_dict.get("pruned_tokens") or 0
 
+    c_billed_cost = conv_dict.get("billed_cost") or 0.0
+    conv_quota = calculate_quota_metrics(
+        billed_cost=c_billed_cost, model_name=conv_model, quota_state=quota_state
+    )
+    conv_dict["weekly_quota_pct"] = conv_quota["weekly_pct"]
+    conv_dict["five_hour_quota_pct"] = conv_quota["five_hour_pct"]
+    conv_dict["quota"] = conv_quota
+
     compaction_meta = {
         "count": conv_dict["compaction_count"],
         "pruned_tokens": conv_dict["pruned_tokens"],
-        "has_compaction": bool(conv_dict["compaction_count"] > 0 or conv_dict["pruned_tokens"] > 0)
+        "has_compaction": bool(
+            conv_dict["compaction_count"] > 0 or conv_dict["pruned_tokens"] > 0
+        ),
     }
 
     # Ancestor lineage trail
@@ -1044,68 +1273,99 @@ def query_session_details(conn, cid, tz=None):
     visited_ancestors = set()
     while curr_pid and curr_pid not in visited_ancestors:
         visited_ancestors.add(curr_pid)
-        a_row = cur.execute("SELECT id, title, project, model_name, subagent_role, depth, parent_id FROM conversations WHERE id = ?", (curr_pid,)).fetchone()
+        a_row = cur.execute(
+            "SELECT id, title, project, model_name, subagent_role, depth, parent_id FROM conversations WHERE id = ?",
+            (curr_pid,),
+        ).fetchone()
         if a_row:
             a_dict = dict(a_row)
-            ancestors.insert(0, {
-                "id": a_dict["id"],
-                "title": a_dict["title"] or f"Session {a_dict['id'][:8]}",
-                "role": a_dict["subagent_role"] or "Parent",
-                "depth": a_dict["depth"] or 0
-            })
+            ancestors.insert(
+                0,
+                {
+                    "id": a_dict["id"],
+                    "title": a_dict["title"] or f"Session {a_dict['id'][:8]}",
+                    "role": a_dict["subagent_role"] or "Parent",
+                    "depth": a_dict["depth"] or 0,
+                },
+            )
             curr_pid = a_dict.get("parent_id")
         else:
             break
 
     # Direct children
-    ch_rows = cur.execute("""
+    ch_rows = cur.execute(
+        """
         SELECT id, title, project, model_name, created_at, total_steps, total_tokens,
                billed_cost, billed_input_tokens, billed_output_tokens,
                depth, subagent_role, subagent_type, invoking_step_index
         FROM conversations
         WHERE parent_id = ?
         ORDER BY invoking_step_index ASC, created_at ASC
-    """, (cid,)).fetchall()
+    """,
+        (cid,),
+    ).fetchall()
     children = []
     for cr in ch_rows:
         c_dt = parse_to_local_dt(cr["created_at"], target_tz)
         c_act = (cr["billed_input_tokens"] or 0) + (cr["billed_output_tokens"] or 0)
-        children.append({
-            "id": cr["id"],
-            "title": cr["title"] or f"Sub-Agent {cr['id'][:8]}",
-            "role": cr["subagent_role"] or "Worker",
-            "type": cr["subagent_type"] or "self",
-            "depth": cr["depth"] or 1,
-            "step_index": cr["invoking_step_index"],
-            "steps": cr["total_steps"] or 0,
-            "tokens": c_act,
-            "cost": round(cr["billed_cost"] or 0.0, 2),
-            "created_at": c_dt.strftime("%Y-%m-%d %H:%M") if c_dt else cr["created_at"]
-        })
+        ch_cost = round(cr["billed_cost"] or 0.0, 2)
+        ch_m = cr["model_name"] or "Gemini"
+        ch_q = calculate_quota_metrics(
+            billed_cost=ch_cost, model_name=ch_m, quota_state=quota_state
+        )
+        children.append(
+            {
+                "id": cr["id"],
+                "title": cr["title"] or f"Sub-Agent {cr['id'][:8]}",
+                "role": cr["subagent_role"] or "Worker",
+                "type": cr["subagent_type"] or "self",
+                "depth": cr["depth"] or 1,
+                "step_index": cr["invoking_step_index"],
+                "steps": cr["total_steps"] or 0,
+                "tokens": c_act,
+                "cost": ch_cost,
+                "weekly_quota_pct": ch_q["weekly_pct"],
+                "five_hour_quota_pct": ch_q["five_hour_pct"],
+                "created_at": c_dt.strftime("%Y-%m-%d %H:%M")
+                if c_dt
+                else cr["created_at"],
+            }
+        )
 
     # Swarm fleet rollup for whole tree
     effective_root = conv_dict.get("root_id") or cid
-    swarm_rows = cur.execute("""
+    swarm_rows = cur.execute(
+        """
         SELECT id, title, parent_id, root_id, depth, subagent_role, subagent_type,
                total_steps, total_tokens, billed_cost, billed_input_tokens, billed_output_tokens,
-               duration_seconds
+               duration_seconds, model_name
         FROM conversations
         WHERE root_id = ? OR id = ?
         ORDER BY depth ASC, created_at ASC
-    """, (effective_root, effective_root)).fetchall()
+    """,
+        (effective_root, effective_root),
+    ).fetchall()
 
     swarm_nodes = [dict(sr) for sr in swarm_rows]
     total_swarm_cost = sum(n["billed_cost"] or 0.0 for n in swarm_nodes)
-    total_swarm_tokens = sum((n["billed_input_tokens"] or 0) + (n["billed_output_tokens"] or 0) for n in swarm_nodes)
+    total_swarm_tokens = sum(
+        (n["billed_input_tokens"] or 0) + (n["billed_output_tokens"] or 0)
+        for n in swarm_nodes
+    )
     total_swarm_steps = sum(n["total_steps"] or 0 for n in swarm_nodes)
 
+    fleet_q = calculate_quota_metrics(
+        billed_cost=total_swarm_cost, model_name=conv_model, quota_state=quota_state
+    )
     fleet_summary = {
         "root_id": effective_root,
         "is_subagent": bool(conv_dict.get("parent_id")),
         "subagent_count": max(0, len(swarm_nodes) - 1),
         "total_cost": round(total_swarm_cost, 2),
         "total_tokens": total_swarm_tokens,
-        "total_steps": total_swarm_steps
+        "total_steps": total_swarm_steps,
+        "weekly_quota_pct": fleet_q["weekly_pct"],
+        "five_hour_quota_pct": fleet_q["five_hour_pct"],
     }
 
     # Build nested tree topology for visualization
@@ -1113,20 +1373,28 @@ def query_session_details(conn, cid, tz=None):
     for n in swarm_nodes:
         n_id = n["id"]
         n_act = (n["billed_input_tokens"] or 0) + (n["billed_output_tokens"] or 0)
+        n_cost = round(n["billed_cost"] or 0.0, 2)
+        n_m = n.get("model_name") or conv_model
+        n_q = calculate_quota_metrics(
+            billed_cost=n_cost, model_name=n_m, quota_state=quota_state
+        )
         nodes_by_id[n_id] = {
             "id": n_id,
             "title": n["title"] or f"Session {n_id[:8]}",
-            "role": n["subagent_role"] or ("Root Coordinator" if (n.get("depth") or 0) == 0 else "Worker"),
+            "role": n["subagent_role"]
+            or ("Root Coordinator" if (n.get("depth") or 0) == 0 else "Worker"),
             "type": n["subagent_type"] or "self",
             "depth": n.get("depth") or 0,
             "steps": n["total_steps"] or 0,
             "tokens": n_act,
-            "cost": round(n["billed_cost"] or 0.0, 2),
+            "cost": n_cost,
+            "weekly_quota_pct": n_q["weekly_pct"],
+            "five_hour_quota_pct": n_q["five_hour_pct"],
             "duration": round(n["duration_seconds"] or 0.0),
             "is_current": (n_id == cid),
-            "children": []
+            "children": [],
         }
-    
+
     root_node = nodes_by_id.get(effective_root)
     for n in swarm_nodes:
         n_id = n["id"]
@@ -1144,17 +1412,28 @@ def query_session_details(conn, cid, tz=None):
         "children": children,
         "fleet_summary": fleet_summary,
         "fleet_tree": root_node,
-        "compaction": compaction_meta
+        "compaction": compaction_meta,
+        "quota": conv_quota,
+        "weekly_quota_pct": conv_quota["weekly_pct"],
+        "five_hour_quota_pct": conv_quota["five_hour_pct"],
     }
 
-def query_turn_diff(conn, conv_id: str, step_a: int, step_b: int, cumulative: bool = True, tz=None):
+
+def query_turn_diff(
+    conn, conv_id: str, step_a: int, step_b: int, cumulative: bool = True, tz=None
+):
     from context_monitor.diff import get_turn_diff_from_db
+
     cur = conn.cursor()
-    conv = cur.execute("SELECT id, title, model_name FROM conversations WHERE id = ?", (conv_id,)).fetchone()
+    conv = cur.execute(
+        "SELECT id, title, model_name FROM conversations WHERE id = ?", (conv_id,)
+    ).fetchone()
     if not conv:
         return None
 
-    diff_data = get_turn_diff_from_db(conn, conv_id, step_a, step_b, cumulative=cumulative)
+    diff_data = get_turn_diff_from_db(
+        conn, conv_id, step_a, step_b, cumulative=cumulative
+    )
     target_tz = get_target_tz(tz)
     for step_key in ("step_a", "step_b"):
         if diff_data.get(step_key) and diff_data[step_key].get("created_at"):
@@ -1165,5 +1444,3 @@ def query_turn_diff(conn, conv_id: str, step_a: int, step_b: int, cumulative: bo
     diff_data["conversation_title"] = conv["title"] or f"Session {conv['id'][:8]}"
     diff_data["model_name"] = conv["model_name"] or "Gemini"
     return diff_data
-
-

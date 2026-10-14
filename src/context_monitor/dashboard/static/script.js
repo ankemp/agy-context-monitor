@@ -316,6 +316,9 @@
         }
 
         renderKPIs(summaryRes);
+        if (summaryRes.quota || summaryRes.quota_summary) {
+          renderQuotaSection(summaryRes.quota || summaryRes.quota_summary);
+        }
         setTimelineRange(currentTimelineDays);
         renderModelsChart(summaryRes.models);
         renderProjectCostSection(allProjectCostData, currentProject);
@@ -333,6 +336,78 @@
       } catch (err) {
         console.error("Failed to load dashboard data", err);
       }
+    }
+
+    function renderQuotaSection(quota) {
+      if (!quota) return;
+      const buckets = quota.buckets || quota;
+      const gw = buckets['gemini-weekly'] || quota['gemini-weekly'] || quota.gemini_weekly;
+      const g5 = buckets['gemini-5h'] || quota['gemini-5h'] || quota.gemini_5h;
+      const pw = buckets['3p-weekly'] || quota['3p-weekly'] || quota.threep_weekly;
+      const p5 = buckets['3p-5h'] || quota['3p-5h'] || quota.threep_5h;
+
+      if (gw) {
+        const rem = gw.quota_remaining_pct != null ? gw.quota_remaining_pct : (gw.remaining_pct != null ? gw.remaining_pct : (gw.remaining_fraction != null ? gw.remaining_fraction * 100 : 100));
+        const cap = gw.calibrated_capacity || quota.calibrated_weekly_capacity || 672.0;
+        const cd = gw.reset_countdown || quota.weekly_reset_countdown || '';
+        const elRem = document.getElementById('quotaGeminiWeeklyRem');
+        const elBar = document.getElementById('quotaGeminiWeeklyBar');
+        const elReset = document.getElementById('quotaGeminiWeeklyReset');
+        const elCap = document.getElementById('quotaGeminiWeeklyCap');
+        if (elRem) elRem.textContent = `${Number(rem).toFixed(1)}% rem`;
+        if (elBar) elBar.style.width = `${Math.min(Math.max(0, 100 - rem), 100)}%`;
+        if (elReset) elReset.textContent = cd ? `Reset: ${cd}` : 'Reset: --';
+        if (elCap) elCap.textContent = `Cap: $${Number(cap).toFixed(2)}`;
+      }
+
+      if (g5) {
+        const rem = g5.quota_remaining_pct != null ? g5.quota_remaining_pct : (g5.remaining_pct != null ? g5.remaining_pct : (g5.remaining_fraction != null ? g5.remaining_fraction * 100 : 100));
+        const cap = g5.calibrated_capacity || quota.calibrated_5h_capacity || 236.7;
+        const cd = g5.reset_countdown || quota.five_hour_reset_countdown || '';
+        const elRem = document.getElementById('quotaGemini5hRem');
+        const elBar = document.getElementById('quotaGemini5hBar');
+        const elReset = document.getElementById('quotaGemini5hReset');
+        const elCap = document.getElementById('quotaGemini5hCap');
+        if (elRem) elRem.textContent = `${Number(rem).toFixed(1)}% rem`;
+        if (elBar) elBar.style.width = `${Math.min(Math.max(0, 100 - rem), 100)}%`;
+        if (elReset) elReset.textContent = cd ? `Reset: ${cd}` : 'Reset: --';
+        if (elCap) elCap.textContent = `Cap: $${Number(cap).toFixed(2)}`;
+      }
+
+      if (pw) {
+        const rem = pw.quota_remaining_pct != null ? pw.quota_remaining_pct : (pw.remaining_pct != null ? pw.remaining_pct : (pw.remaining_fraction != null ? pw.remaining_fraction * 100 : 100));
+        const cap = pw.calibrated_capacity || 200.0;
+        const cd = pw.reset_countdown || '';
+        const elRem = document.getElementById('quota3pWeeklyRem');
+        const elBar = document.getElementById('quota3pWeeklyBar');
+        const elReset = document.getElementById('quota3pWeeklyReset');
+        const elCap = document.getElementById('quota3pWeeklyCap');
+        if (elRem) elRem.textContent = `${Number(rem).toFixed(1)}% rem`;
+        if (elBar) elBar.style.width = `${Math.min(Math.max(0, 100 - rem), 100)}%`;
+        if (elReset) elReset.textContent = cd ? `Reset: ${cd}` : 'Reset: --';
+        if (elCap) elCap.textContent = `Cap: $${Number(cap).toFixed(2)}`;
+      }
+
+      if (p5) {
+        const rem = p5.quota_remaining_pct != null ? p5.quota_remaining_pct : (p5.remaining_pct != null ? p5.remaining_pct : (p5.remaining_fraction != null ? p5.remaining_fraction * 100 : 100));
+        const cap = p5.calibrated_capacity || 70.0;
+        const cd = p5.reset_countdown || '';
+        const elRem = document.getElementById('quota3p5hRem');
+        const elBar = document.getElementById('quota3p5hBar');
+        const elReset = document.getElementById('quota3p5hReset');
+        const elCap = document.getElementById('quota3p5hCap');
+        if (elRem) elRem.textContent = `${Number(rem).toFixed(1)}% rem`;
+        if (elBar) elBar.style.width = `${Math.min(Math.max(0, 100 - rem), 100)}%`;
+        if (elReset) elReset.textContent = cd ? `Reset: ${cd}` : 'Reset: --';
+        if (elCap) elCap.textContent = `Cap: $${Number(cap).toFixed(2)}`;
+      }
+
+      const sessWk = quota.session_weekly_pct != null ? quota.session_weekly_pct : (quota.weekly_pct || 0);
+      const sess5h = quota.session_5h_pct != null ? quota.session_5h_pct : (quota.five_hour_pct || 0);
+      const elSessWk = document.getElementById('sessionQuotaImpactWk');
+      const elSess5h = document.getElementById('sessionQuotaImpact5h');
+      if (elSessWk) elSessWk.textContent = `${Number(sessWk).toFixed(2)}% weekly`;
+      if (elSess5h) elSess5h.textContent = `${Number(sess5h).toFixed(2)}% 5h`;
     }
 
     function renderKPIs(data) {
@@ -1816,7 +1891,9 @@
             </div>
           `;
           stepsHtml = `<span class="font-mono text-gray-200 text-xs">${c.total_steps}</span> <span class="text-[10px] text-gray-500 font-mono">/ ${c.fleet_steps}</span>`;
-          costHtml = `<span class="font-bold text-rose-400 font-mono text-[11px]">$${(c.billed_cost || 0).toFixed(2)}</span> <span class="text-[10px] text-pink-300 font-mono font-medium">/ $${(c.fleet_cost || 0).toFixed(2)}</span>`;
+          const cWkStr = c.weekly_quota_pct != null ? ` <span class="text-[10px] text-cyan-300 font-mono">(${c.weekly_quota_pct.toFixed(2)}% wk)</span>` : '';
+          const flWkStr = c.fleet_weekly_quota_pct != null ? ` <span class="text-[10px] text-pink-300 font-mono font-medium">(${c.fleet_weekly_quota_pct.toFixed(2)}% wk)</span>` : '';
+          costHtml = `<span class="font-bold text-rose-400 font-mono text-[11px]">$${(c.billed_cost || 0).toFixed(2)}${cWkStr}</span> <span class="text-[10px] text-pink-300 font-mono font-medium">/ $${(c.fleet_cost || 0).toFixed(2)}${flWkStr}</span>`;
           tokensHtml = `<span class="font-semibold text-indigo-400 font-mono text-[11px]">${formatTokens(c.tokens || c.total_tokens)}</span> <span class="text-[10px] text-purple-300 font-mono font-medium">/ ${formatTokens(c.fleet_tokens)}</span>`;
         } else {
           let roleBadge = '';
@@ -1831,7 +1908,8 @@
             </div>
           `;
           stepsHtml = `<span class="text-gray-300 font-mono text-xs">${c.total_steps}</span>`;
-          costHtml = `<span class="font-bold text-rose-400 font-mono text-[11px]">$${(c.billed_cost || 0).toFixed(2)}</span>`;
+          const singleWkStr = c.weekly_quota_pct != null ? ` <span class="text-[10px] text-cyan-300 font-mono">(${c.weekly_quota_pct.toFixed(2)}% wk)</span>` : '';
+          costHtml = `<span class="font-bold text-rose-400 font-mono text-[11px]">$${(c.billed_cost || 0).toFixed(2)}${singleWkStr}</span>`;
           tokensHtml = `<span class="font-semibold text-indigo-400 font-mono text-[11px]" title="${formatTokens(c.disk_tokens || 0)} disk footprint">${formatTokens(c.tokens || c.total_tokens)}</span>`;
         }
 
@@ -1878,7 +1956,7 @@
               </td>
               <td class="py-2 px-3 text-purple-400/80 whitespace-nowrap text-xs">${sub.model_name || 'inherit'}</td>
               <td class="py-2 px-3 text-right text-gray-400 font-mono text-xs">${sub.total_steps}</td>
-              <td class="py-2 px-3 text-right font-mono font-medium text-rose-400/80 text-xs">$${(sub.billed_cost || 0).toFixed(2)}</td>
+              <td class="py-2 px-3 text-right font-mono font-medium text-rose-400/80 text-xs">$${(sub.billed_cost || 0).toFixed(2)}${sub.weekly_quota_pct != null ? ` <span class="text-[10px] text-cyan-300 font-mono">(${sub.weekly_quota_pct.toFixed(2)}% wk)</span>` : ''}</td>
               <td class="py-2 px-3 text-right font-mono font-medium text-indigo-400/80 text-xs">${formatTokens(sub.tokens || sub.total_tokens)}</td>
               <td class="py-2 px-3 text-right text-gray-400 whitespace-nowrap text-xs" title="${childTimeTitle}">
                 <span class="text-emerald-400/80">${formatDuration(childActiveSec)}</span>
@@ -2008,6 +2086,16 @@
           cardModalCodeLines.title = `Code authored in this session: ${total} total lines\n• +${written} new lines written (write_to_file)\n• ~${edited} modified lines replaced (replace_file_content)`;
         }
 
+        if (data.quota || conv.quota) {
+          const q = data.quota || conv.quota;
+          const sessWk = q.session_weekly_pct != null ? q.session_weekly_pct : (q.weekly_pct || 0);
+          const sess5h = q.session_5h_pct != null ? q.session_5h_pct : (q.five_hour_pct || 0);
+          const elSessWk = document.getElementById('sessionQuotaImpactWk');
+          const elSess5h = document.getElementById('sessionQuotaImpact5h');
+          if (elSessWk) elSessWk.textContent = `${Number(sessWk).toFixed(2)}% weekly`;
+          if (elSess5h) elSess5h.textContent = `${Number(sess5h).toFixed(2)}% 5h`;
+        }
+
         function formatToolBadge(toolOrSource, activity) {
           const isMcp = (activity && activity.startsWith('MCP')) || (toolOrSource && (toolOrSource.includes(':') || toolOrSource.startsWith('`mcp')));
           if (isMcp) {
@@ -2019,12 +2107,16 @@
         const tcBody = document.getElementById('modalTopConsumers');
         tcBody.innerHTML = '';
         for (const s of data.top_consumers) {
+          const costStr = (s.billed_cost != null && s.billed_cost > 0)
+            ? `$${s.billed_cost.toFixed(4)}${s.weekly_quota_pct != null ? ` <span class="text-[10px] text-cyan-300 font-mono">(${s.weekly_quota_pct.toFixed(2)}% wk)</span>` : ''}`
+            : '$0.00';
           const tr = document.createElement('tr');
           tr.innerHTML = `
             <td class="py-2 px-2.5 text-gray-400 font-mono">#${s.step_index}</td>
             <td class="py-2 px-2.5 font-medium text-white">${s.activity}</td>
             <td class="py-2 px-2.5">${formatToolBadge(s.tool_or_source, s.activity)}</td>
             <td class="py-2 px-2.5 text-right font-semibold text-white">${formatTokens(s.est_tokens)}</td>
+            <td class="py-2 px-2.5 text-right font-mono text-gray-300 whitespace-nowrap">${costStr}</td>
             <td class="py-2 px-2.5 text-gray-400 max-w-xs truncate" title="${s.detail || ''}">${s.detail || '--'}</td>
           `;
           tcBody.appendChild(tr);
@@ -2041,7 +2133,7 @@
             const switchTr = document.createElement('tr');
             switchTr.className = 'bg-brand-950/60 border-y border-brand-500/30';
             switchTr.innerHTML = `
-              <td colspan="5" class="py-1 px-2.5 text-center text-xs font-semibold text-brand-300">
+              <td colspan="6" class="py-1 px-2.5 text-center text-xs font-semibold text-brand-300">
                 🔄 Model Switched to: <span class="text-white">${s.model_name}</span>
               </td>
             `;
@@ -2053,19 +2145,23 @@
             const compTr = document.createElement('tr');
             compTr.className = 'bg-amber-950/60 border-y border-amber-500/50';
             compTr.innerHTML = `
-              <td colspan="5" class="py-1.5 px-2.5 text-center text-xs font-semibold text-amber-300">
+              <td colspan="6" class="py-1.5 px-2.5 text-center text-xs font-semibold text-amber-300">
                 ⚡ Memory Compaction Checkpoint #${s.step_index}: Context window was truncated/compacted at this step
               </td>
             `;
             sBody.appendChild(compTr);
           }
 
+          const stepCostStr = (s.billed_cost != null && s.billed_cost > 0)
+            ? `$${s.billed_cost.toFixed(4)}${s.weekly_quota_pct != null ? ` <span class="text-[10px] text-cyan-300 font-mono">(${s.weekly_quota_pct.toFixed(2)}% wk)</span>` : ''}`
+            : '$0.00';
           const tr = document.createElement('tr');
           tr.innerHTML = `
             <td class="py-1.5 px-2.5 text-gray-400 font-mono">#${s.step_index}</td>
             <td class="py-1.5 px-2.5 text-gray-300">${s.activity}</td>
             <td class="py-1.5 px-2.5">${formatToolBadge(s.tool_or_source, s.activity)}</td>
             <td class="py-1.5 px-2.5 text-right text-gray-400">${formatTokens(s.est_tokens)}</td>
+            <td class="py-1.5 px-2.5 text-right font-mono text-gray-300 whitespace-nowrap">${stepCostStr}</td>
             <td class="py-1.5 px-2.5 text-gray-400 max-w-md truncate" title="${s.detail || ''}">${s.detail || '--'}</td>
           `;
           sBody.appendChild(tr);
@@ -2923,16 +3019,39 @@
       function connect() {
         evtSource = new EventSource('/api/events');
 
-        evtSource.addEventListener('connected', () => {
+        evtSource.addEventListener('connected', (event) => {
           const badge = document.getElementById('liveSyncBadge');
           const text = document.getElementById('syncText');
           if (badge) badge.className = 'px-3 py-1.5 rounded-md bg-emerald-950/60 border border-emerald-500/30 text-emerald-300 text-xs font-medium flex items-center space-x-1.5 transition select-none';
           if (text) text.textContent = 'Live Sync: SSE Active';
+          try {
+            if (event.data) {
+              const d = JSON.parse(event.data);
+              if (d && d.quota) renderQuotaSection(d.quota);
+            }
+          } catch (e) {}
         });
 
         evtSource.addEventListener('db_update', (event) => {
           console.log("⚡ SQLite change detected via SSE. Refreshing UI...");
+          try {
+            if (event.data) {
+              const d = JSON.parse(event.data);
+              if (d && d.quota) renderQuotaSection(d.quota);
+            }
+          } catch (e) {}
           fetchDashboardData();
+        });
+
+        evtSource.addEventListener('quota_update', (event) => {
+          try {
+            if (event.data) {
+              const d = JSON.parse(event.data);
+              renderQuotaSection(d.quota || d);
+            }
+          } catch (e) {
+            console.error("Failed to parse quota_update SSE event", e);
+          }
         });
 
         evtSource.onerror = () => {

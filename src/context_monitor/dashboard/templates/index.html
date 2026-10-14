@@ -266,6 +266,117 @@
       </div>
     </div>
 
+    <!-- 1c. Subscription Quota & Rate Limit Capacity -->
+    <div id="quotaSection" class="card p-5 bg-dark-800 border-dark-700">
+      <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-4">
+        <div>
+          <h2 class="text-sm font-semibold text-white flex items-center space-x-2">
+            <i data-lucide="gauge" class="w-4 h-4 text-cyan-400"></i>
+            <span>Subscription Quotas & Rate Limits</span>
+          </h2>
+          <p class="text-xs text-gray-400 mt-0.5">Live remaining quota fractions, reset countdowns, and calibrated compute capacity</p>
+        </div>
+        <div class="flex items-center space-x-3 text-xs">
+          <span id="quotaSyncedAt" class="text-gray-400 font-mono text-[11px]">Live Sync: Active</span>
+        </div>
+      </div>
+
+      <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
+        <!-- Gemini Weekly -->
+        <div class="bg-dark-850 p-3.5 rounded-lg border border-dark-700 flex flex-col justify-between">
+          <div>
+            <div class="flex justify-between items-center text-xs mb-1.5">
+              <span class="text-gray-300 font-medium flex items-center space-x-1.5">
+                <span class="w-2 h-2 rounded-full bg-cyan-400"></span>
+                <span>Gemini Weekly</span>
+              </span>
+              <span id="quotaGeminiWeeklyRem" class="font-mono font-bold text-cyan-400">--% rem</span>
+            </div>
+            <div class="w-full bg-dark-900 rounded-full h-2 overflow-hidden mb-2">
+              <div id="quotaGeminiWeeklyBar" class="bg-cyan-500 h-2 rounded-full" style="width: 0%; transition: none;"></div>
+            </div>
+          </div>
+          <div class="text-[11px] text-gray-400 flex justify-between font-mono pt-1.5 border-t border-dark-700/60">
+            <span id="quotaGeminiWeeklyReset">Reset: --</span>
+            <span id="quotaGeminiWeeklyCap" class="text-gray-300" title="Calibrated Window Compute Capacity">Cap: $--</span>
+          </div>
+        </div>
+
+        <!-- Gemini 5-Hour -->
+        <div class="bg-dark-850 p-3.5 rounded-lg border border-dark-700 flex flex-col justify-between">
+          <div>
+            <div class="flex justify-between items-center text-xs mb-1.5">
+              <span class="text-gray-300 font-medium flex items-center space-x-1.5">
+                <span class="w-2 h-2 rounded-full bg-indigo-400"></span>
+                <span>Gemini 5-Hour</span>
+              </span>
+              <span id="quotaGemini5hRem" class="font-mono font-bold text-indigo-400">--% rem</span>
+            </div>
+            <div class="w-full bg-dark-900 rounded-full h-2 overflow-hidden mb-2">
+              <div id="quotaGemini5hBar" class="bg-indigo-500 h-2 rounded-full" style="width: 0%; transition: none;"></div>
+            </div>
+          </div>
+          <div class="text-[11px] text-gray-400 flex justify-between font-mono pt-1.5 border-t border-dark-700/60">
+            <span id="quotaGemini5hReset">Reset: --</span>
+            <span id="quotaGemini5hCap" class="text-gray-300" title="Calibrated Window Compute Capacity">Cap: $--</span>
+          </div>
+        </div>
+
+        <!-- Claude / 3P Weekly -->
+        <div class="bg-dark-850 p-3.5 rounded-lg border border-dark-700 flex flex-col justify-between">
+          <div>
+            <div class="flex justify-between items-center text-xs mb-1.5">
+              <span class="text-gray-300 font-medium flex items-center space-x-1.5">
+                <span class="w-2 h-2 rounded-full bg-purple-400"></span>
+                <span>Claude / 3P Weekly</span>
+              </span>
+              <span id="quota3pWeeklyRem" class="font-mono font-bold text-purple-400">--% rem</span>
+            </div>
+            <div class="w-full bg-dark-900 rounded-full h-2 overflow-hidden mb-2">
+              <div id="quota3pWeeklyBar" class="bg-purple-500 h-2 rounded-full" style="width: 0%; transition: none;"></div>
+            </div>
+          </div>
+          <div class="text-[11px] text-gray-400 flex justify-between font-mono pt-1.5 border-t border-dark-700/60">
+            <span id="quota3pWeeklyReset">Reset: --</span>
+            <span id="quota3pWeeklyCap" class="text-gray-300" title="Calibrated Window Compute Capacity">Cap: $--</span>
+          </div>
+        </div>
+
+        <!-- Claude / 3P 5-Hour -->
+        <div class="bg-dark-850 p-3.5 rounded-lg border border-dark-700 flex flex-col justify-between">
+          <div>
+            <div class="flex justify-between items-center text-xs mb-1.5">
+              <span class="text-gray-300 font-medium flex items-center space-x-1.5">
+                <span class="w-2 h-2 rounded-full bg-pink-400"></span>
+                <span>Claude / 3P 5-Hour</span>
+              </span>
+              <span id="quota3p5hRem" class="font-mono font-bold text-pink-400">--% rem</span>
+            </div>
+            <div class="w-full bg-dark-900 rounded-full h-2 overflow-hidden mb-2">
+              <div id="quota3p5hBar" class="bg-pink-500 h-2 rounded-full" style="width: 0%; transition: none;"></div>
+            </div>
+          </div>
+          <div class="text-[11px] text-gray-400 flex justify-between font-mono pt-1.5 border-t border-dark-700/60">
+            <span id="quota3p5hReset">Reset: --</span>
+            <span id="quota3p5hCap" class="text-gray-300" title="Calibrated Window Compute Capacity">Cap: $--</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Current Session / Total Quota Impact Banner -->
+      <div id="sessionQuotaImpactBanner" class="mt-4 pt-3 border-t border-dark-700/60 flex flex-col sm:flex-row sm:items-center justify-between text-xs text-gray-400 gap-2">
+        <div class="flex items-center space-x-2">
+          <span class="text-gray-300 font-medium">Session Quota Impact:</span>
+          <span id="sessionQuotaImpactWk" class="font-mono font-semibold text-cyan-300">--% weekly</span>
+          <span>•</span>
+          <span id="sessionQuotaImpact5h" class="font-mono font-semibold text-indigo-300">--% 5h</span>
+        </div>
+        <div class="text-[11px] text-gray-400">
+          <span id="quotaCalibrationNote">Concurrency-safe capacity calibrated from SQLite steps telemetry</span>
+        </div>
+      </div>
+    </div>
+
     <!-- 2. Main Visual Charts (Token Velocity & Model Shares) -->
     <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
       <div class="card p-5 lg:col-span-2 flex flex-col">
@@ -886,6 +997,7 @@
                   <th class="py-2 px-2.5">Activity</th>
                   <th class="py-2 px-2.5">Tool / Source</th>
                   <th class="py-2 px-2.5 text-right">Est. Tokens</th>
+                  <th class="py-2 px-2.5 text-right">Cost (% Quota)</th>
                   <th class="py-2 px-2.5">Details</th>
                 </tr>
               </thead>
@@ -928,6 +1040,7 @@
                   <th class="py-2 px-2.5">Type</th>
                   <th class="py-2 px-2.5">Tool / Source</th>
                   <th class="py-2 px-2.5 text-right">Tokens</th>
+                  <th class="py-2 px-2.5 text-right">Cost (% Quota)</th>
                   <th class="py-2 px-2.5">Details</th>
                 </tr>
               </thead>

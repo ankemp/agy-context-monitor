@@ -16,17 +16,15 @@ from urllib.parse import urlparse, parse_qs
 from datetime import datetime
 from jinja2 import Environment, FileSystemLoader
 
-import sys
-from pathlib import Path
 _src = Path(__file__).resolve().parent.parent.parent
 if str(_src) not in sys.path:
     sys.path.insert(0, str(_src))
 
-from context_monitor.db import get_db_connection, init_db
-from context_monitor.dashboard import api_routes, sse_stream
+from context_monitor.db import get_db_connection, init_db  # noqa: E402
+from context_monitor.dashboard import api_routes, sse_stream  # noqa: E402
 
 DASHBOARD_DIR = Path(__file__).resolve().parent
-env = Environment(loader=FileSystemLoader(DASHBOARD_DIR / 'templates'))
+env = Environment(loader=FileSystemLoader(DASHBOARD_DIR / "templates"))
 
 # In-memory API response cache invalidated automatically via SQLite PRAGMA data_version
 _API_CACHE_LOCK = threading.Lock()
@@ -36,6 +34,7 @@ _MONITOR_INOS = {}
 _LAST_DATA_VERSIONS = {}
 _ACTIVE_DB = None
 
+
 def clear_api_cache():
     """Explicitly clears the in-memory API cache and resets tracked data versions."""
     global _ACTIVE_DB
@@ -44,21 +43,30 @@ def clear_api_cache():
         _LAST_DATA_VERSIONS.clear()
         _ACTIVE_DB = None
 
+
 # Hook clear_api_cache into SSE change notification stream
 sse_stream.register_change_callback(clear_api_cache)
+
 
 def _extract_db_path(conn: sqlite3.Connection) -> str | None:
     try:
         rows = conn.execute("PRAGMA database_list;").fetchall()
         for row in rows:
-            name = row["name"] if hasattr(row, "keys") and "name" in row.keys() else row[1]
+            name = (
+                row["name"] if hasattr(row, "keys") and "name" in row.keys() else row[1]
+            )
             if name == "main":
-                f = row["file"] if hasattr(row, "keys") and "file" in row.keys() else row[2]
+                f = (
+                    row["file"]
+                    if hasattr(row, "keys") and "file" in row.keys()
+                    else row[2]
+                )
                 if f and str(f).strip():
                     return str(Path(f).resolve())
     except Exception:
         pass
     return None
+
 
 def get_cached_api_response(conn, cache_key: str, compute_fn):
     global _ACTIVE_DB
@@ -88,7 +96,9 @@ def get_cached_api_response(conn, cache_key: str, compute_fn):
 
             if mon_conn is None and cur_ino is not None:
                 try:
-                    mon_conn = sqlite3.connect(db_path, timeout=30.0, check_same_thread=False)
+                    mon_conn = sqlite3.connect(
+                        db_path, timeout=30.0, check_same_thread=False
+                    )
                     mon_conn.execute("PRAGMA busy_timeout = 5000;")
                     _MONITOR_CONNS[db_path] = mon_conn
                     _MONITOR_INOS[db_path] = cur_ino
@@ -104,7 +114,9 @@ def get_cached_api_response(conn, cache_key: str, compute_fn):
                     except Exception:
                         pass
                     try:
-                        mon_conn = sqlite3.connect(db_path, timeout=30.0, check_same_thread=False)
+                        mon_conn = sqlite3.connect(
+                            db_path, timeout=30.0, check_same_thread=False
+                        )
                         mon_conn.execute("PRAGMA busy_timeout = 5000;")
                         _MONITOR_CONNS[db_path] = mon_conn
                         dv = mon_conn.execute("PRAGMA data_version;").fetchone()[0]
@@ -138,7 +150,15 @@ def get_cached_api_response(conn, cache_key: str, compute_fn):
 
     serialized = json.dumps(data).encode("utf-8")
     with _API_CACHE_LOCK:
-        if _ACTIVE_DB == target_key and _LAST_DATA_VERSIONS.get(target_key) == dv:
+        if _ACTIVE_DB == target_key:
+            if db_path and mon_conn is not None:
+                try:
+                    current_dv = mon_conn.execute("PRAGMA data_version;").fetchone()[0]
+                except Exception:
+                    current_dv = dv
+            else:
+                current_dv = dv
+            _LAST_DATA_VERSIONS[target_key] = current_dv
             _API_CACHE[cache_key] = serialized
     return serialized
 
@@ -154,7 +174,7 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             project_param = None
 
         if path == "/" or path == "/index.html":
-            template = env.get_template('index.html')
+            template = env.get_template("index.html")
             html = template.render(IS_STATIC_EXPORT=False)
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -178,7 +198,7 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                 self.wfile.write(f.read())
             return
 
-        if path == "/api/events":
+        if path in ("/api/events", "/events", "/api/stream"):
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
@@ -191,7 +211,18 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                 sse_stream.SSE_CLIENTS.add(client_q)
 
             try:
-                init_msg = f"event: connected\ndata: {json.dumps({'status': 'ok'})}\n\n"
+                conn_quota = get_db_connection()
+                try:
+                    quota_initial = api_routes.query_quota_data(conn_quota)
+                except Exception:
+                    quota_initial = None
+                finally:
+                    conn_quota.close()
+
+                init_data = {"status": "ok"}
+                if quota_initial is not None:
+                    init_data["quota"] = quota_initial
+                init_msg = f"event: connected\ndata: {json.dumps(init_data)}\n\n"
                 self.wfile.write(init_msg.encode("utf-8"))
                 self.wfile.flush()
 
@@ -211,6 +242,28 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                     sse_stream.SSE_CLIENTS.discard(client_q)
             return
 
+        if path == "/api/quota":
+            model_param = qs.get("model", [None])[0]
+            cost_param = qs.get("cost", qs.get("billed_cost", [0.0]))[0]
+            try:
+                cost_val = float(cost_param) if cost_param is not None else 0.0
+            except (ValueError, TypeError):
+                cost_val = 0.0
+            conn = get_db_connection()
+            try:
+                data = api_routes.query_quota_data(
+                    conn, model_name=model_param, billed_cost=cost_val
+                )
+                serialized = json.dumps(data).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Cache-Control", "no-cache")
+                self.end_headers()
+                self.wfile.write(serialized)
+            finally:
+                conn.close()
+            return
+
         # API Routes
         conn = get_db_connection()
         target_tz = api_routes.get_target_tz(client_tz)
@@ -220,15 +273,31 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
             def compute():
                 if path == "/api/projects":
                     cur = conn.cursor()
-                    rows = cur.execute("SELECT DISTINCT project FROM conversations WHERE project IS NOT NULL AND project != '' ORDER BY project ASC").fetchall()
+                    rows = cur.execute(
+                        "SELECT DISTINCT project FROM conversations WHERE project IS NOT NULL AND project != '' ORDER BY project ASC"
+                    ).fetchall()
                     return [r["project"] for r in rows]
+                elif path == "/api/quota":
+                    model_param = qs.get("model", [None])[0]
+                    cost_param = qs.get("cost", qs.get("billed_cost", [0.0]))[0]
+                    try:
+                        cost_val = float(cost_param) if cost_param is not None else 0.0
+                    except (ValueError, TypeError):
+                        cost_val = 0.0
+                    return api_routes.query_quota_data(
+                        conn, model_name=model_param, billed_cost=cost_val
+                    )
                 elif path == "/api/summary":
                     return api_routes.query_summary_data(conn, target_tz, project_param)
                 elif path == "/api/timeline":
                     days = qs.get("days", [None])[0]
-                    return api_routes.query_timeline_data(conn, days, target_tz, project_param)
+                    return api_routes.query_timeline_data(
+                        conn, days, target_tz, project_param
+                    )
                 elif path == "/api/cost-by-project":
-                    return api_routes.query_cost_by_project(conn, target_tz, project_param)
+                    return api_routes.query_cost_by_project(
+                        conn, target_tz, project_param
+                    )
                 elif path == "/api/tools":
                     return api_routes.query_tools_data(conn, project_param)
                 elif path == "/api/mcp":
@@ -236,14 +305,23 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                 elif path == "/api/hot-files":
                     return api_routes.query_hot_files_data(conn, project_param)
                 elif path == "/api/activity-matrix":
-                    return api_routes.query_activity_matrix(conn, target_tz, project_param)
+                    return api_routes.query_activity_matrix(
+                        conn, target_tz, project_param
+                    )
                 elif path == "/api/conversations":
                     limit = int(qs.get("limit", [200])[0])
                     view_mode = qs.get("view", qs.get("mode", ["hierarchy"]))[0]
-                    return api_routes.query_conversations_list(conn, limit, target_tz, project_param, view_mode)
-                elif path.startswith("/api/session/"):
-                    session_id = path.split("/")[-1]
-                    session_data = api_routes.query_session_details(conn, session_id, target_tz)
+                    return api_routes.query_conversations_list(
+                        conn, limit, target_tz, project_param, view_mode
+                    )
+                elif path.startswith("/api/session/") or (
+                    path.startswith("/api/conversations/")
+                    and path.rstrip("/") != "/api/conversations"
+                ):
+                    session_id = path.rstrip("/").split("/")[-1]
+                    session_data = api_routes.query_session_details(
+                        conn, session_id, target_tz
+                    )
                     if session_data is None:
                         return ("error", 404, "Session not found")
                     return session_data
@@ -260,9 +338,15 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                         step_a = int(step_a_param)
                         step_b = int(step_b_param)
                     except ValueError:
-                        return ("error", 400, "Invalid step parameters: a and b must be integers")
+                        return (
+                            "error",
+                            400,
+                            "Invalid step parameters: a and b must be integers",
+                        )
 
-                    data = api_routes.query_turn_diff(conn, conv_id, step_a, step_b, cumulative, target_tz)
+                    data = api_routes.query_turn_diff(
+                        conn, conv_id, step_a, step_b, cumulative, target_tz
+                    )
                     if data is None:
                         return ("error", 404, "Conversation not found")
                     return data
@@ -287,8 +371,10 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         # Suppress logging
         pass
 
+
 class DashboardServer(ThreadingHTTPServer):
     daemon_threads = True
+
     def handle_error(self, request, client_address):
         cls, err, tb = sys.exc_info()
         if cls is BrokenPipeError or cls is ConnectionResetError:
@@ -296,7 +382,10 @@ class DashboardServer(ThreadingHTTPServer):
         else:
             super().handle_error(request, client_address)
 
-def export_standalone_html(output_path: Path, include_conversations: bool = False, tz: str = None):
+
+def export_standalone_html(
+    output_path: Path, include_conversations: bool = False, tz: str = None
+):
     init_db()
     conn = get_db_connection()
     target_tz = api_routes.get_target_tz(tz)
@@ -308,7 +397,12 @@ def export_standalone_html(output_path: Path, include_conversations: bool = Fals
         mcp = api_routes.query_mcp_data(conn)
         hot_files = api_routes.query_hot_files_data(conn)
         activity_matrix = api_routes.query_activity_matrix(conn, target_tz)
-        conversations = api_routes.query_conversations_list(conn, 200, target_tz) if include_conversations else []
+        conversations = (
+            api_routes.query_conversations_list(conn, 200, target_tz)
+            if include_conversations
+            else []
+        )
+        quota = api_routes.query_quota_data(conn)
     finally:
         conn.close()
 
@@ -323,11 +417,13 @@ def export_standalone_html(output_path: Path, include_conversations: bool = Fals
         mcp: {json.dumps(mcp)},
         hot_files: {json.dumps(hot_files)},
         activity_matrix: {json.dumps(activity_matrix)},
-        conversations: {json.dumps(conversations)}
+        conversations: {json.dumps(conversations)},
+        quota: {json.dumps(quota)}
       }};
       
       window.fetch = async function(url) {{
         if (url.includes('/api/summary')) return {{ json: async () => STATIC_DATA.summary }};
+        if (url.includes('/api/quota')) return {{ json: async () => STATIC_DATA.quota }};
         if (url.includes('/api/timeline')) return {{ json: async () => STATIC_DATA.timeline }};
         if (url.includes('/api/cost-by-project')) return {{ json: async () => STATIC_DATA.cost_by_project }};
         if (url.includes('/api/tools')) return {{ json: async () => STATIC_DATA.tools }};
@@ -340,15 +436,15 @@ def export_standalone_html(output_path: Path, include_conversations: bool = Fals
       }};
     </script>
     """
-    
+
     with open(DASHBOARD_DIR / "static" / "style.css", "r") as f:
         inline_css = f"<style>{f.read()}</style>"
-    
+
     with open(DASHBOARD_DIR / "static" / "script.js", "r") as f:
         inline_js = f"<script>{f.read()}</script>"
 
-    template = env.get_template('index.html')
-    gen_time_str = datetime.now(target_tz).strftime('%b %d, %Y %H:%M %Z')
+    template = env.get_template("index.html")
+    gen_time_str = datetime.now(target_tz).strftime("%b %d, %Y %H:%M %Z")
 
     html_content = template.render(
         IS_STATIC_EXPORT=True,
@@ -356,7 +452,7 @@ def export_standalone_html(output_path: Path, include_conversations: bool = Fals
         INLINE_CSS=inline_css,
         INLINE_JS=inline_js,
         GEN_TIME_STR=gen_time_str,
-        INCLUDE_CONVERSATIONS=include_conversations
+        INCLUDE_CONVERSATIONS=include_conversations,
     )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -364,27 +460,52 @@ def export_standalone_html(output_path: Path, include_conversations: bool = Fals
         f.write(html_content)
     print(f"Exported static dashboard to {output_path.absolute()}")
 
+
 def main():
     parser = argparse.ArgumentParser(description="Antigravity Analytics Dashboard")
-    parser.add_argument("--port", type=int, default=8765, help="Port to run the dashboard server on")
-    parser.add_argument("--host", type=str, default="localhost", help="Host to bind the server to")
-    parser.add_argument("--export-html", type=str, help="Export a standalone offline HTML report to this path")
-    parser.add_argument("--include-conversations", action="store_true", help="Include full conversation explorer in exported HTML")
-    parser.add_argument("--tz", type=str, help="Target timezone (e.g. 'America/New_York') for exported report. Defaults to system local.")
-    parser.add_argument("--open", action="store_true", help="Automatically open the dashboard in the default web browser")
+    parser.add_argument(
+        "--port", type=int, default=8765, help="Port to run the dashboard server on"
+    )
+    parser.add_argument(
+        "--host", type=str, default="localhost", help="Host to bind the server to"
+    )
+    parser.add_argument(
+        "--export-html",
+        type=str,
+        help="Export a standalone offline HTML report to this path",
+    )
+    parser.add_argument(
+        "--include-conversations",
+        action="store_true",
+        help="Include full conversation explorer in exported HTML",
+    )
+    parser.add_argument(
+        "--tz",
+        type=str,
+        help="Target timezone (e.g. 'America/New_York') for exported report. Defaults to system local.",
+    )
+    parser.add_argument(
+        "--open",
+        action="store_true",
+        help="Automatically open the dashboard in the default web browser",
+    )
     args = parser.parse_args()
 
     if args.export_html:
-        export_standalone_html(Path(args.export_html), args.include_conversations, args.tz)
+        export_standalone_html(
+            Path(args.export_html), args.include_conversations, args.tz
+        )
         sys.exit(0)
 
     try:
         from context_monitor.db import DEFAULT_DB_PATH, init_db
+
         db_path = DEFAULT_DB_PATH
         init_db(db_path)
     except ImportError:
         try:
             from db import DEFAULT_DB_PATH, init_db
+
             db_path = DEFAULT_DB_PATH
             init_db(db_path)
         except ImportError:
@@ -408,6 +529,7 @@ def main():
             print(f"Error: Port {args.port} is already in use.")
         else:
             raise
+
 
 if __name__ == "__main__":
     main()

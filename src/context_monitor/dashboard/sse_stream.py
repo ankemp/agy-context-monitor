@@ -1,12 +1,22 @@
-import time
 import queue
 import threading
 from datetime import datetime
 from pathlib import Path
 
+__all__ = [
+    "broadcast_sse",
+    "register_change_callback",
+    "unregister_change_callback",
+    "queue",
+    "SSE_CLIENTS",
+    "SSE_LOCK",
+    "DbChangeWatcher",
+]
+
 SSE_CLIENTS = set()
 SSE_LOCK = threading.Lock()
 _CHANGE_CALLBACKS = []
+
 
 def register_change_callback(callback):
     """Register a callback to be called when db changes occur."""
@@ -14,18 +24,31 @@ def register_change_callback(callback):
         if callback not in _CHANGE_CALLBACKS:
             _CHANGE_CALLBACKS.append(callback)
 
+
 def unregister_change_callback(callback):
     with SSE_LOCK:
         if callback in _CHANGE_CALLBACKS:
             _CHANGE_CALLBACKS.remove(callback)
 
+
 def broadcast_sse(event_name: str, data: dict):
     if event_name == "db_update":
         try:
             from context_monitor.dashboard.server import clear_api_cache
+
             clear_api_cache()
         except Exception:
             pass
+
+        if isinstance(data, dict) and "quota" not in data:
+            try:
+                from context_monitor.db import get_db_connection
+                from context_monitor.dashboard import api_routes
+
+                with get_db_connection() as conn:
+                    data["quota"] = api_routes.query_quota_data(conn)
+            except Exception:
+                pass
 
         with SSE_LOCK:
             callbacks = list(_CHANGE_CALLBACKS)
@@ -43,6 +66,7 @@ def broadcast_sse(event_name: str, data: dict):
             except Exception:
                 dead.add(q)
         SSE_CLIENTS.difference_update(dead)
+
 
 class DbChangeWatcher(threading.Thread):
     def __init__(self, db_path: Path | str, check_interval: float = 0.5):
@@ -79,13 +103,15 @@ class DbChangeWatcher(threading.Thread):
                     self.last_state = cur_state
                     try:
                         from context_monitor.dashboard.server import clear_api_cache
+
                         clear_api_cache()
                     except Exception:
                         pass
                     if self._stop_event.wait(0.3):
                         break
                     self.last_state = self._get_state()
-                    broadcast_sse("db_update", {"timestamp": datetime.now().isoformat()})
+                    broadcast_sse(
+                        "db_update", {"timestamp": datetime.now().isoformat()}
+                    )
             except Exception:
                 pass
-
