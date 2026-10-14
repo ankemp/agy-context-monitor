@@ -44,34 +44,76 @@ __all__ = [
     "QuotaStateList",
 ]
 
-DEFAULT_LOG_PATH = Path(os.path.expanduser("~/Library/Logs/Antigravity/language_server.log"))
+DEFAULT_LOG_PATH = Path(
+    os.path.expanduser("~/Library/Logs/Antigravity/language_server.log")
+)
 
 
 class QuotaStateList(list):
-    """List of quota state dictionaries supporting bucket_id key indexing."""
+    """List of quota state dictionaries supporting bucket_id key indexing and dict-like inspection."""
 
     def __getitem__(self, key: Any) -> Any:
         if isinstance(key, str):
             for item in self:
-                if isinstance(item, dict) and item.get("bucket_id") == key:
+                if isinstance(item, dict) and (
+                    item.get("bucket_id") == key or item.get("bucketId") == key
+                ):
                     return item
             raise KeyError(f"Bucket '{key}' not found in quota state")
         return super().__getitem__(key)
 
-    def get(self, key: str, default: Any = None) -> Any:
+    def __contains__(self, key: Any) -> bool:
+        if isinstance(key, str):
+            return any(
+                isinstance(item, dict)
+                and (item.get("bucket_id") == key or item.get("bucketId") == key)
+                for item in self
+            )
+        return super().__contains__(key)
+
+    def get(self, key: Any, default: Any = None) -> Any:
         if isinstance(key, str):
             for item in self:
-                if isinstance(item, dict) and item.get("bucket_id") == key:
+                if isinstance(item, dict) and (
+                    item.get("bucket_id") == key or item.get("bucketId") == key
+                ):
                     return item
             return default
+        if isinstance(key, int):
+            if 0 <= key < len(self):
+                return self[key]
+            return default
         return default
+
+    def keys(self) -> list[str]:
+        """Returns bucket_id keys for all buckets in the list."""
+        return [
+            item.get("bucket_id") or item.get("bucketId", "")
+            for item in self
+            if isinstance(item, dict)
+            and (item.get("bucket_id") or item.get("bucketId"))
+        ]
+
+    def values(self) -> list[dict]:
+        """Returns bucket dictionaries in the list."""
+        return [item for item in self if isinstance(item, dict)]
+
+    def items(self) -> list[tuple[str, dict]]:
+        """Returns (bucket_id, bucket_dict) tuples."""
+        return [
+            (item.get("bucket_id") or item.get("bucketId", ""), item)
+            for item in self
+            if isinstance(item, dict)
+            and (item.get("bucket_id") or item.get("bucketId"))
+        ]
 
     def to_dict(self) -> dict[str, dict]:
         """Converts list of bucket records into a dict keyed by bucket_id."""
         return {
-            item["bucket_id"]: item
+            (item.get("bucket_id") or item.get("bucketId", "")): item
             for item in self
-            if isinstance(item, dict) and "bucket_id" in item
+            if isinstance(item, dict)
+            and (item.get("bucket_id") or item.get("bucketId"))
         }
 
 
@@ -87,7 +129,11 @@ def _get_default_capacity(bucket_id: str) -> float:
     if bid == "3p-5h":
         return get_3p_5h_capacity()
     if "weekly" in bid:
-        return get_gemini_weekly_capacity() if "gemini" in bid else get_3p_weekly_capacity()
+        return (
+            get_gemini_weekly_capacity()
+            if "gemini" in bid
+            else get_3p_weekly_capacity()
+        )
     return get_gemini_5h_capacity() if "gemini" in bid else get_3p_5h_capacity()
 
 
@@ -101,7 +147,7 @@ def discover_language_server_credentials(
         tuple[int | None, str | None]: (http_port, csrf_token) or (None, None) on failure.
     """
     token = _discover_csrf_token()
-    port = _discover_http_port(log_path or DEFAULT_LOG_PATH)
+    port = _discover_http_port(log_path)
     return port, token
 
 
@@ -114,28 +160,35 @@ def _discover_csrf_token() -> str | None:
     if env_token:
         return env_token.strip()
 
-    try:
-        proc = subprocess.run(
-            ["ps", "-ww", "-eo", "pid,command"],
-            capture_output=True,
-            text=True,
-            timeout=2.0,
-            check=False,
-        )
-        if proc.returncode == 0:
-            for line in proc.stdout.splitlines():
-                if "language_server" not in line or "grep" in line:
-                    continue
-                m = re.search(r"--csrf_token(?:=|\s+)([^\s]+)", line)
-                if m:
-                    return m.group(1).strip()
-    except Exception:
-        pass
+    ps_commands = [
+        ["ps", "-ww", "-eo", "pid,command"],
+        ["ps", "aux"],
+        ["ps", "-ef"],
+    ]
+
+    for cmd in ps_commands:
+        try:
+            proc = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=2.0,
+                check=False,
+            )
+            if proc.returncode == 0:
+                for line in reversed(proc.stdout.splitlines()):
+                    if "language_server" not in line or "grep" in line:
+                        continue
+                    m = re.search(r"--csrf_token(?:=|\s+)([^\s]+)", line)
+                    if m:
+                        return m.group(1).strip().strip("'\"")
+        except Exception:
+            continue
 
     return None
 
 
-def _discover_http_port(log_file: Path | str) -> int | None:
+def _discover_http_port(log_file: Path | str | None = None) -> int | None:
     r"""
     Discovers HTTP port from language_server.log matching
     'listening on random port at (\d+) for HTTP\b'.
@@ -148,14 +201,32 @@ def _discover_http_port(log_file: Path | str) -> int | None:
         except ValueError:
             pass
 
-    path = Path(log_file)
-    if not path.exists() or not path.is_file():
-        return None
+    if log_file is not None:
+        path = Path(log_file)
+        if not path.exists() or not path.is_file():
+            return None
+    else:
+        for candidate in [
+            DEFAULT_LOG_PATH,
+            Path(os.path.expanduser("~/.config/Antigravity/logs/language_server.log")),
+            Path(
+                os.path.expanduser(
+                    "~/.local/state/Antigravity/logs/language_server.log"
+                )
+            ),
+        ]:
+            if candidate.exists() and candidate.is_file():
+                path = candidate
+                break
+        else:
+            return None
 
     try:
         file_size = path.stat().st_size
         chunk_size = 65536  # 64 KB chunks
-        max_bytes_to_scan = 2 * 1024 * 1024  # Scan up to 2MB backward
+        max_bytes_to_scan = (
+            100 * 1024 * 1024
+        )  # Scan up to 100MB backward (handles long-running sessions)
 
         pattern = re.compile(rb"listening on random port at (\d+) for HTTP\b")
 
@@ -245,21 +316,8 @@ def calibrate_capacity(
       returns existing persisted calibrated_capacity if > 0 else fallback_capacity.
     - Otherwise returns round(calibrated, 2).
     """
-    bid = (bucket_id or "").lower()
+    bid = (bucket_id or "").strip().lower()
     is_5h = "5h" in bid
-
-    window_start_prefix = ""
-    if reset_time:
-        try:
-            reset_dt = datetime.fromisoformat(reset_time.replace("Z", "+00:00"))
-            if is_5h:
-                start_dt = reset_dt - timedelta(hours=5)
-            else:
-                start_dt = reset_dt - timedelta(days=7)
-            # Prefix format matches both Z and +00:00 UTC formats
-            window_start_prefix = start_dt.strftime("%Y-%m-%dT%H:%M:%S")
-        except Exception:
-            window_start_prefix = ""
 
     persisted_capacity = 0.0
     try:
@@ -275,7 +333,31 @@ def calibrate_capacity(
 
     fallback_val = persisted_capacity if persisted_capacity > 0 else fallback_capacity
 
-    used_fraction = 1.0 - float(remaining_fraction)
+    if not reset_time:
+        return fallback_val
+
+    try:
+        reset_dt = datetime.fromisoformat(reset_time.replace("Z", "+00:00"))
+        if reset_dt.tzinfo is None:
+            reset_dt = reset_dt.replace(tzinfo=timezone.utc)
+        else:
+            reset_dt = reset_dt.astimezone(timezone.utc)
+
+        if is_5h:
+            start_dt = reset_dt - timedelta(hours=5)
+        else:
+            start_dt = reset_dt - timedelta(days=7)
+        # Prefix format in UTC matches steps.created_at ISO format
+        window_start_prefix = start_dt.strftime("%Y-%m-%dT%H:%M:%S")
+    except Exception:
+        return fallback_val
+
+    try:
+        rem_val = float(remaining_fraction) if remaining_fraction is not None else 1.0
+    except (ValueError, TypeError):
+        rem_val = 1.0
+
+    used_fraction = 1.0 - rem_val
     if used_fraction < 0.01:
         return fallback_val
 
@@ -283,13 +365,10 @@ def calibrate_capacity(
     total_billed_cost = 0.0
 
     try:
-        if window_start_prefix:
-            cur = conn.execute(
-                "SELECT model_name, billed_cost FROM steps WHERE created_at >= ?",
-                (window_start_prefix,),
-            )
-        else:
-            cur = conn.execute("SELECT model_name, billed_cost FROM steps")
+        cur = conn.execute(
+            "SELECT model_name, billed_cost FROM steps WHERE created_at >= ?",
+            (window_start_prefix,),
+        )
 
         for r in cur.fetchall():
             m_name = r[0] or ""
@@ -310,7 +389,7 @@ def calibrate_capacity(
 
 
 def sync_and_get_quota_state(
-    conn: sqlite3.Connection,
+    conn: sqlite3.Connection | None = None,
     force_refresh: bool = False,
     ttl_seconds: int | None = None,
     ls_fetcher: Any = None,
@@ -322,6 +401,17 @@ def sync_and_get_quota_state(
     If fetch succeeds, calibrates capacity and upserts into quota_state.
     If fetch fails, returns cached rows (even if expired) or synthesizes fallback rows.
     """
+    if conn is None:
+        from context_monitor.db import get_db_connection
+
+        with get_db_connection() as managed_conn:
+            return sync_and_get_quota_state(
+                conn=managed_conn,
+                force_refresh=force_refresh,
+                ttl_seconds=ttl_seconds,
+                ls_fetcher=ls_fetcher,
+            )
+
     if ttl_seconds is None:
         ttl_seconds = get_quota_cache_ttl()
 
@@ -337,7 +427,13 @@ def sync_and_get_quota_state(
                 all_fresh = False
                 break
             try:
-                fetched_dt = datetime.fromisoformat(str(fetched_at_str).replace("Z", "+00:00"))
+                fetched_dt = datetime.fromisoformat(
+                    str(fetched_at_str).replace("Z", "+00:00")
+                )
+                if fetched_dt.tzinfo is None:
+                    fetched_dt = fetched_dt.replace(tzinfo=timezone.utc)
+                else:
+                    fetched_dt = fetched_dt.astimezone(timezone.utc)
                 if (now - fetched_dt).total_seconds() > ttl_seconds:
                     all_fresh = False
                     break
@@ -364,7 +460,12 @@ def sync_and_get_quota_state(
             raw_payload = None
 
     if raw_payload and isinstance(raw_payload, dict):
-        groups = raw_payload.get("response", {}).get("groups", [])
+        response_data = (
+            raw_payload.get("response")
+            if isinstance(raw_payload.get("response"), dict)
+            else raw_payload
+        )
+        groups = response_data.get("groups", [])
         rows_to_upsert = []
         now_iso = datetime.now(timezone.utc).isoformat()
 
@@ -375,7 +476,15 @@ def sync_and_get_quota_state(
                 if not bucket_id:
                     continue
                 window = b.get("window", "")
-                rem_frac = float(b.get("remainingFraction", b.get("remaining_fraction", 1.0)))
+                raw_rem = (
+                    b.get("remainingFraction")
+                    if b.get("remainingFraction") is not None
+                    else b.get("remaining_fraction", 1.0)
+                )
+                try:
+                    rem_frac = float(raw_rem) if raw_rem is not None else 1.0
+                except (ValueError, TypeError):
+                    rem_frac = 1.0
                 reset_time = b.get("resetTime") or b.get("reset_time") or ""
                 fallback_cap = _get_default_capacity(bucket_id)
 
@@ -387,15 +496,17 @@ def sync_and_get_quota_state(
                     fallback_capacity=fallback_cap,
                 )
 
-                rows_to_upsert.append({
-                    "bucket_id": bucket_id,
-                    "group_name": group_name,
-                    "window": window,
-                    "remaining_fraction": rem_frac,
-                    "reset_time": reset_time,
-                    "calibrated_capacity": calibrated,
-                    "fetched_at": now_iso,
-                })
+                rows_to_upsert.append(
+                    {
+                        "bucket_id": bucket_id,
+                        "group_name": group_name,
+                        "window": window,
+                        "remaining_fraction": rem_frac,
+                        "reset_time": reset_time,
+                        "calibrated_capacity": calibrated,
+                        "fetched_at": now_iso,
+                    }
+                )
 
         if rows_to_upsert:
             upsert_quota_state(conn, rows_to_upsert)
@@ -445,9 +556,14 @@ def sync_and_get_quota_state(
             "fetched_at": now_iso,
         },
     ]
-    upsert_quota_state(conn, fallback_rows)
-    fresh_rows = get_quota_state(conn)
-    return QuotaStateList(fresh_rows)
+    try:
+        upsert_quota_state(conn, fallback_rows)
+        fresh_rows = get_quota_state(conn)
+        if fresh_rows:
+            return QuotaStateList(fresh_rows)
+    except Exception:
+        pass
+    return QuotaStateList(fallback_rows)
 
 
 def calculate_quota_metrics(
@@ -457,26 +573,40 @@ def calculate_quota_metrics(
     *,
     thread_cost: float | None = None,
     model_name: str | None = None,
+    billed_cost: float | None = None,
 ) -> dict[str, Any]:
     """
     Calculates percentage of weekly and 5-hour quota consumed by a turn and thread.
 
-    Supports two calling conventions:
+    Supports multiple calling conventions:
     1. calculate_quota_metrics(turn_cost: float, thread_cost: float, quota_state: list[dict])
     2. calculate_quota_metrics(billed_cost: float, model_name: str, quota_state: dict[str, dict])
+    3. Keyword arguments: billed_cost=..., model_name=..., quota_state=...
 
     Returns:
         dict containing per-bucket metrics ('gemini-weekly', 'gemini-5h', '3p-weekly', '3p-5h')
         as well as top-level convenience keys ('weekly_pct', 'five_hour_pct', 'weekly_remaining_pct', etc.)
     """
+    if billed_cost is not None:
+        turn_cost = billed_cost
+
+    # If quota_state was passed as model_name string (e.g. calculate_quota_metrics(turn, thread, "Gemini Pro"))
+    if isinstance(quota_state, str):
+        eff_model = quota_state
+        quota_state = None
+    else:
+        eff_model = model_name or "Gemini 3.8 Flash (High)"
+
     if isinstance(thread_cost_or_model, str):
         billed_val = float(turn_cost)
         eff_model = thread_cost_or_model
         eff_thread_cost = thread_cost if thread_cost is not None else billed_val
     else:
         billed_val = float(turn_cost)
-        eff_thread_cost = float(thread_cost_or_model) if thread_cost is None else float(thread_cost)
-        eff_model = model_name or "Gemini 3.8 Flash (High)"
+        if thread_cost is not None:
+            eff_thread_cost = float(thread_cost)
+        else:
+            eff_thread_cost = float(thread_cost_or_model)
 
     state_by_bucket: dict[str, dict] = {}
     if quota_state is not None:
@@ -484,18 +614,30 @@ def calculate_quota_metrics(
             state_by_bucket = quota_state
         elif isinstance(quota_state, list):
             for item in quota_state:
-                if isinstance(item, dict) and "bucket_id" in item:
-                    state_by_bucket[item["bucket_id"]] = item
+                if isinstance(item, dict):
+                    bid = item.get("bucket_id") or item.get("bucketId")
+                    if bid:
+                        state_by_bucket[bid] = item
 
     standard_buckets = ["gemini-weekly", "gemini-5h", "3p-weekly", "3p-5h"]
     bucket_metrics = {}
 
     for bid in standard_buckets:
         b = state_by_bucket.get(bid, {})
-        cap = float(b.get("calibrated_capacity") or _get_default_capacity(bid))
-        rem_frac = float(b.get("remaining_fraction", 1.0))
+        cap_val = (
+            b.get("calibrated_capacity")
+            if b.get("calibrated_capacity") is not None
+            else b.get("calibratedCapacity")
+        )
+        cap = float(cap_val or _get_default_capacity(bid))
+        rem_frac_val = (
+            b.get("remaining_fraction")
+            if b.get("remaining_fraction") is not None
+            else b.get("remainingFraction", 1.0)
+        )
+        rem_frac = float(rem_frac_val if rem_frac_val is not None else 1.0)
         rem_pct = round(rem_frac * 100.0, 2)
-        r_time = str(b.get("reset_time") or "")
+        r_time = str(b.get("reset_time") or b.get("resetTime") or "")
 
         t_pct = round((billed_val / cap) * 100.0, 4) if cap > 0 else 0.0
         th_pct = round((eff_thread_cost / cap) * 100.0, 4) if cap > 0 else 0.0
@@ -525,7 +667,6 @@ def calculate_quota_metrics(
         "gemini-5h": bucket_metrics["gemini-5h"],
         "3p-weekly": bucket_metrics["3p-weekly"],
         "3p-5h": bucket_metrics["3p-5h"],
-
         # Model-routed top-level convenience metrics
         "model_name": eff_model,
         "pricing_key": pkey,
@@ -536,6 +677,8 @@ def calculate_quota_metrics(
         "five_hour_pct": five_h_m["turn_pct"],
         "thread_weekly_pct": weekly_m["thread_pct"],
         "thread_5h_pct": five_h_m["thread_pct"],
+        "session_weekly_pct": weekly_m["thread_pct"],
+        "session_5h_pct": five_h_m["thread_pct"],
         "weekly_remaining_pct": weekly_m["quota_remaining_pct"],
         "five_hour_remaining_pct": five_h_m["quota_remaining_pct"],
         "weekly_reset_time": weekly_m["reset_time"],
@@ -557,29 +700,39 @@ def format_reset_countdown(reset_time_iso: str, now: datetime | None = None) -> 
         return ""
     try:
         reset_dt = datetime.fromisoformat(reset_time_iso.replace("Z", "+00:00"))
+        if reset_dt.tzinfo is None:
+            reset_dt = reset_dt.replace(tzinfo=timezone.utc)
+        else:
+            reset_dt = reset_dt.astimezone(timezone.utc)
+
+        if now is None:
+            now_dt = datetime.now(timezone.utc)
+        elif now.tzinfo is None:
+            now_dt = now.replace(tzinfo=timezone.utc)
+        else:
+            now_dt = now.astimezone(timezone.utc)
+
+        diff_seconds = int((reset_dt - now_dt).total_seconds())
+        if diff_seconds <= 0:
+            return "0m"
+
+        days = diff_seconds // 86400
+        hours = (diff_seconds % 86400) // 3600
+        minutes = (diff_seconds % 3600) // 60
+
+        if days > 0:
+            return f"{days}d {hours}h"
+        if hours > 0:
+            return f"{hours}h {minutes}m"
+        return f"{max(1, minutes)}m"
     except Exception:
         return ""
 
-    if now is None:
-        now = datetime.now(timezone.utc)
-    elif now.tzinfo is None:
-        now = now.replace(tzinfo=timezone.utc)
 
-    diff_seconds = int((reset_dt - now).total_seconds())
-    if diff_seconds <= 0:
-        return "0m"
-
-    days = diff_seconds // 86400
-    hours = (diff_seconds % 86400) // 3600
-    minutes = (diff_seconds % 3600) // 60
-
-    if days > 0:
-        return f"{days}d {hours}h"
-    if hours > 0:
-        return f"{hours}h {minutes}m"
-    return f"{max(1, minutes)}m"
-
-
-def format_quota_pct(pct: float, precision: int = 2) -> str:
+def format_quota_pct(pct: float | None, precision: int = 2) -> str:
     """Formats percentage float as string: e.g. 0.31 -> '0.31%'."""
-    return f"{pct:.{precision}f}%"
+    try:
+        val = float(pct if pct is not None else 0.0)
+    except (ValueError, TypeError):
+        val = 0.0
+    return f"{val:.{precision}f}%"

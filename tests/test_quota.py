@@ -74,12 +74,16 @@ def test_discover_language_server_credentials_mock(tmp_path: Path):
     assert token == "test-token-abcd-1234"
 
 
-def test_discover_language_server_credentials_env_overrides(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_discover_language_server_credentials_env_overrides(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
     """Verifies environment variables AGY_HTTP_PORT and AGY_CSRF_TOKEN take precedence."""
     monkeypatch.setenv("AGY_HTTP_PORT", "55555")
     monkeypatch.setenv("AGY_CSRF_TOKEN", "env-csrf-token-999")
 
-    port, token = discover_language_server_credentials(log_path=tmp_path / "nonexistent.log")
+    port, token = discover_language_server_credentials(
+        log_path=tmp_path / "nonexistent.log"
+    )
     assert port == 55555
     assert token == "env-csrf-token-999"
 
@@ -87,8 +91,12 @@ def test_discover_language_server_credentials_env_overrides(tmp_path: Path, monk
 def test_discover_language_server_missing_process_or_log(tmp_path: Path):
     """Verifies graceful handling when process or log is missing."""
     with patch("subprocess.run") as mock_run:
-        mock_run.return_value = MagicMock(returncode=0, stdout="  PID COMMAND\n123 /bin/other\n")
-        port, token = discover_language_server_credentials(log_path=tmp_path / "nonexistent.log")
+        mock_run.return_value = MagicMock(
+            returncode=0, stdout="  PID COMMAND\n123 /bin/other\n"
+        )
+        port, token = discover_language_server_credentials(
+            log_path=tmp_path / "nonexistent.log"
+        )
     assert port is None
     assert token is None
 
@@ -106,7 +114,9 @@ def test_discover_language_server_large_log_reads_backward(tmp_path: Path):
         f.write(b"ERROR: logging before google.Init: startup complete\n")
 
     with patch("subprocess.run") as mock_run:
-        mock_run.return_value = MagicMock(returncode=0, stdout="language_server --csrf_token tok-1")
+        mock_run.return_value = MagicMock(
+            returncode=0, stdout="language_server --csrf_token tok-1"
+        )
         port, token = discover_language_server_credentials(log_path=log_file)
 
     assert port == 56789
@@ -138,12 +148,17 @@ def test_fetch_raw_quota_summary_success():
     mock_resp.__enter__.return_value = mock_resp
 
     with patch("urllib.request.urlopen", return_value=mock_resp) as mock_urlopen:
-        result = fetch_raw_quota_summary(port=56421, csrf_token="test-token", timeout=1.5)
+        result = fetch_raw_quota_summary(
+            port=56421, csrf_token="test-token", timeout=1.5
+        )
 
     assert result == fake_json
     mock_urlopen.assert_called_once()
     req = mock_urlopen.call_args[0][0]
-    assert req.full_url == "http://127.0.0.1:56421/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary"
+    assert (
+        req.full_url
+        == "http://127.0.0.1:56421/exa.language_server_pb.LanguageServerService/RetrieveUserQuotaSummary"
+    )
     assert req.headers["X-codeium-csrf-token"] == "test-token"
     assert req.headers["Content-type"] == "application/json"
 
@@ -156,7 +171,10 @@ def test_fetch_raw_quota_summary_timeout_and_error():
     assert res is None
 
     # Test URLError
-    with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("Connection refused")):
+    with patch(
+        "urllib.request.urlopen",
+        side_effect=urllib.error.URLError("Connection refused"),
+    ):
         res = fetch_raw_quota_summary(port=56421, csrf_token="test-token", timeout=1.5)
     assert res is None
 
@@ -175,7 +193,9 @@ def test_calibration_from_db_and_concurrency_isolation(tmp_path: Path):
     db_file = tmp_path / "test_cal.db"
     init_db(db_file)
     conn = get_db_connection(db_file)
-    conn.execute("INSERT INTO conversations (id, title, model_name) VALUES ('c1', 'T1', 'Gemini 3.8 Flash (High)')")
+    conn.execute(
+        "INSERT INTO conversations (id, title, model_name) VALUES ('c1', 'T1', 'Gemini 3.8 Flash (High)')"
+    )
     conn.execute("""
         INSERT INTO steps (conversation_id, step_index, created_at, step_type, model_name, billed_cost)
         VALUES ('c1', 1, '2026-10-14T10:00:00Z', 'PLANNER_RESPONSE', 'Gemini 3.8 Flash (High)', 43.8064)
@@ -208,7 +228,9 @@ def test_calibration_from_db_and_concurrency_isolation(tmp_path: Path):
         }
     }
 
-    state = sync_and_get_quota_state(conn, force_refresh=True, ls_fetcher=lambda: mock_ls_payload)
+    state = sync_and_get_quota_state(
+        conn, force_refresh=True, ls_fetcher=lambda: mock_ls_payload
+    )
     assert abs(state["gemini-weekly"]["calibrated_capacity"] - 672.0) < 0.5
 
     # Thread A with $0.672 cost = 0.1% of weekly quota
@@ -241,8 +263,12 @@ def test_near_zero_reset_uses_fallback_capacity(tmp_path: Path):
             ]
         }
     }
-    state = sync_and_get_quota_state(conn, force_refresh=True, ls_fetcher=lambda: mock_fresh_reset)
-    assert state["gemini-weekly"]["calibrated_capacity"] == DEFAULT_GEMINI_WEEKLY_CAPACITY
+    state = sync_and_get_quota_state(
+        conn, force_refresh=True, ls_fetcher=lambda: mock_fresh_reset
+    )
+    assert (
+        state["gemini-weekly"]["calibrated_capacity"] == DEFAULT_GEMINI_WEEKLY_CAPACITY
+    )
     conn.close()
 
 
@@ -251,7 +277,9 @@ def test_low_billed_cost_uses_fallback_capacity(tmp_path: Path):
     db_file = tmp_path / "test_low_cost.db"
     init_db(db_file)
     conn = get_db_connection(db_file)
-    conn.execute("INSERT INTO conversations (id, title, model_name) VALUES ('c1', 'T1', 'Gemini 3.8 Flash')")
+    conn.execute(
+        "INSERT INTO conversations (id, title, model_name) VALUES ('c1', 'T1', 'Gemini 3.8 Flash')"
+    )
     # Only $0.20 cost (< $0.50 threshold)
     conn.execute("""
         INSERT INTO steps (conversation_id, step_index, created_at, step_type, model_name, billed_cost)
@@ -277,15 +305,20 @@ def test_calibration_preserves_existing_calibrated_capacity(tmp_path: Path):
     conn = get_db_connection(db_file)
 
     # Seed quota_state with an already calibrated capacity of $800.00
-    upsert_quota_state(conn, [{
-        "bucket_id": "gemini-weekly",
-        "group_name": "Gemini Models",
-        "window": "weekly",
-        "remaining_fraction": 0.50,
-        "reset_time": "2026-10-14T00:00:00Z",
-        "calibrated_capacity": 800.0,
-        "fetched_at": "2026-10-14T00:00:00Z",
-    }])
+    upsert_quota_state(
+        conn,
+        [
+            {
+                "bucket_id": "gemini-weekly",
+                "group_name": "Gemini Models",
+                "window": "weekly",
+                "remaining_fraction": 0.50,
+                "reset_time": "2026-10-14T00:00:00Z",
+                "calibrated_capacity": 800.0,
+                "fetched_at": "2026-10-14T00:00:00Z",
+            }
+        ],
+    )
 
     # Fresh reset: used_fraction = 0.0001 < 0.01
     cap = calibrate_capacity(
@@ -295,7 +328,9 @@ def test_calibration_preserves_existing_calibrated_capacity(tmp_path: Path):
         reset_time="2026-10-21T00:00:00Z",
         fallback_capacity=672.0,
     )
-    assert cap == 800.0  # Preserved from previous calibration rather than falling back to 672.0
+    assert (
+        cap == 800.0
+    )  # Preserved from previous calibration rather than falling back to 672.0
     conn.close()
 
 
@@ -304,7 +339,9 @@ def test_calibration_5h_window_boundary(tmp_path: Path):
     db_file = tmp_path / "test_5h.db"
     init_db(db_file)
     conn = get_db_connection(db_file)
-    conn.execute("INSERT INTO conversations (id, title, model_name) VALUES ('c1', 'T1', 'Gemini 3.8 Flash')")
+    conn.execute(
+        "INSERT INTO conversations (id, title, model_name) VALUES ('c1', 'T1', 'Gemini 3.8 Flash')"
+    )
 
     # reset_time is 2026-10-14T15:00:00Z -> 5h window starts at 2026-10-14T10:00:00Z
     # Step 1: 09:30:00Z (outside 5h window, cost $10.00)
@@ -337,7 +374,9 @@ def test_model_family_filtering(tmp_path: Path):
     db_file = tmp_path / "test_family.db"
     init_db(db_file)
     conn = get_db_connection(db_file)
-    conn.execute("INSERT INTO conversations (id, title, model_name) VALUES ('c1', 'T1', 'Mixed')")
+    conn.execute(
+        "INSERT INTO conversations (id, title, model_name) VALUES ('c1', 'T1', 'Mixed')"
+    )
 
     # Gemini cost = $33.60
     conn.execute("""
@@ -440,61 +479,72 @@ def test_sync_and_get_quota_state_offline_fallback(tmp_path: Path):
     # 1. When DB is empty and fetch fails: returns synthesized fallback rows with default capacities
     state_empty = sync_and_get_quota_state(conn, ls_fetcher=failing_fetcher)
     assert len(state_empty) == 4
-    assert state_empty["gemini-weekly"]["calibrated_capacity"] == DEFAULT_GEMINI_WEEKLY_CAPACITY
+    assert (
+        state_empty["gemini-weekly"]["calibrated_capacity"]
+        == DEFAULT_GEMINI_WEEKLY_CAPACITY
+    )
     assert state_empty["gemini-5h"]["calibrated_capacity"] == DEFAULT_GEMINI_5H_CAPACITY
     assert state_empty["3p-weekly"]["calibrated_capacity"] == DEFAULT_3P_WEEKLY_CAPACITY
     assert state_empty["3p-5h"]["calibrated_capacity"] == DEFAULT_3P_5H_CAPACITY
 
     # 2. When DB has existing (expired) rows and fetch fails: returns existing rows without error
-    conn.execute("UPDATE quota_state SET remaining_fraction = 0.77 WHERE bucket_id = 'gemini-weekly'")
+    conn.execute(
+        "UPDATE quota_state SET remaining_fraction = 0.77 WHERE bucket_id = 'gemini-weekly'"
+    )
     past_iso = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
     conn.execute("UPDATE quota_state SET fetched_at = ?", (past_iso,))
     conn.commit()
 
-    state_cached = sync_and_get_quota_state(conn, ttl_seconds=60, ls_fetcher=failing_fetcher)
+    state_cached = sync_and_get_quota_state(
+        conn, ttl_seconds=60, ls_fetcher=failing_fetcher
+    )
     assert state_cached["gemini-weekly"]["remaining_fraction"] == 0.77
     conn.close()
 
 
 def test_calculate_quota_metrics_calling_conventions():
     """Verifies calculate_quota_metrics works with both task conventions."""
-    mock_state_list = QuotaStateList([
-        {
-            "bucket_id": "gemini-weekly",
-            "group_name": "Gemini Models",
-            "window": "weekly",
-            "remaining_fraction": 0.934,
-            "reset_time": "2026-10-21T02:27:22Z",
-            "calibrated_capacity": 672.0,
-        },
-        {
-            "bucket_id": "gemini-5h",
-            "group_name": "Gemini Models",
-            "window": "5h",
-            "remaining_fraction": 0.950,
-            "reset_time": "2026-10-14T22:36:42Z",
-            "calibrated_capacity": 236.7,
-        },
-        {
-            "bucket_id": "3p-weekly",
-            "group_name": "Claude and GPT models",
-            "window": "weekly",
-            "remaining_fraction": 1.0,
-            "reset_time": "2026-10-21T18:00:00Z",
-            "calibrated_capacity": 200.0,
-        },
-        {
-            "bucket_id": "3p-5h",
-            "group_name": "Claude and GPT models",
-            "window": "5h",
-            "remaining_fraction": 1.0,
-            "reset_time": "2026-10-14T23:00:00Z",
-            "calibrated_capacity": 70.0,
-        },
-    ])
+    mock_state_list = QuotaStateList(
+        [
+            {
+                "bucket_id": "gemini-weekly",
+                "group_name": "Gemini Models",
+                "window": "weekly",
+                "remaining_fraction": 0.934,
+                "reset_time": "2026-10-21T02:27:22Z",
+                "calibrated_capacity": 672.0,
+            },
+            {
+                "bucket_id": "gemini-5h",
+                "group_name": "Gemini Models",
+                "window": "5h",
+                "remaining_fraction": 0.950,
+                "reset_time": "2026-10-14T22:36:42Z",
+                "calibrated_capacity": 236.7,
+            },
+            {
+                "bucket_id": "3p-weekly",
+                "group_name": "Claude and GPT models",
+                "window": "weekly",
+                "remaining_fraction": 1.0,
+                "reset_time": "2026-10-21T18:00:00Z",
+                "calibrated_capacity": 200.0,
+            },
+            {
+                "bucket_id": "3p-5h",
+                "group_name": "Claude and GPT models",
+                "window": "5h",
+                "remaining_fraction": 1.0,
+                "reset_time": "2026-10-14T23:00:00Z",
+                "calibrated_capacity": 70.0,
+            },
+        ]
+    )
 
     # Convention 1: (turn_cost, thread_cost, quota_state)
-    m1 = calculate_quota_metrics(turn_cost=0.672, thread_cost_or_model=2.016, quota_state=mock_state_list)
+    m1 = calculate_quota_metrics(
+        turn_cost=0.672, thread_cost_or_model=2.016, quota_state=mock_state_list
+    )
     assert "gemini-weekly" in m1
     assert "gemini-5h" in m1
     assert "3p-weekly" in m1
@@ -554,7 +604,9 @@ def test_live_language_server_discovery():
     if token is not None:
         assert isinstance(token, str)
         assert len(token) > 10
-    if port is not None:
+        assert port is not None, (
+            "Language server is running with token, but port was not discovered from log"
+        )
         assert isinstance(port, int)
         assert port > 1024
 
@@ -563,3 +615,168 @@ def test_quota_function_aliases():
     """Verifies that backwards-compatible function aliases point to canonical functions."""
     assert discover_language_server is discover_language_server_credentials
     assert fetch_live_quota_from_ls is fetch_raw_quota_summary
+
+
+def test_quota_state_list_dict_interface():
+    """Verifies that QuotaStateList supports dictionary membership, methods, and list indexing."""
+    qs = QuotaStateList(
+        [
+            {"bucket_id": "gemini-weekly", "calibrated_capacity": 672.0},
+            {"bucket_id": "gemini-5h", "calibrated_capacity": 236.7},
+        ]
+    )
+    # Dict membership and retrieval
+    assert "gemini-weekly" in qs
+    assert "gemini-5h" in qs
+    assert "3p-weekly" not in qs
+    assert qs["gemini-weekly"]["calibrated_capacity"] == 672.0
+    assert qs.get("gemini-weekly")["calibrated_capacity"] == 672.0
+    assert qs.get("3p-weekly", "fallback") == "fallback"
+
+    # List indexing
+    assert qs[0]["bucket_id"] == "gemini-weekly"
+    assert qs.get(0)["bucket_id"] == "gemini-weekly"
+    assert qs.get(99, None) is None
+
+    # Dict methods
+    assert list(qs.keys()) == ["gemini-weekly", "gemini-5h"]
+    assert len(list(qs.values())) == 2
+    items = list(qs.items())
+    assert items[0][0] == "gemini-weekly"
+    assert items[1][0] == "gemini-5h"
+    d = qs.to_dict()
+    assert isinstance(d, dict)
+    assert "gemini-weekly" in d
+
+
+def test_calculate_quota_metrics_keyword_args_and_robustness():
+    """Verifies calculate_quota_metrics with keyword arguments, camelCase dicts, and session metrics."""
+    # Keyword arguments calling convention
+    m = calculate_quota_metrics(
+        billed_cost=0.50,
+        model_name="Claude 3.7 Sonnet",
+    )
+    assert m["bucket_prefix"] == "3p"
+    assert m["turn_pct"] > 0
+    assert m["session_weekly_pct"] == m["thread_weekly_pct"]
+
+    # Positional turn + thread with string model
+    m2 = calculate_quota_metrics(0.50, 2.50, "Gemini 3.8 Flash (High)")
+    assert m2["bucket_prefix"] == "gemini"
+    assert m2["turn_pct"] > 0
+    assert m2["thread_pct"] > m2["turn_pct"]
+
+    # Raw camelCase bucket dicts from RPC
+    camel_state = [
+        {
+            "bucketId": "gemini-weekly",
+            "remainingFraction": 0.85,
+            "resetTime": "2026-10-21T02:27:22Z",
+            "calibratedCapacity": 672.0,
+        }
+    ]
+    m3 = calculate_quota_metrics(1.0, 5.0, camel_state)
+    assert m3["gemini-weekly"]["quota_remaining_pct"] == 85.0
+    assert m3["gemini-weekly"]["calibrated_capacity"] == 672.0
+
+
+def test_format_reset_countdown_and_pct_edge_cases():
+    """Verifies timezone normalization and formatting edge cases."""
+    # Naive timestamp string
+    cd1 = format_reset_countdown(
+        "2026-10-21T02:27:22",
+        now=datetime(2026, 10, 14, 2, 27, 22),
+    )
+    assert cd1 == "7d 0h"
+
+    # Timezone offset timestamp string
+    cd2 = format_reset_countdown(
+        "2026-10-21T02:27:22-05:00",
+        now=datetime(2026, 10, 14, 7, 27, 22, tzinfo=timezone.utc),
+    )
+    assert cd2 == "7d 0h"
+
+    # Invalid and empty strings
+    assert format_reset_countdown("invalid") == ""
+    assert format_reset_countdown("") == ""
+    assert format_reset_countdown(None) == ""
+
+    # format_quota_pct with None and strings
+    assert format_quota_pct(None) == "0.00%"
+    assert format_quota_pct("0.456", precision=1) == "0.5%"
+
+
+def test_calibrate_capacity_edge_cases(tmp_path: Path):
+    """Verifies that calibrate_capacity safely handles empty/invalid reset times and offsets."""
+    db_file = tmp_path / "test_cal_edges.db"
+    init_db(db_file)
+    conn = get_db_connection(db_file)
+
+    # Empty or invalid reset_time -> returns fallback capacity
+    cap1 = calibrate_capacity(conn, "gemini-weekly", 0.50, "", 672.0)
+    assert cap1 == 672.0
+    cap2 = calibrate_capacity(conn, "gemini-weekly", 0.50, "invalid-time", 672.0)
+    assert cap2 == 672.0
+
+    # None or non-numeric remaining_fraction -> treated as 1.0 (used_fraction=0 < 0.01) -> fallback
+    cap3 = calibrate_capacity(
+        conn, "gemini-weekly", None, "2026-10-21T00:00:00Z", 672.0
+    )
+    assert cap3 == 672.0
+
+    # Timezone offset string is converted to UTC to match steps
+    conn.execute(
+        "INSERT INTO conversations (id, title, model_name) VALUES ('c_tz', 'TZ', 'Gemini 3.8 Flash')"
+    )
+    # Step at 2026-10-14T07:30:00Z
+    conn.execute("""
+        INSERT INTO steps (conversation_id, step_index, created_at, step_type, model_name, billed_cost)
+        VALUES ('c_tz', 1, '2026-10-14T07:30:00Z', 'USER_MESSAGE', 'Gemini 3.8 Flash', 33.60)
+    """)
+    conn.commit()
+
+    # reset_time at 2026-10-21T03:00:00-05:00 -> in UTC: 2026-10-21T08:00:00Z
+    # 7 days earlier: 2026-10-14T08:00:00Z
+    # Step at 07:30:00Z is BEFORE the 7d window start -> should not be counted!
+    cap4 = calibrate_capacity(
+        conn,
+        "gemini-weekly",
+        0.95,
+        "2026-10-21T03:00:00-05:00",
+        672.0,
+    )
+    # Outside window -> billed cost = 0 < 0.50 -> fallback 672.0
+    assert cap4 == 672.0
+    conn.close()
+
+
+def test_sync_and_get_quota_state_default_connection_and_payload_variants(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Verifies that conn=None manages connection and raw payload without 'response' key is supported."""
+    db_file = tmp_path / "test_default_conn.db"
+    init_db(db_file)
+    monkeypatch.setattr("context_monitor.db.DEFAULT_DB_PATH", db_file)
+
+    direct_payload = {
+        "groups": [
+            {
+                "displayName": "Gemini Models",
+                "buckets": [
+                    {
+                        "bucketId": "gemini-weekly",
+                        "window": "weekly",
+                        "remainingFraction": 0.88,
+                        "resetTime": "2026-10-21T00:00:00Z",
+                    }
+                ],
+            }
+        ]
+    }
+
+    # Pass conn=None -> opens managed connection automatically
+    state = sync_and_get_quota_state(
+        conn=None, force_refresh=True, ls_fetcher=lambda: direct_payload
+    )
+    assert "gemini-weekly" in state
+    assert state["gemini-weekly"]["remaining_fraction"] == 0.88
