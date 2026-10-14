@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import socket
+import subprocess
 import threading
 import urllib.request
 from datetime import datetime, timezone
@@ -380,6 +381,13 @@ def test_dashboard_frontend_invariants():
     assert "quota_update" in js_content
     assert "renderQuotaSection" in js_content
 
+    # Token Consumption Velocity % Quota Integration
+    assert "% weekly quota capacity" in html_content
+    assert "Est. API Value ($ / % wk)" in js_content
+    assert "currentWeeklyQuotaCapacity" in js_content
+    assert "% of weekly quota" in js_content
+    assert "wk quota" in js_content
+
 
 def test_standalone_html_export_quota(test_db: Path, tmp_path: Path):
     """Verifies standalone HTML export embeds quota in STATIC_DATA and includes quota UI."""
@@ -403,3 +411,143 @@ def test_standalone_html_export_quota(test_db: Path, tmp_path: Path):
     assert '"quota":' in html
     assert "quotaGeminiWeeklyRem" in html
     assert "Subscription Quotas" in html
+
+
+def test_dashboard_velocity_chart_quota_execution():
+    """Deeply verifies velocity chart quota capacity, yCost dual axis ticks, and tooltips via Node execution."""
+    node_script = """
+    const fs = require('fs');
+    const code = fs.readFileSync('src/context_monitor/dashboard/static/script.js', 'utf8');
+
+    let capturedConfig = null;
+    let chartUpdated = false;
+    let updateMode = null;
+    const mockCanvas = { getContext: () => ({}) };
+    const mockDocument = {
+      getElementById: (id) => {
+        if (id === 'timelineChart') return mockCanvas;
+        return { textContent: '', className: '', style: {}, addEventListener: () => {} };
+      },
+      querySelectorAll: () => [],
+      addEventListener: () => {}
+    };
+
+    const mockWindow = {
+      location: { search: '' },
+      addEventListener: () => {},
+      history: { pushState: () => {} }
+    };
+
+    const mockChart = {
+      defaults: { font: {}, elements: {}, plugins: {} },
+      register: () => {}
+    };
+
+    const fn = new Function('window', 'document', 'Chart', 'lucide', `
+      let capturedConfig = null;
+      let chartUpdated = false;
+      let updateMode = null;
+      ${code.replace(
+        'function upsertChart(existingChart, canvas, config) {',
+        'function upsertChart(existingChart, canvas, config) { capturedConfig = config; return { update: (m) => { chartUpdated = true; updateMode = m; } };'
+      )}
+      return {
+        updateWeeklyQuotaCapacity,
+        renderTimelineChart,
+        getWeeklyCapacity: () => currentWeeklyQuotaCapacity,
+        getConfig: () => capturedConfig,
+        isChartUpdated: () => chartUpdated,
+        setStacked: () => { currentTimelineViewMode = 'stacked'; currentProject = 'all'; }
+      };
+    `);
+
+    const api = fn(mockWindow, mockDocument, mockChart, { createIcons: () => {} });
+
+    // Initial capacity default check
+    const defaultCap = api.getWeeklyCapacity();
+
+    // Render unstacked chart
+    api.renderTimelineChart([
+      { day: '2026-10-14', tokens: 100000, cost: 43.8, sessions: 5 }
+    ]);
+    const cfg = api.getConfig();
+    const tickFn = cfg.options.scales.yCost.ticks.callback;
+    const labelFn = cfg.options.plugins.tooltip.callbacks.label;
+
+    const ticks = {
+      zero: tickFn(0),
+      thirty: tickFn(30),
+      sixty: tickFn(60),
+      ninety: tickFn(90),
+      fractionalSmall: tickFn(2.5),
+      fractionalMed: tickFn(12.5),
+      nearInt: tickFn(29.999999999999996),
+      kilo: tickFn(1500)
+    };
+
+    const costHover = labelFn({ dataset: { label: 'Est. API Value ($)' }, raw: 43.8, dataIndex: 0 });
+    const unstackedBarHover = labelFn({ dataset: { label: 'API Tokens Consumed' }, raw: 100000, dataIndex: 0 });
+
+    // Dynamic quota update triggers timelineChart update
+    api.updateWeeklyQuotaCapacity({ buckets: { 'gemini-weekly': { calibrated_capacity: 500.0 } } });
+    const updatedCap = api.getWeeklyCapacity();
+    const tickThirtyAfterCapUpdate = tickFn(30);
+    const wasUpdated = api.isChartUpdated();
+
+    // Render stacked chart
+    api.setStacked();
+    api.renderTimelineChart([
+      { day: '2026-10-14', tokens: 100000, cost: 40.0, projects: { 'projA': 50000, 'projB': 50000 } }
+    ]);
+    const stackedCfg = api.getConfig();
+    const stackedLabelFn = stackedCfg.options.plugins.tooltip.callbacks.label;
+    const stackedFooterFn = stackedCfg.options.plugins.tooltip.callbacks.footer;
+
+    const stackedBarItemHover = stackedLabelFn({
+      dataset: { label: 'projA', stack: 'tokens_stack' },
+      raw: 50000,
+      dataIndex: 0
+    });
+    const stackedFooter = stackedFooterFn([{ dataIndex: 0 }]);
+
+    console.log(JSON.stringify({
+      defaultCap,
+      updatedCap,
+      wasUpdated,
+      axisTitle: cfg.options.scales.yCost.title.text,
+      ticks,
+      tickThirtyAfterCapUpdate,
+      costHover,
+      unstackedBarHover,
+      stackedBarItemHover,
+      stackedFooter
+    }));
+    """
+
+    res = subprocess.run(
+        ["node", "-e", node_script], capture_output=True, text=True, cwd=Path.cwd()
+    )
+    assert res.returncode == 0, f"Node script failed: {res.stderr}"
+    data = json.loads(res.stdout)
+
+    assert data["defaultCap"] == 672.0
+    assert data["updatedCap"] == 500.0
+    assert data["wasUpdated"] is True
+    assert data["axisTitle"] == "Est. API Value ($ / % wk)"
+
+    # Ticks formatting checks
+    assert data["ticks"]["zero"] == "$0 (0.0%)"
+    assert data["ticks"]["thirty"] == "$30 (4.5%)"
+    assert data["ticks"]["sixty"] == "$60 (8.9%)"
+    assert data["ticks"]["ninety"] == "$90 (13.4%)"
+    assert data["ticks"]["fractionalSmall"] == "$2.50 (0.4%)"
+    assert data["ticks"]["fractionalMed"] == "$12.50 (1.9%)"
+    assert data["ticks"]["nearInt"] == "$30 (4.5%)"
+    assert data["ticks"]["kilo"] == "$1.5k (223.2%)"
+    assert data["tickThirtyAfterCapUpdate"] == "$30 (6.0%)"
+
+    # Tooltips checks
+    assert data["costHover"] == "Est. API Value: $43.80 (6.52% of weekly quota)"
+    assert "of weekly quota" in data["unstackedBarHover"]
+    assert "50.0% · 4.00% wk quota" in data["stackedBarItemHover"]
+    assert "Total API Tokens: 100.0k (8.00% of weekly quota)" in data["stackedFooter"]

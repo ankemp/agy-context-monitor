@@ -104,6 +104,63 @@ body {
   border: 1px solid var(--border, #e0e0e0);
 }
 
+/* Cost & Quota Badge Group */
+.cost-quota-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  background: var(--secondary, #f1f3f4);
+  border: 1px solid var(--border, #e0e0e0);
+  border-radius: 999px;
+  padding: 1px 2px;
+  white-space: nowrap;
+  flex-shrink: 0;
+  user-select: none;
+}
+
+.cost-quota-group #cost-badge {
+  background: transparent;
+  border: none;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-weight: 600;
+  padding: 1px 5px 1px 6px;
+  color: var(--foreground, #1f1f1f);
+  white-space: nowrap;
+}
+
+.cost-quota-group #quota-badge {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  white-space: nowrap;
+}
+
+.cost-quota-group #quota-badge.ok {
+  background: color-mix(in srgb, #0284c7 18%, transparent);
+  color: color-mix(in srgb, #0284c7 85%, var(--foreground, #1f1f1f));
+  border-color: color-mix(in srgb, #0284c7 25%, transparent);
+}
+
+.cost-quota-group #quota-badge.secondary {
+  background: color-mix(in srgb, #0284c7 12%, transparent);
+  color: color-mix(in srgb, #0284c7 80%, var(--foreground, #1f1f1f));
+  border-color: transparent;
+}
+
+.cost-quota-group #quota-badge.warning {
+  background: color-mix(in srgb, #e37400 20%, transparent);
+  color: color-mix(in srgb, #e37400 90%, var(--foreground, #1f1f1f));
+  border-color: color-mix(in srgb, #e37400 30%, transparent);
+}
+
+.cost-quota-group #quota-badge.error {
+  background: color-mix(in srgb, #d93025 20%, transparent);
+  color: color-mix(in srgb, #d93025 90%, var(--foreground, #1f1f1f));
+  border-color: color-mix(in srgb, #d93025 30%, transparent);
+}
+
 /* Cards ------------------------------------------------------------------- */
 
 .card {

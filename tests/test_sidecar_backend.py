@@ -629,3 +629,62 @@ def test_sidecar_get_global_data_filters_older_conversations(tmp_path):
     )
     # 3P weekly cost = $2.00 + $1.00 = $3.00 => $3.00 / $200 = 1.5%
     assert abs(data["quota"]["buckets"]["3p-weekly"]["session_impact_pct"] - 1.5) < 0.01
+
+
+def test_sidecar_backend_header_meta_badges(tmp_path):
+    """Verifies that backend query data provides required fields for header cost and quota badges."""
+    db_path = tmp_path / "test_header_badges.db"
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    cur.executescript("""
+    CREATE TABLE conversations (
+        id TEXT PRIMARY KEY, title TEXT, project TEXT, model_name TEXT,
+        created_at TEXT, updated_at TEXT, total_steps INTEGER DEFAULT 0,
+        total_tokens INTEGER DEFAULT 0, billed_cost REAL DEFAULT 0.0
+    );
+    CREATE TABLE steps (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, conversation_id TEXT, step_index INTEGER,
+        category TEXT, activity TEXT, tool_or_source TEXT, est_tokens INTEGER DEFAULT 0,
+        detail TEXT, billed_cost REAL DEFAULT 0.0
+    );
+    CREATE TABLE quota_state (
+        bucket_id TEXT PRIMARY KEY, group_name TEXT, window TEXT,
+        remaining_fraction REAL, reset_time TEXT, calibrated_capacity REAL, fetched_at TEXT
+    );
+    INSERT INTO quota_state VALUES
+        ('gemini-weekly', 'Gemini Models', 'weekly', 0.90, '2026-10-21T02:27:22Z', 672.0, '2026-10-14T10:00:00Z');
+    INSERT INTO conversations VALUES
+        ('conv-badge-1', 'Badge Test', 'p', 'Gemini 3.8 Flash', '2026-10-14T10:00:00Z', '2026-10-14T10:00:00Z', 1, 1000, 3.36);
+    INSERT INTO steps VALUES
+        (1, 'conv-badge-1', 1, 'General', 'Prompt', 'User', 1000, 'Test', 3.36);
+    """)
+    conn.commit()
+    conn.close()
+
+    node_code = f"""
+    import {{ openDatabase, getSessionData, getGlobalData }} from './sidecars/panel/query.mjs';
+    const db = openDatabase('{db_path}');
+    const s = getSessionData(db, 'conv-badge-1');
+    const g = getGlobalData(db);
+    console.log(JSON.stringify({{ session: s, global: g }}));
+    """
+
+    res = subprocess.run(
+        ["node", "--input-type=module", "-e", node_code],
+        capture_output=True,
+        text=True,
+        cwd=Path.cwd(),
+    )
+    assert res.returncode == 0, f"Node script failed: {res.stderr}"
+    data = json.loads(res.stdout)
+
+    # Session mode header checks: cost $3.36, quota ~0.50% wk
+    session = data["session"]
+    assert abs(session["billed_cost"] - 3.36) < 0.01
+    assert abs(session["weekly_quota_pct"] - 0.50) < 0.01
+    assert session["quota"]["calibrated_weekly_capacity"] == 672.0
+
+    # Global mode header checks: cost $3.36, quota ~0.50% fleet
+    global_data = data["global"]
+    assert abs(global_data["total_cost"] - 3.36) < 0.01
+    assert abs(global_data["weekly_quota_pct"] - 0.50) < 0.01

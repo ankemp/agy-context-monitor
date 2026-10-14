@@ -95,6 +95,26 @@
     let allToolsData = [];
     let allMcpData = [];
     let currentTimelineDays = 30;
+    let currentWeeklyQuotaCapacity = 672.0;
+
+    function updateWeeklyQuotaCapacity(quota) {
+      if (!quota) return;
+      const buckets = quota.buckets || quota;
+      const gw = buckets['gemini-weekly'] || quota['gemini-weekly'] || quota.gemini_weekly;
+      const cap = gw?.calibrated_capacity || quota.calibrated_weekly_capacity;
+      if (Number(cap) > 0) {
+        const newCap = Number(cap);
+        if (newCap !== currentWeeklyQuotaCapacity) {
+          currentWeeklyQuotaCapacity = newCap;
+          if (typeof timelineChart !== 'undefined' && timelineChart) {
+            timelineChart.update('none');
+          }
+        }
+      }
+    }
+    if (typeof STATIC_DATA !== 'undefined' && STATIC_DATA && STATIC_DATA.quota) {
+      updateWeeklyQuotaCapacity(STATIC_DATA.quota);
+    }
     let currentToolFilter = 'all';
     let currentHotFilesFilter = 'files';
     let cachedActivityMatrix = null;
@@ -340,6 +360,7 @@
 
     function renderQuotaSection(quota) {
       if (!quota) return;
+      updateWeeklyQuotaCapacity(quota);
       const buckets = quota.buckets || quota;
       const gw = buckets['gemini-weekly'] || quota['gemini-weekly'] || quota.gemini_weekly;
       const g5 = buckets['gemini-5h'] || quota['gemini-5h'] || quota.gemini_5h;
@@ -1157,23 +1178,33 @@
               callbacks: {
                 label: (ctx) => {
                   if (ctx.dataset.label === 'Est. API Value ($)') {
-                    return `Est. API Value: $${Number(ctx.raw || 0).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2})}`;
+                    const val = Number(ctx.raw || 0);
+                    const costFormatted = val.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
+                    const pct = currentWeeklyQuotaCapacity > 0 ? ((val / currentWeeklyQuotaCapacity) * 100).toFixed(2) : '0.00';
+                    return `Est. API Value: $${costFormatted} (${pct}% of weekly quota)`;
                   }
                   if (ctx.dataset.label === 'Sessions') {
                     return `Sessions: ${ctx.raw}`;
                   }
                   if (isStacked && ctx.dataset.stack === 'tokens_stack') {
                     const dayTotal = data[ctx.dataIndex]?.tokens || 0;
+                    const dayCost = data[ctx.dataIndex]?.cost || 0;
                     const pct = dayTotal > 0 ? ((ctx.raw / dayTotal) * 100).toFixed(1) : '0.0';
-                    return `${ctx.dataset.label}: ${formatTokens(ctx.raw)} (${pct}%)`;
+                    const projCost = dayTotal > 0 ? dayCost * (ctx.raw / dayTotal) : 0;
+                    const projQuotaPct = currentWeeklyQuotaCapacity > 0 ? ((projCost / currentWeeklyQuotaCapacity) * 100).toFixed(2) : '0.00';
+                    return `${ctx.dataset.label}: ${formatTokens(ctx.raw)} (${pct}% · ${projQuotaPct}% wk quota)`;
                   }
-                  return `API Tokens: ${formatTokens(ctx.raw)}`;
+                  const dayCost = data[ctx.dataIndex]?.cost || 0;
+                  const dayQuotaPct = currentWeeklyQuotaCapacity > 0 ? ((dayCost / currentWeeklyQuotaCapacity) * 100).toFixed(2) : '0.00';
+                  return `${ctx.dataset.label || 'API Tokens'}: ${formatTokens(ctx.raw)} (${dayQuotaPct}% of weekly quota)`;
                 },
                 footer: (items) => {
                   if (!isStacked) return '';
                   const idx = items[0]?.dataIndex;
                   const dayTokens = data[idx]?.tokens || 0;
-                  return `Total API Tokens: ${formatTokens(dayTokens)}`;
+                  const dayCost = data[idx]?.cost || 0;
+                  const dayQuotaPct = currentWeeklyQuotaCapacity > 0 ? ((dayCost / currentWeeklyQuotaCapacity) * 100).toFixed(2) : '0.00';
+                  return `Total API Tokens: ${formatTokens(dayTokens)} (${dayQuotaPct}% of weekly quota)`;
                 }
               }
             }
@@ -1210,10 +1241,21 @@
               grid: { drawOnChartArea: false },
               ticks: {
                 color: '#f43f5e',
-                callback: v => '$' + (v >= 1000 ? (v / 1000).toFixed(1) + 'k' : v.toFixed(v < 10 ? 2 : 0)),
+                callback: v => {
+                  let costStr;
+                  if (v >= 1000) {
+                    costStr = '$' + (v / 1000).toFixed(1) + 'k';
+                  } else if (Math.abs(v - Math.round(v)) < 1e-4) {
+                    costStr = '$' + Math.round(v);
+                  } else {
+                    costStr = '$' + v.toFixed(2);
+                  }
+                  const pct = currentWeeklyQuotaCapacity > 0 ? ((v / currentWeeklyQuotaCapacity) * 100).toFixed(1) : '0.0';
+                  return `${costStr} (${pct}%)`;
+                },
                 font: { size: 10 }
               },
-              title: { display: true, text: 'Est. API Value', color: '#f43f5e', font: { size: 10 } }
+              title: { display: true, text: 'Est. API Value ($ / % wk)', color: '#f43f5e', font: { size: 10 } }
             }
           }
         }

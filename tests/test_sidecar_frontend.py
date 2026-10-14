@@ -40,6 +40,15 @@ def test_frontend_files_exist_and_invariants():
     assert ".bar-segment" in css, "Must support multi-segment capacity bar styling"
     assert ".tab-btn" in css, "Must support quota model family tab button styling"
     assert ".quota-bar" in css, "Must support quota bar styling"
+    assert ".cost-quota-group" in css, (
+        "Must support unified cost-quota badge group styling"
+    )
+    assert "white-space: nowrap" in css, "Must prevent badge group line breaks"
+    assert "flex-shrink: 0" in css, "Must prevent badge group squishing"
+    assert "#quota-badge" in css, "Must style quota-badge within cost-quota group"
+    assert 'class="cost-quota-group"' in html, (
+        "HTML header must contain cost-quota-group"
+    )
 
     # App JS checks: Sidecar API, multi-segment, global mode, quota, and lifecycle guards
     assert "window.sidecar" in js
@@ -173,12 +182,15 @@ def test_sidecar_frontend_render_quota_execution():
       intervals.forEach(clearTimeout);
 
       const results = {
+        costBadge: elements['cost-badge'].textContent,
         weeklyPct: elements['quota-weekly-pct'].textContent,
         weeklyPctClass: elements['quota-weekly-pct'].className,
         weeklyBarWidth: elements['quota-weekly-bar'].style.width,
         weeklyBarClass: elements['quota-weekly-bar'].className,
         sessionImpact: elements['quota-session-impact'].textContent,
         quotaBadge: elements['quota-badge'].textContent,
+        quotaBadgeTitle: elements['quota-badge'].title,
+        quotaBadgeClass: elements['quota-badge'].className,
         geminiTabSelected: elements['quota-tab-gemini'].attributes['aria-selected'],
         threepTabSelected: elements['quota-tab-3p'].attributes['aria-selected']
       };
@@ -192,6 +204,7 @@ def test_sidecar_frontend_render_quota_execution():
         weeklyBarWidth: elements['quota-weekly-bar'].style.width,
         sessionImpact: elements['quota-session-impact'].textContent,
         quotaBadge: elements['quota-badge'].textContent,
+        quotaBadgeTitle: elements['quota-badge'].title,
         geminiTabSelected: elements['quota-tab-gemini'].attributes['aria-selected'],
         threepTabSelected: elements['quota-tab-3p'].attributes['aria-selected']
       };
@@ -207,11 +220,14 @@ def test_sidecar_frontend_render_quota_execution():
     assert res.returncode == 0, f"Node DOM execution failed: {res.stderr}"
     data = json.loads(res.stdout)
 
+    assert data["costBadge"] == "$6.72"
     assert data["weeklyPct"] == "85.0% remaining"
     assert "ok" in data["weeklyBarClass"]
     assert data["weeklyBarWidth"] == "85%"
     assert data["sessionImpact"] == "1.00% session share"
     assert data["quotaBadge"] == "1.00% wk"
+    assert data["quotaBadgeTitle"] == "Session Quota Impact"
+    assert "ok" in data["quotaBadgeClass"]
     assert data["geminiTabSelected"] == "true"
     assert data["threepTabSelected"] == "false"
 
@@ -337,8 +353,11 @@ def test_sidecar_frontend_global_mode_execution():
       intervals.forEach(clearTimeout);
 
       const results = {
+        costBadge: elements['cost-badge'].textContent,
         sessionImpact: elements['quota-session-impact'].textContent,
         quotaBadge: elements['quota-badge'].textContent,
+        quotaBadgeTitle: elements['quota-badge'].title,
+        quotaBadgeClass: elements['quota-badge'].className,
         globalQuota: elements['global-quota'].textContent
       };
 
@@ -353,6 +372,9 @@ def test_sidecar_frontend_global_mode_execution():
     assert res.returncode == 0, f"Node DOM global execution failed: {res.stderr}"
     data = json.loads(res.stdout)
 
+    assert data["costBadge"] == "$13.44"
     assert "fleet total" in data["sessionImpact"]
-    assert "fleet" in data["quotaBadge"]
+    assert data["quotaBadge"] == "2.00% fleet"
+    assert data["quotaBadgeTitle"] == "Fleet Quota Impact"
+    assert "ok" in data["quotaBadgeClass"]
     assert "2.00% wk" in data["globalQuota"]
