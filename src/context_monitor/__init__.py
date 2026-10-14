@@ -4,15 +4,35 @@ Antigravity Context Monitor Package
 Real-time context window usage, token diagnostics, telemetry, and diff engine.
 """
 
-from context_monitor.db import DEFAULT_DB_PATH, get_db_connection, init_db
+from context_monitor.db import (
+    DEFAULT_DB_PATH,
+    get_db_connection,
+    get_quota_state,
+    init_db,
+    upsert_quota_state,
+)
 from context_monitor.diff import DiffResult, diff_block_lists, get_turn_diff_from_db
 from context_monitor.formats import BlockParser, BlockType, ContentBlock
 from context_monitor.html_report import generate_html_report
+from context_monitor.quota import (
+    QuotaStateList,
+    calculate_quota_metrics,
+    calibrate_capacity,
+    discover_language_server,
+    discover_language_server_credentials,
+    fetch_live_quota_from_ls,
+    fetch_raw_quota_summary,
+    format_quota_pct,
+    format_reset_countdown,
+    sync_and_get_quota_state,
+)
 
 __all__ = [
     "DEFAULT_DB_PATH",
     "get_db_connection",
     "init_db",
+    "upsert_quota_state",
+    "get_quota_state",
     "BlockParser",
     "BlockType",
     "ContentBlock",
@@ -20,4 +40,14 @@ __all__ = [
     "diff_block_lists",
     "get_turn_diff_from_db",
     "generate_html_report",
+    "QuotaStateList",
+    "calculate_quota_metrics",
+    "calibrate_capacity",
+    "discover_language_server",
+    "discover_language_server_credentials",
+    "fetch_live_quota_from_ls",
+    "fetch_raw_quota_summary",
+    "format_quota_pct",
+    "format_reset_countdown",
+    "sync_and_get_quota_state",
 ]
