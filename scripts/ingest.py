@@ -808,341 +808,343 @@ def sync_to_sqlite(cid: str, model_name: str, analysis: dict):
             with conn:
                 cur = conn.cursor()
 
-            # Query existing blocks BEFORE deleting them to compute turn diff
-            prev_blocks = cur.execute(
-                """
-                SELECT step_index, block_type, content, block_hash, call_id
-                FROM transcript_blocks
-                WHERE conversation_id = ?
-                ORDER BY step_index ASC, id ASC
-            """,
-                (cid,),
-            ).fetchall()
+                # Query existing blocks BEFORE deleting them to compute turn diff
+                prev_blocks = cur.execute(
+                    """
+                    SELECT step_index, block_type, content, block_hash, call_id
+                    FROM transcript_blocks
+                    WHERE conversation_id = ?
+                    ORDER BY step_index ASC, id ASC
+                """,
+                    (cid,),
+                ).fetchall()
 
-            curr_blocks = analysis.get("parsed_blocks", [])
-            if curr_blocks and prev_blocks:
-                diff_res = diff_block_lists(prev_blocks, curr_blocks)
-            elif curr_blocks:
-                diff_res = diff_block_lists([], curr_blocks)
+                curr_blocks = analysis.get("parsed_blocks", [])
+                if curr_blocks and prev_blocks:
+                    diff_res = diff_block_lists(prev_blocks, curr_blocks)
+                elif curr_blocks:
+                    diff_res = diff_block_lists([], curr_blocks)
 
-            active_model = analysis.get("latest_model", model_name)
-            parent_id = analysis.get("parent_id")
-            subagent_role = analysis.get("subagent_role")
-            subagent_type = analysis.get("subagent_type")
-            invoking_step = analysis.get("invoking_step_index")
-            root_id = cid
-            depth = 0
+                active_model = analysis.get("latest_model", model_name)
+                parent_id = analysis.get("parent_id")
+                subagent_role = analysis.get("subagent_role")
+                subagent_type = analysis.get("subagent_type")
+                invoking_step = analysis.get("invoking_step_index")
+                root_id = cid
+                depth = 0
 
-            # Check if an existing row already has lineage from a parent's dispatch
-            existing = cur.execute(
-                "SELECT parent_id, root_id, depth, subagent_role, subagent_type, invoking_step_index, project, title, compaction_count, pruned_tokens FROM conversations WHERE id = ?",
-                (cid,),
-            ).fetchone()
-
-            comp_count = 0
-            pruned_toks = 0
-            if existing:
-                try:
-                    comp_count = existing["compaction_count"] or 0
-                except (IndexError, KeyError):
-                    comp_count = 0
-                try:
-                    pruned_toks = existing["pruned_tokens"] or 0
-                except (IndexError, KeyError):
-                    pruned_toks = 0
-                if not parent_id and existing["parent_id"]:
-                    parent_id = existing["parent_id"]
-                if not subagent_role and existing["subagent_role"]:
-                    subagent_role = existing["subagent_role"]
-                if not subagent_type and existing["subagent_type"]:
-                    subagent_type = existing["subagent_type"]
-                if (
-                    invoking_step is None
-                    and existing["invoking_step_index"] is not None
-                ):
-                    invoking_step = existing["invoking_step_index"]
-
-            if diff_res and diff_res.compaction_detected:
-                comp_count += 1
-                pruned_toks += diff_res.removed_tokens
-
-            if parent_id and not analysis.get("parent_id"):
-                analysis["parent_id"] = parent_id
-            if subagent_role and not analysis.get("subagent_role"):
-                analysis["subagent_role"] = subagent_role
-
-            if parent_id:
-                p_row = cur.execute(
-                    "SELECT id, root_id, project, depth, title FROM conversations WHERE id = ?",
-                    (parent_id,),
+                # Check if an existing row already has lineage from a parent's dispatch
+                existing = cur.execute(
+                    "SELECT parent_id, root_id, depth, subagent_role, subagent_type, invoking_step_index, project, title, compaction_count, pruned_tokens FROM conversations WHERE id = ?",
+                    (cid,),
                 ).fetchone()
-                if p_row:
-                    root_id = p_row["root_id"] or p_row["id"]
-                    depth = (p_row["depth"] or 0) + 1
-                    if not analysis.get("project") and p_row["project"]:
-                        analysis["project"] = p_row["project"]
+
+                comp_count = 0
+                pruned_toks = 0
+                if existing:
+                    try:
+                        comp_count = existing["compaction_count"] or 0
+                    except (IndexError, KeyError):
+                        comp_count = 0
+                    try:
+                        pruned_toks = existing["pruned_tokens"] or 0
+                    except (IndexError, KeyError):
+                        pruned_toks = 0
+                    if not parent_id and existing["parent_id"]:
+                        parent_id = existing["parent_id"]
+                    if not subagent_role and existing["subagent_role"]:
+                        subagent_role = existing["subagent_role"]
+                    if not subagent_type and existing["subagent_type"]:
+                        subagent_type = existing["subagent_type"]
                     if (
-                        not analysis.get("title")
-                        or analysis["title"] in ("Active Session", "")
-                    ) and p_row["title"]:
-                        role_label = subagent_role or "Worker"
-                        clean_p_title = p_row["title"]
-                        m_sub = re.match(r"^\[.+?\]\s*(.+)", clean_p_title)
-                        if m_sub:
-                            clean_p_title = m_sub.group(1)
-                        analysis["title"] = f"[{role_label}] {clean_p_title[:90]}"
+                        invoking_step is None
+                        and existing["invoking_step_index"] is not None
+                    ):
+                        invoking_step = existing["invoking_step_index"]
+
+                if diff_res and diff_res.compaction_detected:
+                    comp_count += 1
+                    pruned_toks += diff_res.removed_tokens
+
+                if parent_id and not analysis.get("parent_id"):
+                    analysis["parent_id"] = parent_id
+                if subagent_role and not analysis.get("subagent_role"):
+                    analysis["subagent_role"] = subagent_role
+
+                if parent_id:
+                    p_row = cur.execute(
+                        "SELECT id, root_id, project, depth, title FROM conversations WHERE id = ?",
+                        (parent_id,),
+                    ).fetchone()
+                    if p_row:
+                        root_id = p_row["root_id"] or p_row["id"]
+                        depth = (p_row["depth"] or 0) + 1
+                        if not analysis.get("project") and p_row["project"]:
+                            analysis["project"] = p_row["project"]
+                        if (
+                            not analysis.get("title")
+                            or analysis["title"] in ("Active Session", "")
+                        ) and p_row["title"]:
+                            role_label = subagent_role or "Worker"
+                            clean_p_title = p_row["title"]
+                            m_sub = re.match(r"^\[.+?\]\s*(.+)", clean_p_title)
+                            if m_sub:
+                                clean_p_title = m_sub.group(1)
+                            analysis["title"] = f"[{role_label}] {clean_p_title[:90]}"
+                    else:
+                        root_id = parent_id
+                        depth = 1
+
+                models_used_list = analysis.get("models_used", [])
+                model_transitions = analysis.get("model_transitions", [])
+                if not models_used_list and active_model:
+                    models_used_list = [active_model]
+                if not model_transitions:
+                    model_transitions = models_used_list
+
+                if len(model_transitions) > 1:
+                    if len(model_transitions) <= 3:
+                        conv_model_name = " → ".join(model_transitions)
+                    else:
+                        conv_model_name = (
+                            f"{model_transitions[0]} → ... → {model_transitions[-1]}"
+                        )
+                    models_used_str = ", ".join(models_used_list)
+                elif models_used_list:
+                    conv_model_name = models_used_list[0]
+                    models_used_str = models_used_list[0]
                 else:
-                    root_id = parent_id
-                    depth = 1
+                    conv_model_name = active_model
+                    models_used_str = active_model
 
-            models_used_list = analysis.get("models_used", [])
-            model_transitions = analysis.get("model_transitions", [])
-            if not models_used_list and active_model:
-                models_used_list = [active_model]
-            if not model_transitions:
-                model_transitions = models_used_list
-
-            if len(model_transitions) > 1:
-                if len(model_transitions) <= 3:
-                    conv_model_name = " → ".join(model_transitions)
-                else:
-                    conv_model_name = (
-                        f"{model_transitions[0]} → ... → {model_transitions[-1]}"
-                    )
-                models_used_str = ", ".join(models_used_list)
-            elif models_used_list:
-                conv_model_name = models_used_list[0]
-                models_used_str = models_used_list[0]
-            else:
-                conv_model_name = active_model
-                models_used_str = active_model
-
-            # Upsert conversation record with hierarchy and compaction columns
-            conn.execute(
-                """
-                INSERT INTO conversations (
-                    id, title, project, model_name, models_used, created_at, updated_at, total_steps, total_characters, total_tokens,
-                    duration_seconds, active_agent_seconds, active_pairing_seconds, thinking_tokens,
-                    user_prompts, tool_calls_count, redundant_file_reads, lines_written, lines_edited, failed_tool_calls,
-                    billed_cost, billed_input_tokens, billed_output_tokens,
-                    parent_id, root_id, depth, subagent_role, subagent_type, invoking_step_index,
-                    compaction_count, pruned_tokens
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
-                    title = excluded.title,
-                    project = COALESCE(excluded.project, conversations.project),
-                    model_name = excluded.model_name,
-                    models_used = excluded.models_used,
-                    updated_at = excluded.updated_at,
-                    total_steps = excluded.total_steps,
-                    total_characters = excluded.total_characters,
-                    total_tokens = excluded.total_tokens,
-                    duration_seconds = excluded.duration_seconds,
-                    active_agent_seconds = excluded.active_agent_seconds,
-                    active_pairing_seconds = excluded.active_pairing_seconds,
-                    thinking_tokens = excluded.thinking_tokens,
-                    user_prompts = excluded.user_prompts,
-                    tool_calls_count = excluded.tool_calls_count,
-                    redundant_file_reads = excluded.redundant_file_reads,
-                    lines_written = excluded.lines_written,
-                    lines_edited = excluded.lines_edited,
-                    failed_tool_calls = excluded.failed_tool_calls,
-                    billed_cost = excluded.billed_cost,
-                    billed_input_tokens = excluded.billed_input_tokens,
-                    billed_output_tokens = excluded.billed_output_tokens,
-                    parent_id = COALESCE(excluded.parent_id, conversations.parent_id),
-                    root_id = COALESCE(excluded.root_id, conversations.root_id),
-                    depth = CASE WHEN excluded.parent_id IS NOT NULL THEN excluded.depth ELSE conversations.depth END,
-                    subagent_role = COALESCE(excluded.subagent_role, conversations.subagent_role),
-                    subagent_type = COALESCE(excluded.subagent_type, conversations.subagent_type),
-                    invoking_step_index = COALESCE(excluded.invoking_step_index, conversations.invoking_step_index),
-                    compaction_count = excluded.compaction_count,
-                    pruned_tokens = excluded.pruned_tokens
-            """,
-                (
-                    cid,
-                    analysis["title"],
-                    analysis.get("project"),
-                    conv_model_name,
-                    models_used_str,
-                    analysis["start_time"] or datetime.now().isoformat(),
-                    analysis["end_time"] or datetime.now().isoformat(),
-                    len(analysis["steps"]),
-                    analysis["total_chars"],
-                    analysis["total_tokens"],
-                    analysis["duration_seconds"],
-                    analysis.get("active_agent_seconds", 0.0),
-                    analysis.get("active_pairing_seconds", 0.0),
-                    analysis.get("thinking_tokens", 0),
-                    analysis.get("user_prompts", 0),
-                    analysis.get("tool_calls_count", 0),
-                    analysis.get("redundant_file_reads", 0),
-                    analysis.get("lines_written", 0),
-                    analysis.get("lines_edited", 0),
-                    analysis.get("failed_tool_calls", 0),
-                    analysis.get("billed_cost", 0.0),
-                    analysis.get("billed_input_tokens", 0),
-                    analysis.get("billed_output_tokens", 0),
-                    parent_id,
-                    root_id,
-                    depth,
-                    subagent_role,
-                    subagent_type,
-                    invoking_step,
-                    comp_count,
-                    pruned_toks,
-                ),
-            )
-
-            # Upsert dispatched subagents so child rows have lineage right away
-            for child in analysis.get("dispatched_subagents", []):
-                ch_id = child["id"]
-                ch_role = child.get("role")
-                ch_type = child.get("type")
-                ch_step = child.get("step_index")
-                clean_t = analysis["title"]
-                m_sub = re.match(r"^\[.+?\]\s*(.+)", clean_t)
-                if m_sub:
-                    clean_t = m_sub.group(1)
-                ch_title = f"[{ch_role}] {clean_t[:90]}"
-
+                # Upsert conversation record with hierarchy and compaction columns
                 conn.execute(
                     """
                     INSERT INTO conversations (
-                        id, title, project, parent_id, root_id, depth, subagent_role, subagent_type, invoking_step_index
+                        id, title, project, model_name, models_used, created_at, updated_at, total_steps, total_characters, total_tokens,
+                        duration_seconds, active_agent_seconds, active_pairing_seconds, thinking_tokens,
+                        user_prompts, tool_calls_count, redundant_file_reads, lines_written, lines_edited, failed_tool_calls,
+                        billed_cost, billed_input_tokens, billed_output_tokens,
+                        parent_id, root_id, depth, subagent_role, subagent_type, invoking_step_index,
+                        compaction_count, pruned_tokens
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(id) DO UPDATE SET
-                        parent_id = excluded.parent_id,
-                        root_id = excluded.root_id,
-                        depth = excluded.depth,
+                        title = excluded.title,
+                        project = COALESCE(excluded.project, conversations.project),
+                        model_name = excluded.model_name,
+                        models_used = excluded.models_used,
+                        updated_at = excluded.updated_at,
+                        total_steps = excluded.total_steps,
+                        total_characters = excluded.total_characters,
+                        total_tokens = excluded.total_tokens,
+                        duration_seconds = excluded.duration_seconds,
+                        active_agent_seconds = excluded.active_agent_seconds,
+                        active_pairing_seconds = excluded.active_pairing_seconds,
+                        thinking_tokens = excluded.thinking_tokens,
+                        user_prompts = excluded.user_prompts,
+                        tool_calls_count = excluded.tool_calls_count,
+                        redundant_file_reads = excluded.redundant_file_reads,
+                        lines_written = excluded.lines_written,
+                        lines_edited = excluded.lines_edited,
+                        failed_tool_calls = excluded.failed_tool_calls,
+                        billed_cost = excluded.billed_cost,
+                        billed_input_tokens = excluded.billed_input_tokens,
+                        billed_output_tokens = excluded.billed_output_tokens,
+                        parent_id = COALESCE(excluded.parent_id, conversations.parent_id),
+                        root_id = COALESCE(excluded.root_id, conversations.root_id),
+                        depth = CASE WHEN excluded.parent_id IS NOT NULL THEN excluded.depth ELSE conversations.depth END,
                         subagent_role = COALESCE(excluded.subagent_role, conversations.subagent_role),
                         subagent_type = COALESCE(excluded.subagent_type, conversations.subagent_type),
                         invoking_step_index = COALESCE(excluded.invoking_step_index, conversations.invoking_step_index),
-                        project = COALESCE(conversations.project, excluded.project)
+                        compaction_count = excluded.compaction_count,
+                        pruned_tokens = excluded.pruned_tokens
                 """,
                     (
-                        ch_id,
-                        ch_title,
-                        analysis.get("project"),
                         cid,
+                        analysis["title"],
+                        analysis.get("project"),
+                        conv_model_name,
+                        models_used_str,
+                        analysis["start_time"] or datetime.now().isoformat(),
+                        analysis["end_time"] or datetime.now().isoformat(),
+                        len(analysis["steps"]),
+                        analysis["total_chars"],
+                        analysis["total_tokens"],
+                        analysis["duration_seconds"],
+                        analysis.get("active_agent_seconds", 0.0),
+                        analysis.get("active_pairing_seconds", 0.0),
+                        analysis.get("thinking_tokens", 0),
+                        analysis.get("user_prompts", 0),
+                        analysis.get("tool_calls_count", 0),
+                        analysis.get("redundant_file_reads", 0),
+                        analysis.get("lines_written", 0),
+                        analysis.get("lines_edited", 0),
+                        analysis.get("failed_tool_calls", 0),
+                        analysis.get("billed_cost", 0.0),
+                        analysis.get("billed_input_tokens", 0),
+                        analysis.get("billed_output_tokens", 0),
+                        parent_id,
                         root_id,
-                        depth + 1,
-                        ch_role,
-                        ch_type,
-                        ch_step,
+                        depth,
+                        subagent_role,
+                        subagent_type,
+                        invoking_step,
+                        comp_count,
+                        pruned_toks,
                     ),
                 )
 
-            # Upsert steps with step-level model_name
-            step_params = [
-                (
-                    cid,
-                    s["step_index"],
-                    s["created_at"],
-                    s["source"],
-                    s["step_type"],
-                    s["category"],
-                    s["activity"],
-                    s["tool_or_source"],
-                    s["characters"],
-                    s["est_tokens"],
-                    s.get("thinking_tokens", 0),
-                    s.get("phase", "reasoning"),
-                    s.get("model_name", active_model),
-                    s["detail"],
-                    s.get("billed_cost", 0.0),
-                    s.get("billed_input_tokens", 0),
-                    s.get("billed_output_tokens", 0),
-                )
-                for s in analysis["steps"]
-            ]
-            conn.executemany(
-                """
-                INSERT INTO steps (
-                    conversation_id, step_index, created_at, source, step_type, category, activity,
-                    tool_or_source, characters, est_tokens, thinking_tokens, phase, model_name, detail,
-                    billed_cost, billed_input_tokens, billed_output_tokens
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(conversation_id, step_index) DO UPDATE SET
-                    characters = excluded.characters,
-                    est_tokens = excluded.est_tokens,
-                    thinking_tokens = excluded.thinking_tokens,
-                    phase = excluded.phase,
-                    model_name = excluded.model_name,
-                    detail = excluded.detail,
-                    billed_cost = excluded.billed_cost,
-                    billed_input_tokens = excluded.billed_input_tokens,
-                    billed_output_tokens = excluded.billed_output_tokens
-            """,
-                step_params,
-            )
+                # Upsert dispatched subagents so child rows have lineage right away
+                for child in analysis.get("dispatched_subagents", []):
+                    ch_id = child["id"]
+                    ch_role = child.get("role")
+                    ch_type = child.get("type")
+                    ch_step = child.get("step_index")
+                    clean_t = analysis["title"]
+                    m_sub = re.match(r"^\[.+?\]\s*(.+)", clean_t)
+                    if m_sub:
+                        clean_t = m_sub.group(1)
+                    ch_title = f"[{ch_role}] {clean_t[:90]}"
 
-            # Sync tool executions
-            if analysis.get("tool_executions"):
-                conn.execute(
-                    "DELETE FROM tool_executions WHERE conversation_id = ?", (cid,)
-                )
-                tool_params = [
+                    conn.execute(
+                        """
+                        INSERT INTO conversations (
+                            id, title, project, parent_id, root_id, depth, subagent_role, subagent_type, invoking_step_index
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(id) DO UPDATE SET
+                            parent_id = excluded.parent_id,
+                            root_id = excluded.root_id,
+                            depth = excluded.depth,
+                            subagent_role = COALESCE(excluded.subagent_role, conversations.subagent_role),
+                            subagent_type = COALESCE(excluded.subagent_type, conversations.subagent_type),
+                            invoking_step_index = COALESCE(excluded.invoking_step_index, conversations.invoking_step_index),
+                            project = COALESCE(conversations.project, excluded.project)
+                    """,
+                        (
+                            ch_id,
+                            ch_title,
+                            analysis.get("project"),
+                            cid,
+                            root_id,
+                            depth + 1,
+                            ch_role,
+                            ch_type,
+                            ch_step,
+                        ),
+                    )
+
+                # Upsert steps with step-level model_name
+                step_params = [
                     (
                         cid,
-                        te["step_index"],
-                        te["tool_name"],
-                        te.get("mcp_server"),
-                        te.get("mcp_tool"),
-                        te.get("target_path"),
-                        te.get("command_line"),
-                        te.get("exit_code"),
-                        te.get("is_error", 0),
+                        s["step_index"],
+                        s["created_at"],
+                        s["source"],
+                        s["step_type"],
+                        s["category"],
+                        s["activity"],
+                        s["tool_or_source"],
+                        s["characters"],
+                        s["est_tokens"],
+                        s.get("thinking_tokens", 0),
+                        s.get("phase", "reasoning"),
+                        s.get("model_name", active_model),
+                        s["detail"],
+                        s.get("billed_cost", 0.0),
+                        s.get("billed_input_tokens", 0),
+                        s.get("billed_output_tokens", 0),
                     )
-                    for te in analysis["tool_executions"]
+                    for s in analysis["steps"]
                 ]
                 conn.executemany(
                     """
-                    INSERT INTO tool_executions (
-                        conversation_id, step_index, tool_name, mcp_server, mcp_tool,
-                        target_path, command_line, exit_code, is_error
+                    INSERT INTO steps (
+                        conversation_id, step_index, created_at, source, step_type, category, activity,
+                        tool_or_source, characters, est_tokens, thinking_tokens, phase, model_name, detail,
+                        billed_cost, billed_input_tokens, billed_output_tokens
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(conversation_id, step_index) DO UPDATE SET
+                        characters = excluded.characters,
+                        est_tokens = excluded.est_tokens,
+                        thinking_tokens = excluded.thinking_tokens,
+                        phase = excluded.phase,
+                        model_name = excluded.model_name,
+                        detail = excluded.detail,
+                        billed_cost = excluded.billed_cost,
+                        billed_input_tokens = excluded.billed_input_tokens,
+                        billed_output_tokens = excluded.billed_output_tokens
                 """,
-                    tool_params,
+                    step_params,
                 )
 
-            # Sync transcript blocks
-            if analysis.get("parsed_blocks"):
-                conn.execute(
-                    "DELETE FROM transcript_blocks WHERE conversation_id = ?", (cid,)
-                )
-                block_params = []
-                for b in analysis["parsed_blocks"]:
-                    content_str = b.text
-                    if b.arguments is not None:
-                        import json
-
-                        content_str += "\n" + json.dumps(b.arguments)
-
-                    block_params.append(
+                # Sync tool executions
+                if analysis.get("tool_executions"):
+                    conn.execute(
+                        "DELETE FROM tool_executions WHERE conversation_id = ?", (cid,)
+                    )
+                    tool_params = [
                         (
                             cid,
-                            b.step_index,
-                            b.kind.value,
-                            content_str,
-                            b.hash,
-                            b.call_id,
+                            te["step_index"],
+                            te["tool_name"],
+                            te.get("mcp_server"),
+                            te.get("mcp_tool"),
+                            te.get("target_path"),
+                            te.get("command_line"),
+                            te.get("exit_code"),
+                            te.get("is_error", 0),
                         )
+                        for te in analysis["tool_executions"]
+                    ]
+                    conn.executemany(
+                        """
+                        INSERT INTO tool_executions (
+                            conversation_id, step_index, tool_name, mcp_server, mcp_tool,
+                            target_path, command_line, exit_code, is_error
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                        tool_params,
                     )
 
-                conn.executemany(
-                    """
-                    INSERT INTO transcript_blocks (
-                        conversation_id, step_index, block_type, content, block_hash, call_id
+                # Sync transcript blocks
+                if analysis.get("parsed_blocks"):
+                    conn.execute(
+                        "DELETE FROM transcript_blocks WHERE conversation_id = ?", (cid,)
                     )
-                    VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                    block_params,
-                )
+                    block_params = []
+                    for b in analysis["parsed_blocks"]:
+                        content_str = b.text
+                        if b.arguments is not None:
+                            import json
+
+                            content_str += "\n" + json.dumps(b.arguments)
+
+                        block_params.append(
+                            (
+                                cid,
+                                b.step_index,
+                                b.kind.value,
+                                content_str,
+                                b.hash,
+                                b.call_id,
+                            )
+                        )
+
+                    conn.executemany(
+                        """
+                        INSERT INTO transcript_blocks (
+                            conversation_id, step_index, block_type, content, block_hash, call_id
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                        block_params,
+                    )
+
+                conn.commit()
 
             # Refresh and cache quota state
             try:
@@ -1501,6 +1503,15 @@ def main():
     if not transcript_path_str or not os.path.exists(transcript_path_str):
         print(json.dumps({}))
         return
+
+    # Defensive fallback: resolve conversation_id from brain path if missing or generic
+    if (not conversation_id or conversation_id == "unknown") and transcript_path_str:
+        p = Path(transcript_path_str)
+        parts = p.parts
+        if "brain" in parts:
+            idx = parts.index("brain")
+            if idx + 1 < len(parts):
+                conversation_id = parts[idx + 1]
 
     transcript_path = Path(transcript_path_str)
     first_model, latest_model, max_tokens = detect_model(transcript_path)

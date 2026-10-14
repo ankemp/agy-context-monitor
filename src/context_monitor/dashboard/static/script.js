@@ -298,6 +298,59 @@
       return `${m}m`;
     }
 
+    function shortenModelName(name) {
+      if (!name) return 'Gemini';
+      let clean = String(name).trim();
+      if (clean.toLowerCase().startsWith('gemini ')) {
+        clean = clean.substring(7).trim();
+      }
+      clean = clean.replace(/\(Medium\)/i, '(Med)');
+      return clean;
+    }
+
+    function getModelTierClass(modelStr) {
+      const m = String(modelStr || '').toLowerCase();
+      if (m.includes('argon') || m.includes('reasoning') || m.includes('thinking')) {
+        return 'bg-cyan-950/70 text-cyan-300 border-cyan-500/40';
+      }
+      if (m.includes('pro') || m.includes('opus')) {
+        return 'bg-indigo-950/70 text-indigo-300 border-indigo-500/40';
+      }
+      if (m.includes('flash') || m.includes('haiku') || (m.includes('mini') && !m.includes('gemini'))) {
+        return 'bg-purple-950/70 text-purple-300 border-purple-500/40';
+      }
+      if (m.includes('claude') || m.includes('sonnet') || m.includes('gpt')) {
+        return 'bg-amber-950/70 text-amber-300 border-amber-500/40';
+      }
+      return 'bg-zinc-800/80 text-gray-400 border-zinc-700/50';
+    }
+
+    function formatModelBadgeHtml(modelStr) {
+      if (!modelStr) {
+        return `<span class="px-1.5 py-0.5 rounded text-[10px] font-mono font-medium bg-zinc-800/80 text-gray-400 border border-zinc-700/50 shrink-0" title="Unknown">Gemini</span>`;
+      }
+
+      const str = String(modelStr).trim();
+      const parts = str.split(/\s*(?:→|➔|->)\s*/).filter(Boolean);
+
+      if (parts.length === 0) {
+        return `<span class="px-1.5 py-0.5 rounded text-[10px] font-mono font-medium bg-zinc-800/80 text-gray-400 border border-zinc-700/50 shrink-0" title="${str}">${str}</span>`;
+      }
+
+      const badgesHtml = parts.map(part => {
+        const short = shortenModelName(part);
+        const tierClass = getModelTierClass(part);
+        return `<span class="px-1.5 py-0.5 rounded text-[10px] font-mono font-medium ${tierClass} border shrink-0" title="${part}">${short}</span>`;
+      });
+
+      if (parts.length === 1) {
+        return `<div class="flex flex-wrap items-center gap-1 max-w-[220px]">${badgesHtml[0]}</div>`;
+      }
+
+      const joinedHtml = badgesHtml.join('<span class="text-gray-500 text-[10px] font-mono select-none">→</span>');
+      return `<div class="flex flex-wrap items-center gap-1 max-w-[220px]">${joinedHtml}</div>`;
+    }
+
     async function fetchDashboardData() {
       try {
         const clientTz = Intl.DateTimeFormat().resolvedOptions().timeZone || '';
@@ -1958,7 +2011,7 @@
         tr.innerHTML = `
           <td class="py-2.5 px-3 text-gray-400 whitespace-nowrap font-mono text-[11px]">${dateStr}</td>
           <td class="py-2.5 px-3">${titleHtml}</td>
-          <td class="py-2.5 px-3 text-purple-300 whitespace-nowrap text-xs">${c.model_name}</td>
+          <td class="py-2.5 px-3 max-w-[220px] align-middle">${formatModelBadgeHtml(c.model_name)}</td>
           <td class="py-2.5 px-3 text-right">${stepsHtml}</td>
           <td class="py-2.5 px-3 text-right">${costHtml}</td>
           <td class="py-2.5 px-3 text-right">${tokensHtml}</td>
@@ -1996,7 +2049,7 @@
                   ${subCompactionBadge}
                 </div>
               </td>
-              <td class="py-2 px-3 text-purple-400/80 whitespace-nowrap text-xs">${sub.model_name || 'inherit'}</td>
+              <td class="py-2 px-3 max-w-[220px] align-middle">${formatModelBadgeHtml(sub.model_name || 'inherit')}</td>
               <td class="py-2 px-3 text-right text-gray-400 font-mono text-xs">${sub.total_steps}</td>
               <td class="py-2 px-3 text-right font-mono font-medium text-rose-400/80 text-xs">$${(sub.billed_cost || 0).toFixed(2)}${sub.weekly_quota_pct != null ? ` <span class="text-[10px] text-cyan-300 font-mono">(${sub.weekly_quota_pct.toFixed(2)}% wk)</span>` : ''}</td>
               <td class="py-2 px-3 text-right font-mono font-medium text-indigo-400/80 text-xs">${formatTokens(sub.tokens || sub.total_tokens)}</td>
@@ -2027,7 +2080,7 @@
         
         const distinctModels = [...new Set(data.steps.map(s => s.model_name).filter(Boolean))];
         const modelLabel = distinctModels.length > 1 ? distinctModels.join(' ➔ ') : (conv.model_name || 'Gemini');
-        document.getElementById('modalModel').textContent = modelLabel;
+        document.getElementById('modalModel').innerHTML = formatModelBadgeHtml(modelLabel);
         
         const activeSec = conv.active_agent_seconds || conv.active_pairing_seconds || conv.duration_seconds || 0;
         document.getElementById('modalDuration').textContent = formatDuration(activeSec);

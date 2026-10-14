@@ -553,3 +553,86 @@ def test_dashboard_velocity_chart_quota_execution():
     assert "of weekly quota" in data["unstackedBarHover"]
     assert "50.0% · 4.00% wk quota" in data["stackedBarItemHover"]
     assert "Total API Tokens: 100.0k (8.00% of weekly quota)" in data["stackedFooter"]
+
+
+def test_model_badge_formatting():
+    """Verifies formatModelBadgeHtml shortens model names, assigns tier colors, and wraps transitions."""
+    node_script = """
+    const fs = require('fs');
+    const code = fs.readFileSync('src/context_monitor/dashboard/static/script.js', 'utf8');
+
+    const fn = new Function('window', 'document', 'Chart', 'lucide', `
+      ${code}
+      return {
+        formatModelBadgeHtml,
+        shortenModelName,
+        getModelTierClass
+      };
+    `);
+
+    const mockWindow = {
+      location: { search: '' },
+      addEventListener: () => {},
+      history: { pushState: () => {} }
+    };
+    const mockDocument = {
+      getElementById: () => null,
+      querySelectorAll: () => [],
+      addEventListener: () => {}
+    };
+
+    const api = fn(mockWindow, mockDocument, { defaults: { font: {}, elements: {}, plugins: {} }, register: () => {} }, { createIcons: () => {} });
+
+    const singleFlash = api.formatModelBadgeHtml('Gemini 3.8 Flash (High)');
+    const singleArgon = api.formatModelBadgeHtml('Gemini 4 Argon (Medium)');
+    const singlePro = api.formatModelBadgeHtml('Gemini 3.8 Pro (High)');
+    const singleClaude = api.formatModelBadgeHtml('Claude 3.7 Sonnet');
+    const singleInherit = api.formatModelBadgeHtml('inherit');
+    const transitionMulti = api.formatModelBadgeHtml('Gemini 3.8 Flash (High) → Gemini 4 Argon (Medium) → Gemini 3.8 Flash (High)');
+    const nullModel = api.formatModelBadgeHtml(null);
+
+    console.log(JSON.stringify({
+      singleFlash,
+      singleArgon,
+      singlePro,
+      singleClaude,
+      singleInherit,
+      transitionMulti,
+      nullModel
+    }));
+    """
+
+    res = subprocess.run(
+        ["node", "-e", node_script], capture_output=True, text=True, cwd=Path.cwd()
+    )
+    assert res.returncode == 0, f"Node script failed: {res.stderr}"
+    data = json.loads(res.stdout)
+
+    # 1. Single model shortening and color checks
+    assert ">3.8 Flash (High)<" in data["singleFlash"]
+    assert 'title="Gemini 3.8 Flash (High)"' in data["singleFlash"]
+    assert "purple" in data["singleFlash"]
+
+    assert ">4 Argon (Med)<" in data["singleArgon"]
+    assert 'title="Gemini 4 Argon (Medium)"' in data["singleArgon"]
+    assert "cyan" in data["singleArgon"]
+
+    assert "3.8 Pro (High)" in data["singlePro"]
+    assert "indigo" in data["singlePro"]
+
+    assert "Claude 3.7 Sonnet" in data["singleClaude"]
+    assert "amber" in data["singleClaude"]
+
+    assert "inherit" in data["singleInherit"]
+    assert "zinc" in data["singleInherit"] or "gray" in data["singleInherit"]
+
+    # 2. Multi-model transitions
+    assert "flex flex-wrap items-center gap-1 max-w-[220px]" in data["transitionMulti"]
+    assert "→" in data["transitionMulti"]
+    assert "3.8 Flash (High)" in data["transitionMulti"]
+    assert "4 Argon (Med)" in data["transitionMulti"]
+
+    # 3. Null / empty handling
+    assert data["nullModel"] != ""
+    assert "Gemini" in data["nullModel"] or "Unknown" in data["nullModel"]
+

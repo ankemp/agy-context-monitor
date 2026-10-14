@@ -15,7 +15,7 @@ import re
 from unittest.mock import MagicMock, patch
 
 import pytest
-from context_monitor.db import get_db_connection, init_db
+from context_monitor.db import get_db_connection, init_db, upsert_quota_state
 from scripts.backfill_analytics import run_backfill
 from scripts.ingest import (
     _extract_bucket_view,
@@ -382,6 +382,94 @@ def test_sync_to_sqlite_attaches_quota_state(tmp_path: Path):
         assert "quota_state" in analysis
         assert analysis["quota_state"] is not None
         assert "gemini-weekly" in analysis["quota_state"]
+    finally:
+        ingest_mod.DEFAULT_DB_PATH = orig_db
+
+
+def test_sync_to_sqlite_commits_with_warm_quota_cache(tmp_path: Path):
+    """Verifies sync_to_sqlite commits conversation and step records even when quota cache is warm."""
+    from datetime import datetime, timezone
+
+    test_db = tmp_path / "sync_warm_quota_test.db"
+    init_db(test_db)
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    warm_rows = [
+        {
+            "bucket_id": "gemini-weekly",
+            "group_name": "Gemini Models",
+            "window": "weekly",
+            "remaining_fraction": 0.89,
+            "reset_time": "2026-10-21T00:00:00Z",
+            "calibrated_capacity": 672.0,
+            "fetched_at": now_iso,
+        },
+        {
+            "bucket_id": "gemini-5h",
+            "group_name": "Gemini Models",
+            "window": "5h",
+            "remaining_fraction": 0.78,
+            "reset_time": "2026-10-15T00:00:00Z",
+            "calibrated_capacity": 236.7,
+            "fetched_at": now_iso,
+        },
+    ]
+    with get_db_connection(test_db) as conn:
+        upsert_quota_state(conn, warm_rows)
+
+    import scripts.ingest as ingest_mod
+
+    orig_db = ingest_mod.DEFAULT_DB_PATH
+    try:
+        ingest_mod.DEFAULT_DB_PATH = test_db
+        analysis = {
+            "title": "Warm Cache Commit Test",
+            "start_time": now_iso,
+            "end_time": now_iso,
+            "duration_seconds": 120,
+            "total_chars": 2000,
+            "total_tokens": 500,
+            "active_context_tokens": 500,
+            "billed_cost": 0.15,
+            "billed_input_tokens": 400,
+            "billed_output_tokens": 100,
+            "latest_model": "Gemini 3.8 Flash (High)",
+            "category_stats": {"User Requests": 500},
+            "steps": [
+                {
+                    "step_index": 0,
+                    "created_at": now_iso,
+                    "source": "USER_EXPLICIT",
+                    "step_type": "USER_INPUT",
+                    "category": "User Requests",
+                    "activity": "User Prompt",
+                    "tool_or_source": "User",
+                    "characters": 500,
+                    "est_tokens": 125,
+                    "detail": "Test prompt",
+                    "billed_cost": 0.0,
+                    "billed_input_tokens": 0,
+                    "billed_output_tokens": 0,
+                }
+            ],
+            "tool_executions": [],
+            "parsed_blocks": [],
+        }
+        sync_to_sqlite("conv-warm-cache-1", "Gemini 3.8 Flash (High)", analysis)
+
+        with get_db_connection(test_db) as verify_conn:
+            conv_row = verify_conn.execute(
+                "SELECT * FROM conversations WHERE id = 'conv-warm-cache-1'"
+            ).fetchone()
+            assert conv_row is not None, "Conversation row was rolled back!"
+            assert conv_row["title"] == "Warm Cache Commit Test"
+            assert conv_row["total_tokens"] == 500
+
+            step_row = verify_conn.execute(
+                "SELECT * FROM steps WHERE conversation_id = 'conv-warm-cache-1'"
+            ).fetchone()
+            assert step_row is not None, "Step row was rolled back!"
+            assert step_row["step_index"] == 0
     finally:
         ingest_mod.DEFAULT_DB_PATH = orig_db
 
