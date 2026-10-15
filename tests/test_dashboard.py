@@ -8,6 +8,7 @@ zero polling invariant, static charts invariant, and standalone HTML export.
 from __future__ import annotations
 
 import json
+import re
 import socket
 import subprocess
 import threading
@@ -15,6 +16,7 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
 import pytest
 from context_monitor.dashboard import api_routes, server
@@ -422,10 +424,327 @@ def test_standalone_html_export_quota(test_db: Path, tmp_path: Path):
     assert "<!DOCTYPE html>" in html
     assert "STATIC_DATA" in html
     assert '"quota":' in html
+    assert '"timeline_cycle":' in html
     assert "quotaGeminiWeeklyRem" in html
     assert "Subscription Quotas" in html
     assert "24x7 Activity Matrix Weighted" in html
     assert "Linear Wall-Clock" in html
+
+
+def test_build_static_bundle(test_db: Path):
+    """Verifies build_static_bundle constructs the full static bundle including timeline_cycle."""
+    conn = get_db_connection(test_db)
+    try:
+        # 1. Default invocation
+        bundle = server.build_static_bundle(conn)
+        assert isinstance(bundle, dict)
+        expected_keys = {
+            "summary",
+            "timeline",
+            "timeline_cycle",
+            "cost_by_project",
+            "tools",
+            "mcp",
+            "hot_files",
+            "activity_matrix",
+            "conversations",
+            "quota",
+        }
+        assert expected_keys.issubset(bundle.keys())
+        assert isinstance(bundle["timeline_cycle"], list)
+        assert len(bundle["timeline_cycle"]) > 0
+        for item in bundle["timeline_cycle"]:
+            assert "day" in item
+            assert "tokens" in item
+            assert "cost" in item
+            assert "label" in item
+            assert "is_start" in item
+            assert "is_reset" in item
+            assert "is_future" in item
+
+        # 2. Parameterized invocation with timezone and project
+        bundle_proj = server.build_static_bundle(
+            conn,
+            target_tz="America/New_York",
+            project="test-project",
+            include_conversations=True,
+        )
+        assert isinstance(bundle_proj["timeline_cycle"], list)
+        assert isinstance(bundle_proj["conversations"], list)
+    finally:
+        conn.close()
+
+
+def test_standalone_html_export_cycle_offline_execution(test_db: Path, tmp_path: Path):
+    """Verifies static offline HTML export embeds timeline_cycle, and that the actual
+    embedded window.fetch router and script.js render cycle data immediately with 0 network requests."""
+    out_file = tmp_path / "standalone_export.html"
+    with (
+        patch(
+            "context_monitor.dashboard.server.get_db_connection",
+            lambda *args, **kwargs: get_db_connection(test_db),
+        ),
+        patch(
+            "context_monitor.quota.discover_language_server_credentials",
+            return_value=(None, None),
+        ),
+    ):
+        server.export_standalone_html(out_file, tz="America/Chicago")
+
+    assert out_file.exists()
+    html = out_file.read_text(encoding="utf-8")
+    assert '"timeline_cycle":' in html
+    assert "days=cycle" in html
+
+    # Extract the actual embedded JS block produced by server.py
+    embedded_match = re.search(
+        r"<script>(\s*const IS_STATIC_EXPORT = true;[\s\S]*?)</script>", html
+    )
+    assert embedded_match is not None, "Embedded static JS block was not found in exported HTML"
+    embedded_js = embedded_match.group(1)
+
+    node_script = f"""
+    const fs = require('fs');
+    const scriptCode = fs.readFileSync('src/context_monitor/dashboard/static/script.js', 'utf8');
+
+    // 1. Initialize browser window mock
+    const window = {{
+      location: {{ search: '' }},
+      addEventListener: () => {{}},
+      history: {{ pushState: () => {{}} }}
+    }};
+
+    // 2. Evaluate the REAL embedded JS block from the exported HTML file
+    const evalEmbedded = new Function('window', `{embedded_js}; return {{ STATIC_DATA, IS_STATIC_EXPORT }};`);
+    const {{ STATIC_DATA, IS_STATIC_EXPORT }} = evalEmbedded(window);
+
+    // Verify window.fetch was attached and routes days=cycle to STATIC_DATA.timeline_cycle
+    if (typeof window.fetch !== 'function') {{
+      throw new Error('window.fetch was not registered by exported embedded JS');
+    }}
+
+    async function runStaticOfflineTest() {{
+      // Verify direct mock fetch calls on the exported window.fetch
+      const cycleFetchRes = await (await window.fetch('/api/timeline?days=cycle&tz=America/Chicago')).json();
+      if (!Array.isArray(cycleFetchRes) || cycleFetchRes.length !== STATIC_DATA.timeline_cycle.length) {{
+        throw new Error('Exported window.fetch failed to return timeline_cycle on /api/timeline?days=cycle');
+      }}
+
+      const standardFetchRes = await (await window.fetch('/api/timeline?days=30')).json();
+      if (!Array.isArray(standardFetchRes) || standardFetchRes.length !== STATIC_DATA.timeline.length) {{
+        throw new Error('Exported window.fetch failed to return standard timeline on non-cycle request');
+      }}
+
+      // Set up spy on window.fetch to count subsequent network requests
+      let fetchCalls = [];
+      const realExportedFetch = window.fetch;
+      window.fetch = async (...args) => {{
+        fetchCalls.push(args[0]);
+        return realExportedFetch(...args);
+      }};
+
+      const mockCanvas = {{ getContext: () => ({{}}) }};
+      const elements = {{}};
+      const getEl = (id) => {{
+        if (id === 'timelineChart') return mockCanvas;
+        if (!elements[id]) {{
+          elements[id] = {{ textContent: '', className: '', style: {{}}, options: [], classList: {{ remove: () => {{}}, add: () => {{}} }}, appendChild: () => {{}}, addEventListener: () => {{}} }};
+        }}
+        return elements[id];
+      }};
+      const mockDocument = {{
+        getElementById: getEl,
+        querySelectorAll: () => [],
+        createElement: () => ({{ value: '', textContent: '' }}),
+        addEventListener: () => {{}}
+      }};
+      const mockChart = {{
+        defaults: {{ font: {{}}, elements: {{}}, plugins: {{}} }},
+        register: () => {{}}
+      }};
+
+      let capturedConfig = null;
+      const modCode = scriptCode.replace(
+        'function upsertChart(existingChart, canvas, config) {{',
+        'function upsertChart(existingChart, canvas, config) {{ capturedConfig = config; return {{ update: () => {{}} }};'
+      );
+
+      const fn = new Function('window', 'document', 'Chart', 'lucide', 'fetch', 'STATIC_DATA', 'IS_STATIC_EXPORT', `
+        ${{modCode}}
+        return {{
+          setTimelineRange,
+          renderTimelineChart,
+          getCycleTimelineData: () => cycleTimelineData,
+          getCachedCycleProject: () => cachedCycleProject,
+          getConfig: () => capturedConfig,
+          getFetchCalls: () => fetchCalls,
+          mockFetch: window.fetch
+        }};
+      `);
+
+      const api = fn(window, mockDocument, mockChart, {{ createIcons: () => {{}} }}, window.fetch, STATIC_DATA, IS_STATIC_EXPORT);
+
+      // Verify cycleTimelineData and cachedCycleProject were initialized synchronously from STATIC_DATA
+      const initialCycle = api.getCycleTimelineData();
+      if (!initialCycle || initialCycle.length !== STATIC_DATA.timeline_cycle.length) {{
+        throw new Error('cycleTimelineData was not pre-initialized from STATIC_DATA.timeline_cycle');
+      }}
+      if (api.getCachedCycleProject() !== 'all') {{
+        throw new Error('cachedCycleProject was not initialized to "all" in static mode');
+      }}
+
+      // Simulate clicking #btnCycle (which calls setTimelineRange('cycle'))
+      api.setTimelineRange('cycle');
+
+      // Assert that chart was configured with the static cycle data
+      const cfg = api.getConfig();
+      if (!cfg || !cfg.data || !cfg.data.labels) {{
+        throw new Error('Chart was not rendered after setTimelineRange("cycle")');
+      }}
+      const expectedFirstLabel = STATIC_DATA.timeline_cycle[0].label;
+      const expectedLastLabel = STATIC_DATA.timeline_cycle[STATIC_DATA.timeline_cycle.length - 1].label;
+      if (cfg.data.labels[0] !== expectedFirstLabel) {{
+        throw new Error(`Expected first boundary label '${{expectedFirstLabel}}', got ${{cfg.data.labels[0]}}`);
+      }}
+      if (cfg.data.labels[cfg.data.labels.length - 1] !== expectedLastLabel) {{
+        throw new Error(`Expected last boundary label '${{expectedLastLabel}}', got ${{cfg.data.labels[cfg.data.labels.length - 1]}}`);
+      }}
+
+      // Verify that NO external fetch calls were made (zero network requests, instant offline render)
+      const zeroFetchCalls = fetchCalls.length === 0;
+      if (!zeroFetchCalls) {{
+        throw new Error("Expected 0 fetch calls for static offline cycle switch, got " + fetchCalls.length + ": " + JSON.stringify(fetchCalls));
+      }}
+
+      console.log(JSON.stringify({{
+        status: 'ok',
+        cycleInitialized: true,
+        zeroFetchCalls: zeroFetchCalls,
+        firstLabel: cfg.data.labels[0],
+        lastLabel: cfg.data.labels[cfg.data.labels.length - 1]
+      }}));
+    }}
+
+    runStaticOfflineTest().catch(err => {{
+      console.error(err);
+      process.exit(1);
+    }});
+    """
+
+    res = subprocess.run(
+        ["node", "-e", node_script], capture_output=True, text=True, cwd=Path.cwd()
+    )
+    assert res.returncode == 0, f"Node script failed: {res.stderr}"
+    json_line = [
+        line for line in res.stdout.strip().splitlines() if line.startswith("{")
+    ][-1]
+    data = json.loads(json_line)
+    assert data["status"] == "ok"
+    assert data["cycleInitialized"] is True
+    assert data["zeroFetchCalls"] is True
+
+
+def test_standalone_html_export_cycle_offline_empty_quota(tmp_path: Path):
+    """Verifies static offline HTML export when quota_state table is completely empty:
+    gracefully includes 7-day fallback timeline_cycle and renders without crashing or network requests."""
+    empty_db = tmp_path / "empty_quota.db"
+    init_db(empty_db)
+    out_file = tmp_path / "empty_quota_export.html"
+    with (
+        patch(
+            "context_monitor.dashboard.server.get_db_connection",
+            lambda *args, **kwargs: get_db_connection(empty_db),
+        ),
+        patch(
+            "context_monitor.quota.discover_language_server_credentials",
+            return_value=(None, None),
+        ),
+    ):
+        server.export_standalone_html(out_file, tz="America/Chicago")
+
+    assert out_file.exists()
+    html = out_file.read_text(encoding="utf-8")
+    assert '"timeline_cycle":' in html
+
+    embedded_match = re.search(
+        r"<script>(\s*const IS_STATIC_EXPORT = true;[\s\S]*?)</script>", html
+    )
+    assert embedded_match is not None
+    embedded_js = embedded_match.group(1)
+
+    node_script = f"""
+    const fs = require('fs');
+    const scriptCode = fs.readFileSync('src/context_monitor/dashboard/static/script.js', 'utf8');
+
+    const window = {{
+      location: {{ search: '' }},
+      addEventListener: () => {{}},
+      history: {{ pushState: () => {{}} }}
+    }};
+
+    const evalEmbedded = new Function('window', `{embedded_js}; return {{ STATIC_DATA, IS_STATIC_EXPORT }};`);
+    const {{ STATIC_DATA, IS_STATIC_EXPORT }} = evalEmbedded(window);
+
+    let fetchCalls = [];
+    window.fetch = async (...args) => {{
+      fetchCalls.push(args[0]);
+      return {{ json: async () => STATIC_DATA.timeline_cycle }};
+    }};
+
+    const mockCanvas = {{ getContext: () => ({{}}) }};
+    const elements = {{}};
+    const getEl = (id) => {{
+      if (id === 'timelineChart') return mockCanvas;
+      if (!elements[id]) {{
+        elements[id] = {{ textContent: '', className: '', style: {{}}, options: [], classList: {{ remove: () => {{}}, add: () => {{}} }}, appendChild: () => {{}}, addEventListener: () => {{}} }};
+      }}
+      return elements[id];
+    }};
+    const mockDocument = {{
+      getElementById: getEl,
+      querySelectorAll: () => [],
+      createElement: () => ({{ value: '', textContent: '' }}),
+      addEventListener: () => {{}}
+    }};
+    const mockChart = {{
+      defaults: {{ font: {{}}, elements: {{}}, plugins: {{}} }},
+      register: () => {{}}
+    }};
+
+    let capturedConfig = null;
+    const modCode = scriptCode.replace(
+      'function upsertChart(existingChart, canvas, config) {{',
+      'function upsertChart(existingChart, canvas, config) {{ capturedConfig = config; return {{ update: () => {{}} }};'
+    );
+
+    const fn = new Function('window', 'document', 'Chart', 'lucide', 'fetch', 'STATIC_DATA', 'IS_STATIC_EXPORT', `
+      ${{modCode}}
+      return {{
+        setTimelineRange,
+        getCycleTimelineData: () => cycleTimelineData,
+        getConfig: () => capturedConfig
+      }};
+    `);
+
+    const api = fn(window, mockDocument, mockChart, {{ createIcons: () => {{}} }}, window.fetch, STATIC_DATA, IS_STATIC_EXPORT);
+    if (!api.getCycleTimelineData() || api.getCycleTimelineData().length !== 7) {{
+      throw new Error('Expected 7-day fallback timeline_cycle, got: ' + (api.getCycleTimelineData()?.length));
+    }}
+
+    api.setTimelineRange('cycle');
+    if (fetchCalls.length !== 0) {{
+      throw new Error('Expected 0 fetch calls, got: ' + fetchCalls.length);
+    }}
+    console.log(JSON.stringify({{ status: 'ok', fallbackLen: api.getCycleTimelineData().length }}));
+    """
+
+    res = subprocess.run(
+        ["node", "-e", node_script], capture_output=True, text=True, cwd=Path.cwd()
+    )
+    assert res.returncode == 0, f"Node script failed: {res.stderr}"
+    data = json.loads(res.stdout.strip().splitlines()[-1])
+    assert data["status"] == "ok"
+    assert data["fallbackLen"] == 7
 
 
 def test_dashboard_velocity_chart_quota_execution():
@@ -566,6 +885,250 @@ def test_dashboard_velocity_chart_quota_execution():
     assert "of weekly quota" in data["unstackedBarHover"]
     assert "50.0% · 4.00% wk quota" in data["stackedBarItemHover"]
     assert "Total API Tokens: 100.0k (8.00% of weekly quota)" in data["stackedFooter"]
+
+
+def test_dashboard_velocity_chart_cycle_mode_execution():
+    """Verifies #btnCycle toggle button in index.html, setTimelineRange('cycle') button classes,
+    boundary chart labels (e.g. 'Tue 21:27'), cycle-aware tooltip callbacks, defensive inputs,
+    stacked footer formatting, on-demand fetch error safety, and project change cache invalidation."""
+    dashboard_dir = (
+        Path(__file__).resolve().parent.parent / "src" / "context_monitor" / "dashboard"
+    )
+    html_file = dashboard_dir / "templates" / "index.html"
+    html_content = html_file.read_text(encoding="utf-8")
+
+    # Invariant: #btnCycle exists in index.html with correct attributes and position
+    assert 'id="btnCycle"' in html_content, "#btnCycle missing in index.html"
+    assert "setTimelineRange('cycle')" in html_content, (
+        "setTimelineRange('cycle') onclick missing in index.html"
+    )
+    cycle_idx = html_content.find('id="btnCycle"')
+    btn7d_idx = html_content.find('id="btn7d"')
+    assert cycle_idx != -1 and btn7d_idx != -1 and cycle_idx < btn7d_idx, (
+        "#btnCycle must appear immediately before #btn7d in index.html"
+    )
+
+    node_script = """
+    const fs = require('fs');
+    const code = fs.readFileSync('src/context_monitor/dashboard/static/script.js', 'utf8');
+
+    let capturedConfig = null;
+    const mockCanvas = { getContext: () => ({}) };
+    const elements = {};
+    const getEl = (id) => {
+      if (id === 'timelineChart') return mockCanvas;
+      if (!elements[id]) {
+        elements[id] = { textContent: '', className: '', style: {}, options: [], classList: { remove: () => {}, add: () => {} }, appendChild: () => {}, addEventListener: () => {} };
+      }
+      return elements[id];
+    };
+    const mockDocument = {
+      getElementById: getEl,
+      querySelectorAll: () => [],
+      createElement: () => ({ value: '', textContent: '' }),
+      addEventListener: () => {}
+    };
+
+    const mockWindow = {
+      location: { search: '' },
+      addEventListener: () => {},
+      history: { pushState: () => {} }
+    };
+
+    const mockChart = {
+      defaults: { font: {}, elements: {}, plugins: {} },
+      register: () => {}
+    };
+
+    let fetchCount = 0;
+    let shouldRejectFetch = false;
+    const mockFetch = (url) => {
+      fetchCount++;
+      if (shouldRejectFetch) {
+        return Promise.reject(new Error('Network error'));
+      }
+      return Promise.resolve({
+        json: () => Promise.resolve([
+          { day: '2026-10-13', label: 'Tue 21:27', is_start: true, is_reset: false, is_future: false, tokens: 50000, cost: 20.0, sessions: 2 },
+          { day: '2026-10-20', label: 'Tue 21:27', is_start: false, is_reset: true, is_future: true, tokens: 0, cost: 0.0, sessions: 0 }
+        ])
+      });
+    };
+
+    const fn = new Function('window', 'document', 'Chart', 'lucide', 'fetch', `
+      let capturedConfig = null;
+      ${code.replace(
+        'function upsertChart(existingChart, canvas, config) {',
+        'function upsertChart(existingChart, canvas, config) { capturedConfig = config; return { update: () => {} };'
+      )}
+      return {
+        setTimelineRange,
+        renderTimelineChart,
+        handleProjectChange: window.handleProjectChange,
+        setTimelineViewMode: window.setTimelineViewMode,
+        getConfig: () => capturedConfig,
+        setCycleTimelineData: (d) => { cycleTimelineData = d; },
+        getCycleTimelineData: () => cycleTimelineData,
+        getCurrentTimelineDays: () => currentTimelineDays
+      };
+    `);
+
+    async function runTests() {
+      const api = fn(mockWindow, mockDocument, mockChart, { createIcons: () => {} }, mockFetch);
+
+      // Defensive checks: renderTimelineChart with null or undefined does not throw
+      api.renderTimelineChart(null);
+      api.renderTimelineChart(undefined);
+      api.renderTimelineChart([]);
+
+      // Test 1: Button classes when toggling between cycle and 7d, and case-insensitivity
+      api.setTimelineRange('cycle');
+      const btnCycleClassAfterCycle = getEl('btnCycle').className;
+      const btn7dClassAfterCycle = getEl('btn7d').className;
+      const btn30dClassAfterCycle = getEl('btn30d').className;
+
+      api.setTimelineRange(7);
+      const btnCycleClassAfter7d = getEl('btnCycle').className;
+      const btn7dClassAfter7d = getEl('btn7d').className;
+
+      // Case-insensitivity: 'Cycle' activates button and mode
+      api.setTimelineRange('Cycle');
+      const btnCycleClassReactivated = getEl('btnCycle').className;
+
+      // Test 2: Chart rendering with cycle boundary labels and tooltips
+      const mockCycleData = [
+        { day: '2026-10-13', label: 'Tue 21:27', is_start: true, is_reset: false, is_future: false, tokens: 120000, cost: 52.4, sessions: 6, projects: { 'proj1': 120000 } },
+        { day: '2026-10-14', label: '2026-10-14', is_start: false, is_reset: false, is_future: false, tokens: 80000, cost: 35.0, sessions: 4, projects: { 'proj1': 80000 } },
+        { day: '2026-10-15', label: '2026-10-15', is_start: false, is_reset: false, is_future: true, tokens: 0, cost: 0.0, sessions: 0, projects: {} },
+        { day: '2026-10-20', label: 'Tue 21:27', is_start: false, is_reset: true, is_future: true, tokens: 0, cost: 0.0, sessions: 0, projects: {} }
+      ];
+
+      api.setCycleTimelineData(mockCycleData);
+      api.setTimelineRange('cycle');
+
+      const cfg = api.getConfig();
+      const labels = cfg.data.labels;
+      const labelFn = cfg.options.plugins.tooltip.callbacks.label;
+      const titleFn = cfg.options.plugins.tooltip.callbacks.title;
+
+      // Tooltip evaluations
+      const startBarHover = labelFn({ dataset: { label: 'API Tokens Consumed' }, raw: 120000, dataIndex: 0 });
+      const startCostHover = labelFn({ dataset: { label: 'Est. API Value ($)' }, raw: 52.4, dataIndex: 0 });
+      const startTitle = titleFn ? titleFn([{ dataIndex: 0 }]) : null;
+
+      const midBarHover = labelFn({ dataset: { label: 'API Tokens Consumed' }, raw: 80000, dataIndex: 1 });
+      const midTitle = titleFn ? titleFn([{ dataIndex: 1 }]) : null;
+
+      const futureBarHover = labelFn({ dataset: { label: 'API Tokens Consumed' }, raw: 0, dataIndex: 2 });
+      const futureCostHover = labelFn({ dataset: { label: 'Est. API Value ($)' }, raw: 0, dataIndex: 2 });
+      const futureTitle = titleFn ? titleFn([{ dataIndex: 2 }]) : null;
+
+      const resetBarHover = labelFn({ dataset: { label: 'API Tokens Consumed' }, raw: 0, dataIndex: 3 });
+      const resetCostHover = labelFn({ dataset: { label: 'Est. API Value ($)' }, raw: 0, dataIndex: 3 });
+      const resetTitle = titleFn ? titleFn([{ dataIndex: 3 }]) : null;
+
+      // Test 3: Stacked view mode with cycle data
+      api.setTimelineViewMode('stacked');
+      const stackedCfg = api.getConfig();
+      const stackedFooterFn = stackedCfg.options.plugins.tooltip.callbacks.footer;
+      const stackedFutureFooter = stackedFooterFn([{ dataIndex: 2 }]);
+      const stackedResetFooter = stackedFooterFn([{ dataIndex: 3 }]);
+
+      // Test 4: On-demand fetch when cycleTimelineData is null & catch-block safety
+      api.setCycleTimelineData(null);
+      shouldRejectFetch = true;
+      api.setTimelineRange('cycle');
+      // User quickly switches to 7d before rejection completes
+      api.setTimelineRange(7);
+      await new Promise(r => setTimeout(r, 20));
+      const rangeAfterReject = api.getCurrentTimelineDays();
+
+      // Test 5: Invalidate cycle data on project change
+      api.setCycleTimelineData(mockCycleData);
+      api.handleProjectChange('projX', false);
+      const cycleDataAfterProjChange = api.getCycleTimelineData();
+
+      console.log(JSON.stringify({
+        btnCycleClassAfterCycle,
+        btn7dClassAfterCycle,
+        btn30dClassAfterCycle,
+        btnCycleClassAfter7d,
+        btn7dClassAfter7d,
+        btnCycleClassReactivated,
+        labels,
+        startBarHover,
+        startCostHover,
+        startTitle,
+        midBarHover,
+        midTitle,
+        futureBarHover,
+        futureCostHover,
+        futureTitle,
+        resetBarHover,
+        resetCostHover,
+        resetTitle,
+        stackedFutureFooter,
+        stackedResetFooter,
+        rangeAfterReject,
+        cycleDataAfterProjChange
+      }));
+    }
+
+    runTests();
+    """
+
+    res = subprocess.run(
+        ["node", "-e", node_script], capture_output=True, text=True, cwd=Path.cwd()
+    )
+    assert res.returncode == 0, f"Node script failed: {res.stderr}"
+    data = json.loads(res.stdout)
+
+    # Button classes
+    assert "bg-brand-600" in data["btnCycleClassAfterCycle"]
+    assert "text-white" in data["btnCycleClassAfterCycle"]
+    assert "text-gray-400" in data["btn7dClassAfterCycle"]
+    assert "text-gray-400" in data["btn30dClassAfterCycle"]
+
+    assert "text-gray-400" in data["btnCycleClassAfter7d"]
+    assert "bg-brand-600" in data["btn7dClassAfter7d"]
+
+    assert "bg-brand-600" in data["btnCycleClassReactivated"]
+
+    # Chart Labels
+    assert data["labels"] == ["Tue 21:27", "2026-10-14", "2026-10-15", "Tue 21:27"]
+
+    # Tooltips: Week Start
+    assert "Week Start (Tue 21:27)" in data["startBarHover"]
+    assert "Week Start (Tue 21:27)" in data["startCostHover"]
+    if data["startTitle"]:
+        assert "Week Start (Tue 21:27)" in data["startTitle"]
+
+    # Tooltips: Intermediate day
+    assert "Week Start" not in data["midBarHover"]
+    assert "Reset" not in data["midBarHover"]
+    assert "Upcoming" not in data["midBarHover"]
+
+    # Tooltips: Future day
+    assert "Upcoming in cycle" in data["futureBarHover"]
+    assert "0 tokens" in data["futureBarHover"]
+    assert "Upcoming" in data["futureCostHover"]
+
+    # Tooltips: Reset day
+    assert "Reset (Tue 21:27)" in data["resetBarHover"]
+    assert "Reset (Tue 21:27)" in data["resetCostHover"]
+    if data["resetTitle"]:
+        assert "Reset (Tue 21:27)" in data["resetTitle"]
+
+    # Stacked footers
+    assert "Upcoming in cycle" in data["stackedFutureFooter"]
+    assert "0 tokens" in data["stackedFutureFooter"]
+    assert "Reset (Tue 21:27)" in data["stackedResetFooter"]
+
+    # On-demand fetch catch safety: active range preserved
+    assert data["rangeAfterReject"] == 7
+
+    # Project change invalidation
+    assert data["cycleDataAfterProjChange"] is None
 
 
 def test_model_badge_formatting():
@@ -1909,6 +2472,401 @@ def test_query_timeline_data_malformed_timestamps_graceful(tmp_path: Path):
         assert bounded == unbounded[-7:]
 
 
+def test_query_timeline_data_cycle_mode_with_quota_reset(tmp_path: Path):
+    """Verifies that query_timeline_data with days='cycle' generates a static 7-day quota cycle:
+    - Spans from start date to reset date (start_dt.date() to reset_dt.date()).
+    - Far-left item has is_start == True and compact %a %H:%M label (e.g. Tue 21:27).
+    - Far-right item has is_reset == True, %a %H:%M label, and is_future == True.
+    - Intermediate days have YYYY-MM-DD label.
+    - Days after today have is_future == True, 0 tokens, and 0.0 cost.
+    - Only steps with created_at >= start_dt_utc are included in the week start day count.
+    """
+    db_file = tmp_path / "test_cycle.db"
+    init_db(db_file)
+    tz_str = "America/Chicago"
+    target_tz = ZoneInfo(tz_str)
+    now_local = datetime.now(target_tz)
+    today = now_local.date()
+
+    # Anchor reset_dt_local: exactly 5 days from today at 21:27:00
+    reset_date_local = today + timedelta(days=5)
+    reset_dt_local = datetime(
+        reset_date_local.year,
+        reset_date_local.month,
+        reset_date_local.day,
+        21,
+        27,
+        0,
+        tzinfo=target_tz,
+    )
+    reset_dt_utc = reset_dt_local.astimezone(timezone.utc)
+    start_dt_utc = reset_dt_utc - timedelta(days=7)
+    start_dt_local = start_dt_utc.astimezone(target_tz)
+
+    start_date = start_dt_local.date()
+    end_date = reset_dt_local.date()
+
+    with get_db_connection(db_file) as conn:
+        upsert_quota_state(
+            conn,
+            [
+                {
+                    "bucket_id": "gemini-weekly",
+                    "group_name": "Gemini Models",
+                    "window": "weekly",
+                    "remaining_fraction": 0.75,
+                    "reset_time": reset_dt_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "calibrated_capacity": 700.0,
+                    "fetched_at": datetime.now(timezone.utc).isoformat(),
+                }
+            ],
+        )
+
+        conn.execute(
+            "INSERT INTO conversations (id, title, project, model_name, created_at) "
+            "VALUES ('c1', 'Conv 1', 'project-a', 'Gemini Flash', ?)",
+            (start_dt_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),),
+        )
+
+        # Seed steps:
+        # 1. Step on start_date but BEFORE start_dt_utc (2 hours prior) -> must be EXCLUDED
+        ts_before = (start_dt_utc - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        # 2. Step on start_date AFTER start_dt_utc (1 hour after) -> must be INCLUDED
+        ts_after = (start_dt_utc + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        # 3. Step on today (middle of cycle)
+        ts_today = (
+            datetime(today.year, today.month, today.day, 12, 0, 0, tzinfo=target_tz)
+            .astimezone(timezone.utc)
+            .strftime("%Y-%m-%dT%H:%M:%SZ")
+        )
+        # 4. Step far in the past (10 days ago) -> must be EXCLUDED
+        ts_past = (start_dt_utc - timedelta(days=3)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        # 5. Step after reset (reset_dt + 2h) -> must be EXCLUDED
+        ts_post_reset = (reset_dt_utc + timedelta(hours=2)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+
+        steps_to_insert = [
+            ("c1", 1, "exec", "cat", "act", "t", "m", 100, "", ts_before, 1.50, 800, 200),
+            ("c1", 2, "exec", "cat", "act", "t", "m", 100, "", ts_after, 3.00, 2000, 500),
+            ("c1", 3, "exec", "cat", "act", "t", "m", 100, "", ts_today, 5.00, 4000, 1000),
+            ("c1", 4, "exec", "cat", "act", "t", "m", 100, "", ts_past, 2.00, 1000, 500),
+            ("c1", 5, "exec", "cat", "act", "t", "m", 100, "", ts_post_reset, 4.00, 3000, 1000),
+        ]
+        conn.executemany(
+            """
+            INSERT INTO steps (
+                conversation_id, step_index, phase, category, activity,
+                tool_or_source, model_name, est_tokens, detail, created_at,
+                billed_cost, billed_input_tokens, billed_output_tokens
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            steps_to_insert,
+        )
+        conn.commit()
+
+        # Query cycle data
+        timeline = api_routes.query_timeline_data(conn, days="cycle", tz=tz_str)
+
+        # Assertions
+        assert len(timeline) >= 8  # 7-day cycle spans start_date through reset_date
+        assert timeline[0]["day"] == start_date.strftime("%Y-%m-%d")
+        assert timeline[-1]["day"] == end_date.strftime("%Y-%m-%d")
+
+        # Far-left item (week start)
+        first = timeline[0]
+        assert first["is_start"] is True
+        assert first["is_reset"] is False
+        assert first["label"] == start_dt_local.strftime("%a %H:%M")
+        # Verify strict boundary filtering: step_before excluded, only step_after counted
+        assert first["steps"] == 1
+        assert first["tokens"] == 2500  # 2000 in + 500 out
+        assert first["cost"] == 3.00
+
+        # Far-right item (reset day)
+        last = timeline[-1]
+        assert last["is_start"] is False
+        assert last["is_reset"] is True
+        assert last["label"] == reset_dt_local.strftime("%a %H:%M")
+        assert last["is_future"] is True
+        assert last["tokens"] == 0
+        assert last["cost"] == 0.0
+        assert last["steps"] == 0
+
+        # Intermediate days and future days checks
+        for item in timeline[1:-1]:
+            assert item["is_start"] is False
+            assert item["is_reset"] is False
+            assert item["label"] == item["day"]
+            item_date = datetime.strptime(item["day"], "%Y-%m-%d").date()
+            if item_date > today:
+                assert item["is_future"] is True
+                assert item["tokens"] == 0
+                assert item["cost"] == 0.0
+                assert item["steps"] == 0
+            elif item_date == today:
+                assert item["is_future"] is False
+                assert item["tokens"] == 5000
+                assert item["cost"] == 5.00
+                assert item["steps"] == 1
+            else:
+                assert item["is_future"] is False
+
+
+def test_query_timeline_data_cycle_mode_fallback_without_quota(tmp_path: Path):
+    """Verifies that if quota_state has no reset time, days='cycle' gracefully falls back
+    to a standard 7-day window ending today.
+    """
+    db_file = tmp_path / "test_fallback.db"
+    init_db(db_file)
+    tz_str = "America/Chicago"
+    target_tz = ZoneInfo(tz_str)
+    today = datetime.now(target_tz).date()
+
+    with get_db_connection(db_file) as conn:
+        # Without any quota_state rows
+        timeline = api_routes.query_timeline_data(conn, days="cycle", tz=tz_str)
+        assert len(timeline) == 7
+        assert timeline[-1]["day"] == today.strftime("%Y-%m-%d")
+        assert timeline[0]["day"] == (today - timedelta(days=6)).strftime("%Y-%m-%d")
+        for item in timeline:
+            assert item["is_start"] is False
+            assert item["is_reset"] is False
+            assert item["is_future"] is False
+            assert item["label"] == item["day"]
+
+        # Also test with empty reset_time in quota_state
+        upsert_quota_state(
+            conn,
+            [
+                {
+                    "bucket_id": "gemini-weekly",
+                    "group_name": "Gemini Models",
+                    "window": "weekly",
+                    "remaining_fraction": 1.0,
+                    "reset_time": "",
+                    "calibrated_capacity": 700.0,
+                    "fetched_at": datetime.now(timezone.utc).isoformat(),
+                }
+            ],
+        )
+        timeline_empty_reset = api_routes.query_timeline_data(
+            conn, days="reset", tz=tz_str
+        )
+        assert len(timeline_empty_reset) == 7
+        assert timeline_empty_reset[-1]["day"] == today.strftime("%Y-%m-%d")
+
+
+def test_query_timeline_data_cycle_project_filtering(tmp_path: Path):
+    """Verifies project filtering correctly isolates project tokens within the cycle window."""
+    db_file = tmp_path / "test_project_filter.db"
+    init_db(db_file)
+    now_utc = datetime.now(timezone.utc).replace(microsecond=0)
+    reset_dt_utc = now_utc + timedelta(days=4)
+
+    with get_db_connection(db_file) as conn:
+        upsert_quota_state(
+            conn,
+            [
+                {
+                    "bucket_id": "gemini-weekly",
+                    "group_name": "Gemini Models",
+                    "window": "weekly",
+                    "remaining_fraction": 0.8,
+                    "reset_time": reset_dt_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "calibrated_capacity": 700.0,
+                    "fetched_at": now_utc.isoformat(),
+                }
+            ],
+        )
+
+        conn.execute(
+            "INSERT INTO conversations (id, title, project) VALUES "
+            "('c_alpha', 'Alpha Conv', 'project-alpha'), "
+            "('c_beta', 'Beta Conv', 'project-beta')"
+        )
+
+        now_iso = now_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+        conn.executemany(
+            """
+            INSERT INTO steps (
+                conversation_id, step_index, phase, category, activity,
+                tool_or_source, model_name, est_tokens, detail, created_at,
+                billed_cost, billed_input_tokens, billed_output_tokens
+            ) VALUES (?, ?, 'exec', 'cat', 'act', 't', 'm', 100, '', ?, ?, ?, ?)
+            """,
+            [
+                ("c_alpha", 1, now_iso, 2.00, 3000, 1000),  # 4000 tokens
+                ("c_beta", 1, now_iso, 3.50, 5000, 2000),   # 7000 tokens
+            ],
+        )
+        conn.commit()
+
+        # Query for project-alpha
+        tl_alpha = api_routes.query_timeline_data(
+            conn, days="cycle", tz="UTC", project="project-alpha"
+        )
+        today_str = now_utc.strftime("%Y-%m-%d")
+        today_alpha = next(d for d in tl_alpha if d["day"] == today_str)
+        assert today_alpha["tokens"] == 4000
+        assert today_alpha["cost"] == 2.00
+        assert today_alpha["projects"] == {"project-alpha": 4000}
+
+        # Query for project-beta
+        tl_beta = api_routes.query_timeline_data(
+            conn, days="cycle", tz="UTC", project="project-beta"
+        )
+        today_beta = next(d for d in tl_beta if d["day"] == today_str)
+        assert today_beta["tokens"] == 7000
+        assert today_beta["cost"] == 3.50
+        assert today_beta["projects"] == {"project-beta": 7000}
+
+        # Query all
+        tl_all = api_routes.query_timeline_data(conn, days="cycle", tz="UTC")
+        today_all = next(d for d in tl_all if d["day"] == today_str)
+        assert today_all["tokens"] == 11000
+        assert today_all["cost"] == 5.50
+        assert today_all["projects"] == {"project-alpha": 4000, "project-beta": 7000}
+
+
+def test_get_target_tz_handles_zoneinfo_and_tzinfo_instances(monkeypatch):
+    """Verifies get_target_tz directly returns ZoneInfo and tzinfo instances without
+    raising TypeError or falling back to environment/system local timezone.
+    """
+    monkeypatch.setenv("TZ", "UTC")
+    chicago_tz = ZoneInfo("America/Chicago")
+    tokyo_tz = ZoneInfo("Asia/Tokyo")
+
+    # ZoneInfo instance passed
+    assert api_routes.get_target_tz(chicago_tz) == chicago_tz
+    assert api_routes.get_target_tz(tokyo_tz) == tokyo_tz
+
+    # datetime.timezone instance passed
+    assert api_routes.get_target_tz(timezone.utc) == timezone.utc
+
+    # String passed
+    assert api_routes.get_target_tz("America/Chicago") == chicago_tz
+    assert api_routes.get_target_tz("  America/Chicago  ") == chicago_tz
+
+
+def test_query_timeline_data_cycle_edge_cases(tmp_path: Path):
+    """Verifies edge cases for cycle mode:
+    - Subsecond reset_time and created_at timestamps are included without dropped boundaries
+    - Timestamps with spaces (e.g. 'YYYY-MM-DD HH:MM:SS') are correctly matched
+    - Expired/past reset times gracefully fall back to 7 days ending today
+    - Leading/trailing whitespace in days parameter (e.g. '  cycle  ')
+    - Passing tz as a ZoneInfo instance
+    - Fallback to 3p-weekly bucket when gemini-weekly is absent
+    """
+    db_file = tmp_path / "test_cycle_edge.db"
+    init_db(db_file)
+    tz = ZoneInfo("America/Chicago")
+    today = datetime.now(tz).date()
+
+    with get_db_connection(db_file) as conn:
+        now_utc = datetime.now(timezone.utc).replace(microsecond=500000)
+        reset_dt_utc = now_utc + timedelta(days=4)
+        start_dt_utc = reset_dt_utc - timedelta(days=7)
+
+        # 1. Test sub-second timestamps and space-separated timestamps
+        upsert_quota_state(
+            conn,
+            [
+                {
+                    "bucket_id": "gemini-weekly",
+                    "group_name": "Gemini Models",
+                    "window": "weekly",
+                    "remaining_fraction": 0.8,
+                    "reset_time": reset_dt_utc.strftime("%Y-%m-%dT%H:%M:%S.500Z"),
+                    "calibrated_capacity": 700.0,
+                    "fetched_at": now_utc.isoformat(),
+                }
+            ],
+        )
+
+        conn.execute(
+            "INSERT INTO conversations (id, title, project) VALUES ('c_edge', 'Edge Conv', 'p1')"
+        )
+
+        # Insert:
+        # a) Step at exact start_dt_utc with subseconds (.500Z) -> must be INCLUDED
+        # b) Step on start date with space separator ('YYYY-MM-DD HH:MM:SS') after start_dt_utc -> must be INCLUDED
+        # c) Step 10 seconds before start_dt_utc -> must be EXCLUDED
+        ts_exact_subsecond = start_dt_utc.strftime("%Y-%m-%dT%H:%M:%S.500Z")
+        ts_space = (start_dt_utc + timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M:%S")
+        ts_before = (start_dt_utc - timedelta(seconds=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        conn.executemany(
+            """
+            INSERT INTO steps (
+                conversation_id, step_index, phase, category, activity,
+                tool_or_source, model_name, est_tokens, detail, created_at,
+                billed_cost, billed_input_tokens, billed_output_tokens
+            ) VALUES (?, ?, 'exec', 'cat', 'act', 't', 'm', 100, '', ?, 1.0, 500, 500)
+            """,
+            [
+                ("c_edge", 1, ts_exact_subsecond),
+                ("c_edge", 2, ts_space),
+                ("c_edge", 3, ts_before),
+            ],
+        )
+        conn.commit()
+
+        # Query passing ZoneInfo instance and whitespace in '  cycle  '
+        tl = api_routes.query_timeline_data(conn, days="  cycle  ", tz=tz)
+        assert len(tl) >= 8
+        first_day = tl[0]
+        assert first_day["is_start"] is True
+        # Both ts_exact_subsecond and ts_space are included, ts_before excluded
+        assert first_day["steps"] == 2
+        assert first_day["tokens"] == 2000
+
+        # 2. Test expired reset time in the past falls back to 7 days ending today
+        past_reset = datetime.now(timezone.utc) - timedelta(days=10)
+        upsert_quota_state(
+            conn,
+            [
+                {
+                    "bucket_id": "gemini-weekly",
+                    "group_name": "Gemini Models",
+                    "window": "weekly",
+                    "remaining_fraction": 0.8,
+                    "reset_time": past_reset.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "calibrated_capacity": 700.0,
+                    "fetched_at": past_reset.isoformat(),
+                }
+            ],
+        )
+        tl_expired = api_routes.query_timeline_data(conn, days="cycle", tz=tz)
+        assert len(tl_expired) == 7
+        assert tl_expired[-1]["day"] == today.strftime("%Y-%m-%d")
+        assert tl_expired[0]["day"] == (today - timedelta(days=6)).strftime("%Y-%m-%d")
+        assert all(item["is_start"] is False for item in tl_expired)
+        assert all(item["is_reset"] is False for item in tl_expired)
+
+        # 3. Test fallback to 3p-weekly bucket when gemini-weekly is absent
+        conn.execute("DELETE FROM quota_state")
+        upcoming_3p = datetime.now(timezone.utc) + timedelta(days=3)
+        upsert_quota_state(
+            conn,
+            [
+                {
+                    "bucket_id": "3p-weekly",
+                    "group_name": "Claude and GPT models",
+                    "window": "weekly",
+                    "remaining_fraction": 0.9,
+                    "reset_time": upcoming_3p.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "calibrated_capacity": 200.0,
+                    "fetched_at": datetime.now(timezone.utc).isoformat(),
+                }
+            ],
+        )
+        tl_3p = api_routes.query_timeline_data(conn, days="cycle", tz=tz)
+        assert len(tl_3p) >= 8
+        assert tl_3p[0]["is_start"] is True
+        assert tl_3p[-1]["is_reset"] is True
+
+
 def test_frontend_debouncing_and_abort_controller():
     """Verifies Task 4 frontend optimizations in script.js:
     - Trailing debounce timer for db_update SSE events
@@ -2146,9 +3104,9 @@ def test_frontend_lazy_heatmap_and_abort_execution():
       // Advance past trailing timer
       await new Promise(r => setTimeout(r, 350));
 
-      // Exactly 8 fetches for the single collapsed Promise.all fetch
-      if (fetchCount !== beforeBurstFetches + 8) {
-        throw new Error(`Expected exactly 8 fetches after debounce window, got ${fetchCount - beforeBurstFetches}`);
+      // Exactly 9 fetches for the single collapsed Promise.all fetch (includes preloaded cycle timeline)
+      if (fetchCount !== beforeBurstFetches + 9) {
+        throw new Error(`Expected exactly 9 fetches after debounce window, got ${fetchCount - beforeBurstFetches}`);
       }
 
       // 9. Test AbortError rejection handling: should not throw unhandled rejection

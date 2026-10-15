@@ -3,13 +3,15 @@ import math
 import os
 import json
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone, tzinfo
 from typing import Any, NamedTuple
 from zoneinfo import ZoneInfo
 
+from context_monitor.db import get_quota_state
 from context_monitor.pricing import get_pricing_key
 from context_monitor.quota import (
     _get_default_capacity,
+    _to_utc_datetime,
     calculate_quota_metrics,
     get_hourly_activity_profile,
     sync_and_get_quota_state,
@@ -234,8 +236,10 @@ _compute_quota_pcts = compute_quota_pcts
 
 def get_target_tz(tz_name=None):
     if tz_name:
+        if isinstance(tz_name, (ZoneInfo, tzinfo)) or hasattr(tz_name, "utcoffset"):
+            return tz_name
         try:
-            return ZoneInfo(tz_name)
+            return ZoneInfo(str(tz_name).strip())
         except Exception:
             pass
     env_tz = os.environ.get("TZ")
@@ -626,9 +630,43 @@ def query_cost_by_project(conn, tz=None, project=None, limit_sessions=6):
     }
 
 
+def _make_timeline_item(
+    day: str,
+    label: str | None = None,
+    is_start: bool = False,
+    is_reset: bool = False,
+    is_future: bool = False,
+    sessions: int = 0,
+    steps: int = 0,
+    tokens: int = 0,
+    cost: float = 0.0,
+    projects: dict[str, int] | None = None,
+) -> dict[str, Any]:
+    item: dict[str, Any] = {
+        "day": day,
+        "sessions": sessions,
+        "steps": steps,
+        "tokens": tokens,
+        "cost": round(cost, 2),
+        "projects": projects if projects is not None else {},
+    }
+    if label is not None:
+        item["label"] = label
+        item["is_start"] = is_start
+        item["is_reset"] = is_reset
+        item["is_future"] = is_future
+    return item
+
+
 def query_timeline_data(conn, days=None, tz=None, project=None):
+    is_cycle_mode = (
+        str(days).lower().strip() in ("cycle", "reset", "since_reset")
+        if (days is not None and not isinstance(days, bool))
+        else False
+    )
+
     num_days = None
-    if days is not None and not isinstance(days, bool):
+    if not is_cycle_mode and days is not None and not isinstance(days, bool):
         try:
             val = int(float(days)) if isinstance(days, str) else int(days)
             if val <= 0:
@@ -663,7 +701,62 @@ def query_timeline_data(conn, days=None, tz=None, project=None):
             )
             params.append(project)
 
-    if num_days is not None:
+    has_valid_reset = False
+    start_dt_utc = None
+    reset_dt_utc = None
+    start_dt_local = None
+    reset_dt_local = None
+
+    if is_cycle_mode:
+        try:
+            quota_rows = get_quota_state(conn)
+        except Exception:
+            quota_rows = []
+
+        gw_bucket = None
+        for b in quota_rows:
+            bid = str(b.get("bucket_id") or b.get("bucketId") or "").lower()
+            if bid in ("gemini-weekly", "gemini_weekly"):
+                gw_bucket = b
+                break
+
+        if not (gw_bucket and gw_bucket.get("reset_time")):
+            for b in quota_rows:
+                bid = str(b.get("bucket_id") or b.get("bucketId") or "").lower()
+                win = str(b.get("window") or "").lower()
+                if ("weekly" in bid or win == "weekly") and b.get("reset_time"):
+                    gw_bucket = b
+                    break
+
+        reset_time = gw_bucket.get("reset_time") if gw_bucket else None
+        if reset_time:
+            reset_dt_utc = _to_utc_datetime(reset_time)
+            if reset_dt_utc is not None:
+                reset_dt_utc = reset_dt_utc.replace(microsecond=0)
+                start_dt_utc = reset_dt_utc - timedelta(days=7)
+                start_dt_local = start_dt_utc.astimezone(target_tz)
+                reset_dt_local = reset_dt_utc.astimezone(target_tz)
+                if reset_dt_local.date() >= today:
+                    has_valid_reset = True
+
+        if has_valid_reset:
+            start_dt_utc_clean = start_dt_utc.replace(microsecond=0)
+            reset_dt_utc_clean = reset_dt_utc.replace(microsecond=0)
+            where_conditions.append("created_at >= ?")
+            params.append(start_dt_utc_clean.strftime("%Y-%m-%d"))
+            where_conditions.append("replace(created_at, ' ', 'T') >= ?")
+            params.append(start_dt_utc_clean.strftime("%Y-%m-%dT%H:%M:%S"))
+            where_conditions.append("replace(created_at, ' ', 'T') < ?")
+            params.append(reset_dt_utc_clean.strftime("%Y-%m-%dT%H:%M:%S"))
+            start_date = start_dt_local.date()
+            end_date = reset_dt_local.date()
+        else:
+            start_date = today - timedelta(days=6)
+            end_date = today
+            cutoff_date = today - timedelta(days=8)
+            where_conditions.append("created_at >= ?")
+            params.append(cutoff_date.isoformat())
+    elif num_days is not None:
         try:
             cutoff_date = today - timedelta(days=num_days + 1)
             where_conditions.append("created_at >= ?")
@@ -735,7 +828,9 @@ def query_timeline_data(conn, days=None, tz=None, project=None):
     for day_str, s_set in day_sessions.items():
         daily_map[day_str]["sessions"] = len(s_set)
 
-    if num_days is not None:
+    if is_cycle_mode:
+        pass
+    elif num_days is not None:
         start_date = today - timedelta(days=num_days - 1)
         end_date = today
     else:
@@ -756,21 +851,41 @@ def query_timeline_data(conn, days=None, tz=None, project=None):
     curr = start_date
     while curr <= end_date:
         d_str = curr.strftime("%Y-%m-%d")
-        if d_str in daily_map:
-            item = daily_map[d_str]
-            item["cost"] = round(item["cost"], 2)
-            timeline.append(item)
+        if is_cycle_mode:
+            is_start = False
+            is_reset = False
+            if has_valid_reset:
+                if curr == start_date:
+                    is_start = True
+                    label = start_dt_local.strftime("%a %H:%M")
+                elif curr == end_date:
+                    is_reset = True
+                    label = reset_dt_local.strftime("%a %H:%M")
+                else:
+                    label = d_str
+            else:
+                label = d_str
+
+            is_future = curr > today
+            if is_future:
+                timeline.append(_make_timeline_item(d_str, label=label, is_start=is_start, is_reset=is_reset, is_future=True))
+            else:
+                if d_str in daily_map:
+                    item = daily_map[d_str]
+                    timeline.append(_make_timeline_item(
+                        d_str, label=label, is_start=is_start, is_reset=is_reset, is_future=False,
+                        sessions=item["sessions"], steps=item["steps"], tokens=item["tokens"], cost=item["cost"], projects=item["projects"]
+                    ))
+                else:
+                    timeline.append(_make_timeline_item(d_str, label=label, is_start=is_start, is_reset=is_reset, is_future=False))
         else:
-            timeline.append(
-                {
-                    "day": d_str,
-                    "sessions": 0,
-                    "steps": 0,
-                    "tokens": 0,
-                    "cost": 0.0,
-                    "projects": {},
-                }
-            )
+            if d_str in daily_map:
+                item = daily_map[d_str]
+                timeline.append(_make_timeline_item(
+                    d_str, sessions=item["sessions"], steps=item["steps"], tokens=item["tokens"], cost=item["cost"], projects=item["projects"]
+                ))
+            else:
+                timeline.append(_make_timeline_item(d_str))
         curr += timedelta(days=1)
 
     return timeline

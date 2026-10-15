@@ -91,10 +91,28 @@
     let allHotFiles = [];
     let allConversations = [];
     let allTimelineData = [];
+    let cycleTimelineData = (typeof STATIC_DATA !== 'undefined' && STATIC_DATA && STATIC_DATA.timeline_cycle) ? STATIC_DATA.timeline_cycle : null;
+    let cachedCycleProject = (typeof STATIC_DATA !== 'undefined' && STATIC_DATA && STATIC_DATA.timeline_cycle) ? 'all' : null;
+
+    function getCycleTimelineQuery(clientTz, project) {
+      let params = ['days=cycle'];
+      if (clientTz) params.push(`tz=${encodeURIComponent(clientTz)}`);
+      if (typeof project !== 'undefined' && project && project !== 'all') {
+        params.push(`project=${encodeURIComponent(project)}`);
+      }
+      return `?${params.join('&')}`;
+    }
+
+    function getCycleItemSuffix(item) {
+      if (item?.is_start) return ` · Week Start (${item.label})`;
+      if (item?.is_reset) return ` · Reset (${item.label})`;
+      return '';
+    }
+
     let allProjectCostData = null;
     let allToolsData = [];
     let allMcpData = [];
-    let currentTimelineDays = 30;
+    let currentTimelineDays = 'cycle';
     let currentWeeklyQuotaCapacity = 672.0;
 
     function updateWeeklyQuotaCapacity(quota) {
@@ -237,6 +255,8 @@
       if (updateUrl) {
         syncProjectToUrl(currentProject);
       }
+      cycleTimelineData = null;
+      cachedCycleProject = null;
       fetchDashboardData();
     };
 
@@ -372,13 +392,16 @@
         if (currentProject !== 'all') baseQuery.push(`project=${encodeURIComponent(currentProject)}`);
         const queryStr = baseQuery.length > 0 ? `?${baseQuery.join('&')}` : '';
 
+        const cycleQueryStr = getCycleTimelineQuery(clientTz, currentProject);
+
         let convQuery = [...baseQuery, `view=${encodeURIComponent(currentConvViewMode)}`];
         const convQueryStr = convQuery.length > 0 ? `?${convQuery.join('&')}` : '';
 
         const fetchOpts = signal ? { signal } : {};
-        const [summaryRes, timelineRes, costProjRes, toolsRes, mcpRes, hotFilesRes, matrixRes, convsRes] = await Promise.all([
+        const [summaryRes, timelineRes, timelineCycleRes, costProjRes, toolsRes, mcpRes, hotFilesRes, matrixRes, convsRes] = await Promise.all([
           fetch(`/api/summary${queryStr}`, fetchOpts).then(r => r.json()),
           fetch(`/api/timeline${queryStr}`, fetchOpts).then(r => r.json()),
+          fetch(`/api/timeline${cycleQueryStr}`, fetchOpts).then(r => r.json()),
           fetch(`/api/cost-by-project${queryStr}`, fetchOpts).then(r => r.json()),
           fetch(`/api/tools${queryStr}`, fetchOpts).then(r => r.json()),
           fetch(`/api/mcp${queryStr}`, fetchOpts).then(r => r.json()),
@@ -390,6 +413,8 @@
         if (signal && signal.aborted) return;
 
         allTimelineData = Array.isArray(timelineRes) ? timelineRes : [];
+        cycleTimelineData = Array.isArray(timelineCycleRes) ? timelineCycleRes : [];
+        cachedCycleProject = currentProject;
         allProjectCostData = costProjRes || { total_cost: 0, projects: [] };
         allToolsData = Array.isArray(toolsRes) ? toolsRes : [];
         allMcpData = Array.isArray(mcpRes) ? mcpRes : [];
@@ -1215,6 +1240,8 @@
     // ==========================================
     function setTimelineRange(days) {
       currentTimelineDays = days;
+      const isCycle = (typeof days === 'string' && days.toLowerCase().trim() === 'cycle');
+      const btnCycle = document.getElementById('btnCycle');
       const btn7d = document.getElementById('btn7d');
       const btn14d = document.getElementById('btn14d');
       const btn30d = document.getElementById('btn30d');
@@ -1225,11 +1252,36 @@
         inactive: 'px-2.5 py-1 rounded-md text-gray-400 hover:text-white transition text-[11px] whitespace-nowrap outline-none focus:outline-none focus:ring-0'
       };
 
+      if (btnCycle) btnCycle.className = isCycle ? btnClasses.active : btnClasses.inactive;
       if (btn7d) btn7d.className = days === 7 ? btnClasses.active : btnClasses.inactive;
       if (btn14d) btn14d.className = days === 14 ? btnClasses.active : btnClasses.inactive;
       if (btn30d) btn30d.className = days === 30 ? btnClasses.active : btnClasses.inactive;
       if (btnAll) btnAll.className = days === null ? btnClasses.active : btnClasses.inactive;
       
+      if (isCycle) {
+        if (cycleTimelineData && (!cachedCycleProject || cachedCycleProject === currentProject)) {
+          renderTimelineChart(cycleTimelineData);
+        } else {
+          const clientTz = Intl.DateTimeFormat().resolvedOptions().timeZone || '';
+          fetch(`/api/timeline${getCycleTimelineQuery(clientTz, currentProject)}`)
+            .then(r => r.json())
+            .then(res => {
+              cycleTimelineData = Array.isArray(res) ? res : [];
+              cachedCycleProject = currentProject;
+              if (currentTimelineDays === 'cycle' || (typeof currentTimelineDays === 'string' && currentTimelineDays.toLowerCase().trim() === 'cycle')) {
+                renderTimelineChart(cycleTimelineData);
+              }
+            })
+            .catch(e => {
+              console.error('Failed to fetch cycle timeline data', e);
+              if (currentTimelineDays === 'cycle' || (typeof currentTimelineDays === 'string' && currentTimelineDays.toLowerCase().trim() === 'cycle')) {
+                renderTimelineChart([]);
+              }
+            });
+        }
+        return;
+      }
+
       let sliced = allTimelineData;
       if (days) {
         sliced = allTimelineData.slice(-days);
@@ -1247,8 +1299,8 @@
 
     function renderTimelineChart(data) {
       const canvas = document.getElementById('timelineChart');
-      if (!canvas) return;
-      const labels = data.map(d => d.day);
+      if (!canvas || !canvas.getContext || !Array.isArray(data)) return;
+      const labels = data.map(d => d.label || d.day);
       const isStacked = (currentTimelineViewMode === 'stacked' && currentProject === 'all');
 
       let barDatasets = [];
@@ -1403,35 +1455,62 @@
                 return true;
               },
               callbacks: {
+                title: (items) => {
+                  if (!items || items.length === 0) return '';
+                  const idx = items[0].dataIndex;
+                  const item = data[idx];
+                  if (!item) return items[0].label || '';
+                  if (item.is_start) return `${item.day} · Week Start (${item.label})`;
+                  if (item.is_reset) return `${item.day} · Reset (${item.label})`;
+                  if (item.is_future) return `${item.day} · Upcoming in cycle`;
+                  return item.day || items[0].label || '';
+                },
                 label: (ctx) => {
+                  const item = data[ctx.dataIndex];
+                  const isFuture = item?.is_future;
+                  const suffix = getCycleItemSuffix(item);
+
                   if (ctx.dataset.label === 'Est. API Value ($)') {
+                    if (isFuture) return `Est. API Value: Upcoming${suffix}`;
                     const val = Number(ctx.raw || 0);
                     const costFormatted = val.toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
                     const pct = currentWeeklyQuotaCapacity > 0 ? ((val / currentWeeklyQuotaCapacity) * 100).toFixed(2) : '0.00';
-                    return `Est. API Value: $${costFormatted} (${pct}% of weekly quota)`;
+                    return `Est. API Value: $${costFormatted} (${pct}% of weekly quota)${suffix}`;
                   }
                   if (ctx.dataset.label === 'Sessions') {
-                    return `Sessions: ${ctx.raw}`;
+                    if (isFuture) return `Sessions: Upcoming${suffix}`;
+                    return `Sessions: ${ctx.raw}${suffix}`;
                   }
                   if (isStacked && ctx.dataset.stack === 'tokens_stack') {
+                    if (isFuture) {
+                      return `${ctx.dataset.label}: Upcoming in cycle · 0 tokens${suffix}`;
+                    }
                     const dayTotal = data[ctx.dataIndex]?.tokens || 0;
                     const dayCost = data[ctx.dataIndex]?.cost || 0;
                     const pct = dayTotal > 0 ? ((ctx.raw / dayTotal) * 100).toFixed(1) : '0.0';
                     const projCost = dayTotal > 0 ? dayCost * (ctx.raw / dayTotal) : 0;
                     const projQuotaPct = currentWeeklyQuotaCapacity > 0 ? ((projCost / currentWeeklyQuotaCapacity) * 100).toFixed(2) : '0.00';
-                    return `${ctx.dataset.label}: ${formatTokens(ctx.raw)} (${pct}% · ${projQuotaPct}% wk quota)`;
+                    return `${ctx.dataset.label}: ${formatTokens(ctx.raw)} (${pct}% · ${projQuotaPct}% wk quota)${suffix}`;
+                  }
+                  if (isFuture) {
+                    return `${ctx.dataset.label || 'API Tokens'}: Upcoming in cycle · 0 tokens${suffix}`;
                   }
                   const dayCost = data[ctx.dataIndex]?.cost || 0;
                   const dayQuotaPct = currentWeeklyQuotaCapacity > 0 ? ((dayCost / currentWeeklyQuotaCapacity) * 100).toFixed(2) : '0.00';
-                  return `${ctx.dataset.label || 'API Tokens'}: ${formatTokens(ctx.raw)} (${dayQuotaPct}% of weekly quota)`;
+                  return `${ctx.dataset.label || 'API Tokens'}: ${formatTokens(ctx.raw)} (${dayQuotaPct}% of weekly quota)${suffix}`;
                 },
                 footer: (items) => {
                   if (!isStacked) return '';
                   const idx = items[0]?.dataIndex;
+                  const item = data[idx];
+                  const suffix = getCycleItemSuffix(item);
+                  if (item?.is_future) {
+                    return `Total API Tokens: Upcoming in cycle · 0 tokens${suffix}`;
+                  }
                   const dayTokens = data[idx]?.tokens || 0;
                   const dayCost = data[idx]?.cost || 0;
                   const dayQuotaPct = currentWeeklyQuotaCapacity > 0 ? ((dayCost / currentWeeklyQuotaCapacity) * 100).toFixed(2) : '0.00';
-                  return `Total API Tokens: ${formatTokens(dayTokens)} (${dayQuotaPct}% of weekly quota)`;
+                  return `Total API Tokens: ${formatTokens(dayTokens)} (${dayQuotaPct}% of weekly quota)${suffix}`;
                 }
               }
             }

@@ -389,55 +389,82 @@ class DashboardServer(ThreadingHTTPServer):
             super().handle_error(request, client_address)
 
 
+def build_static_bundle(
+    conn, target_tz=None, project=None, include_conversations: bool = False
+) -> dict:
+    """Builds the comprehensive offline static data dictionary for standalone HTML exports."""
+    target_tz = api_routes.get_target_tz(target_tz)
+    summary = api_routes.query_summary_data(conn, target_tz, project)
+    timeline = api_routes.query_timeline_data(conn, None, target_tz, project)
+    timeline_cycle = api_routes.query_timeline_data(
+        conn, days="cycle", tz=target_tz, project=project
+    )
+    cost_by_project = api_routes.query_cost_by_project(conn, target_tz, project)
+    tools = api_routes.query_tools_data(conn, project)
+    mcp = api_routes.query_mcp_data(conn, project)
+    hot_files = api_routes.query_hot_files_data(conn, project)
+    activity_matrix = api_routes.query_activity_matrix(conn, target_tz, project)
+    conversations = (
+        api_routes.query_conversations_list(conn, 200, target_tz, project)
+        if include_conversations
+        else []
+    )
+    quota = api_routes.query_quota_data(conn)
+    return {
+        "summary": summary,
+        "timeline": timeline,
+        "timeline_cycle": timeline_cycle,
+        "cost_by_project": cost_by_project,
+        "tools": tools,
+        "mcp": mcp,
+        "hot_files": hot_files,
+        "activity_matrix": activity_matrix,
+        "conversations": conversations,
+        "quota": quota,
+    }
+
+
 def export_standalone_html(
-    output_path: Path, include_conversations: bool = False, tz: str = None
+    output_path: Path,
+    include_conversations: bool = False,
+    tz: str = None,
+    project: str = None,
 ):
     init_db()
     conn = get_db_connection()
     target_tz = api_routes.get_target_tz(tz)
     try:
-        summary = api_routes.query_summary_data(conn, target_tz)
-        timeline = api_routes.query_timeline_data(conn, None, target_tz)
-        cost_by_project = api_routes.query_cost_by_project(conn, target_tz)
-        tools = api_routes.query_tools_data(conn)
-        mcp = api_routes.query_mcp_data(conn)
-        hot_files = api_routes.query_hot_files_data(conn)
-        activity_matrix = api_routes.query_activity_matrix(conn, target_tz)
-        conversations = (
-            api_routes.query_conversations_list(conn, 200, target_tz)
-            if include_conversations
-            else []
+        static_data = build_static_bundle(
+            conn,
+            target_tz=target_tz,
+            project=project,
+            include_conversations=include_conversations,
         )
-        quota = api_routes.query_quota_data(conn)
     finally:
         conn.close()
 
     embedded_js = f"""
     <script>
       const IS_STATIC_EXPORT = true;
-      const STATIC_DATA = {{
-        summary: {json.dumps(summary)},
-        timeline: {json.dumps(timeline)},
-        cost_by_project: {json.dumps(cost_by_project)},
-        tools: {json.dumps(tools)},
-        mcp: {json.dumps(mcp)},
-        hot_files: {json.dumps(hot_files)},
-        activity_matrix: {json.dumps(activity_matrix)},
-        conversations: {json.dumps(conversations)},
-        quota: {json.dumps(quota)}
-      }};
+      const STATIC_DATA = {json.dumps(static_data)};
       
       window.fetch = async function(url) {{
-        if (url.includes('/api/summary')) return {{ json: async () => STATIC_DATA.summary }};
-        if (url.includes('/api/quota')) return {{ json: async () => STATIC_DATA.quota }};
-        if (url.includes('/api/timeline')) return {{ json: async () => STATIC_DATA.timeline }};
-        if (url.includes('/api/cost-by-project')) return {{ json: async () => STATIC_DATA.cost_by_project }};
-        if (url.includes('/api/tools')) return {{ json: async () => STATIC_DATA.tools }};
-        if (url.includes('/api/mcp')) return {{ json: async () => STATIC_DATA.mcp }};
-        if (url.includes('/api/hot-files')) return {{ json: async () => STATIC_DATA.hot_files }};
-        if (url.includes('/api/activity-matrix')) return {{ json: async () => STATIC_DATA.activity_matrix }};
-        if (url.includes('/api/conversations')) return {{ json: async () => STATIC_DATA.conversations }};
-        if (url.includes('/api/projects')) return {{ json: async () => [] }};
+        const urlStr = (url && url.url) ? url.url : (url && url.href ? url.href : String(url));
+        if (urlStr.includes('/api/summary')) return {{ json: async () => STATIC_DATA.summary }};
+        if (urlStr.includes('/api/quota')) return {{ json: async () => STATIC_DATA.quota }};
+        if (urlStr.includes('/api/timeline')) {{
+          if (urlStr.toLowerCase().includes('days=cycle') && STATIC_DATA.timeline_cycle) {{
+            return {{ json: async () => STATIC_DATA.timeline_cycle }};
+          }}
+          return {{ json: async () => STATIC_DATA.timeline }};
+        }}
+        if (urlStr.includes('/api/cost-by-project')) return {{ json: async () => STATIC_DATA.cost_by_project }};
+        if (urlStr.includes('/api/tools')) return {{ json: async () => STATIC_DATA.tools }};
+        if (urlStr.includes('/api/mcp')) return {{ json: async () => STATIC_DATA.mcp }};
+        if (urlStr.includes('/api/hot-files')) return {{ json: async () => STATIC_DATA.hot_files }};
+        if (urlStr.includes('/api/activity-matrix')) return {{ json: async () => STATIC_DATA.activity_matrix }};
+        if (urlStr.includes('/api/conversations')) return {{ json: async () => STATIC_DATA.conversations }};
+        if (urlStr.includes('/api/projects')) return {{ json: async () => [] }};
         return {{ json: async () => ({{}}) }};
       }};
     </script>
