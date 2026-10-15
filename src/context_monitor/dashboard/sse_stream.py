@@ -40,6 +40,13 @@ def broadcast_sse(event_name: str, data: dict):
         except Exception:
             pass
 
+        try:
+            from context_monitor.quota import invalidate_activity_profile_cache
+
+            invalidate_activity_profile_cache()
+        except Exception:
+            pass
+
         if isinstance(data, dict) and "quota" not in data:
             try:
                 from context_monitor.db import get_db_connection
@@ -101,12 +108,6 @@ class DbChangeWatcher(threading.Thread):
                 cur_state = self._get_state()
                 if cur_state != self.last_state:
                     self.last_state = cur_state
-                    try:
-                        from context_monitor.dashboard.server import clear_api_cache
-
-                        clear_api_cache()
-                    except Exception:
-                        pass
                     if self._stop_event.wait(0.3):
                         break
                     self.last_state = self._get_state()

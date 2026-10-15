@@ -351,7 +351,20 @@
       return `<div class="flex flex-wrap items-center gap-1 max-w-[220px]">${joinedHtml}</div>`;
     }
 
+    let dashboardAbortController = null;
+
     async function fetchDashboardData() {
+      if (dashboardAbortController) {
+        dashboardAbortController.abort();
+      }
+      dashboardAbortController = typeof AbortController !== 'undefined' ? new AbortController() : null;
+      const signal = dashboardAbortController ? dashboardAbortController.signal : undefined;
+
+      if (dbUpdateDebounceTimer) {
+        clearTimeout(dbUpdateDebounceTimer);
+        dbUpdateDebounceTimer = null;
+      }
+
       try {
         const clientTz = Intl.DateTimeFormat().resolvedOptions().timeZone || '';
         let baseQuery = [];
@@ -362,22 +375,25 @@
         let convQuery = [...baseQuery, `view=${encodeURIComponent(currentConvViewMode)}`];
         const convQueryStr = convQuery.length > 0 ? `?${convQuery.join('&')}` : '';
 
+        const fetchOpts = signal ? { signal } : {};
         const [summaryRes, timelineRes, costProjRes, toolsRes, mcpRes, hotFilesRes, matrixRes, convsRes] = await Promise.all([
-          fetch(`/api/summary${queryStr}`).then(r => r.json()),
-          fetch(`/api/timeline${queryStr}`).then(r => r.json()),
-          fetch(`/api/cost-by-project${queryStr}`).then(r => r.json()),
-          fetch(`/api/tools${queryStr}`).then(r => r.json()),
-          fetch(`/api/mcp${queryStr}`).then(r => r.json()),
-          fetch(`/api/hot-files${queryStr}`).then(r => r.json()),
-          fetch(`/api/activity-matrix${queryStr}`).then(r => r.json()),
-          fetch(`/api/conversations${convQueryStr}`).then(r => r.json())
+          fetch(`/api/summary${queryStr}`, fetchOpts).then(r => r.json()),
+          fetch(`/api/timeline${queryStr}`, fetchOpts).then(r => r.json()),
+          fetch(`/api/cost-by-project${queryStr}`, fetchOpts).then(r => r.json()),
+          fetch(`/api/tools${queryStr}`, fetchOpts).then(r => r.json()),
+          fetch(`/api/mcp${queryStr}`, fetchOpts).then(r => r.json()),
+          fetch(`/api/hot-files${queryStr}`, fetchOpts).then(r => r.json()),
+          fetch(`/api/activity-matrix${queryStr}`, fetchOpts).then(r => r.json()),
+          fetch(`/api/conversations${convQueryStr}`, fetchOpts).then(r => r.json())
         ]);
 
-        allTimelineData = timelineRes || [];
+        if (signal && signal.aborted) return;
+
+        allTimelineData = Array.isArray(timelineRes) ? timelineRes : [];
         allProjectCostData = costProjRes || { total_cost: 0, projects: [] };
-        allToolsData = toolsRes || [];
-        allMcpData = mcpRes || [];
-        cachedActivityMatrix = matrixRes;
+        allToolsData = Array.isArray(toolsRes) ? toolsRes : [];
+        allMcpData = Array.isArray(mcpRes) ? mcpRes : [];
+        cachedActivityMatrix = matrixRes || {};
 
         if (summaryRes.timezone_label) {
           document.getElementById('tzLabel').textContent = summaryRes.timezone_label;
@@ -401,13 +417,18 @@
         renderPhaseChart(summaryRes.phases);
         renderHeatmapAllViews(matrixRes);
         renderHotFiles(hotFilesRes);
-        if (convsRes && convsRes.length > 0) {
+        if (convsRes) {
           renderConversations(convsRes);
         }
-        
-        lucide.createIcons();
       } catch (err) {
+        if (err && (err.name === 'AbortError' || err.code === 20 || (signal && signal.aborted))) {
+          return;
+        }
         console.error("Failed to load dashboard data", err);
+      } finally {
+        if (dashboardAbortController && dashboardAbortController.signal === signal) {
+          dashboardAbortController = null;
+        }
       }
     }
 
@@ -476,12 +497,141 @@
         if (elCap) elCap.textContent = `Cap: $${Number(cap).toFixed(2)}`;
       }
 
-      const sessWk = quota.session_weekly_pct != null ? quota.session_weekly_pct : (quota.weekly_pct || 0);
-      const sess5h = quota.session_5h_pct != null ? quota.session_5h_pct : (quota.five_hour_pct || 0);
+      // Pacing and projection calculation
+      const weeklyPacing = quota.weekly_pacing || (gw && gw.pacing) || (pw && pw.pacing) || null;
+      const fiveHourPacing = quota.five_hour_pacing || (g5 && g5.pacing) || (p5 && p5.pacing) || null;
+
+      const projWkPct = quota.projected_weekly_pct != null
+        ? quota.projected_weekly_pct
+        : (weeklyPacing && weeklyPacing.projected_pct != null ? weeklyPacing.projected_pct : null);
+
+      const projWkCost = quota.projected_weekly_cost != null
+        ? quota.projected_weekly_cost
+        : (weeklyPacing && weeklyPacing.projected_cost != null ? weeklyPacing.projected_cost : null);
+
+      // Determine calibration state defensively
+      const isCalibrating = (weeklyPacing && weeklyPacing.is_calibrating != null)
+        ? Boolean(weeklyPacing.is_calibrating)
+        : (quota.is_calibrating != null
+            ? Boolean(quota.is_calibrating)
+            : (projWkPct == null || isNaN(Number(projWkPct))));
+
+      // Determine pacing status: prefer explicit status; if absent, infer from projected %
+      let rawStatus = quota.pacing_status || (weeklyPacing && weeklyPacing.status) || null;
+      if (!rawStatus) {
+        if (isCalibrating || projWkPct == null || isNaN(Number(projWkPct))) {
+          rawStatus = 'calibrating';
+        } else {
+          const p = Number(projWkPct);
+          if (p <= 80.0) rawStatus = 'on_track';
+          else if (p <= 100.0) rawStatus = 'moderate';
+          else rawStatus = 'exceeding';
+        }
+      }
+
+      const statusKey = isCalibrating ? 'calibrating' : String(rawStatus || 'calibrating').toLowerCase().replace(/[-\s]/g, '_');
+
+      const proj5hPct = quota.projected_5h_pct != null
+        ? quota.projected_5h_pct
+        : (fiveHourPacing && fiveHourPacing.projected_pct != null ? fiveHourPacing.projected_pct : null);
+
+      const is5hCalibrating = (fiveHourPacing && fiveHourPacing.is_calibrating != null)
+        ? Boolean(fiveHourPacing.is_calibrating)
+        : (quota.is_5h_calibrating != null ? Boolean(quota.is_5h_calibrating) : false);
+
       const elSessWk = document.getElementById('sessionQuotaImpactWk');
       const elSess5h = document.getElementById('sessionQuotaImpact5h');
-      if (elSessWk) elSessWk.textContent = `${Number(sessWk).toFixed(2)}% weekly`;
-      if (elSess5h) elSess5h.textContent = `${Number(sess5h).toFixed(2)}% 5h`;
+      const elBadge = document.getElementById('pacingBadge');
+
+      if (elSessWk) {
+        if (isCalibrating || projWkPct == null || isNaN(Number(projWkPct))) {
+          elSessWk.textContent = 'Calibrating...';
+        } else {
+          const costStr = (projWkCost != null && !isNaN(Number(projWkCost)))
+            ? ` (~$${Math.round(Number(projWkCost)).toLocaleString()})`
+            : '';
+          elSessWk.textContent = `~${Number(projWkPct).toFixed(1)}% projected${costStr}`;
+        }
+      }
+
+      if (elBadge) {
+        let badgeLabel = 'Calibrating';
+        let badgeClass = 'px-2 py-0.5 rounded text-[11px] font-medium bg-cyan-950/60 text-cyan-300 border border-cyan-500/30';
+
+        if (statusKey === 'on_track') {
+          badgeLabel = 'On Track';
+          badgeClass = 'px-2 py-0.5 rounded text-[11px] font-medium bg-emerald-950/60 text-emerald-300 border border-emerald-500/30';
+        } else if (statusKey === 'moderate' || statusKey === 'near_limit') {
+          badgeLabel = 'Near Limit';
+          badgeClass = 'px-2 py-0.5 rounded text-[11px] font-medium bg-amber-950/60 text-amber-300 border border-amber-500/30';
+        } else if (statusKey === 'exceeding' || statusKey === 'pacing_alert' || statusKey === 'alert') {
+          badgeLabel = 'Pacing Alert';
+          badgeClass = 'px-2 py-0.5 rounded text-[11px] font-medium bg-rose-950/60 text-rose-300 border border-rose-500/30';
+        } else {
+          badgeLabel = 'Calibrating';
+          badgeClass = 'px-2 py-0.5 rounded text-[11px] font-medium bg-cyan-950/60 text-cyan-300 border border-cyan-500/30';
+        }
+        elBadge.textContent = badgeLabel;
+        elBadge.className = badgeClass;
+      }
+
+      if (elSess5h) {
+        if (is5hCalibrating) {
+          elSess5h.textContent = 'Calibrating...';
+        } else if (proj5hPct != null && !isNaN(Number(proj5hPct))) {
+          elSess5h.textContent = `~${Number(proj5hPct).toFixed(1)}% projected`;
+        } else {
+          elSess5h.textContent = '--% projected';
+        }
+      }
+
+      // Explanatory tooltip on hover explaining calculation details
+      const banner = document.getElementById('sessionQuotaImpactBanner');
+      if (banner || elSessWk) {
+        let tooltip = 'End-of-Week Quota Projection & Cycle Pacing:\nProjected consumption based on elapsed cycle velocity and calibrated compute capacity.';
+        if (weeklyPacing) {
+          const elapsedHoursStr = (weeklyPacing.elapsed_hours != null && !isNaN(Number(weeklyPacing.elapsed_hours))) ? `${Number(weeklyPacing.elapsed_hours).toFixed(1)}h` : '--';
+          const remainingHoursStr = (weeklyPacing.remaining_hours != null && !isNaN(Number(weeklyPacing.remaining_hours))) ? `${Number(weeklyPacing.remaining_hours).toFixed(1)}h` : '--';
+          const rate = (weeklyPacing.burn_rate_pct_per_hour != null && !isNaN(Number(weeklyPacing.burn_rate_pct_per_hour))) ? `${Number(weeklyPacing.burn_rate_pct_per_hour).toFixed(3)}%/h` : '--';
+          const used = (weeklyPacing.used_pct != null && !isNaN(Number(weeklyPacing.used_pct))) ? `${Number(weeklyPacing.used_pct).toFixed(1)}%` : '--';
+          const proj = (weeklyPacing.projected_pct != null && !isNaN(Number(weeklyPacing.projected_pct))) ? `~${Number(weeklyPacing.projected_pct).toFixed(1)}%` : '--';
+          const cost = (weeklyPacing.projected_cost != null && !isNaN(Number(weeklyPacing.projected_cost))) ? `~$${Math.round(Number(weeklyPacing.projected_cost)).toLocaleString()}` : '--';
+
+          const isActivityWeighted = weeklyPacing.weighting_mode === 'activity_weighted' && weeklyPacing.elapsed_activity_pct != null && !isNaN(Number(weeklyPacing.elapsed_activity_pct));
+          const elapsedCycleStr = isActivityWeighted
+            ? `• Elapsed Cycle: ${elapsedHoursStr} (${Number(weeklyPacing.elapsed_activity_pct).toFixed(1)}% of weekly activity) | Remaining: ${remainingHoursStr}`
+            : `• Elapsed Cycle: ${elapsedHoursStr} | Remaining: ${remainingHoursStr}`;
+
+          let projStr = `• Projected End-of-Week: ${proj} (${cost})`;
+          if (isActivityWeighted && weeklyPacing.linear_projected_pct != null && !isNaN(Number(weeklyPacing.linear_projected_pct))) {
+            projStr = `• Projected End-of-Week: ${proj} (${cost}) [vs ~${Number(weeklyPacing.linear_projected_pct).toFixed(1)}% unweighted linear]`;
+          }
+
+          const modelStr = isActivityWeighted
+            ? '• Pacing Model: 24x7 Activity Matrix Weighted'
+            : '• Pacing Model: Linear Wall-Clock';
+
+          tooltip = `Weekly Pacing Calculation:\n${elapsedCycleStr}\n• Current Used: ${used}\n• Velocity / Burn Rate: ${rate}\n${projStr}\n${modelStr}`;
+          if (weeklyPacing.hours_until_exhaustion != null && !isNaN(Number(weeklyPacing.hours_until_exhaustion))) {
+            const hrs = Number(weeklyPacing.hours_until_exhaustion);
+            const timeStr = hrs >= 24
+              ? `~${(hrs / 24).toFixed(1)} days (~${hrs.toFixed(1)}h)`
+              : `~${hrs.toFixed(1)}h`;
+            tooltip += `\n• Exhaustion Risk: 100% quota reached in ${timeStr}`;
+          }
+          if (isCalibrating || weeklyPacing.is_calibrating) {
+            tooltip += '\n• Early-Cycle Guard: Trajectory calibrating during initial cycle window';
+          }
+        } else if (projWkPct != null && !isNaN(Number(projWkPct))) {
+          const cost = (projWkCost != null && !isNaN(Number(projWkCost))) ? ` (~$${Math.round(Number(projWkCost)).toLocaleString()})` : '';
+          tooltip = `Weekly Pacing Calculation:\n• Projected End-of-Week: ~${Number(projWkPct).toFixed(1)}%${cost}`;
+        }
+        if (proj5hPct != null && !isNaN(Number(proj5hPct)) && !is5hCalibrating) {
+          tooltip += `\n\n5-Hour Cycle Pace: ~${Number(proj5hPct).toFixed(1)}% projected`;
+        }
+        if (banner) banner.title = tooltip;
+        if (elSessWk) elSessWk.title = tooltip;
+      }
     }
 
     function renderKPIs(data) {
@@ -620,8 +770,27 @@
       return COLOR_PALETTE.lvl4;
     }
 
+    function renderActiveHeatmapGrid(data) {
+      const d = data || cachedActivityMatrix;
+      if (!d) return;
+      const daily = d.daily || {};
+
+      if (currentHeatmapMode === 'year') {
+        renderYearGrid(daily);
+      } else if (currentHeatmapMode === 'quarter') {
+        renderQuarterGrid(daily);
+      } else if (currentHeatmapMode === 'month') {
+        renderMonthHourlyGrid(d.past_30_days_hourly || {});
+      } else if (currentHeatmapMode === 'past7hourly') {
+        renderPast7HourlyGrid(d.past_7_days_hourly || {});
+      } else if (currentHeatmapMode === 'hourly') {
+        renderHourlyAggregateGrid(d.hourly_aggregate || []);
+      }
+    }
+
     function renderHeatmapAllViews(data) {
       if (!data) return;
+      cachedActivityMatrix = data;
       const daily = data.daily || {};
       const streak = data.streak || {};
 
@@ -633,16 +802,8 @@
       for (const k in daily) totalOps += daily[k].steps || 0;
       document.getElementById('heatmapOpsCount').textContent = `${totalOps.toLocaleString()} operations in 2026`;
 
-      // View 1: 52-Week Year Matrix
-      renderYearGrid(daily);
-      // View 2: 3 Months (14 Weeks) Matrix
-      renderQuarterGrid(daily);
-      // View 3: Past 30 Days (Hourly Matrix: 24 cols x 30 rows)
-      renderMonthHourlyGrid(data.past_30_days_hourly || {});
-      // View 4: Past 7 Days (Hourly 24x7 Commit Squares)
-      renderPast7HourlyGrid(data.past_7_days_hourly || {});
-      // View 5: 24x7 Aggregate (Hourly 24x7 Commit Squares)
-      renderHourlyAggregateGrid(data.hourly_aggregate || []);
+      // Lazy Heatmap: Render only the active mode's grid on refresh to avoid rebuilding 1,500+ hidden DOM elements
+      renderActiveHeatmapGrid(data);
 
       if (activeHeatmapHover) {
         if (activeHeatmapHover.type === 'daily') {
@@ -1018,6 +1179,14 @@
 
     function setHeatmapMode(mode) {
       currentHeatmapMode = mode;
+      activeHeatmapHover = null;
+      const tooltip = document.getElementById('ghTooltipText');
+      if (tooltip) {
+        tooltip.textContent = (mode === 'hourly' || mode === 'month' || mode === 'past7hourly')
+          ? 'Hover over any hour cell to see historical operation distribution'
+          : 'Hover over any commit square to see operations';
+      }
+
       document.getElementById('ghYearView').className = mode === 'year' ? 'flex flex-col w-fit' : 'hidden';
       document.getElementById('ghQuarterView').className = mode === 'quarter' ? 'flex flex-col w-fit' : 'hidden';
       document.getElementById('ghMonthView').className = mode === 'month' ? 'flex flex-col w-fit' : 'hidden';
@@ -1034,7 +1203,12 @@
       document.getElementById('hmBtnMonth').className = mode === 'month' ? btnClasses.active : btnClasses.inactive;
       document.getElementById('hmBtnPast7').className = mode === 'past7hourly' ? btnClasses.active : btnClasses.inactive;
       document.getElementById('hmBtnHourly').className = mode === 'hourly' ? btnClasses.active : btnClasses.inactive;
+
+      if (cachedActivityMatrix) {
+        renderActiveHeatmapGrid(cachedActivityMatrix);
+      }
     }
+    window.setHeatmapMode = setHeatmapMode;
 
     // ==========================================
     // CHARTS & TABLES
@@ -1932,7 +2106,9 @@
         `;
         tbody.appendChild(tr);
       }
-      lucide.createIcons();
+      if (typeof lucide !== 'undefined' && lucide.createIcons) {
+        lucide.createIcons({ root: tbody });
+      }
     }
 
     function renderConversations(convs) {
@@ -2064,7 +2240,9 @@
           }
         }
       }
-      lucide.createIcons();
+      if (typeof lucide !== 'undefined' && lucide.createIcons) {
+        lucide.createIcons({ root: tbody });
+      }
     }
 
     async function inspectSession(cid) {
@@ -2185,10 +2363,10 @@
           const q = data.quota || conv.quota;
           const sessWk = q.session_weekly_pct != null ? q.session_weekly_pct : (q.weekly_pct || 0);
           const sess5h = q.session_5h_pct != null ? q.session_5h_pct : (q.five_hour_pct || 0);
-          const elSessWk = document.getElementById('sessionQuotaImpactWk');
-          const elSess5h = document.getElementById('sessionQuotaImpact5h');
-          if (elSessWk) elSessWk.textContent = `${Number(sessWk).toFixed(2)}% weekly`;
-          if (elSess5h) elSess5h.textContent = `${Number(sess5h).toFixed(2)}% 5h`;
+          const elModalSessWk = document.getElementById('modalSessionQuotaImpactWk');
+          const elModalSess5h = document.getElementById('modalSessionQuotaImpact5h');
+          if (elModalSessWk) elModalSessWk.textContent = `${Number(sessWk).toFixed(2)}% weekly`;
+          if (elModalSess5h) elModalSess5h.textContent = `${Number(sess5h).toFixed(2)}% 5h`;
         }
 
         function formatToolBadge(toolOrSource, activity) {
@@ -2305,9 +2483,14 @@
         renderSwarmView(data);
         setSessionViewMode('flow');
 
-        document.getElementById('sessionModal').classList.remove('hidden');
-        document.getElementById('sessionModal').classList.add('flex');
-        lucide.createIcons();
+        const modal = document.getElementById('sessionModal');
+        if (modal) {
+          modal.classList.remove('hidden');
+          modal.classList.add('flex');
+          if (typeof lucide !== 'undefined' && lucide.createIcons) {
+            lucide.createIcons({ root: modal });
+          }
+        }
       } catch (err) {
         console.error("Failed to fetch session", err);
       }
@@ -2478,7 +2661,9 @@
           </div>
         `;
       }
-      lucide.createIcons();
+      if (typeof lucide !== 'undefined' && lucide.createIcons) {
+        lucide.createIcons({ root: treeEl });
+      }
     }
 
     function populateDiffSelectors(steps) {
@@ -2742,7 +2927,9 @@
 
       if (added.length === 0 && removed.length === 0 && common.length === 0) {
         container.innerHTML = '<div class="text-xs text-gray-500 italic p-6 text-center">No blocks found between Turn A and Turn B.</div>';
-        lucide.createIcons();
+        if (typeof lucide !== 'undefined' && lucide.createIcons) {
+          lucide.createIcons({ root: container });
+        }
         return;
       }
 
@@ -2799,7 +2986,9 @@
         container.appendChild(details);
       }
 
-      lucide.createIcons();
+      if (typeof lucide !== 'undefined' && lucide.createIcons) {
+        lucide.createIcons({ root: container });
+      }
     }
 
     function hashCode(str) {
@@ -3097,7 +3286,9 @@
           container.appendChild(row);
         }
       }
-      lucide.createIcons();
+      if (typeof lucide !== 'undefined' && lucide.createIcons) {
+        lucide.createIcons({ root: container });
+      }
     }
 
     function closeModal() {
@@ -3107,6 +3298,8 @@
         modal.classList.remove('flex');
       }
     }
+
+    let dbUpdateDebounceTimer = null;
 
     function initLiveSyncSSE() {
       let evtSource = null;
@@ -3132,10 +3325,16 @@
           try {
             if (event.data) {
               const d = JSON.parse(event.data);
-              if (d && d.quota) renderQuotaSection(d.quota);
+              if (d && (d.quota || d.quota_summary)) renderQuotaSection(d.quota || d.quota_summary);
             }
           } catch (e) {}
-          fetchDashboardData();
+          if (dbUpdateDebounceTimer) {
+            clearTimeout(dbUpdateDebounceTimer);
+          }
+          dbUpdateDebounceTimer = setTimeout(() => {
+            fetchDashboardData();
+            dbUpdateDebounceTimer = null;
+          }, 300);
         });
 
         evtSource.addEventListener('quota_update', (event) => {
@@ -3182,6 +3381,9 @@
         }
       } catch (e) {
         console.error('Failed to load projects', e);
+      }
+      if (typeof lucide !== 'undefined' && lucide.createIcons) {
+        lucide.createIcons();
       }
       fetchDashboardData();
       if (typeof IS_STATIC_EXPORT === "undefined" || !IS_STATIC_EXPORT) { initLiveSyncSSE(); }

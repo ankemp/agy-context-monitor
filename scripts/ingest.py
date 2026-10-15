@@ -39,6 +39,7 @@ from context_monitor.quota import (  # noqa: E402
     calculate_quota_metrics,
     format_quota_pct,
     format_reset_countdown,
+    get_hourly_activity_profile,
     sync_and_get_quota_state,
 )
 from context_monitor.settings import should_generate_artifacts  # noqa: E402
@@ -1113,7 +1114,8 @@ def sync_to_sqlite(cid: str, model_name: str, analysis: dict):
                 # Sync transcript blocks
                 if analysis.get("parsed_blocks"):
                     conn.execute(
-                        "DELETE FROM transcript_blocks WHERE conversation_id = ?", (cid,)
+                        "DELETE FROM transcript_blocks WHERE conversation_id = ?",
+                        (cid,),
                     )
                     block_params = []
                     for b in analysis["parsed_blocks"]:
@@ -1146,9 +1148,10 @@ def sync_to_sqlite(cid: str, model_name: str, analysis: dict):
 
                 conn.commit()
 
-            # Refresh and cache quota state
+            # Refresh and cache quota state and activity profile
             try:
                 analysis["quota_state"] = sync_and_get_quota_state(conn)
+                analysis["activity_profile"] = get_hourly_activity_profile(conn)
             except Exception:
                 pass
 
@@ -1197,6 +1200,35 @@ def _extract_bucket_view(
         "countdown": cd,
         "countdown_str": cd_str,
     }
+
+
+def _resolve_quota_and_activity(
+    analysis: dict[str, Any],
+    db_path: Path | None = None,
+) -> tuple[Any, Any]:
+    """Resolve quota state and activity profile from analysis or database fallback."""
+    quota_state = analysis.get("quota_state")
+    activity_profile = analysis.get("activity_profile")
+    target_db = db_path if db_path is not None else DEFAULT_DB_PATH
+    if (
+        (quota_state is None or activity_profile is None)
+        and target_db
+        and target_db.exists()
+    ):
+        try:
+            conn = get_db_connection(target_db, timeout=2.0)
+            try:
+                if quota_state is None:
+                    quota_state = sync_and_get_quota_state(conn)
+                    analysis["quota_state"] = quota_state
+                if activity_profile is None:
+                    activity_profile = get_hourly_activity_profile(conn)
+                    analysis["activity_profile"] = activity_profile
+            finally:
+                conn.close()
+        except Exception:
+            pass
+    return quota_state, activity_profile
 
 
 def generate_context_usage_report(
@@ -1266,16 +1298,7 @@ def generate_context_usage_report(
             pass
 
         # Quota metrics resolution
-        quota_state = analysis.get("quota_state")
-        if quota_state is None and DEFAULT_DB_PATH and DEFAULT_DB_PATH.exists():
-            try:
-                q_conn = get_db_connection(DEFAULT_DB_PATH, timeout=2.0)
-                try:
-                    quota_state = sync_and_get_quota_state(q_conn)
-                finally:
-                    q_conn.close()
-            except Exception:
-                quota_state = None
+        quota_state, activity_profile = _resolve_quota_and_activity(analysis)
 
         state_dict: dict[str, dict] = {}
         if quota_state:
@@ -1303,6 +1326,7 @@ def generate_context_usage_report(
                     thread_cost=session_cost,
                     model_name=active_model,
                     quota_state=state_dict,
+                    activity_profile=activity_profile,
                 )
             except Exception:
                 quota_metrics = None
@@ -1405,8 +1429,13 @@ def generate_context_usage_report(
             step_wk_quota = (
                 (step_cost / weekly_capacity * 100.0) if weekly_capacity > 0 else 0.0
             )
+            step_index = s.get("step_index", 1)
+            activity = s.get("activity", "Turn")
+            source = s.get("tool_or_source", "Model")
+            est_tokens = s.get("est_tokens", 0)
+            detail = s.get("detail", "")
             lines.append(
-                f"| #{s['step_index']} | {s['activity']} | {s['tool_or_source']} | ~{format_tokens(s['est_tokens'])} | {step_wk_quota:.2f}% | {s['detail']} |"
+                f"| #{step_index} | {activity} | {source} | ~{format_tokens(est_tokens)} | {step_wk_quota:.2f}% | {detail} |"
             )
 
         sec_num = 3
@@ -1535,17 +1564,7 @@ def main():
             diff_res=diff_res,
         )
 
-    quota_state = analysis.get("quota_state")
-    if quota_state is None and DEFAULT_DB_PATH and DEFAULT_DB_PATH.exists():
-        try:
-            conn = get_db_connection(DEFAULT_DB_PATH, timeout=2.0)
-            try:
-                quota_state = sync_and_get_quota_state(conn)
-                analysis["quota_state"] = quota_state
-            finally:
-                conn.close()
-        except Exception:
-            pass
+    quota_state, activity_profile = _resolve_quota_and_activity(analysis)
 
     quota_metrics = None
     turn_wk_pct = None
@@ -1563,6 +1582,7 @@ def main():
                 thread_cost=session_cost,
                 model_name=latest_model,
                 quota_state=quota_state,
+                activity_profile=activity_profile,
             )
             if (
                 analysis.get("parent_id") or analysis.get("subagent_role")

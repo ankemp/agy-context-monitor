@@ -10,6 +10,7 @@ Manages SQLite connection pooling, table schemas, WAL mode configuration,
 and schema migrations for cross-conversation analytics.
 """
 
+import math
 import os
 import sqlite3
 from datetime import datetime, timezone
@@ -383,6 +384,8 @@ def upsert_quota_state(conn: sqlite3.Connection, quota_rows: list[dict] | dict) 
                 raw_rem = row.get("remainingFraction")
             try:
                 remaining_fraction = float(raw_rem) if raw_rem is not None else 1.0
+                if math.isnan(remaining_fraction) or math.isinf(remaining_fraction):
+                    remaining_fraction = 1.0
             except (ValueError, TypeError):
                 remaining_fraction = 1.0
 
@@ -396,6 +399,8 @@ def upsert_quota_state(conn: sqlite3.Connection, quota_rows: list[dict] | dict) 
                 raw_cap = row.get("calibratedCapacity")
             try:
                 calibrated_capacity = float(raw_cap) if raw_cap is not None else 0.0
+                if math.isnan(calibrated_capacity) or math.isinf(calibrated_capacity):
+                    calibrated_capacity = 0.0
             except (ValueError, TypeError):
                 calibrated_capacity = 0.0
 

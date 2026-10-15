@@ -42,6 +42,12 @@ def clear_api_cache():
         _API_CACHE.clear()
         _LAST_DATA_VERSIONS.clear()
         _ACTIVE_DB = None
+    try:
+        from context_monitor.quota import invalidate_activity_profile_cache
+
+        invalidate_activity_profile_cache()
+    except Exception:
+        pass
 
 
 # Hook clear_api_cache into SSE change notification stream

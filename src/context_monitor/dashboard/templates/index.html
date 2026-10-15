@@ -363,16 +363,18 @@
         </div>
       </div>
 
-      <!-- Current Session / Total Quota Impact Banner -->
-      <div id="sessionQuotaImpactBanner" class="mt-4 pt-3 border-t border-dark-700/60 flex flex-col sm:flex-row sm:items-center justify-between text-xs text-gray-400 gap-2">
-        <div class="flex items-center space-x-2">
-          <span class="text-gray-300 font-medium">Session Quota Impact:</span>
-          <span id="sessionQuotaImpactWk" class="font-mono font-semibold text-cyan-300">--% weekly</span>
-          <span>•</span>
-          <span id="sessionQuotaImpact5h" class="font-mono font-semibold text-indigo-300">--% 5h</span>
+      <!-- End-of-Week Quota Projection & Cycle Pacing Banner -->
+      <div id="sessionQuotaImpactBanner" class="mt-4 pt-3 border-t border-dark-700/60 flex flex-col sm:flex-row sm:items-center justify-between text-xs text-gray-400 gap-2 cursor-help" title="Weekly Pacing: Projected end-of-week consumption based on cycle elapsed burn rate and calibrated compute capacity">
+        <div class="flex items-center space-x-2 flex-wrap gap-y-1">
+          <span class="text-gray-300 font-medium">End-of-Week Projection:</span>
+          <span id="sessionQuotaImpactWk" class="font-mono font-semibold text-cyan-300">--% projected</span>
+          <span id="pacingBadge" class="px-2 py-0.5 rounded text-[11px] font-medium bg-cyan-950/60 text-cyan-300 border border-cyan-500/30">Calibrating</span>
+          <span class="text-gray-500">•</span>
+          <span class="text-gray-400">5-Hour Cycle Pace:</span>
+          <span id="sessionQuotaImpact5h" class="font-mono font-semibold text-indigo-300">--% projected</span>
         </div>
         <div class="text-[11px] text-gray-400">
-          <span id="quotaCalibrationNote">Concurrency-safe capacity calibrated from SQLite steps telemetry</span>
+          <span id="quotaCalibrationNote" title="Concurrency-safe capacity calibrated from SQLite steps telemetry">Pacing projected from elapsed window velocity and calibrated compute capacity</span>
         </div>
       </div>
     </div>

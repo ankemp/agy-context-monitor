@@ -382,6 +382,9 @@ def test_sync_to_sqlite_attaches_quota_state(tmp_path: Path):
         assert "quota_state" in analysis
         assert analysis["quota_state"] is not None
         assert "gemini-weekly" in analysis["quota_state"]
+        assert "activity_profile" in analysis
+        assert analysis["activity_profile"] is not None
+        assert "matrix" in analysis["activity_profile"]
     finally:
         ingest_mod.DEFAULT_DB_PATH = orig_db
 
@@ -825,3 +828,56 @@ def test_generate_context_usage_report_top_steps_and_fleet_weekly_quota_columns(
         "| [Subagent 1](conversation://sub-101) | worker | Tier 1 | 5 | ~20.0k | $3.36 | 0.50% |"
         in report_md
     )
+
+
+def test_generate_context_usage_report_resolves_and_caches_activity_profile(
+    tmp_path: Path,
+):
+    from datetime import datetime, timezone
+
+    db_file = tmp_path / "test_ingest_profile.db"
+    init_db(db_file)
+    conn = get_db_connection(db_file)
+    conn.execute(
+        "INSERT INTO conversations (id, title, model_name) VALUES ('c1', 'T1', 'Gemini 3.8 Flash')"
+    )
+    for i in range(60):
+        conn.execute(
+            "INSERT INTO steps (conversation_id, step_index, created_at, step_type, billed_cost) VALUES ('c1', ?, '2026-10-14T14:00:00Z', 'USER_MESSAGE', 0.1)",
+            (i + 1,),
+        )
+    upsert_quota_state(
+        conn,
+        [
+            {
+                "bucket_id": "gemini-weekly",
+                "group_name": "Gemini Models",
+                "window": "weekly",
+                "remaining_fraction": 0.85,
+                "reset_time": "2026-10-20T14:00:00Z",
+                "calibrated_capacity": 672.0,
+                "fetched_at": datetime.now(timezone.utc).isoformat(),
+            }
+        ],
+    )
+    conn.commit()
+    conn.close()
+
+    analysis = {
+        "steps": [{"billed_cost": 0.5}],
+        "category_stats": {"tool_result": 500},
+        "total_chars": 500,
+        "billed_cost": 0.5,
+    }
+
+    with patch("scripts.ingest.DEFAULT_DB_PATH", db_file):
+        report_md = generate_context_usage_report(
+            cid="c1",
+            model_name="Gemini 3.8 Flash (High)",
+            max_tokens=1000000,
+            analysis=analysis,
+        )
+        assert "quota_state" in analysis
+        assert "activity_profile" in analysis
+        assert analysis["activity_profile"]["total_steps"] == 60
+        assert "## Subscription & Quota Impact" in report_md

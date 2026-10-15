@@ -1,16 +1,235 @@
 from pathlib import Path
+import math
 import os
 import json
 import re
 from datetime import datetime, timedelta
+from typing import Any, NamedTuple
 from zoneinfo import ZoneInfo
 
+from context_monitor.pricing import get_pricing_key
 from context_monitor.quota import (
+    _get_default_capacity,
     calculate_quota_metrics,
+    get_hourly_activity_profile,
     sync_and_get_quota_state,
 )
 
 CHARS_PER_TOKEN = 3.8
+
+
+class QuotaPercentages(NamedTuple):
+    weekly_quota_pct: float
+    five_hour_quota_pct: float
+
+
+def _extract_single_capacity(
+    qs_dict: dict[str, Any],
+    *key_candidates: str,
+    default_capacity: float,
+) -> float:
+    for k in key_candidates:
+        if k in qs_dict:
+            val = qs_dict[k]
+            if isinstance(val, (int, float)):
+                try:
+                    f = float(val)
+                    if f > 0:
+                        return f
+                except (ValueError, TypeError):
+                    pass
+            elif isinstance(val, dict):
+                c = (
+                    val.get("calibrated_capacity")
+                    or val.get("calibratedCapacity")
+                    or val.get("capacity")
+                    or val.get("cap")
+                )
+                if c is not None:
+                    try:
+                        f = float(c)
+                        if f > 0:
+                            return f
+                    except (ValueError, TypeError):
+                        pass
+            elif isinstance(val, str):
+                try:
+                    f = float(val)
+                    if f > 0:
+                        return f
+                except (ValueError, TypeError):
+                    pass
+    return default_capacity
+
+
+def extract_bucket_capacities(
+    quota_state: list[dict] | dict[str, Any] | tuple | None,
+) -> dict[str, float]:
+    """Extracts calibrated capacities as a dictionary with standard bucket IDs."""
+    if (
+        isinstance(quota_state, (tuple, list))
+        and len(quota_state) == 4
+        and all(isinstance(x, (int, float)) for x in quota_state)
+    ):
+        return {
+            "gemini-weekly": float(quota_state[0]),
+            "gemini-5h": float(quota_state[1]),
+            "3p-weekly": float(quota_state[2]),
+            "3p-5h": float(quota_state[3]),
+        }
+
+    qs_dict: dict[str, Any] = {}
+    if isinstance(quota_state, dict):
+        qs_dict = quota_state
+        if "buckets" in qs_dict and isinstance(qs_dict["buckets"], dict):
+            for k, v in qs_dict["buckets"].items():
+                qs_dict[str(k).lower()] = v
+        for k, v in list(qs_dict.items()):
+            qs_dict[str(k).lower()] = v
+    elif isinstance(quota_state, (list, tuple)):
+        for item in quota_state:
+            if isinstance(item, dict):
+                bid = (
+                    item.get("bucket_id")
+                    or item.get("bucketId")
+                    or item.get("bucket")
+                    or ""
+                ).lower()
+                if bid:
+                    qs_dict[bid] = item
+            elif hasattr(item, "keys"):
+                bid = str(item.get("bucket_id") or item.get("bucketId") or "").lower()
+                if bid:
+                    qs_dict[bid] = dict(item)
+
+    gw_cap = _extract_single_capacity(
+        qs_dict,
+        "gemini-weekly",
+        "gemini_weekly",
+        "gw",
+        "gw_cap",
+        default_capacity=float(_get_default_capacity("gemini-weekly") or 672.0),
+    )
+    g5_cap = _extract_single_capacity(
+        qs_dict,
+        "gemini-5h",
+        "gemini_5h",
+        "g5",
+        "g5_cap",
+        default_capacity=float(_get_default_capacity("gemini-5h") or 236.7),
+    )
+    pw_cap = _extract_single_capacity(
+        qs_dict,
+        "3p-weekly",
+        "3p_weekly",
+        "pw",
+        "pw_cap",
+        default_capacity=float(_get_default_capacity("3p-weekly") or 200.0),
+    )
+    p5_cap = _extract_single_capacity(
+        qs_dict,
+        "3p-5h",
+        "3p_5h",
+        "p5",
+        "p5_cap",
+        default_capacity=float(_get_default_capacity("3p-5h") or 70.0),
+    )
+    return {
+        "gemini-weekly": gw_cap,
+        "gemini-5h": g5_cap,
+        "3p-weekly": pw_cap,
+        "3p-5h": p5_cap,
+    }
+
+
+def _extract_bucket_capacities(
+    quota_state: list[dict] | dict[str, Any] | tuple | None,
+) -> tuple[float, float, float, float]:
+    """Extracts calibrated capacities (gw, g5, pw, p5) from quota state."""
+    caps = extract_bucket_capacities(quota_state)
+    return (
+        caps["gemini-weekly"],
+        caps["gemini-5h"],
+        caps["3p-weekly"],
+        caps["3p-5h"],
+    )
+
+
+def compute_quota_pcts(
+    billed_cost: float | None = 0.0,
+    model_name: str | None = None,
+    capacities: (
+        dict[str, float] | tuple[float, float, float, float] | float | None
+    ) = None,
+    g5_cap: float | None = None,
+    pw_cap: float | None = None,
+    p5_cap: float | None = None,
+    *,
+    cost: float | None = None,
+) -> QuotaPercentages:
+    """Computes (weekly_quota_pct, five_hour_quota_pct) in O(1) time without pacing simulations.
+
+    Interfaces supported:
+    1. compute_quota_pcts(billed_cost: float, model_name: str, capacities: dict[str, float])
+    2. compute_quota_pcts(cost, model_name, gw_cap, g5_cap, pw_cap, p5_cap)
+    3. compute_quota_pcts(cost, model_name, capacities_tuple)
+    """
+    eff_cost = (
+        cost if cost is not None else (billed_cost if billed_cost is not None else 0.0)
+    )
+    try:
+        c = float(eff_cost)
+        if math.isnan(c) or math.isinf(c):
+            c = 0.0
+    except (ValueError, TypeError):
+        c = 0.0
+
+    if isinstance(capacities, (dict, list)) or (
+        isinstance(capacities, tuple) and len(capacities) != 4
+    ):
+        caps = extract_bucket_capacities(capacities)
+        gw = caps["gemini-weekly"]
+        g5 = caps["gemini-5h"]
+        pw = caps["3p-weekly"]
+        p5 = caps["3p-5h"]
+    elif isinstance(capacities, tuple) and len(capacities) == 4:
+        gw, g5, pw, p5 = capacities
+    elif isinstance(capacities, (int, float)):
+        gw = float(capacities)
+        g5 = (
+            float(g5_cap)
+            if g5_cap is not None
+            else float(_get_default_capacity("gemini-5h") or 236.7)
+        )
+        pw = (
+            float(pw_cap)
+            if pw_cap is not None
+            else float(_get_default_capacity("3p-weekly") or 200.0)
+        )
+        p5 = (
+            float(p5_cap)
+            if p5_cap is not None
+            else float(_get_default_capacity("3p-5h") or 70.0)
+        )
+    else:
+        caps = extract_bucket_capacities(None)
+        gw = caps["gemini-weekly"]
+        g5 = caps["gemini-5h"]
+        pw = caps["3p-weekly"]
+        p5 = caps["3p-5h"]
+
+    pkey = get_pricing_key(model_name or "Gemini")
+    is_3p = pkey in ("claude", "gpt")
+    cap_w = pw if is_3p else gw
+    cap_5 = p5 if is_3p else g5
+
+    w_pct = round((c / cap_w) * 100.0, 4) if cap_w > 0 else 0.0
+    f_pct = round((c / cap_5) * 100.0, 4) if cap_5 > 0 else 0.0
+
+    return QuotaPercentages(weekly_quota_pct=w_pct, five_hour_quota_pct=f_pct)
+
+
+_compute_quota_pcts = compute_quota_pcts
 
 
 def get_target_tz(tz_name=None):
@@ -44,10 +263,12 @@ def query_quota_data(
     conn, model_name: str | None = None, billed_cost: float = 0.0
 ) -> dict:
     quota_state = sync_and_get_quota_state(conn)
+    activity_profile = get_hourly_activity_profile(conn) if conn is not None else None
     metrics = calculate_quota_metrics(
         billed_cost=billed_cost,
         model_name=model_name or "Gemini 3.8 Flash (High)",
         quota_state=quota_state,
+        activity_profile=activity_profile,
     )
     res = dict(metrics)
     res["quota_state"] = [dict(r) for r in quota_state]
@@ -239,6 +460,8 @@ def query_summary_data(conn, tz=None, project=None):
     tz_info = get_target_tz(tz)
     tz_label = datetime.now(tz_info).strftime("%Z (%z)")
 
+    q_data = query_quota_data(conn, billed_cost=total_billed_cost)
+
     return {
         "total_convs": row["total_convs"] or 0,
         "root_convs": row["root_convs"] or (row["total_convs"] or 0),
@@ -280,8 +503,8 @@ def query_summary_data(conn, tz=None, project=None):
         "timezone_label": tz_label,
         "models": models,
         "categories": categories,
-        "quota": query_quota_data(conn, billed_cost=total_billed_cost),
-        "quota_summary": query_quota_data(conn, billed_cost=total_billed_cost),
+        "quota": q_data,
+        "quota_summary": q_data,
     }
 
 
@@ -404,8 +627,22 @@ def query_cost_by_project(conn, tz=None, project=None, limit_sessions=6):
 
 
 def query_timeline_data(conn, days=None, tz=None, project=None):
+    num_days = None
+    if days is not None and not isinstance(days, bool):
+        try:
+            val = int(float(days)) if isinstance(days, str) else int(days)
+            if val <= 0:
+                return []
+            if val > 100_000:
+                num_days = None
+            else:
+                num_days = val
+        except (ValueError, TypeError, OverflowError):
+            num_days = None
+
     cur = conn.cursor()
     target_tz = get_target_tz(tz)
+    today = datetime.now(target_tz).date()
 
     conv_proj = dict(
         cur.execute(
@@ -413,14 +650,28 @@ def query_timeline_data(conn, days=None, tz=None, project=None):
         ).fetchall()
     )
 
-    where_clause = "WHERE created_at IS NOT NULL AND created_at != ''"
-    params = ()
+    where_conditions = ["created_at IS NOT NULL", "created_at != ''"]
+    params = []
     if project and project != "all":
         if project == "(unassigned)":
-            where_clause += " AND conversation_id IN (SELECT id FROM conversations WHERE project IS NULL OR project = '')"
+            where_conditions.append(
+                "conversation_id IN (SELECT id FROM conversations WHERE project IS NULL OR project = '')"
+            )
         else:
-            where_clause += " AND conversation_id IN (SELECT id FROM conversations WHERE project = ?)"
-            params = (project,)
+            where_conditions.append(
+                "conversation_id IN (SELECT id FROM conversations WHERE project = ?)"
+            )
+            params.append(project)
+
+    if num_days is not None:
+        try:
+            cutoff_date = today - timedelta(days=num_days + 1)
+            where_conditions.append("created_at >= ?")
+            params.append(cutoff_date.isoformat())
+        except OverflowError:
+            num_days = None
+
+    where_clause = "WHERE " + " AND ".join(where_conditions)
 
     rows = cur.execute(
         f"""
@@ -434,7 +685,7 @@ def query_timeline_data(conn, days=None, tz=None, project=None):
         {where_clause}
         GROUP BY hour_key, conversation_id
     """,
-        params,
+        tuple(params),
     ).fetchall()
 
     daily_map = {}
@@ -450,9 +701,14 @@ def query_timeline_data(conn, days=None, tz=None, project=None):
 
         cached_day = hour_cache.get(hour_key)
         if cached_day is None:
-            dt = datetime.fromisoformat(hour_key + ":00:00+00:00").astimezone(target_tz)
-            cached_day = dt.strftime("%Y-%m-%d")
-            hour_cache[hour_key] = cached_day
+            try:
+                dt = datetime.fromisoformat(hour_key + ":00:00+00:00").astimezone(
+                    target_tz
+                )
+                cached_day = dt.strftime("%Y-%m-%d")
+                hour_cache[hour_key] = cached_day
+            except (ValueError, TypeError):
+                continue
         day_str = cached_day
 
         if day_str not in daily_map:
@@ -479,10 +735,7 @@ def query_timeline_data(conn, days=None, tz=None, project=None):
     for day_str, s_set in day_sessions.items():
         daily_map[day_str]["sessions"] = len(s_set)
 
-    today = datetime.now(target_tz).date()
-
-    if days is not None:
-        num_days = int(days)
+    if num_days is not None:
         start_date = today - timedelta(days=num_days - 1)
         end_date = today
     else:
@@ -860,6 +1113,7 @@ def query_conversations_list(
         ).fetchall()
 
     quota_state = sync_and_get_quota_state(conn)
+    bucket_caps = _extract_bucket_capacities(quota_state)
 
     convs = []
     root_ids = [r["id"] for r in rows]
@@ -909,9 +1163,7 @@ def query_conversations_list(
             except Exception:
                 pass
             d_cost = round(dr["billed_cost"] or 0.0, 2)
-            d_quota = calculate_quota_metrics(
-                billed_cost=d_cost, model_name=dr_m_used, quota_state=quota_state
-            )
+            d_w_pct, d_5h_pct = _compute_quota_pcts(d_cost, dr_m_used, bucket_caps)
             descendants_by_root[rid].append(
                 {
                     "id": dr["id"],
@@ -930,8 +1182,8 @@ def query_conversations_list(
                     "active_agent_seconds": dr["active_agent_seconds"] or 0,
                     "active_pairing_seconds": dr["active_pairing_seconds"] or 0,
                     "billed_cost": d_cost,
-                    "weekly_quota_pct": d_quota["weekly_pct"],
-                    "five_hour_quota_pct": d_quota["five_hour_pct"],
+                    "weekly_quota_pct": d_w_pct,
+                    "five_hour_quota_pct": d_5h_pct,
                     "parent_id": dr["parent_id"],
                     "root_id": dr["root_id"],
                     "depth": dr["depth"] or 1,
@@ -969,12 +1221,8 @@ def query_conversations_list(
         except Exception:
             pass
 
-        c_quota = calculate_quota_metrics(
-            billed_cost=c_cost, model_name=r_m_used, quota_state=quota_state
-        )
-        fleet_quota = calculate_quota_metrics(
-            billed_cost=fleet_cost, model_name=r_m_used, quota_state=quota_state
-        )
+        c_w_pct, c_5h_pct = _compute_quota_pcts(c_cost, r_m_used, bucket_caps)
+        f_w_pct, f_5h_pct = _compute_quota_pcts(fleet_cost, r_m_used, bucket_caps)
 
         convs.append(
             {
@@ -992,8 +1240,8 @@ def query_conversations_list(
                 "active_agent_seconds": r["active_agent_seconds"] or 0,
                 "active_pairing_seconds": r["active_pairing_seconds"] or 0,
                 "billed_cost": c_cost,
-                "weekly_quota_pct": c_quota["weekly_pct"],
-                "five_hour_quota_pct": c_quota["five_hour_pct"],
+                "weekly_quota_pct": c_w_pct,
+                "five_hour_quota_pct": c_5h_pct,
                 "parent_id": r["parent_id"],
                 "root_id": r["root_id"],
                 "depth": r["depth"] or 0,
@@ -1003,8 +1251,8 @@ def query_conversations_list(
                 "fleet_cost": fleet_cost,
                 "fleet_tokens": fleet_tokens,
                 "fleet_steps": fleet_steps,
-                "fleet_weekly_quota_pct": fleet_quota["weekly_pct"],
-                "fleet_5h_quota_pct": fleet_quota["five_hour_pct"],
+                "fleet_weekly_quota_pct": f_w_pct,
+                "fleet_5h_quota_pct": f_5h_pct,
                 "compaction_count": c_compaction,
                 "pruned_tokens": c_pruned,
                 "fleet_compaction_count": fleet_compaction,
@@ -1193,6 +1441,8 @@ def query_session_details(conn, cid, tz=None):
 
     target_tz = get_target_tz(tz)
     quota_state = sync_and_get_quota_state(conn)
+    bucket_caps = _extract_bucket_capacities(quota_state)
+    activity_profile = get_hourly_activity_profile(conn) if conn is not None else None
     conv_model = conv["model_name"] or "Gemini"
 
     steps = []
@@ -1204,11 +1454,9 @@ def query_session_details(conn, cid, tz=None):
         d["blocks"] = blocks_by_step.get(d["step_index"], [])
         s_cost = d.get("billed_cost") or 0.0
         s_m = d.get("model_name") or conv_model
-        s_q = calculate_quota_metrics(
-            billed_cost=s_cost, model_name=s_m, quota_state=quota_state
-        )
-        d["weekly_quota_pct"] = s_q["weekly_pct"]
-        d["five_hour_quota_pct"] = s_q["five_hour_pct"]
+        s_w_pct, s_5h_pct = _compute_quota_pcts(s_cost, s_m, bucket_caps)
+        d["weekly_quota_pct"] = s_w_pct
+        d["five_hour_quota_pct"] = s_5h_pct
         steps.append(d)
 
     cat_rows = cur.execute(
@@ -1253,7 +1501,10 @@ def query_session_details(conn, cid, tz=None):
 
     c_billed_cost = conv_dict.get("billed_cost") or 0.0
     conv_quota = calculate_quota_metrics(
-        billed_cost=c_billed_cost, model_name=conv_model, quota_state=quota_state
+        billed_cost=c_billed_cost,
+        model_name=conv_model,
+        quota_state=quota_state,
+        activity_profile=activity_profile,
     )
     conv_dict["weekly_quota_pct"] = conv_quota["weekly_pct"]
     conv_dict["five_hour_quota_pct"] = conv_quota["five_hour_pct"]
@@ -1310,9 +1561,7 @@ def query_session_details(conn, cid, tz=None):
         c_act = (cr["billed_input_tokens"] or 0) + (cr["billed_output_tokens"] or 0)
         ch_cost = round(cr["billed_cost"] or 0.0, 2)
         ch_m = cr["model_name"] or "Gemini"
-        ch_q = calculate_quota_metrics(
-            billed_cost=ch_cost, model_name=ch_m, quota_state=quota_state
-        )
+        ch_w_pct, ch_5h_pct = _compute_quota_pcts(ch_cost, ch_m, bucket_caps)
         children.append(
             {
                 "id": cr["id"],
@@ -1324,8 +1573,8 @@ def query_session_details(conn, cid, tz=None):
                 "steps": cr["total_steps"] or 0,
                 "tokens": c_act,
                 "cost": ch_cost,
-                "weekly_quota_pct": ch_q["weekly_pct"],
-                "five_hour_quota_pct": ch_q["five_hour_pct"],
+                "weekly_quota_pct": ch_w_pct,
+                "five_hour_quota_pct": ch_5h_pct,
                 "created_at": c_dt.strftime("%Y-%m-%d %H:%M")
                 if c_dt
                 else cr["created_at"],
@@ -1355,7 +1604,10 @@ def query_session_details(conn, cid, tz=None):
     total_swarm_steps = sum(n["total_steps"] or 0 for n in swarm_nodes)
 
     fleet_q = calculate_quota_metrics(
-        billed_cost=total_swarm_cost, model_name=conv_model, quota_state=quota_state
+        billed_cost=total_swarm_cost,
+        model_name=conv_model,
+        quota_state=quota_state,
+        activity_profile=activity_profile,
     )
     fleet_summary = {
         "root_id": effective_root,
@@ -1375,9 +1627,7 @@ def query_session_details(conn, cid, tz=None):
         n_act = (n["billed_input_tokens"] or 0) + (n["billed_output_tokens"] or 0)
         n_cost = round(n["billed_cost"] or 0.0, 2)
         n_m = n.get("model_name") or conv_model
-        n_q = calculate_quota_metrics(
-            billed_cost=n_cost, model_name=n_m, quota_state=quota_state
-        )
+        n_w_pct, n_5h_pct = _compute_quota_pcts(n_cost, n_m, bucket_caps)
         nodes_by_id[n_id] = {
             "id": n_id,
             "title": n["title"] or f"Session {n_id[:8]}",
@@ -1388,8 +1638,8 @@ def query_session_details(conn, cid, tz=None):
             "steps": n["total_steps"] or 0,
             "tokens": n_act,
             "cost": n_cost,
-            "weekly_quota_pct": n_q["weekly_pct"],
-            "five_hour_quota_pct": n_q["five_hour_pct"],
+            "weekly_quota_pct": n_w_pct,
+            "five_hour_quota_pct": n_5h_pct,
             "duration": round(n["duration_seconds"] or 0.0),
             "is_current": (n_id == cid),
             "children": [],
