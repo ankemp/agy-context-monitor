@@ -21,7 +21,7 @@ app.page('/app.js', () => readLocal('app.js'));
 app.api('/styles.css', () => new Response(readLocal('styles.css'), { contentType: 'text/css' }), 'GET');
 
 // API routes: resolve DB handle on demand to recover gracefully if DB initializes after boot
-app.api('/api/session', (data) => getSessionData(getDatabase(), data?.cid), 'GET');
+app.api('/api/session', (data) => getSessionData(getDatabase(), data?.cid, data?.inspect_cid), 'GET');
 app.api('/api/global', () => getGlobalData(getDatabase()), 'GET');
 
 app.run();

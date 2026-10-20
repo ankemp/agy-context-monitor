@@ -238,6 +238,26 @@ export function getDatabase(customPath) {
 export function createDefaultSession(cid = null, title = 'No conversation records', modelName = 'Gemini 3.7 Flash', db = null) {
   const maxTokens = getModelContextLimit(modelName);
   const quotaSummary = getQuotaSummary(db, modelName, 0);
+  const defaultFleet = {
+    is_swarm: false,
+    root_id: cid || null,
+    active_cid: cid || null,
+    inspected_cid: cid || null,
+    is_inspecting_other: false,
+    inspected_role: 'Main Session',
+    agent_count: 1,
+    subagent_count: 0,
+    total_cost: 0,
+    total_tokens: 0,
+    total_disk_tokens: 0,
+    total_steps: 0,
+    weekly_quota_pct: 0,
+    five_hour_quota_pct: 0,
+    shielded_tokens: 0,
+    shielding_ratio: 1.0,
+    nodes: []
+  };
+
   return {
     cid,
     title,
@@ -261,50 +281,107 @@ export function createDefaultSession(cid = null, title = 'No conversation record
     quota_remaining_weekly_pct: quotaSummary.weekly_remaining_pct,
     quota_remaining_5h_pct: quotaSummary.five_hour_remaining_pct,
     quota_reset_time: quotaSummary.weekly_reset_time,
-    quota: quotaSummary
+    quota: quotaSummary,
+    fleet: defaultFleet
   };
 }
 
-export function getSessionData(db, cid) {
+function resolveConversationRoot(db, conv) {
+  if (!conv) return null;
+  if (conv.root_id) return conv.root_id;
+  if (!conv.parent_id) return conv.id;
+  try {
+    let curr = conv;
+    for (let d = 0; d < 10 && curr && curr.parent_id; d++) {
+      const p = db.prepare('SELECT id, parent_id, root_id FROM conversations WHERE id = ?').get(curr.parent_id);
+      if (!p) break;
+      if (p.root_id) return p.root_id;
+      curr = p;
+    }
+    return curr?.id || conv.parent_id || conv.id;
+  } catch {
+    return conv.parent_id || conv.id;
+  }
+}
+
+export function getSessionData(db, cid, inspectCid = null) {
   if (!db) {
-    return createDefaultSession(cid, 'No analytics database', 'Unknown', null);
+    return createDefaultSession(inspectCid || cid || null, 'No analytics database', 'Unknown', null);
   }
 
-  let conv = null;
+  let activeCid = cid || null;
+  let targetCid = inspectCid || cid || null;
+  let activeConv = null;
+  let targetConv = null;
+
   try {
-    if (cid) {
-      conv = db.prepare(`
+    if (activeCid) {
+      activeConv = db.prepare(`
         SELECT *
         FROM conversations
         WHERE id = ?
-      `).get(cid);
+      `).get(activeCid);
 
       // If a specific conversation was requested but is not found yet in SQLite,
       // do NOT fall back to another conversation (prevents cross-session data leakage).
-      if (!conv) {
-        return createDefaultSession(cid, 'Active Session (indexing...)', 'Gemini 3.7 Flash', db);
+      if (!activeConv) {
+        return createDefaultSession(activeCid, 'Active Session (indexing...)', 'Gemini 3.7 Flash', db);
+      }
+    }
+
+    if (targetCid) {
+      if (activeConv && targetCid === activeCid) {
+        targetConv = activeConv;
+      } else {
+        targetConv = db.prepare(`
+          SELECT *
+          FROM conversations
+          WHERE id = ?
+        `).get(targetCid);
       }
     } else {
       // No specific cid passed; fetch latest active conversation
-      conv = db.prepare(`
+      targetConv = db.prepare(`
         SELECT *
         FROM conversations
         ORDER BY updated_at DESC
         LIMIT 1
       `).get();
 
-      if (!conv) {
+      if (!targetConv) {
         return createDefaultSession(null, 'No conversation records', 'Gemini 3.7 Flash', db);
+      }
+      targetCid = targetConv.id;
+      activeCid = targetConv.id;
+      activeConv = targetConv;
+    }
+
+    if (!targetConv) {
+      if (activeConv) {
+        targetConv = activeConv;
+        targetCid = activeCid;
+      } else {
+        return createDefaultSession(targetCid || activeCid, 'Active Session (indexing...)', 'Gemini 3.7 Flash', db);
+      }
+    }
+
+    // If activeCid && activeCid !== targetCid, verify targetConv belongs to the same swarm root_id or fall back to activeCid
+    if (activeCid && activeCid !== targetCid && activeConv) {
+      const activeRoot = resolveConversationRoot(db, activeConv);
+      const targetRoot = resolveConversationRoot(db, targetConv);
+      if (activeRoot !== targetRoot) {
+        targetConv = activeConv;
+        targetCid = activeCid;
       }
     }
   } catch {
     // conversations table might not exist yet
-    return createDefaultSession(cid, 'No analytics database', 'Gemini 3.7 Flash', db);
+    return createDefaultSession(targetCid || activeCid, 'No analytics database', 'Gemini 3.7 Flash', db);
   }
 
-  const resolvedCid = conv.id;
-  const modelName = conv.model_name || 'Gemini 3.7 Flash';
-  const billedCost = conv.billed_cost || 0.0;
+  const resolvedCid = targetConv.id;
+  const modelName = targetConv.model_name || 'Gemini 3.7 Flash';
+  const billedCost = Number(targetConv.billed_cost) || 0.0;
 
   // Determine active context start from checkpoint step if present (safely handles missing steps table)
   let cpRow = null;
@@ -358,27 +435,198 @@ export function getSessionData(db, cid) {
     // steps table might not exist in minimal test DBs
   }
 
-  const activeTokens = rangeRow?.active_tokens ?? conv.total_tokens ?? 0;
+  const activeTokens = rangeRow?.active_tokens ?? targetConv.total_tokens ?? 0;
   const maxTokens = getModelContextLimit(modelName);
   const pct = maxTokens ? (activeTokens / maxTokens) * 100 : 0;
 
   const quotaSummary = getQuotaSummary(db, modelName, billedCost);
   const cap = quotaSummary.calibrated_weekly_capacity || DEFAULT_CAPACITIES['gemini-weekly'];
 
+  // Swarm fleet rollups and topology
+  const effectiveRoot = resolveConversationRoot(db, targetConv);
+  let swarmRows = [];
+  try {
+    swarmRows = db.prepare(`
+      SELECT id, title, model_name, total_steps, total_tokens, billed_cost, billed_input_tokens, billed_output_tokens, parent_id, root_id, depth, subagent_role, subagent_type, compaction_count, pruned_tokens
+      FROM conversations
+      WHERE root_id = ? OR id = ?
+    `).all(effectiveRoot, effectiveRoot);
+  } catch {
+    try {
+      swarmRows = db.prepare(`
+        SELECT id, title, model_name, total_steps, total_tokens, billed_cost, parent_id, root_id
+        FROM conversations
+        WHERE root_id = ? OR id = ?
+      `).all(effectiveRoot, effectiveRoot);
+    } catch {
+      try {
+        swarmRows = db.prepare(`
+          SELECT id, title, model_name, total_steps, total_tokens, billed_cost
+          FROM conversations
+          WHERE id = ?
+        `).all(effectiveRoot);
+      } catch {
+        swarmRows = [targetConv];
+      }
+    }
+  }
+
+  if (!swarmRows || swarmRows.length === 0) {
+    swarmRows = [targetConv];
+  } else if (!swarmRows.some(n => n.id === targetConv.id)) {
+    swarmRows.push(targetConv);
+  }
+
+  const nodes = swarmRows.map(node => {
+    let nodeActiveTokens = null;
+    if (node.id === resolvedCid && rangeRow?.active_tokens !== undefined && rangeRow?.active_tokens !== null) {
+      nodeActiveTokens = Number(rangeRow.active_tokens);
+    } else {
+      try {
+        const cp = db.prepare(`
+          SELECT MAX(step_index) as cp_step
+          FROM steps
+          WHERE conversation_id = ? AND step_type = 'CHECKPOINT'
+        `).get(node.id);
+
+        const since = (cp && cp.cp_step !== null && cp.cp_step !== undefined)
+          ? cp.cp_step
+          : 0;
+
+        const row = db.prepare(`
+          SELECT SUM(est_tokens) as active_tokens
+          FROM steps
+          WHERE conversation_id = ? AND step_index >= ?
+        `).get(node.id, since);
+
+        if (row && row.active_tokens !== null && row.active_tokens !== undefined) {
+          nodeActiveTokens = Number(row.active_tokens);
+        }
+      } catch {
+        // steps table might not exist
+      }
+    }
+
+    if (nodeActiveTokens === null || isNaN(nodeActiveTokens)) {
+      nodeActiveTokens = Number(node.total_tokens) || 0;
+    }
+
+    const nodeModel = node.model_name || 'Gemini 3.7 Flash';
+    const nodeMaxTokens = getModelContextLimit(nodeModel);
+    const nodeContextPct = nodeMaxTokens > 0
+      ? Math.min(100, Math.round((nodeActiveTokens / nodeMaxTokens) * 1000) / 10)
+      : 0;
+
+    const nodePrefix = getModelQuotaPrefix(nodeModel);
+    const nodeCost = Number(node.billed_cost) || 0.0;
+    const nodeCap = quotaSummary.buckets?.[`${nodePrefix}-weekly`]?.calibrated_capacity
+      || DEFAULT_CAPACITIES[`${nodePrefix}-weekly`]
+      || (nodePrefix === '3p' ? 200.0 : 672.0);
+    const nodeWeeklyQuotaPct = nodeCap > 0 ? Number(((nodeCost / nodeCap) * 100).toFixed(4)) : 0;
+
+    const node5hCap = quotaSummary.buckets?.[`${nodePrefix}-5h`]?.calibrated_capacity
+      || DEFAULT_CAPACITIES[`${nodePrefix}-5h`]
+      || (nodePrefix === '3p' ? 70.0 : 236.7);
+    const node5hQuotaPct = node5hCap > 0 ? Number(((nodeCost / node5hCap) * 100).toFixed(4)) : 0;
+
+    const diskTokens = Number(node.total_tokens) || 0;
+    const billedTokens = (Number(node.billed_input_tokens) || 0) + (Number(node.billed_output_tokens) || 0);
+    const nodeTotalTokens = billedTokens > 0 ? billedTokens : diskTokens;
+
+    return {
+      id: node.id,
+      title: node.title || (node.id === effectiveRoot ? 'Root Coordinator' : `Subagent ${node.id.slice(0, 8)}`),
+      model_name: nodeModel,
+      total_steps: Number(node.total_steps) || 0,
+      total_tokens: nodeTotalTokens,
+      total_disk_tokens: diskTokens,
+      billed_cost: nodeCost,
+      billed_input_tokens: Number(node.billed_input_tokens) || 0,
+      billed_output_tokens: Number(node.billed_output_tokens) || 0,
+      parent_id: node.parent_id || null,
+      root_id: node.root_id || null,
+      depth: Number(node.depth) || 0,
+      subagent_role: node.subagent_role || (node.id === effectiveRoot ? 'Root Coordinator' : 'Worker'),
+      subagent_type: node.subagent_type || 'self',
+      compaction_count: Number(node.compaction_count) || 0,
+      pruned_tokens: Number(node.pruned_tokens) || 0,
+      max_tokens: nodeMaxTokens,
+      active_tokens: nodeActiveTokens,
+      context_pct: nodeContextPct,
+      weekly_quota_pct: nodeWeeklyQuotaPct,
+      five_hour_quota_pct: node5hQuotaPct,
+      is_active: node.id === activeCid,
+      is_inspected: node.id === targetCid,
+      is_root: node.id === effectiveRoot
+    };
+  });
+
+  nodes.sort((a, b) => {
+    const costDiff = (Number(b.billed_cost) || 0) - (Number(a.billed_cost) || 0);
+    if (Math.abs(costDiff) > 1e-6) {
+      return costDiff;
+    }
+    return (Number(b.total_tokens) || 0) - (Number(a.total_tokens) || 0);
+  });
+
+  const totalFleetCost = Number(nodes.reduce((acc, n) => acc + (Number(n.billed_cost) || 0), 0).toFixed(4));
+  const totalFleetTokens = nodes.reduce((acc, n) => acc + (Number(n.total_tokens) || 0), 0);
+  const totalFleetDiskTokens = nodes.reduce((acc, n) => acc + (Number(n.total_disk_tokens) || 0), 0);
+  const totalFleetSteps = nodes.reduce((acc, n) => acc + (Number(n.total_steps) || 0), 0);
+
+  const rootConv = nodes.find(n => n.id === effectiveRoot) || targetConv;
+  const rootModel = rootConv.model_name || targetConv.model_name || 'Gemini 3.7 Flash';
+  const fleetPrefix = getModelQuotaPrefix(rootModel);
+  const fleetWeeklyCap = quotaSummary.buckets?.[`${fleetPrefix}-weekly`]?.calibrated_capacity
+    || DEFAULT_CAPACITIES[`${fleetPrefix}-weekly`]
+    || (fleetPrefix === '3p' ? 200.0 : 672.0);
+  const fleet5hCap = quotaSummary.buckets?.[`${fleetPrefix}-5h`]?.calibrated_capacity
+    || DEFAULT_CAPACITIES[`${fleetPrefix}-5h`]
+    || (fleetPrefix === '3p' ? 70.0 : 236.7);
+  const fleetCostGemini = nodes.filter(n => getModelQuotaPrefix(n.model_name) === 'gemini').reduce((acc, n) => acc + (Number(n.billed_cost) || 0), 0);
+  const fleetCost3p = nodes.filter(n => getModelQuotaPrefix(n.model_name) === '3p').reduce((acc, n) => acc + (Number(n.billed_cost) || 0), 0);
+  const applicableFleetCost = fleetPrefix === '3p' ? (fleetCost3p > 0 ? fleetCost3p : totalFleetCost) : (fleetCostGemini > 0 ? fleetCostGemini : totalFleetCost);
+  const fleetWeeklyQuotaPct = fleetWeeklyCap > 0 ? Number(((applicableFleetCost / fleetWeeklyCap) * 100).toFixed(4)) : 0;
+  const fleet5hQuotaPct = fleet5hCap > 0 ? Number(((applicableFleetCost / fleet5hCap) * 100).toFixed(4)) : 0;
+
+  const rootTokens = rootConv ? (Number(rootConv.total_tokens) || 0) : (Number(targetConv.total_tokens) || 0);
+  const shieldedTokens = Math.max(0, totalFleetTokens - rootTokens);
+  const shieldingRatio = rootTokens > 0 ? Number((totalFleetTokens / rootTokens).toFixed(1)) : 1.0;
+
+  const fleet = {
+    is_swarm: nodes.length > 1,
+    root_id: effectiveRoot,
+    active_cid: activeCid,
+    inspected_cid: targetCid,
+    is_inspecting_other: Boolean(activeCid !== targetCid),
+    inspected_role: targetConv.subagent_role || 'Main Session',
+    agent_count: nodes.length,
+    subagent_count: Math.max(0, nodes.length - 1),
+    total_cost: totalFleetCost,
+    total_tokens: totalFleetTokens,
+    total_disk_tokens: totalFleetDiskTokens,
+    total_steps: totalFleetSteps,
+    weekly_quota_pct: fleetWeeklyQuotaPct,
+    five_hour_quota_pct: fleet5hQuotaPct,
+    shielded_tokens: shieldedTokens,
+    shielding_ratio: shieldingRatio,
+    nodes
+  };
+
   return {
     cid: resolvedCid,
-    title: conv.title || 'Active Session',
-    project: conv.project,
+    title: targetConv.title || 'Active Session',
+    project: targetConv.project,
     model_name: modelName,
     max_tokens: maxTokens,
     active_tokens: activeTokens,
     pct: Math.round(pct * 10) / 10,
-    total_tokens: conv.total_tokens || activeTokens,
-    total_steps: conv.total_steps || (rangeRow?.step_count ?? 0),
+    total_tokens: targetConv.total_tokens || activeTokens,
+    total_steps: targetConv.total_steps || (rangeRow?.step_count ?? 0),
     billed_cost: billedCost,
-    compaction_count: conv.compaction_count || 0,
-    pruned_tokens: conv.pruned_tokens || 0,
-    compaction_detected: (conv.compaction_count || 0) > 0,
+    compaction_count: targetConv.compaction_count || 0,
+    pruned_tokens: targetConv.pruned_tokens || 0,
+    compaction_detected: (targetConv.compaction_count || 0) > 0,
     min_step: rangeRow?.min_step ?? 0,
     max_step: rangeRow?.max_step ?? 0,
     categories: categories.map(c => ({
@@ -403,7 +651,8 @@ export function getSessionData(db, cid) {
     quota_remaining_weekly_pct: quotaSummary.weekly_remaining_pct,
     quota_remaining_5h_pct: quotaSummary.five_hour_remaining_pct,
     quota_reset_time: quotaSummary.weekly_reset_time,
-    quota: quotaSummary
+    quota: quotaSummary,
+    fleet
   };
 }
 
@@ -412,8 +661,11 @@ export function getGlobalData(db) {
     const quotaSummary = getQuotaSummary(null, 'Gemini 3.7 Flash', 0);
     return {
       total_conversations: 0,
+      root_conversations: 0,
+      subagent_conversations: 0,
       total_tokens: 0,
       total_cost: 0,
+      weekly_cost: 0,
       total_compactions: 0,
       total_pruned_tokens: 0,
       weekly_quota_pct: 0,
@@ -422,6 +674,8 @@ export function getGlobalData(db) {
   }
 
   let totalConversations = 0;
+  let rootConversations = 0;
+  let subagentConversations = 0;
   let totalTokens = 0;
   let totalCost = 0.0;
   let totalCompactions = 0;
@@ -431,19 +685,42 @@ export function getGlobalData(db) {
 
   try {
     const baseRow = db.prepare(`
-      SELECT COUNT(*) as total_conversations,
-             COALESCE(SUM(total_tokens), 0) as total_tokens,
-             COALESCE(SUM(billed_cost), 0.0) as total_cost
+      SELECT
+        COUNT(*) as total_conversations,
+        COALESCE(SUM(CASE WHEN parent_id IS NULL OR parent_id = '' THEN 1 ELSE 0 END), 0) as root_conversations,
+        COALESCE(SUM(CASE WHEN parent_id IS NOT NULL AND parent_id != '' THEN 1 ELSE 0 END), 0) as subagent_conversations,
+        COALESCE(SUM(total_tokens), 0) as total_tokens,
+        COALESCE(SUM(billed_cost), 0.0) as total_cost
       FROM conversations
     `).get();
 
     if (baseRow) {
       totalConversations = Number(baseRow.total_conversations) || 0;
+      rootConversations = Number(baseRow.root_conversations) || 0;
+      subagentConversations = Number(baseRow.subagent_conversations) || 0;
       totalTokens = Number(baseRow.total_tokens) || 0;
       totalCost = Number(baseRow.total_cost) || 0.0;
     }
   } catch {
-    // conversations table missing or empty
+    // parent_id column might not exist in older/minimal schemas
+    try {
+      const fallbackRow = db.prepare(`
+        SELECT COUNT(*) as total_conversations,
+               COALESCE(SUM(total_tokens), 0) as total_tokens,
+               COALESCE(SUM(billed_cost), 0.0) as total_cost
+        FROM conversations
+      `).get();
+
+      if (fallbackRow) {
+        totalConversations = Number(fallbackRow.total_conversations) || 0;
+        rootConversations = totalConversations;
+        subagentConversations = 0;
+        totalTokens = Number(fallbackRow.total_tokens) || 0;
+        totalCost = Number(fallbackRow.total_cost) || 0.0;
+      }
+    } catch {
+      // conversations table missing or empty
+    }
   }
 
   try {
@@ -555,6 +832,8 @@ export function getGlobalData(db) {
 
   return {
     total_conversations: totalConversations,
+    root_conversations: rootConversations,
+    subagent_conversations: subagentConversations,
     total_tokens: totalTokens,
     total_cost: totalCost,
     weekly_cost: weeklyCost,

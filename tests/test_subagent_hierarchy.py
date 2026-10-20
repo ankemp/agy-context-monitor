@@ -133,6 +133,118 @@ class TestSubagentHierarchy(unittest.TestCase):
             self.assertIsNotNone(c_data)
             self.assertEqual(c_data["parent_id"], "parent-123")
 
+    def test_analyze_transcript_flat_and_wave_subagent_dispatch(self):
+        """Verify Antigravity 2.0 flat invoke_subagent args (including JSON-quoted strings) and multi-call waves preserve each subagent role and type."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            parent_dir = Path(tmp_dir) / "parent-wave"
+            parent_logs = parent_dir / ".system_generated" / "logs"
+            parent_logs.mkdir(parents=True)
+
+            transcript = [
+                {
+                    "step_index": 1,
+                    "type": "USER_INPUT",
+                    "source": "USER_EXPLICIT",
+                    "content": "Run parallel wave review",
+                    "created_at": "2026-10-19T22:00:00Z",
+                },
+                {
+                    "step_index": 2,
+                    "type": "PLANNER_RESPONSE",
+                    "source": "MODEL",
+                    "content": "Dispatching two reviewers in parallel...",
+                    "tool_calls": [
+                        {
+                            "name": "invoke_subagent",
+                            "args": {
+                                "Role": '"Standards Review Worker"',
+                                "TypeName": '"DeepInvestigatorWorkerL0"',
+                                "Model": '"inherit"',
+                                "Prompt": '"Check coding standards"',
+                            },
+                        },
+                        {
+                            "name": "invoke_subagent",
+                            "args": {
+                                "Role": "Spec Review Worker",
+                                "TypeName": "research",
+                                "Model": "flash",
+                                "Prompt": "Check spec compliance",
+                            },
+                        },
+                    ],
+                    "created_at": "2026-10-19T22:00:05Z",
+                },
+                {
+                    "step_index": 3,
+                    "type": "GENERIC",
+                    "source": "SYSTEM",
+                    "content": 'Created the following subagent:\n{\n  "conversationId": "wave-child-1",\n  "logAbsoluteUri": "file:///tmp/wave-child-1"\n}',
+                    "created_at": "2026-10-19T22:00:06Z",
+                },
+                {
+                    "step_index": 4,
+                    "type": "GENERIC",
+                    "source": "SYSTEM",
+                    "content": 'Created the following subagent:\n{\n  "conversationId": "wave-child-2",\n  "logAbsoluteUri": "file:///tmp/wave-child-2"\n}',
+                    "created_at": "2026-10-19T22:00:07Z",
+                },
+            ]
+            with open(parent_logs / "transcript.jsonl", "w") as f:
+                for entry in transcript:
+                    f.write(json.dumps(entry) + "\n")
+
+            p_data = ingest.analyze_transcript(parent_dir)
+            self.assertEqual(len(p_data["dispatched_subagents"]), 2)
+            self.assertEqual(p_data["dispatched_subagents"][0]["id"], "wave-child-1")
+            self.assertEqual(p_data["dispatched_subagents"][0]["role"], "Standards Review Worker")
+            self.assertEqual(p_data["dispatched_subagents"][0]["type"], "DeepInvestigatorWorkerL0")
+            self.assertEqual(p_data["dispatched_subagents"][1]["id"], "wave-child-2")
+            self.assertEqual(p_data["dispatched_subagents"][1]["role"], "Spec Review Worker")
+            self.assertEqual(p_data["dispatched_subagents"][1]["type"], "research")
+
+    def test_analyze_transcript_manage_subagents_output(self):
+        """Verify parsing manage_subagents tool output enriches or appends active subagents."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            parent_dir = Path(tmp_dir) / "parent-mgmt"
+            parent_logs = parent_dir / ".system_generated" / "logs"
+            parent_logs.mkdir(parents=True)
+
+            transcript = [
+                {
+                    "step_index": 1,
+                    "type": "PLANNER_RESPONSE",
+                    "source": "MODEL",
+                    "content": "Checking active subagents...",
+                    "tool_calls": [
+                        {
+                            "name": "manage_subagents",
+                            "args": {"Action": "list"},
+                        }
+                    ],
+                    "created_at": "2026-10-19T22:00:05Z",
+                },
+                {
+                    "step_index": 2,
+                    "type": "GENERIC",
+                    "source": "SYSTEM",
+                    "content": 'Found 2 active subagent(s):\n[\n  {"conversationId": "sub-101", "role": "\\"Tester\\"", "type": "qa-runner"},\n  {"conversationId": "sub-102", "role": "Architect", "type": "planner"}\n]',
+                    "created_at": "2026-10-19T22:00:06Z",
+                },
+            ]
+            with open(parent_logs / "transcript.jsonl", "w") as f:
+                for entry in transcript:
+                    f.write(json.dumps(entry) + "\n")
+
+            p_data = ingest.analyze_transcript(parent_dir)
+            self.assertEqual(len(p_data["dispatched_subagents"]), 2)
+            self.assertEqual(p_data["dispatched_subagents"][0]["id"], "sub-101")
+            self.assertEqual(p_data["dispatched_subagents"][0]["role"], "Tester")
+            self.assertEqual(p_data["dispatched_subagents"][0]["type"], "qa-runner")
+            self.assertEqual(p_data["dispatched_subagents"][1]["id"], "sub-102")
+            self.assertEqual(p_data["dispatched_subagents"][1]["role"], "Architect")
+            self.assertEqual(p_data["dispatched_subagents"][1]["type"], "planner")
+
     def test_conversations_hierarchy_and_flat_query(self):
         """Test query_conversations_list in hierarchy and flat modes with tree rollups."""
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -278,6 +390,320 @@ class TestSubagentHierarchy(unittest.TestCase):
             self.assertEqual(summary["root_convs"], 1)
             self.assertEqual(summary["subagent_convs"], 1)
 
+            conn.close()
+
+    def test_clean_arg_str_and_extract_subagent_specs_edge_cases(self):
+        """Test edge cases in _clean_arg_str and extract_subagent_specs."""
+        from scripts.ingest import _clean_arg_str, extract_subagent_specs
+        import scripts.backfill_analytics as backfill
+
+        # _clean_arg_str edge cases
+        self.assertEqual(_clean_arg_str(None), "")
+        self.assertEqual(_clean_arg_str(""), "")
+        self.assertEqual(_clean_arg_str("   "), "")
+        self.assertEqual(_clean_arg_str('"Reviewer"'), "Reviewer")
+        self.assertEqual(_clean_arg_str("'Reviewer'"), "Reviewer")
+        self.assertEqual(_clean_arg_str('"\\"Reviewer\\""'), "Reviewer")
+        self.assertEqual(_clean_arg_str(123), "123")
+        # Strings with internal quotes should preserve internal quote tokens
+        self.assertEqual(_clean_arg_str('"\\"Hello\\" and \\"World\\""'), '"Hello" and "World"')
+        self.assertEqual(_clean_arg_str("'Hello' and 'World'"), "'Hello' and 'World'")
+
+        # extract_subagent_specs edge cases
+        self.assertEqual(extract_subagent_specs({}), [])
+        self.assertEqual(extract_subagent_specs("not a dict"), [])
+
+        # Flat lower-case args with defaults
+        specs = extract_subagent_specs({"prompt": "Do task"})
+        self.assertEqual(len(specs), 1)
+        self.assertEqual(specs[0]["role"], "Autonomous Worker")
+        self.assertEqual(specs[0]["type"], "self")
+        self.assertEqual(specs[0]["model"], "inherit")
+
+        # Double encoded Subagents string
+        double_encoded = json.dumps([{"Role": "Specialist", "TypeName": "custom"}])
+        specs_json = extract_subagent_specs({"Subagents": json.dumps(double_encoded)})
+        self.assertEqual(len(specs_json), 1)
+        self.assertEqual(specs_json[0]["role"], "Specialist")
+        self.assertEqual(specs_json[0]["type"], "custom")
+
+        # Parity with backfill_analytics
+        bf_specs = backfill.extract_subagent_specs({"Role": '"Planner"', "TypeName": "lead"})
+        self.assertEqual(len(bf_specs), 1)
+        self.assertEqual(bf_specs[0]["role"], "Planner")
+        self.assertEqual(bf_specs[0]["type"], "lead")
+
+    def test_parse_manage_subagents_output_edge_cases(self):
+        """Test parse_manage_subagents_output on JSON and regex text formats."""
+        from scripts.ingest import parse_manage_subagents_output
+
+        # Empty or non-matching content
+        self.assertEqual(parse_manage_subagents_output(""), [])
+        self.assertEqual(parse_manage_subagents_output("No subagents here"), [])
+
+        # Words ending in 'id:' such as 'solid:' should not match as conversationId
+        false_positive_text = "active subagent(s):\n- style is solid: border-box\n"
+        self.assertEqual(parse_manage_subagents_output(false_positive_text), [])
+
+        # Bullet format with conversationId, role, type
+        text_content = (
+            "Currently 2 active subagent(s):\n"
+            "- conversationId: child-1, role: Auditor, type: audit-tool\n"
+            "- conversationId: child-2, role: Cleaner, type: cleanup\n"
+        )
+        parsed = parse_manage_subagents_output(text_content)
+        self.assertEqual(len(parsed), 2)
+        self.assertEqual(parsed[0]["id"], "child-1")
+        self.assertEqual(parsed[0]["role"], "Auditor")
+        self.assertEqual(parsed[0]["type"], "audit-tool")
+        self.assertEqual(parsed[1]["id"], "child-2")
+        self.assertEqual(parsed[1]["role"], "Cleaner")
+        self.assertEqual(parsed[1]["type"], "cleanup")
+
+    def test_sync_to_sqlite_fleet_rollups(self):
+        """Test that sync_to_sqlite accurately calculates fleet_agent_count and fleet_cost across root and subagents."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_file = Path(tmp_dir) / "test_analytics.db"
+            init_db(db_file)
+
+            conn = get_db_connection(db_file)
+            # Create a root session
+            root_analysis = {
+                "title": "Root Task",
+                "start_time": "2026-10-19T10:00:00Z",
+                "end_time": "2026-10-19T10:30:00Z",
+                "duration_seconds": 1800,
+                "total_chars": 1000,
+                "total_tokens": 500,
+                "active_context_tokens": 500,
+                "billed_cost": 2.50,
+                "steps": [],
+                "dispatched_subagents": [
+                    {"id": "sub-1", "role": "Worker 1", "type": "self", "step_index": 2}
+                ],
+            }
+            ingest.sync_to_sqlite("root-sess", "Gemini Pro", root_analysis, db_path=db_file)
+
+            # Check root rollups
+            self.assertEqual(root_analysis.get("fleet_agent_count"), 2)  # root + sub-1 placeholder
+            self.assertEqual(root_analysis.get("fleet_cost"), 2.50)
+
+            # Ingest child session
+            child_analysis = {
+                "title": "[Worker 1] Root Task",
+                "start_time": "2026-10-19T10:05:00Z",
+                "end_time": "2026-10-19T10:20:00Z",
+                "duration_seconds": 900,
+                "total_chars": 800,
+                "total_tokens": 400,
+                "active_context_tokens": 400,
+                "billed_cost": 1.25,
+                "parent_id": "root-sess",
+                "subagent_role": "Worker 1",
+                "steps": [],
+            }
+            ingest.sync_to_sqlite("sub-1", "Gemini Pro", child_analysis, db_path=db_file)
+
+            # Both root and child reflect 2 agents and 3.75 total cost
+            self.assertEqual(child_analysis.get("fleet_agent_count"), 2)
+            self.assertEqual(child_analysis.get("fleet_cost"), 3.75)
+            conn.close()
+
+    def test_backfill_analytics_title_update_from_autonomous_worker(self):
+        """Test that backfill updates titles previously named [Autonomous Worker] when a specific role is discovered."""
+        from scripts.backfill_analytics import run_backfill
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            db_file = tmp_path / "test_analytics.db"
+            init_db(db_file)
+
+            # Create transcripts: parent dispatching worker with role Standards Reviewer
+            parent_dir = tmp_path / "parent-c"
+            parent_logs = parent_dir / ".system_generated" / "logs"
+            parent_logs.mkdir(parents=True)
+
+            parent_tx = [
+                {
+                    "step_index": 1,
+                    "type": "USER_INPUT",
+                    "source": "USER_EXPLICIT",
+                    "content": "Implement feature Y",
+                    "created_at": "2026-10-19T10:00:00Z",
+                },
+                {
+                    "step_index": 2,
+                    "type": "PLANNER_RESPONSE",
+                    "source": "MODEL",
+                    "content": "Dispatching worker",
+                    "tool_calls": [
+                        {
+                            "name": "invoke_subagent",
+                            "args": {"Role": "Standards Reviewer", "TypeName": "custom"},
+                        }
+                    ],
+                    "created_at": "2026-10-19T10:00:05Z",
+                },
+                {
+                    "step_index": 3,
+                    "type": "GENERIC",
+                    "source": "SYSTEM",
+                    "content": 'Created the following subagent:\n{\n  "conversationId": "child-c",\n  "logAbsoluteUri": "file:///tmp/child-c"\n}',
+                    "created_at": "2026-10-19T10:00:06Z",
+                },
+            ]
+            with open(parent_logs / "transcript.jsonl", "w") as f:
+                for entry in parent_tx:
+                    f.write(json.dumps(entry) + "\n")
+
+            # Child transcript with old title
+            child_dir = tmp_path / "child-c"
+            child_logs = child_dir / ".system_generated" / "logs"
+            child_logs.mkdir(parents=True)
+
+            child_tx = [
+                {
+                    "step_index": 1,
+                    "type": "SYSTEM_MESSAGE",
+                    "source": "SYSTEM",
+                    "content": "[Message] timestamp=2026-10-19T10:00:06Z sender=parent-c\nDo review",
+                    "created_at": "2026-10-19T10:00:07Z",
+                },
+                {
+                    "step_index": 2,
+                    "type": "PLANNER_RESPONSE",
+                    "source": "MODEL",
+                    "content": "Done",
+                    "created_at": "2026-10-19T10:00:10Z",
+                },
+            ]
+            with open(child_logs / "transcript.jsonl", "w") as f:
+                for entry in child_tx:
+                    f.write(json.dumps(entry) + "\n")
+
+            # First insert with [Autonomous Worker]
+            conn = get_db_connection(db_file)
+            conn.execute(
+                "INSERT INTO conversations (id, title, created_at, updated_at) VALUES ('child-c', '[Autonomous Worker] Implement feature Y', '2026-10-19T10:00:07Z', '2026-10-19T10:00:10Z')"
+            )
+            conn.commit()
+            conn.close()
+
+            # Run backfill on tmp_path
+            run_backfill(brain_dir=tmp_path, db_path=db_file)
+
+            conn = get_db_connection(db_file)
+            child_row = conn.execute("SELECT title, subagent_role FROM conversations WHERE id = 'child-c'").fetchone()
+            self.assertEqual(child_row["subagent_role"], "Standards Reviewer")
+            self.assertEqual(child_row["title"], "[Standards Reviewer] Implement feature Y")
+            conn.close()
+
+    def test_wave_dispatch_queue_alignment_with_failed_call(self):
+        """Verify that a failed invoke_subagent step does not cause subsequent successful dispatches to get misaligned roles."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            parent_dir = Path(tmp_dir) / "parent-failed-call"
+            parent_logs = parent_dir / ".system_generated" / "logs"
+            parent_logs.mkdir(parents=True)
+
+            transcript = [
+                {
+                    "step_index": 1,
+                    "type": "USER_INPUT",
+                    "source": "USER_EXPLICIT",
+                    "content": "Run parallel tasks",
+                    "created_at": "2026-10-19T22:00:00Z",
+                },
+                {
+                    "step_index": 2,
+                    "type": "PLANNER_RESPONSE",
+                    "source": "MODEL",
+                    "content": "Dispatching two workers...",
+                    "tool_calls": [
+                        {
+                            "name": "invoke_subagent",
+                            "args": {"Role": "Failed Worker", "Prompt": "Will fail"},
+                        },
+                        {
+                            "name": "invoke_subagent",
+                            "args": {"Role": "Successful Worker", "Prompt": "Will succeed"},
+                        },
+                    ],
+                    "created_at": "2026-10-19T22:00:05Z",
+                },
+                {
+                    "step_index": 3,
+                    "type": "GENERIC",
+                    "source": "SYSTEM",
+                    "status": "ERROR",
+                    "error": "Failed to spawn process",
+                    "content": "Error: unable to invoke subagent",
+                    "created_at": "2026-10-19T22:00:06Z",
+                },
+                {
+                    "step_index": 4,
+                    "type": "GENERIC",
+                    "source": "SYSTEM",
+                    "content": 'Created the following subagent:\n{\n  "conversationId": "succ-child-1"\n}',
+                    "created_at": "2026-10-19T22:00:07Z",
+                },
+            ]
+            with open(parent_logs / "transcript.jsonl", "w") as f:
+                for entry in transcript:
+                    f.write(json.dumps(entry) + "\n")
+
+            p_data = ingest.analyze_transcript(parent_dir)
+            self.assertEqual(len(p_data["dispatched_subagents"]), 1)
+            self.assertEqual(p_data["dispatched_subagents"][0]["id"], "succ-child-1")
+            # Should have Successful Worker, NOT Failed Worker
+            self.assertEqual(p_data["dispatched_subagents"][0]["role"], "Successful Worker")
+
+    def test_sync_to_sqlite_updates_child_autonomous_worker_title(self):
+        """Verify sync_to_sqlite updates child conversation title and role from [Autonomous Worker] on conflict."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_file = Path(tmp_dir) / "test_analytics.db"
+            init_db(db_file)
+
+            conn = get_db_connection(db_file)
+            # Parent inserts child as Autonomous Worker first
+            initial_analysis = {
+                "title": "Parent Pipeline",
+                "start_time": "2026-10-19T10:00:00Z",
+                "end_time": "2026-10-19T10:10:00Z",
+                "duration_seconds": 600,
+                "total_chars": 500,
+                "total_tokens": 250,
+                "active_context_tokens": 250,
+                "billed_cost": 1.0,
+                "steps": [],
+                "dispatched_subagents": [
+                    {"id": "child-w1", "role": "Autonomous Worker", "type": "self", "step_index": 2}
+                ],
+            }
+            ingest.sync_to_sqlite("parent-sess", "Gemini Pro", initial_analysis, db_path=db_file)
+
+            child_before = conn.execute("SELECT title, subagent_role FROM conversations WHERE id = 'child-w1'").fetchone()
+            self.assertEqual(child_before["title"], "[Autonomous Worker] Parent Pipeline")
+            self.assertEqual(child_before["subagent_role"], "Autonomous Worker")
+
+            # Later pass discovers specific role: Spec Reviewer
+            updated_analysis = {
+                "title": "Parent Pipeline",
+                "start_time": "2026-10-19T10:00:00Z",
+                "end_time": "2026-10-19T10:15:00Z",
+                "duration_seconds": 900,
+                "total_chars": 800,
+                "total_tokens": 400,
+                "active_context_tokens": 400,
+                "billed_cost": 1.5,
+                "steps": [],
+                "dispatched_subagents": [
+                    {"id": "child-w1", "role": "Spec Reviewer", "type": "custom", "step_index": 2}
+                ],
+            }
+            ingest.sync_to_sqlite("parent-sess", "Gemini Pro", updated_analysis, db_path=db_file)
+
+            child_after = conn.execute("SELECT title, subagent_role FROM conversations WHERE id = 'child-w1'").fetchone()
+            self.assertEqual(child_after["title"], "[Spec Reviewer] Parent Pipeline")
+            self.assertEqual(child_after["subagent_role"], "Spec Reviewer")
             conn.close()
 
 

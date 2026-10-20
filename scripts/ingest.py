@@ -55,6 +55,223 @@ def format_tokens(n: int | float) -> str:
     return str(int(n))
 
 
+def _clean_arg_str(val: Any) -> str:
+    """Strips whitespace and unquotes double/single-encoded JSON strings."""
+    if val is None:
+        return ""
+    s = str(val).strip()
+    while True:
+        if s.startswith('"') and s.endswith('"') and len(s) >= 2:
+            try:
+                unquoted = json.loads(s)
+                if isinstance(unquoted, str):
+                    s = unquoted.strip()
+                    continue
+            except Exception:
+                pass
+            inner = s[1:-1].strip()
+            if not re.search(r'(?<!\\)"', inner):
+                s = inner.replace(r'\"', '"').strip()
+                continue
+        if s.startswith("'") and s.endswith("'") and len(s) >= 2:
+            inner = s[1:-1].strip()
+            if not re.search(r"(?<!\\)'", inner):
+                s = inner.replace(r"\'", "'").strip()
+                continue
+        break
+    return s
+
+
+def extract_subagent_specs(tc_args: dict[str, Any]) -> list[dict[str, str]]:
+    """Extracts subagent specifications from invoke_subagent tool call arguments.
+
+    Handles Antigravity 1.0 (Subagents list or JSON string) and Antigravity 2.0 flat arguments
+    (Role, role, TypeName, type, Prompt, prompt, Model, model), cleaning inner quotes.
+    """
+    if not isinstance(tc_args, dict):
+        return []
+
+    sub_raw = tc_args.get("Subagents") or tc_args.get("subagents")
+    if sub_raw:
+        specs_list = []
+        if isinstance(sub_raw, str):
+            s = sub_raw.strip()
+            if (s.startswith('"') and s.endswith('"')) or (
+                s.startswith("'") and s.endswith("'")
+            ):
+                s = _clean_arg_str(s)
+            try:
+                parsed = json.loads(s)
+                if isinstance(parsed, str):
+                    parsed = json.loads(parsed)
+                if isinstance(parsed, list):
+                    specs_list = parsed
+            except Exception:
+                pass
+        elif isinstance(sub_raw, list):
+            specs_list = sub_raw
+
+        if specs_list:
+            results = []
+            for item in specs_list:
+                if isinstance(item, dict):
+                    role = _clean_arg_str(
+                        item.get("Role") or item.get("role") or ""
+                    )
+                    sub_type = _clean_arg_str(
+                        item.get("TypeName")
+                        or item.get("type")
+                        or item.get("subagent_type")
+                        or ""
+                    )
+                    model = _clean_arg_str(
+                        item.get("Model") or item.get("model") or ""
+                    )
+                    results.append(
+                        {
+                            "role": role or "Autonomous Worker",
+                            "type": sub_type or "self",
+                            "model": model or "inherit",
+                            "Role": role or "Autonomous Worker",
+                            "TypeName": sub_type or "self",
+                            "Model": model or "inherit",
+                        }
+                    )
+            if results:
+                return results
+
+    flat_keys = (
+        "Role",
+        "role",
+        "TypeName",
+        "type",
+        "subagent_type",
+        "subagentType",
+        "Prompt",
+        "prompt",
+        "Model",
+        "model",
+    )
+    if any(k in tc_args for k in flat_keys):
+        raw_role = tc_args.get("Role") or tc_args.get("role")
+        raw_type = (
+            tc_args.get("TypeName")
+            or tc_args.get("type")
+            or tc_args.get("subagent_type")
+            or tc_args.get("subagentType")
+        )
+        raw_model = tc_args.get("Model") or tc_args.get("model")
+
+        role = _clean_arg_str(raw_role)
+        sub_type = _clean_arg_str(raw_type)
+        model = _clean_arg_str(raw_model)
+
+        return [
+            {
+                "role": role if role else "Autonomous Worker",
+                "type": sub_type if sub_type else "self",
+                "model": model if model else "inherit",
+                "Role": role if role else "Autonomous Worker",
+                "TypeName": sub_type if sub_type else "self",
+                "Model": model if model else "inherit",
+            }
+        ]
+
+    return []
+
+
+def parse_manage_subagents_output(content: str) -> list[dict[str, str]]:
+    """Parse manage_subagents tool output when active subagent(s): appears."""
+    if not content or (
+        "active subagent" not in content.lower()
+        and "active sub-agent" not in content.lower()
+    ):
+        return []
+
+    results: list[dict[str, str]] = []
+
+    # 1. Try to find and parse JSON array
+    json_match = re.search(r"\[\s*\{.*?\}\s*\]", content, re.DOTALL)
+    if json_match:
+        try:
+            data = json.loads(json_match.group(0))
+            if isinstance(data, list):
+                for item in data:
+                    if isinstance(item, dict):
+                        cid = _clean_arg_str(
+                            item.get("conversationId")
+                            or item.get("conversation_id")
+                            or item.get("id")
+                            or ""
+                        )
+                        if cid:
+                            role = _clean_arg_str(
+                                item.get("role") or item.get("Role") or ""
+                            )
+                            sub_type = _clean_arg_str(
+                                item.get("type") or item.get("TypeName") or ""
+                            )
+                            model = _clean_arg_str(
+                                item.get("model") or item.get("Model") or ""
+                            )
+                            results.append(
+                                {
+                                    "id": cid,
+                                    "conversationId": cid,
+                                    "role": role or "Autonomous Worker",
+                                    "type": sub_type or "self",
+                                    "model": model or "inherit",
+                                    "Role": role or "Autonomous Worker",
+                                    "TypeName": sub_type or "self",
+                                    "Model": model or "inherit",
+                                }
+                            )
+        except Exception:
+            pass
+
+    if results:
+        return results
+
+    # 2. Line-by-line regex extraction for text or bullet points
+    for line in content.splitlines():
+        cid_m = re.search(
+            r'\b(?:conversation_?id|cid|id)["\':\s]+([a-zA-Z0-9_\-]+)',
+            line,
+            re.IGNORECASE,
+        )
+        if not cid_m:
+            cid_m = re.search(
+                r'\b([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})\b',
+                line,
+                re.IGNORECASE,
+            )
+        if cid_m:
+            cid = cid_m.group(1).strip()
+            role_m = re.search(r'\brole["\':\s]+([^,\n\)]+)', line, re.IGNORECASE)
+            type_m = re.search(
+                r'\btype(?:Name)?["\':\s]+([^,\n\)]+)', line, re.IGNORECASE
+            )
+            model_m = re.search(r'\bmodel["\':\s]+([^,\n\)]+)', line, re.IGNORECASE)
+
+            role = _clean_arg_str(role_m.group(1)) if role_m else ""
+            sub_type = _clean_arg_str(type_m.group(1)) if type_m else ""
+            model = _clean_arg_str(model_m.group(1)) if model_m else ""
+            results.append(
+                {
+                    "id": cid,
+                    "conversationId": cid,
+                    "role": role or "Autonomous Worker",
+                    "type": sub_type or "self",
+                    "model": model or "inherit",
+                    "Role": role or "Autonomous Worker",
+                    "TypeName": sub_type or "self",
+                    "Model": model or "inherit",
+                }
+            )
+
+    return results
+
+
 def format_ephemeral_status(
     active_pct: float,
     active_tokens: int | float,
@@ -66,6 +283,9 @@ def format_ephemeral_status(
     session_cost: float | None = None,
     turn_wk_pct: float | None = None,
     diff_res: Any = None,
+    fleet_cost: float | None = None,
+    fleet_wk_pct: float | None = None,
+    fleet_agent_count: int = 1,
 ) -> str:
     """Formats transient progress / status line for Antigravity 2.0 ephemeral display.
 
@@ -109,6 +329,8 @@ def format_ephemeral_status(
             has_valid_quota = True
 
     if not has_valid_quota:
+        if fleet_agent_count > 1 and fleet_cost is not None:
+            return f"{ctx_prefix} · Fleet ({fleet_agent_count}) Value: ${fleet_cost:,.2f}"
         return f"{ctx_prefix} · Session Value: ${effective_cost:,.2f}"
 
     sess_wk_pct = quota_metrics.get("session_weekly_pct")
@@ -117,9 +339,18 @@ def format_ephemeral_status(
             "thread_weekly_pct", quota_metrics.get("weekly_pct", 0.0)
         )
 
-    sess_part = (
-        f"Session: {format_quota_pct(sess_wk_pct, 2)} wk (${effective_cost:,.2f})"
-    )
+    if fleet_agent_count > 1 and fleet_cost is not None:
+        if fleet_wk_pct is not None:
+            eff_fleet_wk_pct = fleet_wk_pct
+        elif effective_cost and effective_cost > 0 and sess_wk_pct is not None:
+            eff_fleet_wk_pct = (fleet_cost / effective_cost) * float(sess_wk_pct)
+        else:
+            eff_fleet_wk_pct = sess_wk_pct or 0.0
+        sess_part = f"Fleet ({fleet_agent_count}): {format_quota_pct(eff_fleet_wk_pct, 2)} wk (${fleet_cost:,.2f})"
+    else:
+        sess_part = (
+            f"Session: {format_quota_pct(sess_wk_pct, 2)} wk (${effective_cost:,.2f})"
+        )
 
     rem_wk_pct = quota_metrics.get("weekly_remaining_pct", 100.0)
     reset_cd = quota_metrics.get("weekly_reset_countdown") or format_reset_countdown(
@@ -414,20 +645,19 @@ def analyze_transcript(
                         clean_path = str(target_p).strip("\"'") if target_p else None
 
                         if tc_name == "invoke_subagent":
-                            sub_raw = tc_args.get("Subagents", "")
-                            if isinstance(sub_raw, str):
-                                try:
-                                    pending_subagent_specs = (
-                                        json.loads(sub_raw)
-                                        if sub_raw.strip().startswith("[")
-                                        else []
-                                    )
-                                except Exception:
-                                    pending_subagent_specs = []
-                            elif isinstance(sub_raw, list):
-                                pending_subagent_specs = sub_raw
-                            else:
-                                pending_subagent_specs = []
+                            specs = extract_subagent_specs(tc_args)
+                            if not specs:
+                                specs = [
+                                    {
+                                        "role": "Autonomous Worker",
+                                        "type": "self",
+                                        "model": "inherit",
+                                        "Role": "Autonomous Worker",
+                                        "TypeName": "self",
+                                        "Model": "inherit",
+                                    }
+                                ]
+                            pending_subagent_specs.extend(specs)
                         elif tc_name == "view_file" and clean_path:
                             norm_path = clean_path.lower()
                             if norm_path in seen_files:
@@ -534,10 +764,8 @@ def analyze_transcript(
 
                 if (
                     tool_name == "invoke_subagent"
-                    or (
-                        "Created the following subagents:" in content
-                        and pending_subagent_specs
-                    )
+                    or "Created the following subagent" in content
+                    or "Created the following subagents:" in content
                 ) and tool_name not in (
                     "run_command",
                     "view_file",
@@ -548,39 +776,91 @@ def analyze_transcript(
                     tool_or_source = "`invoke_subagent`"
                     category = "Tool Output: `invoke_subagent`"
                     found_cids = re.findall(
-                        r'conversationId["\':\s]+([a-zA-Z0-9_\-]+)', content
+                        r'conversation(?:_?id)?["\':\s]+([a-zA-Z0-9_\-]+)',
+                        content,
+                        re.IGNORECASE,
                     )
                     if not found_cids:
                         found_cids = re.findall(
                             r"([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})",
                             content,
                         )
-                    for c_idx, ch_id in enumerate(found_cids):
+                    found_cids = list(dict.fromkeys(found_cids))
+                    if not found_cids and is_error and pending_subagent_specs:
+                        pending_subagent_specs.pop(0)
+
+                    for ch_id in found_cids:
                         spec = (
-                            pending_subagent_specs[c_idx]
-                            if c_idx < len(pending_subagent_specs)
+                            pending_subagent_specs.pop(0)
+                            if pending_subagent_specs
                             else {}
                         )
                         dispatched_subagents.append(
                             {
                                 "id": ch_id,
-                                "role": spec.get("Role")
-                                or spec.get("role")
+                                "role": spec.get("role")
+                                or spec.get("Role")
                                 or "Autonomous Worker",
-                                "type": spec.get("TypeName")
-                                or spec.get("type")
+                                "type": spec.get("type")
+                                or spec.get("TypeName")
                                 or "self",
-                                "model": spec.get("Model")
-                                or spec.get("model")
+                                "model": spec.get("model")
+                                or spec.get("Model")
                                 or "inherit",
                                 "step_index": step_idx,
                             }
                         )
-                    pending_subagent_specs = []
                     detail = (
                         f"Dispatched {len(found_cids)} subagent(s)"
                         if found_cids
                         else "Subagent dispatch"
+                    )
+                elif (
+                    tool_name == "manage_subagents"
+                    or "active subagent" in content.lower()
+                    or "active sub-agent" in content.lower()
+                ) and tool_name not in (
+                    "run_command",
+                    "view_file",
+                    "search_web",
+                    "manage_task",
+                ):
+                    activity = "Subagent Status"
+                    tool_or_source = "`manage_subagents`"
+                    category = "Tool Output: `manage_subagents`"
+                    parsed_agents = parse_manage_subagents_output(content)
+                    for pa in parsed_agents:
+                        cid_found = pa.get("id") or pa.get("conversationId")
+                        if not cid_found:
+                            continue
+                        matched = False
+                        for ds in dispatched_subagents:
+                            if ds.get("id") == cid_found:
+                                if pa.get("role") and (
+                                    ds.get("role") in (None, "", "Autonomous Worker")
+                                    or pa.get("role") != "Autonomous Worker"
+                                ):
+                                    ds["role"] = pa["role"]
+                                if pa.get("type"):
+                                    ds["type"] = pa["type"]
+                                if pa.get("model"):
+                                    ds["model"] = pa["model"]
+                                matched = True
+                                break
+                        if not matched:
+                            dispatched_subagents.append(
+                                {
+                                    "id": cid_found,
+                                    "role": pa.get("role", "Autonomous Worker"),
+                                    "type": pa.get("type", "self"),
+                                    "model": pa.get("model", "inherit"),
+                                    "step_index": step_idx,
+                                }
+                            )
+                    detail = (
+                        f"Active subagent(s): {len(parsed_agents)}"
+                        if parsed_agents
+                        else "Manage subagents"
                     )
                 elif tool_name == "view_file" or "File Path:" in content:
                     activity = "File Content"
@@ -828,13 +1108,15 @@ def sync_to_sqlite(
     analysis: dict,
     *,
     attach_profile: bool = True,
+    db_path: Path | None = None,
 ):
     """Safely and incrementally syncs session data to SQLite in WAL mode and computes turn diff."""
     diff_res = None
     try:
-        if not DEFAULT_DB_PATH:
+        target_db = Path(db_path) if db_path else DEFAULT_DB_PATH
+        if not target_db:
             return None
-        conn = get_db_connection(DEFAULT_DB_PATH, timeout=5.0)
+        conn = get_db_connection(target_db, timeout=5.0)
         try:
             with conn:
                 cur = conn.cursor()
@@ -991,6 +1273,11 @@ def sync_to_sqlite(
                         if (
                             not analysis.get("title")
                             or analysis["title"] in ("Active Session", "")
+                            or (
+                                analysis["title"].startswith("[Autonomous Worker]")
+                                and subagent_role
+                                and subagent_role != "Autonomous Worker"
+                            )
                         ) and p_row["title"]:
                             role_label = subagent_role or "Worker"
                             clean_p_title = p_row["title"]
@@ -1124,7 +1411,15 @@ def sync_to_sqlite(
                             parent_id = excluded.parent_id,
                             root_id = excluded.root_id,
                             depth = excluded.depth,
-                            subagent_role = COALESCE(excluded.subagent_role, conversations.subagent_role),
+                            subagent_role = CASE
+                                WHEN excluded.subagent_role IS NOT NULL AND excluded.subagent_role != 'Autonomous Worker' THEN excluded.subagent_role
+                                ELSE COALESCE(conversations.subagent_role, excluded.subagent_role)
+                            END,
+                            title = CASE
+                                WHEN (conversations.title LIKE '[Autonomous Worker]%' OR conversations.title IS NULL OR conversations.title = '')
+                                     AND excluded.title NOT LIKE '[Autonomous Worker]%' THEN excluded.title
+                                ELSE conversations.title
+                            END,
                             subagent_type = COALESCE(excluded.subagent_type, conversations.subagent_type),
                             invoking_step_index = COALESCE(excluded.invoking_step_index, conversations.invoking_step_index),
                             project = COALESCE(conversations.project, excluded.project)
@@ -1359,6 +1654,22 @@ def sync_to_sqlite(
                 # Refresh rollups for this conversation
                 refresh_conversation_rollups(conn, cid)
                 conn.commit()
+
+            # Query fleet rollups across root + subagents
+            try:
+                fleet_row = conn.execute(
+                    "SELECT COUNT(*), COALESCE(SUM(billed_cost), 0.0) FROM conversations WHERE root_id = ? OR id = ?",
+                    (root_id, root_id),
+                ).fetchone()
+                if fleet_row:
+                    analysis["fleet_agent_count"] = max(fleet_row[0] or 1, 1)
+                    analysis["fleet_cost"] = (
+                        float(fleet_row[1])
+                        if fleet_row[1] is not None
+                        else float(analysis.get("billed_cost", 0.0))
+                    )
+            except Exception:
+                pass
 
             # Refresh and cache quota state and activity profile
             try:
@@ -1829,6 +2140,22 @@ def main():
     session_cost_val = analysis.get("billed_cost", 0.0)
     added_tok = getattr(diff_res, "added_tokens", 0) if diff_res else 0
 
+    fleet_agent_count = analysis.get("fleet_agent_count", 1)
+    fleet_cost = analysis.get("fleet_cost")
+    fleet_wk_pct = None
+    if quota_metrics and fleet_cost is not None:
+        cal_cap = quota_metrics.get("calibrated_weekly_capacity")
+        if cal_cap and cal_cap > 0:
+            fleet_wk_pct = (fleet_cost / cal_cap) * 100.0
+        elif (
+            session_cost_val
+            and session_cost_val > 0
+            and quota_metrics.get("session_weekly_pct") is not None
+        ):
+            fleet_wk_pct = (fleet_cost / session_cost_val) * float(
+                quota_metrics["session_weekly_pct"]
+            )
+
     ephemeral_msg = format_ephemeral_status(
         active_pct=active_pct,
         active_tokens=active_tokens,
@@ -1839,6 +2166,9 @@ def main():
         quota_metrics=quota_metrics,
         turn_wk_pct=turn_wk_pct,
         diff_res=diff_res,
+        fleet_cost=fleet_cost,
+        fleet_wk_pct=fleet_wk_pct,
+        fleet_agent_count=fleet_agent_count,
     )
 
     output_payload = {"injectSteps": [{"ephemeralMessage": ephemeral_msg}]}

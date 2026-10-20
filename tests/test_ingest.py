@@ -185,6 +185,86 @@ def test_format_ephemeral_status_compaction_and_warning():
     assert "Context Warning: Window at 85.0% capacity" in msg_warn
 
 
+def test_format_ephemeral_status_replaces_session_with_fleet_when_subagents_present():
+    quota_metrics = {
+        "weekly_remaining_pct": 75.0,
+        "weekly_reset_countdown": "4d 2h",
+        "session_weekly_pct": 0.25,
+    }
+    msg = format_ephemeral_status(
+        active_pct=15.0,
+        active_tokens=150_000,
+        active_max=1_000_000,
+        added_tok=2_500,
+        turn_cost=0.10,
+        session_cost=1.68,
+        quota_metrics=quota_metrics,
+        fleet_cost=5.38,
+        fleet_wk_pct=0.80,
+        fleet_agent_count=4,
+    )
+    assert "Fleet (4): 0.80% wk ($5.38)" in msg
+    assert "Session:" not in msg
+
+
+def test_format_ephemeral_status_fleet_fallback_no_quota():
+    msg = format_ephemeral_status(
+        active_pct=10.0,
+        active_tokens=100_000,
+        active_max=1_000_000,
+        added_tok=0,
+        turn_cost=1.00,
+        session_cost=1.00,
+        quota_metrics=None,
+        fleet_cost=3.50,
+        fleet_agent_count=3,
+    )
+    assert "Fleet (3) Value: $3.50" in msg
+    assert "Session Value:" not in msg
+
+
+def test_format_ephemeral_status_single_agent_retains_session_prefix():
+    quota_metrics = {
+        "weekly_remaining_pct": 75.0,
+        "weekly_reset_countdown": "4d 2h",
+        "session_weekly_pct": 0.25,
+    }
+    msg = format_ephemeral_status(
+        active_pct=15.0,
+        active_tokens=150_000,
+        active_max=1_000_000,
+        added_tok=0,
+        turn_cost=0.10,
+        session_cost=1.68,
+        quota_metrics=quota_metrics,
+        fleet_cost=1.68,
+        fleet_agent_count=1,
+    )
+    assert "Session: 0.25% wk ($1.68)" in msg
+    assert "Fleet (" not in msg
+
+
+def test_format_ephemeral_status_subagents_without_fleet_cost_retains_session_prefix():
+    quota_metrics = {
+        "weekly_remaining_pct": 75.0,
+        "weekly_reset_countdown": "4d 2h",
+        "session_weekly_pct": 0.25,
+    }
+    msg = format_ephemeral_status(
+        active_pct=15.0,
+        active_tokens=150_000,
+        active_max=1_000_000,
+        added_tok=0,
+        turn_cost=0.10,
+        session_cost=1.68,
+        quota_metrics=quota_metrics,
+        fleet_cost=None,
+        fleet_agent_count=4,
+    )
+    assert "Session: 0.25% wk ($1.68)" in msg
+    assert "Fleet (" not in msg
+
+
 def test_artifact_report_subscription_and_quota_section_no_emojis(tmp_path: Path):
     """Verifies artifact markdown report includes Subscription & Quota Impact without emojis."""
     analysis = {

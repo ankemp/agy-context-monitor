@@ -411,6 +411,8 @@ def test_main_mjs_exists_and_syntax():
         ["node", "--check", str(main_mjs)], capture_output=True, text=True
     )
     assert res.returncode == 0, f"Syntax check failed: {res.stderr}"
+    content = main_mjs.read_text(encoding="utf-8")
+    assert "data?.inspect_cid" in content
 
 
 def test_sidecar_quota_indexing_session_uses_cached_quota(tmp_path):
@@ -688,3 +690,665 @@ def test_sidecar_backend_header_meta_badges(tmp_path):
     global_data = data["global"]
     assert abs(global_data["total_cost"] - 3.36) < 0.01
     assert abs(global_data["weekly_quota_pct"] - 0.50) < 0.01
+
+
+def test_sidecar_fleet_swarm_rollups_and_node_sorting(tmp_path):
+    """Verifies that a root session with 2 sub-agents produces correct fleet rollups and sorted nodes."""
+    db_path = tmp_path / "test_swarm.db"
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    cur.executescript("""
+    CREATE TABLE conversations (
+        id TEXT PRIMARY KEY,
+        title TEXT,
+        project TEXT,
+        model_name TEXT,
+        created_at TEXT,
+        updated_at TEXT,
+        total_steps INTEGER DEFAULT 0,
+        total_tokens INTEGER DEFAULT 0,
+        billed_cost REAL DEFAULT 0.0,
+        billed_input_tokens INTEGER DEFAULT 0,
+        billed_output_tokens INTEGER DEFAULT 0,
+        parent_id TEXT,
+        root_id TEXT,
+        depth INTEGER DEFAULT 0,
+        subagent_role TEXT,
+        subagent_type TEXT,
+        compaction_count INTEGER DEFAULT 0,
+        pruned_tokens INTEGER DEFAULT 0
+    );
+
+    CREATE TABLE steps (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        conversation_id TEXT NOT NULL,
+        step_index INTEGER NOT NULL,
+        created_at TEXT,
+        step_type TEXT,
+        category TEXT,
+        activity TEXT,
+        tool_or_source TEXT,
+        est_tokens INTEGER DEFAULT 0,
+        billed_cost REAL DEFAULT 0.0,
+        detail TEXT
+    );
+
+    CREATE TABLE quota_state (
+        bucket_id TEXT PRIMARY KEY,
+        group_name TEXT NOT NULL,
+        window TEXT NOT NULL,
+        remaining_fraction REAL NOT NULL,
+        reset_time TEXT NOT NULL,
+        calibrated_capacity REAL NOT NULL,
+        fetched_at TEXT NOT NULL
+    );
+
+    INSERT INTO quota_state VALUES
+        ('gemini-weekly', 'Gemini Models', 'weekly', 0.90, '2026-10-21T02:27:22Z', 672.0, '2026-10-14T10:00:00Z'),
+        ('3p-weekly', 'Claude Models', 'weekly', 0.90, '2026-10-21T02:27:22Z', 200.0, '2026-10-14T10:00:00Z');
+    """)
+
+    # Root coordinator (cost 1.50)
+    cur.execute("""
+    INSERT INTO conversations (
+        id, title, project, model_name, created_at, updated_at, total_steps, total_tokens,
+        billed_cost, parent_id, root_id, depth, subagent_role
+    ) VALUES (
+        'root-1', 'Root Coordinator', 'proj-alpha', 'Gemini 3.7 Flash',
+        '2026-10-14T10:00:00Z', '2026-10-14T10:30:00Z', 10, 20000,
+        1.50, NULL, NULL, 0, 'Root Coordinator'
+    )
+    """)
+    cur.execute("""
+    INSERT INTO steps (conversation_id, step_index, step_type, category, activity, tool_or_source, est_tokens, billed_cost)
+    VALUES ('root-1', 1, 'USER_INPUT', 'General', 'Prompt', 'User', 10000, 1.50)
+    """)
+
+    # Subagent 1: Worker (cost 4.50, highest) with Checkpoint step
+    cur.execute("""
+    INSERT INTO conversations (
+        id, title, project, model_name, created_at, updated_at, total_steps, total_tokens,
+        billed_cost, parent_id, root_id, depth, subagent_role
+    ) VALUES (
+        'sub-1', 'Worker Alpha', 'proj-alpha', 'Gemini 3.7 Flash',
+        '2026-10-14T10:05:00Z', '2026-10-14T10:20:00Z', 25, 50000,
+        4.50, 'root-1', 'root-1', 1, 'Worker'
+    )
+    """)
+    cur.execute("""
+    INSERT INTO steps (conversation_id, step_index, step_type, category, activity, tool_or_source, est_tokens, billed_cost)
+    VALUES
+        ('sub-1', 1, 'CHECKPOINT', 'Summaries', 'Checkpoint', 'System', 5000, 1.00),
+        ('sub-1', 2, 'TOOL_RESULT', 'File', 'Read', 'view_file', 15000, 3.50)
+    """)
+
+    # Subagent 2: Researcher (cost 2.00, Claude model)
+    cur.execute("""
+    INSERT INTO conversations (
+        id, title, project, model_name, created_at, updated_at, total_steps, total_tokens,
+        billed_cost, parent_id, root_id, depth, subagent_role
+    ) VALUES (
+        'sub-2', 'Researcher Beta', 'proj-alpha', 'Claude 3.7 Sonnet',
+        '2026-10-14T10:10:00Z', '2026-10-14T10:25:00Z', 15, 30000,
+        2.00, 'root-1', 'root-1', 1, 'Researcher'
+    )
+    """)
+    cur.execute("""
+    INSERT INTO steps (conversation_id, step_index, step_type, category, activity, tool_or_source, est_tokens, billed_cost)
+    VALUES ('sub-2', 1, 'TOOL_RESULT', 'Web', 'Search', 'search_web', 12000, 2.00)
+    """)
+
+    conn.commit()
+    conn.close()
+
+    node_code = f"""
+    import {{ openDatabase, getSessionData }} from './sidecars/panel/query.mjs';
+    const db = openDatabase('{db_path}');
+    const session = getSessionData(db, 'root-1');
+    console.log(JSON.stringify(session));
+    """
+
+    res = subprocess.run(
+        ["node", "--input-type=module", "-e", node_code],
+        capture_output=True,
+        text=True,
+        cwd=Path.cwd(),
+    )
+    assert res.returncode == 0, f"Node script failed: {res.stderr}"
+    data = json.loads(res.stdout)
+
+    # Local root checks
+    assert data["cid"] == "root-1"
+    assert data["title"] == "Root Coordinator"
+    assert abs(data["billed_cost"] - 1.50) < 0.01
+
+    # Fleet checks
+    fleet = data["fleet"]
+    assert fleet["is_swarm"] is True
+    assert fleet["agent_count"] == 3
+    assert fleet["subagent_count"] == 2
+    assert abs(fleet["total_cost"] - 8.00) < 0.01
+    assert fleet["total_steps"] == 50
+    assert fleet["total_tokens"] == 100000
+    assert fleet["root_id"] == "root-1"
+    assert fleet["active_cid"] == "root-1"
+    assert fleet["inspected_cid"] == "root-1"
+    assert fleet["is_inspecting_other"] is False
+    assert fleet["shielded_tokens"] == 80000
+    assert fleet["shielding_ratio"] == 5.0
+
+    # Nodes sorting by billed_cost DESC, total_tokens DESC
+    nodes = fleet["nodes"]
+    assert len(nodes) == 3
+    assert nodes[0]["id"] == "sub-1"
+    assert abs(nodes[0]["billed_cost"] - 4.50) < 0.01
+    assert nodes[0]["subagent_role"] == "Worker"
+    assert nodes[0]["max_tokens"] == 1000000
+    # Post checkpoint active tokens: 5000 + 15000 = 20000
+    assert nodes[0]["active_tokens"] == 20000
+    assert abs(nodes[0]["context_pct"] - 2.0) < 0.1
+
+    assert nodes[1]["id"] == "sub-2"
+    assert abs(nodes[1]["billed_cost"] - 2.00) < 0.01
+    assert nodes[1]["subagent_role"] == "Researcher"
+    assert nodes[1]["max_tokens"] == 200000  # Claude context limit
+    assert nodes[1]["active_tokens"] == 12000
+    assert abs(nodes[1]["context_pct"] - 6.0) < 0.1
+
+    assert nodes[2]["id"] == "root-1"
+    assert abs(nodes[2]["billed_cost"] - 1.50) < 0.01
+    assert nodes[2]["is_root"] is True
+    assert nodes[2]["is_active"] is True
+    assert nodes[2]["is_inspected"] is True
+
+
+def test_sidecar_inspect_subagent_preserves_fleet(tmp_path):
+    """Verifies that inspecting a sub-agent returns local telemetry while preserving full fleet summary."""
+    db_path = tmp_path / "test_swarm_inspect.db"
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    cur.executescript("""
+    CREATE TABLE conversations (
+        id TEXT PRIMARY KEY,
+        title TEXT,
+        project TEXT,
+        model_name TEXT,
+        created_at TEXT,
+        updated_at TEXT,
+        total_steps INTEGER DEFAULT 0,
+        total_tokens INTEGER DEFAULT 0,
+        billed_cost REAL DEFAULT 0.0,
+        billed_input_tokens INTEGER DEFAULT 0,
+        billed_output_tokens INTEGER DEFAULT 0,
+        parent_id TEXT,
+        root_id TEXT,
+        depth INTEGER DEFAULT 0,
+        subagent_role TEXT,
+        subagent_type TEXT,
+        compaction_count INTEGER DEFAULT 0,
+        pruned_tokens INTEGER DEFAULT 0
+    );
+
+    CREATE TABLE steps (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        conversation_id TEXT NOT NULL,
+        step_index INTEGER NOT NULL,
+        created_at TEXT,
+        step_type TEXT,
+        category TEXT,
+        activity TEXT,
+        tool_or_source TEXT,
+        est_tokens INTEGER DEFAULT 0,
+        billed_cost REAL DEFAULT 0.0,
+        detail TEXT
+    );
+
+    INSERT INTO conversations (id, title, model_name, billed_cost, total_tokens, total_steps, parent_id, root_id, subagent_role)
+    VALUES
+        ('root-1', 'Root Coordinator', 'Gemini 3.7 Flash', 1.00, 10000, 5, NULL, NULL, 'Root Coordinator'),
+        ('sub-1', 'Worker Alpha', 'Gemini 3.7 Flash', 3.00, 30000, 12, 'root-1', 'root-1', 'Worker'),
+        ('sub-2', 'Worker Beta', 'Gemini 3.7 Flash', 2.00, 20000, 8, 'root-1', 'root-1', 'Worker');
+
+    INSERT INTO steps (conversation_id, step_index, step_type, category, activity, tool_or_source, est_tokens, billed_cost)
+    VALUES
+        ('sub-1', 1, 'TOOL_RESULT', 'File', 'Edit', 'replace_file_content', 4500, 3.00);
+    """)
+    conn.commit()
+    conn.close()
+
+    # Inspect sub-1 while active session is root-1
+    node_code = f"""
+    import {{ openDatabase, getSessionData }} from './sidecars/panel/query.mjs';
+    const db = openDatabase('{db_path}');
+    const session = getSessionData(db, 'root-1', 'sub-1');
+    console.log(JSON.stringify(session));
+    """
+
+    res = subprocess.run(
+        ["node", "--input-type=module", "-e", node_code],
+        capture_output=True,
+        text=True,
+        cwd=Path.cwd(),
+    )
+    assert res.returncode == 0, f"Node script failed: {res.stderr}"
+    data = json.loads(res.stdout)
+
+    # Inspecting sub-1 returns sub-1 local metrics
+    assert data["cid"] == "sub-1"
+    assert data["title"] == "Worker Alpha"
+    assert abs(data["billed_cost"] - 3.00) < 0.01
+    assert data["active_tokens"] == 4500
+    assert len(data["top_steps"]) == 1
+    assert data["top_steps"][0]["tool_or_source"] == "replace_file_content"
+
+    # Preserves 3-node fleet summary
+    fleet = data["fleet"]
+    assert fleet["is_swarm"] is True
+    assert fleet["agent_count"] == 3
+    assert fleet["subagent_count"] == 2
+    assert fleet["root_id"] == "root-1"
+    assert fleet["active_cid"] == "root-1"
+    assert fleet["inspected_cid"] == "sub-1"
+    assert fleet["is_inspecting_other"] is True
+    assert fleet["inspected_role"] == "Worker"
+    assert abs(fleet["total_cost"] - 6.00) < 0.01
+    assert fleet["total_steps"] == 25
+    assert len(fleet["nodes"]) == 3
+
+    # Node flags reflect inspection status
+    sub1_node = next(n for n in fleet["nodes"] if n["id"] == "sub-1")
+    assert sub1_node["is_inspected"] is True
+    assert sub1_node["is_active"] is False
+
+    root_node = next(n for n in fleet["nodes"] if n["id"] == "root-1")
+    assert root_node["is_inspected"] is False
+    assert root_node["is_active"] is True
+    assert root_node["is_root"] is True
+
+
+def test_sidecar_inspect_unrelated_cid_falls_back(tmp_path):
+    """Verifies that attempting to inspect an unrelated session outside the swarm falls back to active session."""
+    db_path = tmp_path / "test_unrelated.db"
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    cur.executescript("""
+    CREATE TABLE conversations (
+        id TEXT PRIMARY KEY,
+        title TEXT,
+        project TEXT,
+        model_name TEXT,
+        created_at TEXT,
+        updated_at TEXT,
+        total_steps INTEGER DEFAULT 0,
+        total_tokens INTEGER DEFAULT 0,
+        billed_cost REAL DEFAULT 0.0,
+        parent_id TEXT,
+        root_id TEXT
+    );
+
+    INSERT INTO conversations (id, title, model_name, billed_cost, root_id)
+    VALUES
+        ('swarm-root', 'Swarm Root', 'Gemini 3.7 Flash', 1.00, NULL),
+        ('unrelated-conv', 'Unrelated Session', 'Gemini 3.7 Flash', 9.00, NULL);
+    """)
+    conn.commit()
+    conn.close()
+
+    node_code = f"""
+    import {{ openDatabase, getSessionData }} from './sidecars/panel/query.mjs';
+    const db = openDatabase('{db_path}');
+    const session = getSessionData(db, 'swarm-root', 'unrelated-conv');
+    console.log(JSON.stringify(session));
+    """
+
+    res = subprocess.run(
+        ["node", "--input-type=module", "-e", node_code],
+        capture_output=True,
+        text=True,
+        cwd=Path.cwd(),
+    )
+    assert res.returncode == 0, f"Node script failed: {res.stderr}"
+    data = json.loads(res.stdout)
+
+    # Must fall back to swarm-root
+    assert data["cid"] == "swarm-root"
+    assert data["fleet"]["inspected_cid"] == "swarm-root"
+    assert data["fleet"]["is_inspecting_other"] is False
+
+
+def test_sidecar_global_data_root_and_subagent_breakdown(tmp_path):
+    """Verifies that getGlobalData returns root_conversations and subagent_conversations counts."""
+    db_path = tmp_path / "test_global_breakdown.db"
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    cur.executescript("""
+    CREATE TABLE conversations (
+        id TEXT PRIMARY KEY,
+        title TEXT,
+        project TEXT,
+        model_name TEXT,
+        created_at TEXT,
+        updated_at TEXT,
+        total_steps INTEGER DEFAULT 0,
+        total_tokens INTEGER DEFAULT 0,
+        billed_cost REAL DEFAULT 0.0,
+        parent_id TEXT,
+        root_id TEXT
+    );
+
+    INSERT INTO conversations (id, title, model_name, billed_cost, total_tokens, parent_id)
+    VALUES
+        ('r1', 'Root 1', 'Gemini 3.7 Flash', 1.00, 1000, NULL),
+        ('r2', 'Root 2', 'Gemini 3.7 Flash', 2.00, 2000, ''),
+        ('s1', 'Sub 1', 'Gemini 3.7 Flash', 0.50, 500, 'r1'),
+        ('s2', 'Sub 2', 'Gemini 3.7 Flash', 0.50, 500, 'r1'),
+        ('s3', 'Sub 3', 'Gemini 3.7 Flash', 0.50, 500, 'r2');
+    """)
+    conn.commit()
+    conn.close()
+
+    node_code = f"""
+    import {{ openDatabase, getGlobalData }} from './sidecars/panel/query.mjs';
+    const db = openDatabase('{db_path}');
+    const g = getGlobalData(db);
+    console.log(JSON.stringify(g));
+    """
+
+    res = subprocess.run(
+        ["node", "--input-type=module", "-e", node_code],
+        capture_output=True,
+        text=True,
+        cwd=Path.cwd(),
+    )
+    assert res.returncode == 0, f"Node script failed: {res.stderr}"
+    data = json.loads(res.stdout)
+
+    assert data["total_conversations"] == 5
+    assert data["root_conversations"] == 2
+    assert data["subagent_conversations"] == 3
+    assert abs(data["total_cost"] - 4.50) < 0.01
+
+
+def test_sidecar_default_session_fleet_schema():
+    """Verifies that createDefaultSession returns valid default fleet metadata."""
+    node_code = """
+    import { createDefaultSession } from './sidecars/panel/query.mjs';
+    const s = createDefaultSession('default-cid');
+    console.log(JSON.stringify(s));
+    """
+
+    res = subprocess.run(
+        ["node", "--input-type=module", "-e", node_code],
+        capture_output=True,
+        text=True,
+        cwd=Path.cwd(),
+    )
+    assert res.returncode == 0, f"Node script failed: {res.stderr}"
+    data = json.loads(res.stdout)
+
+    assert data["cid"] == "default-cid"
+    assert "fleet" in data
+    fleet = data["fleet"]
+    assert fleet["is_swarm"] is False
+    assert fleet["agent_count"] == 1
+    assert fleet["subagent_count"] == 0
+    assert fleet["nodes"] == []
+    assert fleet["total_cost"] == 0
+    assert fleet["total_tokens"] == 0
+    assert fleet["total_disk_tokens"] == 0
+    assert fleet["total_steps"] == 0
+    assert fleet["weekly_quota_pct"] == 0
+    assert fleet["five_hour_quota_pct"] == 0
+    assert fleet["shielded_tokens"] == 0
+    assert fleet["shielding_ratio"] == 1.0
+
+
+def test_sidecar_nested_swarm_parent_id_walk(tmp_path):
+    """Verifies that nested subagents (depth >= 2) with missing root_id walk parent_id to resolve root."""
+    db_path = tmp_path / "test_nested_swarm.db"
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    cur.executescript("""
+    CREATE TABLE conversations (
+        id TEXT PRIMARY KEY,
+        title TEXT,
+        project TEXT,
+        model_name TEXT,
+        created_at TEXT,
+        updated_at TEXT,
+        total_steps INTEGER DEFAULT 0,
+        total_tokens INTEGER DEFAULT 0,
+        billed_cost REAL DEFAULT 0.0,
+        billed_input_tokens INTEGER DEFAULT 0,
+        billed_output_tokens INTEGER DEFAULT 0,
+        parent_id TEXT,
+        root_id TEXT,
+        depth INTEGER DEFAULT 0,
+        subagent_role TEXT,
+        subagent_type TEXT,
+        compaction_count INTEGER DEFAULT 0,
+        pruned_tokens INTEGER DEFAULT 0
+    );
+
+    INSERT INTO conversations (id, title, model_name, billed_cost, total_tokens, parent_id, root_id, subagent_role)
+    VALUES
+        ('root-coord', 'Root Coordinator', 'Gemini 3.7 Flash', 1.00, 10000, NULL, NULL, 'Root Coordinator'),
+        ('mid-coord', 'Sub Coordinator', 'Gemini 3.7 Flash', 2.00, 20000, 'root-coord', NULL, 'Coordinator'),
+        ('leaf-worker', 'Leaf Worker', 'Gemini 3.7 Flash', 3.00, 30000, 'mid-coord', NULL, 'Worker');
+    """)
+    conn.commit()
+    conn.close()
+
+    # When inspecting leaf-worker while active session is root-coord
+    node_code = f"""
+    import {{ openDatabase, getSessionData }} from './sidecars/panel/query.mjs';
+    const db = openDatabase('{db_path}');
+    const session = getSessionData(db, 'root-coord', 'leaf-worker');
+    console.log(JSON.stringify(session));
+    """
+
+    res = subprocess.run(
+        ["node", "--input-type=module", "-e", node_code],
+        capture_output=True,
+        text=True,
+        cwd=Path.cwd(),
+    )
+    assert res.returncode == 0, f"Node script failed: {res.stderr}"
+    data = json.loads(res.stdout)
+
+    assert data["cid"] == "leaf-worker"
+    fleet = data["fleet"]
+    assert fleet["root_id"] == "root-coord"
+    assert fleet["active_cid"] == "root-coord"
+    assert fleet["inspected_cid"] == "leaf-worker"
+    assert fleet["is_inspecting_other"] is True
+
+
+def test_sidecar_swarm_fallback_schema_missing_subagent_role(tmp_path):
+    """Verifies that schemas lacking subagent_role or billed_input_tokens still query all swarm nodes."""
+    db_path = tmp_path / "test_fallback_schema.db"
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    cur.executescript("""
+    CREATE TABLE conversations (
+        id TEXT PRIMARY KEY,
+        title TEXT,
+        model_name TEXT,
+        total_steps INTEGER DEFAULT 0,
+        total_tokens INTEGER DEFAULT 0,
+        billed_cost REAL DEFAULT 0.0,
+        parent_id TEXT,
+        root_id TEXT
+    );
+
+    INSERT INTO conversations (id, title, model_name, billed_cost, total_tokens, parent_id, root_id)
+    VALUES
+        ('root-f', 'Root Fallback', 'Gemini 3.7 Flash', 1.00, 10000, NULL, NULL),
+        ('sub-f1', 'Sub Fallback 1', 'Gemini 3.7 Flash', 2.00, 20000, 'root-f', 'root-f'),
+        ('sub-f2', 'Sub Fallback 2', 'Gemini 3.7 Flash', 3.00, 30000, 'root-f', 'root-f');
+    """)
+    conn.commit()
+    conn.close()
+
+    node_code = f"""
+    import {{ openDatabase, getSessionData }} from './sidecars/panel/query.mjs';
+    const db = openDatabase('{db_path}');
+    const session = getSessionData(db, 'root-f');
+    console.log(JSON.stringify(session));
+    """
+
+    res = subprocess.run(
+        ["node", "--input-type=module", "-e", node_code],
+        capture_output=True,
+        text=True,
+        cwd=Path.cwd(),
+    )
+    assert res.returncode == 0, f"Node script failed: {res.stderr}"
+    data = json.loads(res.stdout)
+
+    fleet = data["fleet"]
+    assert fleet["is_swarm"] is True
+    assert fleet["agent_count"] == 3
+    assert len(fleet["nodes"]) == 3
+    assert abs(fleet["total_cost"] - 6.00) < 0.01
+
+
+def test_sidecar_inspect_root_from_subagent_session(tmp_path):
+    """Verifies that an active subagent session can inspect the root coordinator."""
+    db_path = tmp_path / "test_inspect_root.db"
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    cur.executescript("""
+    CREATE TABLE conversations (
+        id TEXT PRIMARY KEY,
+        title TEXT,
+        model_name TEXT,
+        total_steps INTEGER DEFAULT 0,
+        total_tokens INTEGER DEFAULT 0,
+        billed_cost REAL DEFAULT 0.0,
+        parent_id TEXT,
+        root_id TEXT,
+        subagent_role TEXT
+    );
+
+    INSERT INTO conversations (id, title, model_name, billed_cost, total_tokens, parent_id, root_id, subagent_role)
+    VALUES
+        ('root-main', 'Coordinator', 'Gemini 3.7 Flash', 1.00, 10000, NULL, NULL, 'Root Coordinator'),
+        ('sub-worker', 'Worker 1', 'Gemini 3.7 Flash', 4.00, 40000, 'root-main', 'root-main', 'Worker');
+    """)
+    conn.commit()
+    conn.close()
+
+    # Active session is sub-worker, inspecting root-main
+    node_code = f"""
+    import {{ openDatabase, getSessionData }} from './sidecars/panel/query.mjs';
+    const db = openDatabase('{db_path}');
+    const session = getSessionData(db, 'sub-worker', 'root-main');
+    console.log(JSON.stringify(session));
+    """
+
+    res = subprocess.run(
+        ["node", "--input-type=module", "-e", node_code],
+        capture_output=True,
+        text=True,
+        cwd=Path.cwd(),
+    )
+    assert res.returncode == 0, f"Node script failed: {res.stderr}"
+    data = json.loads(res.stdout)
+
+    assert data["cid"] == "root-main"
+    assert data["title"] == "Coordinator"
+    fleet = data["fleet"]
+    assert fleet["is_swarm"] is True
+    assert fleet["active_cid"] == "sub-worker"
+    assert fleet["inspected_cid"] == "root-main"
+    assert fleet["is_inspecting_other"] is True
+
+
+def test_sidecar_inspect_nonexistent_cid_falls_back(tmp_path):
+    """Verifies that attempting to inspect a nonexistent CID safely falls back to the active session."""
+    db_path = tmp_path / "test_nonexistent.db"
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    cur.executescript("""
+    CREATE TABLE conversations (
+        id TEXT PRIMARY KEY,
+        title TEXT,
+        model_name TEXT,
+        total_steps INTEGER DEFAULT 0,
+        total_tokens INTEGER DEFAULT 0,
+        billed_cost REAL DEFAULT 0.0,
+        parent_id TEXT,
+        root_id TEXT
+    );
+
+    INSERT INTO conversations (id, title, model_name, billed_cost, total_tokens)
+    VALUES ('active-session', 'Active Session', 'Gemini 3.7 Flash', 2.50, 15000);
+    """)
+    conn.commit()
+    conn.close()
+
+    node_code = f"""
+    import {{ openDatabase, getSessionData }} from './sidecars/panel/query.mjs';
+    const db = openDatabase('{db_path}');
+    const session = getSessionData(db, 'active-session', 'ghost-subagent');
+    console.log(JSON.stringify(session));
+    """
+
+    res = subprocess.run(
+        ["node", "--input-type=module", "-e", node_code],
+        capture_output=True,
+        text=True,
+        cwd=Path.cwd(),
+    )
+    assert res.returncode == 0, f"Node script failed: {res.stderr}"
+    data = json.loads(res.stdout)
+
+    assert data["cid"] == "active-session"
+    assert data["fleet"]["inspected_cid"] == "active-session"
+    assert data["fleet"]["is_inspecting_other"] is False
+
+
+def test_sidecar_global_data_schema_without_parent_id(tmp_path):
+    """Verifies getGlobalData handles schemas lacking parent_id column gracefully."""
+    db_path = tmp_path / "test_no_parent_id.db"
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    cur.executescript("""
+    CREATE TABLE conversations (
+        id TEXT PRIMARY KEY,
+        title TEXT,
+        model_name TEXT,
+        total_tokens INTEGER DEFAULT 0,
+        billed_cost REAL DEFAULT 0.0
+    );
+
+    INSERT INTO conversations (id, title, model_name, total_tokens, billed_cost)
+    VALUES
+        ('c1', 'Chat 1', 'Gemini 3.7 Flash', 1000, 0.10),
+        ('c2', 'Chat 2', 'Gemini 3.7 Flash', 2000, 0.20);
+    """)
+    conn.commit()
+    conn.close()
+
+    node_code = f"""
+    import {{ openDatabase, getGlobalData }} from './sidecars/panel/query.mjs';
+    const db = openDatabase('{db_path}');
+    const g = getGlobalData(db);
+    console.log(JSON.stringify(g));
+    """
+
+    res = subprocess.run(
+        ["node", "--input-type=module", "-e", node_code],
+        capture_output=True,
+        text=True,
+        cwd=Path.cwd(),
+    )
+    assert res.returncode == 0, f"Node script failed: {res.stderr}"
+    data = json.loads(res.stdout)
+
+    assert data["total_conversations"] == 2
+    assert data["root_conversations"] == 2
+    assert data["subagent_conversations"] == 0
+
+
