@@ -457,11 +457,7 @@ function renderFleetCard(fleet) {
       </div>
     `;
 
-    const selectNode = () => {
-      const activeCid = (sidecar && sidecar.conversationId) || cid;
-      inspectedCid = (node.id === activeCid ? null : node.id);
-      refreshTelemetry();
-    };
+    const selectNode = () => selectFleetNode(node.id);
 
     item.addEventListener('click', selectNode);
     item.addEventListener('keydown', (e) => {
@@ -473,6 +469,22 @@ function renderFleetCard(fleet) {
 
     list.appendChild(item);
   }
+}
+
+function selectFleetNode(nodeId) {
+  const activeCid = (sidecar && sidecar.conversationId) || lastCid;
+  inspectedCid = (nodeId === activeCid ? null : nodeId);
+  refreshTelemetry();
+}
+
+function resetInspectedNode() {
+  inspectedCid = null;
+  refreshTelemetry();
+}
+
+if (typeof window !== 'undefined') {
+  window.selectFleetNode = selectFleetNode;
+  window.resetInspectedNode = resetInspectedNode;
 }
 
 async function refreshTelemetry() {
@@ -656,10 +668,7 @@ function init() {
 
   const btnResetInspect = $('btn-reset-inspect');
   if (btnResetInspect) {
-    btnResetInspect.addEventListener('click', () => {
-      inspectedCid = null;
-      refreshTelemetry();
-    });
+    btnResetInspect.addEventListener('click', resetInspectedNode);
   }
 
   // Handle visibility changes: halt polling when hidden, resume when visible

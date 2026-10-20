@@ -477,33 +477,40 @@ export function getSessionData(db, cid, inspectCid = null) {
     swarmRows.push(targetConv);
   }
 
+  let cpStmt = null;
+  let activeTokensStmt = null;
+  try {
+    cpStmt = db.prepare(`
+      SELECT MAX(step_index) as cp_step
+      FROM steps
+      WHERE conversation_id = ? AND step_type = 'CHECKPOINT'
+    `);
+    activeTokensStmt = db.prepare(`
+      SELECT SUM(est_tokens) as active_tokens
+      FROM steps
+      WHERE conversation_id = ? AND step_index >= ?
+    `);
+  } catch {
+    // steps table might not exist
+  }
+
   const nodes = swarmRows.map(node => {
     let nodeActiveTokens = null;
     if (node.id === resolvedCid && rangeRow?.active_tokens !== undefined && rangeRow?.active_tokens !== null) {
       nodeActiveTokens = Number(rangeRow.active_tokens);
-    } else {
+    } else if (cpStmt && activeTokensStmt) {
       try {
-        const cp = db.prepare(`
-          SELECT MAX(step_index) as cp_step
-          FROM steps
-          WHERE conversation_id = ? AND step_type = 'CHECKPOINT'
-        `).get(node.id);
-
+        const cp = cpStmt.get(node.id);
         const since = (cp && cp.cp_step !== null && cp.cp_step !== undefined)
           ? cp.cp_step
           : 0;
 
-        const row = db.prepare(`
-          SELECT SUM(est_tokens) as active_tokens
-          FROM steps
-          WHERE conversation_id = ? AND step_index >= ?
-        `).get(node.id, since);
-
+        const row = activeTokensStmt.get(node.id, since);
         if (row && row.active_tokens !== null && row.active_tokens !== undefined) {
           nodeActiveTokens = Number(row.active_tokens);
         }
       } catch {
-        // steps table might not exist
+        // query fallback
       }
     }
 
@@ -546,7 +553,9 @@ export function getSessionData(db, cid, inspectCid = null) {
       parent_id: node.parent_id || null,
       root_id: node.root_id || null,
       depth: Number(node.depth) || 0,
+      role: node.subagent_role || (node.id === effectiveRoot ? 'Root Coordinator' : 'Worker'),
       subagent_role: node.subagent_role || (node.id === effectiveRoot ? 'Root Coordinator' : 'Worker'),
+      type: node.subagent_type || 'self',
       subagent_type: node.subagent_type || 'self',
       compaction_count: Number(node.compaction_count) || 0,
       pruned_tokens: Number(node.pruned_tokens) || 0,
@@ -556,6 +565,7 @@ export function getSessionData(db, cid, inspectCid = null) {
       weekly_quota_pct: nodeWeeklyQuotaPct,
       five_hour_quota_pct: node5hQuotaPct,
       is_active: node.id === activeCid,
+      is_active_session: node.id === activeCid,
       is_inspected: node.id === targetCid,
       is_root: node.id === effectiveRoot
     };

@@ -712,9 +712,9 @@ def query_cost_by_project(conn, tz=None, project=None, limit_sessions=6):
             LEFT JOIN conversations c ON c.id = cr.campaign_id
             {where_sess}
             ORDER BY cr.billed_cost DESC, (COALESCE(cr.billed_input_tokens, 0) + COALESCE(cr.billed_output_tokens, 0)) DESC, cr.total_tokens DESC
-            LIMIT {limit_sessions}
+            LIMIT ?
         """,
-            params_sess,
+            [*params_sess, limit_sessions],
         ).fetchall()
     except Exception:
         try:
@@ -755,9 +755,9 @@ def query_cost_by_project(conn, tz=None, project=None, limit_sessions=6):
                 LEFT JOIN conversations c ON c.id = cr.campaign_id
                 {where_sess}
                 ORDER BY cr.billed_cost DESC, (COALESCE(cr.billed_input_tokens, 0) + COALESCE(cr.billed_output_tokens, 0)) DESC, cr.total_tokens DESC
-                LIMIT {limit_sessions}
+                LIMIT ?
             """,
-                params_sess,
+                [*params_sess, limit_sessions],
             ).fetchall()
         except Exception:
             where_plain = where_sess.replace("c.project", "project")
@@ -767,9 +767,9 @@ def query_cost_by_project(conn, tz=None, project=None, limit_sessions=6):
                 FROM conversations
                 {where_plain}
                 ORDER BY billed_cost DESC, (COALESCE(billed_input_tokens, 0) + COALESCE(billed_output_tokens, 0)) DESC, total_tokens DESC
-                LIMIT {limit_sessions}
+                LIMIT ?
             """,
-                params_sess,
+                [*params_sess, limit_sessions],
             ).fetchall()
 
     top_sessions = []
@@ -810,6 +810,7 @@ def query_cost_by_project(conn, tz=None, project=None, limit_sessions=6):
                 "duration_seconds": sr["duration_seconds"] or 0,
                 "active_agent_seconds": sr["active_agent_seconds"] or 0,
                 "billed_cost": round(sr["billed_cost"] or 0.0, 2),
+                "fleet_cost": round(sr["billed_cost"] or 0.0, 2),
                 "local_cost": local_cost_val,
                 "subagent_count": subagent_count_val,
             }
@@ -2127,48 +2128,48 @@ def query_session_details(conn, cid, tz=None):
     # Build nested tree topology for visualization
     nodes_by_id = {}
     for n in swarm_nodes:
-        n_id = n["id"]
-        n_act = (n["billed_input_tokens"] or 0) + (n["billed_output_tokens"] or 0)
-        n_cost = round(n["billed_cost"] or 0.0, 2)
-        n_m = n.get("model_name") or conv_model
-        n_w_pct, n_5h_pct = _compute_quota_pcts(n_cost, n_m, bucket_caps)
+        node_id = n["id"]
+        node_active_tokens = (n["billed_input_tokens"] or 0) + (n["billed_output_tokens"] or 0)
+        node_cost = round(n["billed_cost"] or 0.0, 2)
+        node_model = n.get("model_name") or conv_model
+        node_weekly_quota_pct, node_5h_quota_pct = _compute_quota_pcts(node_cost, node_model, bucket_caps)
 
-        max_tokens = get_model_context_limit(n_m)
+        max_tokens = get_model_context_limit(node_model)
         active_tokens = n.get("total_tokens") or 0
         context_pct = (
             round((active_tokens / max_tokens) * 100, 1) if max_tokens else 0.0
         )
         cost_share_pct = (
-            round((n_cost / total_swarm_cost * 100), 1) if total_swarm_cost > 0 else 0.0
+            round((node_cost / total_swarm_cost * 100), 1) if total_swarm_cost > 0 else 0.0
         )
         token_share_pct = (
-            round((n_act / total_swarm_tokens * 100), 1) if total_swarm_tokens > 0 else 0.0
+            round((node_active_tokens / total_swarm_tokens * 100), 1) if total_swarm_tokens > 0 else 0.0
         )
 
-        nodes_by_id[n_id] = {
-            "id": n_id,
-            "title": n["title"] or f"Session {n_id[:8]}",
+        nodes_by_id[node_id] = {
+            "id": node_id,
+            "title": n["title"] or f"Session {node_id[:8]}",
             "role": n["subagent_role"]
             or ("Root Coordinator" if (n.get("depth") or 0) == 0 else "Worker"),
             "type": n["subagent_type"] or "self",
             "depth": n.get("depth") or 0,
             "steps": n["total_steps"] or 0,
-            "tokens": n_act,
+            "tokens": node_active_tokens,
             "total_tokens": active_tokens,
-            "cost": n_cost,
-            "model_name": n_m,
+            "cost": node_cost,
+            "model_name": node_model,
             "compaction_count": n.get("compaction_count") or 0,
             "pruned_tokens": n.get("pruned_tokens") or 0,
             "active_agent_seconds": round(n.get("active_agent_seconds") or 0.0, 1),
             "max_tokens": max_tokens,
             "active_tokens": active_tokens,
             "context_pct": context_pct,
-            "weekly_quota_pct": n_w_pct,
-            "five_hour_quota_pct": n_5h_pct,
+            "weekly_quota_pct": node_weekly_quota_pct,
+            "five_hour_quota_pct": node_5h_quota_pct,
             "cost_share_pct": cost_share_pct,
             "token_share_pct": token_share_pct,
             "duration": round(n["duration_seconds"] or 0.0),
-            "is_current": (n_id == cid),
+            "is_current": (node_id == cid),
             "children": [],
         }
 
