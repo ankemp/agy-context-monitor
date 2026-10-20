@@ -806,8 +806,9 @@ def run_backfill(
             subagent_meta[ch["id"]] = ch
 
     # Pass 2: Resolve root_id, depth, project inheritance, semantic titles, and commit to SQLite
+    total_parsed = len(data_list)
     print(
-        "  [Pass 2/2] Resolving swarm graph lineages, inheriting metadata, and writing to SQLite...",
+        f"  [Pass 2/2] Resolving swarm graph lineages, inheriting metadata, and writing to SQLite ({total_parsed} conversations)...",
         flush=True,
     )
     conn = get_db_connection(target_db)
@@ -1039,11 +1040,11 @@ def run_backfill(
                 total_tools_inserted += len(tools)
                 total_tokens_computed += conv["total_tokens"]
 
-                if i % 25 == 0 or i == total_convs:
+                if i % 25 == 0 or i == total_parsed:
                     conn.commit()
-                    pct = (i / total_convs) * 100
+                    pct = (i / total_parsed) * 100 if total_parsed else 100.0
                     print(
-                        f"  [{pct:5.1f}%] Processed {i}/{total_convs} conversations ({total_steps_inserted:,} steps)...",
+                        f"  [{pct:5.1f}%] Processed {i}/{total_parsed} conversations ({total_steps_inserted:,} steps)...",
                         flush=True,
                     )
 
@@ -1058,6 +1059,12 @@ def run_backfill(
         try:
             sync_and_get_quota_state(conn, force_refresh=True)
             conn.commit()
+        except Exception:
+            pass
+
+        # Checkpoint WAL to truncate WAL file and reclaim disk space
+        try:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
         except Exception:
             pass
     finally:
