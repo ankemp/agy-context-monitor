@@ -24,6 +24,8 @@ __all__ = [
     "init_db",
     "upsert_quota_state",
     "get_quota_state",
+    "refresh_conversation_rollups",
+    "ensure_rollups_synced",
 ]
 
 DEFAULT_DB_PATH = Path(os.path.expanduser("~/.gemini/antigravity/analytics.db"))
@@ -121,6 +123,16 @@ CREATE TABLE IF NOT EXISTS quota_state (
     calibrated_capacity REAL NOT NULL,
     fetched_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS hourly_step_rollups (
+    hour_key TEXT NOT NULL,
+    conversation_id TEXT NOT NULL,
+    step_count INTEGER DEFAULT 0,
+    est_tokens INTEGER DEFAULT 0,
+    billed_tokens INTEGER DEFAULT 0,
+    billed_cost REAL DEFAULT 0.0,
+    PRIMARY KEY (hour_key, conversation_id)
+);
 """
 
 INDEXES_SQL = """
@@ -140,6 +152,8 @@ CREATE INDEX IF NOT EXISTS idx_steps_cat_tokens ON steps(category, est_tokens);
 CREATE INDEX IF NOT EXISTS idx_steps_model_tokens ON steps(model_name, est_tokens);
 CREATE INDEX IF NOT EXISTS idx_steps_phase_tokens ON steps(phase, est_tokens);
 CREATE INDEX IF NOT EXISTS idx_steps_est_tokens ON steps(est_tokens DESC);
+CREATE INDEX IF NOT EXISTS idx_steps_model_billed ON steps(model_name, billed_input_tokens, billed_output_tokens, est_tokens);
+CREATE INDEX IF NOT EXISTS idx_steps_created_cost ON steps(created_at, model_name, billed_cost);
 CREATE INDEX IF NOT EXISTS idx_tool_exec_conv ON tool_executions(conversation_id);
 CREATE INDEX IF NOT EXISTS idx_tool_exec_name ON tool_executions(tool_name);
 CREATE INDEX IF NOT EXISTS idx_tool_exec_server ON tool_executions(mcp_server);
@@ -147,6 +161,7 @@ CREATE INDEX IF NOT EXISTS idx_tool_exec_mcp_tool ON tool_executions(mcp_tool);
 CREATE INDEX IF NOT EXISTS idx_tool_exec_path ON tool_executions(target_path);
 CREATE INDEX IF NOT EXISTS idx_blocks_conv_hash ON transcript_blocks(conversation_id, block_hash);
 CREATE INDEX IF NOT EXISTS idx_blocks_conv_step ON transcript_blocks(conversation_id, step_index);
+CREATE INDEX IF NOT EXISTS idx_rollups_conv ON hourly_step_rollups(conversation_id);
 """
 
 
@@ -314,6 +329,27 @@ def _init_db_conn(conn: sqlite3.Connection) -> None:
                     pass
     conn.commit()
 
+    # Clean up legacy block_type = 'tools' rows in transcript_blocks if present
+    try:
+        cur.execute(
+            "SELECT 1 FROM transcript_blocks WHERE block_type = 'tools' LIMIT 1"
+        )
+        if cur.fetchone() is not None:
+            conn.execute("DELETE FROM transcript_blocks WHERE block_type = 'tools'")
+            conn.commit()
+            try:
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # Ensure hourly_step_rollups is in sync with steps
+    try:
+        ensure_rollups_synced(conn)
+    except Exception:
+        pass
+
 
 def upsert_quota_state(conn: sqlite3.Connection, quota_rows: list[dict] | dict) -> None:
     """Upserts quota state records into the quota_state table.
@@ -473,6 +509,95 @@ def get_quota_state(
             row_dict["updated_at"] = row_dict.get("fetched_at", "")
         result.append(row_dict)
     return result
+
+
+def refresh_conversation_rollups(
+    conn: sqlite3.Connection, conversation_id: str
+) -> None:
+    """Recomputes and updates hourly_step_rollups for a specific conversation."""
+    was_in_transaction = getattr(conn, "in_transaction", False)
+    conn.execute(
+        "DELETE FROM hourly_step_rollups WHERE conversation_id = ?",
+        (conversation_id,),
+    )
+    conn.execute(
+        """
+        INSERT INTO hourly_step_rollups (
+            hour_key, conversation_id, step_count, est_tokens, billed_tokens, billed_cost
+        )
+        SELECT 
+            substr(replace(created_at, ' ', 'T'), 1, 13) AS hour_key,
+            conversation_id,
+            COUNT(*) AS step_count,
+            COALESCE(SUM(est_tokens), 0) AS est_tokens,
+            COALESCE(SUM(COALESCE(billed_input_tokens, 0) + COALESCE(billed_output_tokens, 0)), 0) AS billed_tokens,
+            COALESCE(SUM(COALESCE(billed_cost, 0.0)), 0.0) AS billed_cost
+        FROM steps
+        WHERE conversation_id = ? AND created_at IS NOT NULL AND created_at != ''
+        GROUP BY hour_key, conversation_id
+        """,
+        (conversation_id,),
+    )
+    if not was_in_transaction:
+        conn.commit()
+
+
+def ensure_rollups_synced(conn: sqlite3.Connection) -> None:
+    """Verifies that hourly_step_rollups matches the steps table and rebuilds if out of sync."""
+    was_in_transaction = getattr(conn, "in_transaction", False)
+    cur = conn.cursor()
+    step_stats = cur.execute(
+        """
+        SELECT 
+            COUNT(*), 
+            COALESCE(SUM(est_tokens), 0), 
+            COALESCE(SUM(COALESCE(billed_cost, 0.0)), 0.0)
+        FROM steps 
+        WHERE created_at IS NOT NULL AND created_at != ''
+        """
+    ).fetchone()
+    step_cnt = step_stats[0] if step_stats else 0
+    step_tokens = step_stats[1] if step_stats else 0
+    step_cost = step_stats[2] if step_stats else 0.0
+
+    rollup_stats = cur.execute(
+        """
+        SELECT 
+            COALESCE(SUM(step_count), 0), 
+            COALESCE(SUM(est_tokens), 0), 
+            COALESCE(SUM(billed_cost), 0.0)
+        FROM hourly_step_rollups
+        """
+    ).fetchone()
+    rollup_cnt = rollup_stats[0] if rollup_stats else 0
+    rollup_tokens = rollup_stats[1] if rollup_stats else 0
+    rollup_cost = rollup_stats[2] if rollup_stats else 0.0
+
+    if (
+        step_cnt != rollup_cnt
+        or step_tokens != rollup_tokens
+        or abs(step_cost - rollup_cost) > 1e-4
+    ):
+        conn.execute("DELETE FROM hourly_step_rollups")
+        conn.execute(
+            """
+            INSERT INTO hourly_step_rollups (
+                hour_key, conversation_id, step_count, est_tokens, billed_tokens, billed_cost
+            )
+            SELECT 
+                substr(replace(created_at, ' ', 'T'), 1, 13) AS hour_key,
+                conversation_id,
+                COUNT(*) AS step_count,
+                COALESCE(SUM(est_tokens), 0) AS est_tokens,
+                COALESCE(SUM(COALESCE(billed_input_tokens, 0) + COALESCE(billed_output_tokens, 0)), 0) AS billed_tokens,
+                COALESCE(SUM(COALESCE(billed_cost, 0.0)), 0.0) AS billed_cost
+            FROM steps
+            WHERE created_at IS NOT NULL AND created_at != ''
+            GROUP BY hour_key, conversation_id
+            """
+        )
+        if not was_in_transaction:
+            conn.commit()
 
 
 if __name__ == "__main__":

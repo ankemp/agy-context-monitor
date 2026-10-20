@@ -19,6 +19,7 @@ from context_monitor.db import get_db_connection, init_db, upsert_quota_state
 from scripts.backfill_analytics import run_backfill
 from scripts.ingest import (
     _extract_bucket_view,
+    analyze_transcript,
     format_ephemeral_status,
     generate_artifact_report,
     generate_context_usage_report,
@@ -881,3 +882,179 @@ def test_generate_context_usage_report_resolves_and_caches_activity_profile(
         assert "activity_profile" in analysis
         assert analysis["activity_profile"]["total_steps"] == 60
         assert "## Subscription & Quota Impact" in report_md
+
+
+def test_analyze_transcript_excludes_mcp_tool_schemas_by_default(tmp_path: Path):
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text(
+        '{"step_index": 1, "type": "USER_INPUT", "content": "Hello"}\n'
+        '{"step_index": 2, "type": "PLANNER_RESPONSE", "content": "Hi"}\n',
+        encoding="utf-8",
+    )
+    res = analyze_transcript(transcript)
+    assert all(b.kind.value != "tools" for b in res["parsed_blocks"])
+
+
+def test_analyze_transcript_single_pass_model_detection(tmp_path: Path):
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text(
+        '{"step_index": 1, "type": "SYSTEM", "content": "Init"}\n'
+        '{"step_index": 2, "type": "USER_INPUT", "content": "The user changed setting Model Selection from None to Gemini 2.5 Flash."}\n'
+        '{"step_index": 3, "type": "PLANNER_RESPONSE", "content": "Done"}\n',
+        encoding="utf-8",
+    )
+    res = analyze_transcript(transcript)
+    assert res["latest_model"] == "Gemini 2.5 Flash"
+    assert res["models_used"] == ["Gemini 2.5 Flash"]
+    assert res["steps"][0]["model_name"] == "Gemini 2.5 Flash"
+
+
+def test_sync_to_sqlite_incremental_append_and_compaction_fallback(tmp_path: Path):
+    db_file = tmp_path / "test_incremental.db"
+    init_db(db_file)
+    cid = "test-conv-inc"
+
+    # Step 1: Initial sync with 2 steps
+    t1 = tmp_path / "t1.jsonl"
+    t1.write_text(
+        '{"step_index": 1, "type": "USER_INPUT", "content": "Turn 1", "created_at": "2026-10-20T10:00:00Z"}\n'
+        '{"step_index": 2, "type": "PLANNER_RESPONSE", "content": "Resp 1", "created_at": "2026-10-20T10:00:05Z"}\n',
+        encoding="utf-8",
+    )
+    res1 = analyze_transcript(t1)
+    with patch("scripts.ingest.DEFAULT_DB_PATH", db_file):
+        diff1 = sync_to_sqlite(cid, "Gemini Flash", res1)
+        assert diff1 is not None
+        assert not diff1.compaction_detected
+
+        conn = get_db_connection(db_file)
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM steps WHERE conversation_id = ?", (cid,)
+            ).fetchone()[0]
+            == 2
+        )
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM transcript_blocks WHERE conversation_id = ?",
+                (cid,),
+            ).fetchone()[0]
+            > 0
+        )
+        conn.close()
+
+        # Step 2: Incremental append (add step 3)
+        t2 = tmp_path / "t2.jsonl"
+        t2.write_text(
+            '{"step_index": 1, "type": "USER_INPUT", "content": "Turn 1", "created_at": "2026-10-20T10:00:00Z"}\n'
+            '{"step_index": 2, "type": "PLANNER_RESPONSE", "content": "Resp 1", "created_at": "2026-10-20T10:00:05Z"}\n'
+            '{"step_index": 3, "type": "USER_INPUT", "content": "Turn 2", "created_at": "2026-10-20T10:01:00Z"}\n',
+            encoding="utf-8",
+        )
+        res2 = analyze_transcript(t2)
+        diff2 = sync_to_sqlite(cid, "Gemini Flash", res2)
+        assert diff2 is not None
+        assert not diff2.compaction_detected
+        assert len(diff2.added) > 0
+
+        conn = get_db_connection(db_file)
+        assert (
+            conn.execute(
+                "SELECT COUNT(*) FROM steps WHERE conversation_id = ?", (cid,)
+            ).fetchone()[0]
+            == 3
+        )
+        conv_row = conn.execute(
+            "SELECT compaction_count, pruned_tokens, total_steps FROM conversations WHERE id = ?",
+            (cid,),
+        ).fetchone()
+        assert conv_row["compaction_count"] == 0
+        assert conv_row["total_steps"] == 3
+        conn.close()
+
+        # Step 3: Compaction occurs (turn 1 removed, replaced by checkpoint)
+        t3 = tmp_path / "t3.jsonl"
+        t3.write_text(
+            '{"step_index": 2, "type": "CHECKPOINT", "content": "Summary of turn 1", "created_at": "2026-10-20T10:02:00Z"}\n'
+            '{"step_index": 3, "type": "USER_INPUT", "content": "Turn 2", "created_at": "2026-10-20T10:02:05Z"}\n'
+            '{"step_index": 4, "type": "PLANNER_RESPONSE", "content": "Resp 2", "created_at": "2026-10-20T10:02:10Z"}\n',
+            encoding="utf-8",
+        )
+        res3 = analyze_transcript(t3)
+        diff3 = sync_to_sqlite(cid, "Gemini Flash", res3)
+        assert diff3 is not None
+        assert diff3.compaction_detected
+
+        conn = get_db_connection(db_file)
+        conv_row = conn.execute(
+            "SELECT compaction_count, pruned_tokens, total_steps FROM conversations WHERE id = ?",
+            (cid,),
+        ).fetchone()
+        assert conv_row["compaction_count"] == 1
+        assert conv_row["pruned_tokens"] > 0
+        db_steps = [
+            r[0]
+            for r in conn.execute(
+                "SELECT step_index FROM steps WHERE conversation_id = ? ORDER BY step_index",
+                (cid,),
+            ).fetchall()
+        ]
+        assert db_steps == [2, 3, 4], f"Expected [2, 3, 4] but got {db_steps}"
+        conn.close()
+
+
+def test_sync_to_sqlite_incremental_append_with_ephemeral_steps(tmp_path: Path):
+    """Verifies incremental append succeeds when prior turns contain steps without blocks."""
+    db_file = tmp_path / "test_ephemeral_append.db"
+    init_db(db_file)
+    cid = "test-conv-eph"
+
+    t1 = tmp_path / "t1.jsonl"
+    t1.write_text(
+        '{"step_index": 1, "type": "USER_INPUT", "content": "Turn 1", "created_at": "2026-10-20T10:00:00Z"}\n'
+        '{"step_index": 2, "type": "PLANNER_RESPONSE", "content": "Resp 1", "created_at": "2026-10-20T10:00:05Z"}\n'
+        '{"step_index": 3, "type": "EPHEMERAL_MESSAGE", "content": "Context: 10%", "created_at": "2026-10-20T10:00:06Z"}\n',
+        encoding="utf-8",
+    )
+    res1 = analyze_transcript(t1)
+    with patch("scripts.ingest.DEFAULT_DB_PATH", db_file):
+        diff1 = sync_to_sqlite(cid, "Gemini Flash", res1)
+        assert diff1 is not None
+
+        # Turn 2: strictly append step 4
+        t2 = tmp_path / "t2.jsonl"
+        t2.write_text(
+            '{"step_index": 1, "type": "USER_INPUT", "content": "Turn 1", "created_at": "2026-10-20T10:00:00Z"}\n'
+            '{"step_index": 2, "type": "PLANNER_RESPONSE", "content": "Resp 1", "created_at": "2026-10-20T10:00:05Z"}\n'
+            '{"step_index": 3, "type": "EPHEMERAL_MESSAGE", "content": "Context: 10%", "created_at": "2026-10-20T10:00:06Z"}\n'
+            '{"step_index": 4, "type": "USER_INPUT", "content": "Turn 2", "created_at": "2026-10-20T10:01:00Z"}\n',
+            encoding="utf-8",
+        )
+        res2 = analyze_transcript(t2)
+
+        executed_deletes = []
+        orig_conn = get_db_connection(db_file)
+
+        def trace(stmt):
+            if any(
+                t in stmt
+                for t in (
+                    "DELETE FROM steps",
+                    "DELETE FROM tool_executions",
+                    "DELETE FROM transcript_blocks",
+                )
+            ):
+                executed_deletes.append(stmt)
+
+        orig_conn.set_trace_callback(trace)
+
+        with patch("scripts.ingest.get_db_connection", return_value=orig_conn):
+            diff2 = sync_to_sqlite(cid, "Gemini Flash", res2)
+
+        assert diff2 is not None
+        assert not diff2.compaction_detected
+        assert (
+            len(executed_deletes) == 0
+        ), f"Expected 0 DELETE statements on append, got {executed_deletes}"
+
+

@@ -6,9 +6,11 @@ Real-time context window usage, token diagnostics, telemetry, and diff engine.
 
 from context_monitor.db import (
     DEFAULT_DB_PATH,
+    ensure_rollups_synced,
     get_db_connection,
     get_quota_state,
     init_db,
+    refresh_conversation_rollups,
     upsert_quota_state,
 )
 from context_monitor.diff import DiffResult, diff_block_lists, get_turn_diff_from_db
@@ -41,6 +43,8 @@ __all__ = [
     "init_db",
     "upsert_quota_state",
     "get_quota_state",
+    "refresh_conversation_rollups",
+    "ensure_rollups_synced",
     "BlockParser",
     "BlockType",
     "ContentBlock",

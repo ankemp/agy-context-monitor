@@ -519,3 +519,101 @@ def test_concurrent_multi_db_cache_isolation(tmp_path):
 
     c1.close()
     c2.close()
+
+
+def test_hourly_step_rollups_and_indexes(tmp_path):
+    from context_monitor.db import refresh_conversation_rollups, ensure_rollups_synced
+
+    db_file = tmp_path / "test_rollups.db"
+    init_db(db_file)
+    conn = get_db_connection(db_file)
+    cur = conn.cursor()
+
+    # 1. Verify table and indexes exist
+    tables = [r[0] for r in cur.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()]
+    assert "hourly_step_rollups" in tables
+
+    indexes = [r[0] for r in cur.execute("SELECT name FROM sqlite_master WHERE type='index'").fetchall()]
+    assert "idx_steps_model_billed" in indexes
+    assert "idx_steps_created_cost" in indexes
+    assert "idx_rollups_conv" in indexes
+
+    # 2. Insert sample steps across hours
+    cur.execute("""
+        INSERT INTO conversations (id, title, model_name, created_at, total_steps, total_tokens)
+        VALUES ('c1', 'Rollup Conv', 'Gemini Pro', '2026-10-18T10:00:00Z', 3, 1500)
+    """)
+    cur.execute("""
+        INSERT INTO steps (conversation_id, step_index, created_at, model_name, est_tokens, billed_cost, billed_input_tokens, billed_output_tokens)
+        VALUES
+        ('c1', 1, '2026-10-18T10:15:00Z', 'Gemini Pro', 500, 0.001, 100, 50),
+        ('c1', 2, '2026-10-18T10:45:00Z', 'Gemini Pro', 400, 0.002, 200, 100),
+        ('c1', 3, '2026-10-18T11:10:00Z', 'Gemini Pro', 600, 0.003, 300, 150)
+    """)
+    conn.commit()
+
+    # 3. Test refresh_conversation_rollups
+    refresh_conversation_rollups(conn, "c1")
+    rows = cur.execute("SELECT hour_key, step_count, est_tokens, billed_tokens, billed_cost FROM hourly_step_rollups WHERE conversation_id = 'c1' ORDER BY hour_key ASC").fetchall()
+    assert len(rows) == 2
+    assert rows[0]["hour_key"] == "2026-10-18T10"
+    assert rows[0]["step_count"] == 2
+    assert rows[0]["est_tokens"] == 900
+    assert rows[0]["billed_tokens"] == 450
+    assert abs(rows[0]["billed_cost"] - 0.003) < 1e-6
+
+    assert rows[1]["hour_key"] == "2026-10-18T11"
+    assert rows[1]["step_count"] == 1
+    assert rows[1]["est_tokens"] == 600
+    assert rows[1]["billed_tokens"] == 450
+    assert abs(rows[1]["billed_cost"] - 0.003) < 1e-6
+
+    # 4. Insert steps directly into steps table (simulating direct insert in tests)
+    cur.execute("""
+        INSERT INTO steps (conversation_id, step_index, created_at, model_name, est_tokens, billed_cost, billed_input_tokens, billed_output_tokens)
+        VALUES ('c1', 4, '2026-10-18T12:00:00Z', 'Gemini Pro', 300, 0.001, 50, 50)
+    """)
+    conn.commit()
+
+    # Rollups should be out of date
+    rollup_cnt = cur.execute("SELECT COALESCE(SUM(step_count), 0) FROM hourly_step_rollups").fetchone()[0]
+    step_cnt = cur.execute("SELECT COUNT(*) FROM steps WHERE created_at IS NOT NULL AND created_at != ''").fetchone()[0]
+    assert rollup_cnt == 3
+    assert step_cnt == 4
+
+    # ensure_rollups_synced brings it back into sync and commits
+    ensure_rollups_synced(conn)
+    conn.close()
+
+    # Verify a new connection sees the synced rollups (not rolled back on close)
+    conn2 = get_db_connection(db_file)
+    rollup_cnt2 = conn2.execute("SELECT COALESCE(SUM(step_count), 0) FROM hourly_step_rollups").fetchone()[0]
+    assert rollup_cnt2 == 4
+    conn2.close()
+
+
+def test_legacy_tools_blocks_cleanup(tmp_path):
+    db_file = tmp_path / "test_cleanup.db"
+    init_db(db_file)
+    conn = get_db_connection(db_file)
+
+    # Insert fake legacy tools block
+    conn.execute("""
+        INSERT INTO conversations (id, title) VALUES ('conv-legacy', 'Legacy Conv')
+    """)
+    conn.execute("""
+        INSERT INTO transcript_blocks (conversation_id, step_index, block_type, content, block_hash)
+        VALUES ('conv-legacy', 0, 'tools', '{"some": "schema"}', 'hash-123')
+    """)
+    conn.commit()
+
+    cnt = conn.execute("SELECT COUNT(*) FROM transcript_blocks WHERE block_type = 'tools'").fetchone()[0]
+    assert cnt == 1
+
+    # Running init_db must clean up legacy tools blocks
+    init_db(conn)
+    cnt_after = conn.execute("SELECT COUNT(*) FROM transcript_blocks WHERE block_type = 'tools'").fetchone()[0]
+    assert cnt_after == 0
+
+    conn.close()
+

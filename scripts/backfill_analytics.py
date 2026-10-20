@@ -24,7 +24,13 @@ _root = Path(__file__).resolve().parent.parent
 if str(_root / "src") not in sys.path:
     sys.path.insert(0, str(_root / "src"))
 
-from context_monitor.db import DEFAULT_DB_PATH, get_db_connection, init_db  # noqa: E402
+from context_monitor.db import (  # noqa: E402
+    DEFAULT_DB_PATH,
+    ensure_rollups_synced,
+    get_db_connection,
+    init_db,
+    refresh_conversation_rollups,
+)
 from context_monitor.formats import BlockParser  # noqa: E402
 from context_monitor.pricing import (  # noqa: E402
     DEFAULT_MODEL,
@@ -141,7 +147,11 @@ def classify_phase(step_type: str, tool_name: str) -> str:
     return "reasoning"
 
 
-def parse_conversation(conv_dir: Path) -> dict | None:
+def parse_conversation(
+    conv_dir: Path,
+    *,
+    include_tool_schemas: bool = False,
+) -> dict | None:
     transcript_path = conv_dir / ".system_generated" / "logs" / "transcript.jsonl"
     if not transcript_path.exists():
         transcript_path = (
@@ -153,7 +163,7 @@ def parse_conversation(conv_dir: Path) -> dict | None:
         return None
 
     cid = conv_dir.name
-    first_model, latest_model, _ = detect_model_from_transcript(transcript_path)
+    first_model = None
 
     steps = []
     tool_execs = []
@@ -172,9 +182,9 @@ def parse_conversation(conv_dir: Path) -> dict | None:
     lines_edited = 0
     failed_tool_calls = 0
     project = None
-    cur_model = first_model
-    models_used = [cur_model]
-    model_transitions = [cur_model]
+    cur_model = DEFAULT_MODEL
+    models_used = []
+    model_transitions = []
     detected_parent_id = None
     dispatched_subagents = []
     pending_subagent_specs = []
@@ -212,11 +222,20 @@ def parse_conversation(conv_dir: Path) -> dict | None:
             if step_type == "USER_INPUT":
                 switched_model = extract_model_switch(content)
                 if switched_model:
-                    cur_model = switched_model
-                    if not model_transitions or model_transitions[-1] != cur_model:
-                        model_transitions.append(cur_model)
-                    if cur_model not in models_used:
-                        models_used.append(cur_model)
+                    if first_model is None:
+                        first_model = switched_model
+                        for s in steps:
+                            if s.get("model_name") == DEFAULT_MODEL:
+                                s["model_name"] = first_model
+                        cur_model = switched_model
+                        models_used = [cur_model]
+                        model_transitions = [cur_model]
+                    else:
+                        cur_model = switched_model
+                        if not model_transitions or model_transitions[-1] != cur_model:
+                            model_transitions.append(cur_model)
+                        if cur_model not in models_used:
+                            models_used.append(cur_model)
 
             if (
                 not project
@@ -618,8 +637,16 @@ def parse_conversation(conv_dir: Path) -> dict | None:
 
     total_tokens = int(total_chars / CHARS_PER_TOKEN)
 
-    # Append dynamically loaded tool schemas
-    parsed_blocks.extend(block_parser.load_tool_schemas())
+    if first_model is None:
+        first_model = cur_model
+        if not models_used:
+            models_used = [cur_model]
+        if not model_transitions:
+            model_transitions = [cur_model]
+
+    # Append dynamically loaded tool schemas if explicitly requested
+    if include_tool_schemas:
+        parsed_blocks.extend(block_parser.load_tool_schemas())
 
     # Calculate billed cost based on steps
     total_billed_cost = 0.0
@@ -924,6 +951,10 @@ def run_backfill(
                 )
 
                 # Bulk insert steps (replace existing)
+                conn.execute(
+                    "DELETE FROM steps WHERE conversation_id = ?",
+                    (conv["id"],),
+                )
                 conn.executemany(
                     """
                     INSERT INTO steps (
@@ -1002,6 +1033,7 @@ def run_backfill(
                         block_params,
                     )
 
+                refresh_conversation_rollups(conn, conv["id"])
                 processed_convs += 1
                 total_steps_inserted += len(steps)
                 total_tools_inserted += len(tools)
@@ -1014,6 +1046,13 @@ def run_backfill(
                         f"  [{pct:5.1f}%] Processed {i}/{total_convs} conversations ({total_steps_inserted:,} steps)...",
                         flush=True,
                     )
+
+        # Ensure all rollups are fully in sync with steps
+        try:
+            ensure_rollups_synced(conn)
+            conn.commit()
+        except Exception:
+            pass
 
         # Calibrate and initialize quota state for historical backfill
         try:

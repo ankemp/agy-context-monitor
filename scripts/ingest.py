@@ -25,8 +25,8 @@ _root = Path(__file__).resolve().parent.parent
 if str(_root / "src") not in sys.path:
     sys.path.insert(0, str(_root / "src"))
 
-from context_monitor.db import DEFAULT_DB_PATH, get_db_connection  # noqa: E402
-from context_monitor.diff import diff_block_lists  # noqa: E402
+from context_monitor.db import DEFAULT_DB_PATH, get_db_connection, refresh_conversation_rollups  # noqa: E402
+from context_monitor.diff import DiffResult, diff_block_lists  # noqa: E402
 from context_monitor.formats import BlockParser  # noqa: E402
 from context_monitor.html_report import generate_html_report  # noqa: E402
 from context_monitor.pricing import (  # noqa: E402
@@ -250,7 +250,12 @@ def classify_phase(step_type: str, tool_name: str) -> str:
     return "reasoning"
 
 
-def analyze_transcript(transcript_path: Path, initial_model: str | None = None) -> dict:
+def analyze_transcript(
+    transcript_path: Path,
+    initial_model: str | None = None,
+    *,
+    include_tool_schemas: bool = False,
+) -> dict:
     if transcript_path.is_dir():
         t_file = transcript_path / ".system_generated" / "logs" / "transcript.jsonl"
         if not t_file.exists():
@@ -274,13 +279,15 @@ def analyze_transcript(transcript_path: Path, initial_model: str | None = None) 
     title = ""
     start_time = None
     end_time = None
+    first_model = initial_model
     if initial_model is None:
-        first_m, _, _ = detect_model(transcript_path)
-        cur_model = first_m
+        cur_model = DEFAULT_MODEL
+        models_used = []
+        model_transitions = []
     else:
         cur_model = initial_model
-    models_used = [cur_model]
-    model_transitions = [cur_model]
+        models_used = [cur_model]
+        model_transitions = [cur_model]
     project = None
     detected_parent_id = None
     dispatched_subagents = []
@@ -319,11 +326,20 @@ def analyze_transcript(transcript_path: Path, initial_model: str | None = None) 
             if step_type == "USER_INPUT":
                 switched_model = extract_model_switch(content)
                 if switched_model:
-                    cur_model = switched_model
-                    if not model_transitions or model_transitions[-1] != cur_model:
-                        model_transitions.append(cur_model)
-                    if cur_model not in models_used:
-                        models_used.append(cur_model)
+                    if first_model is None:
+                        first_model = switched_model
+                        for s in steps:
+                            if s.get("model_name") == DEFAULT_MODEL:
+                                s["model_name"] = first_model
+                        cur_model = switched_model
+                        models_used = [cur_model]
+                        model_transitions = [cur_model]
+                    else:
+                        cur_model = switched_model
+                        if not model_transitions or model_transitions[-1] != cur_model:
+                            model_transitions.append(cur_model)
+                        if cur_model not in models_used:
+                            models_used.append(cur_model)
 
             if (
                 not project
@@ -722,8 +738,16 @@ def analyze_transcript(transcript_path: Path, initial_model: str | None = None) 
     if start_dt and end_dt:
         duration_seconds = max((end_dt - start_dt).total_seconds(), 0.0)
 
-    # Append dynamically loaded tool schemas
-    parsed_blocks.extend(block_parser.load_tool_schemas())
+    if first_model is None:
+        first_model = cur_model
+        if not models_used:
+            models_used = [cur_model]
+        if not model_transitions:
+            model_transitions = [cur_model]
+
+    # Append dynamically loaded tool schemas if explicitly requested
+    if include_tool_schemas:
+        parsed_blocks.extend(block_parser.load_tool_schemas())
 
     # Calculate billed cost based on steps
     total_billed_cost = 0.0
@@ -798,7 +822,13 @@ def analyze_transcript(transcript_path: Path, initial_model: str | None = None) 
     }
 
 
-def sync_to_sqlite(cid: str, model_name: str, analysis: dict):
+def sync_to_sqlite(
+    cid: str,
+    model_name: str,
+    analysis: dict,
+    *,
+    attach_profile: bool = True,
+):
     """Safely and incrementally syncs session data to SQLite in WAL mode and computes turn diff."""
     diff_res = None
     try:
@@ -809,22 +839,99 @@ def sync_to_sqlite(cid: str, model_name: str, analysis: dict):
             with conn:
                 cur = conn.cursor()
 
-                # Query existing blocks BEFORE deleting them to compute turn diff
-                prev_blocks = cur.execute(
-                    """
-                    SELECT step_index, block_type, content, block_hash, call_id
-                    FROM transcript_blocks
-                    WHERE conversation_id = ?
-                    ORDER BY step_index ASC, id ASC
-                """,
+                # Check existing state in steps and transcript_blocks
+                row_steps = cur.execute(
+                    "SELECT COALESCE(MAX(step_index), 0), COUNT(*) FROM steps WHERE conversation_id = ?",
                     (cid,),
-                ).fetchall()
+                ).fetchone()
+                prev_max_step = row_steps[0] if row_steps else 0
+                prev_step_count = row_steps[1] if row_steps else 0
+
+                row_blocks = cur.execute(
+                    "SELECT COALESCE(MAX(step_index), 0), COUNT(*) FROM transcript_blocks WHERE conversation_id = ?",
+                    (cid,),
+                ).fetchone()
+                prev_max_block_step = row_blocks[0] if row_blocks else 0
+                prev_block_count = row_blocks[1] if row_blocks else 0
 
                 curr_blocks = analysis.get("parsed_blocks", [])
-                if curr_blocks and prev_blocks:
-                    diff_res = diff_block_lists(prev_blocks, curr_blocks)
-                elif curr_blocks:
-                    diff_res = diff_block_lists([], curr_blocks)
+                curr_steps = analysis.get("steps", [])
+
+                # Check if append-only candidate
+                curr_steps_le = [s for s in curr_steps if s["step_index"] <= prev_max_step]
+                curr_blocks_le = [b for b in curr_blocks if b.step_index <= prev_max_step]
+
+                is_append_only = False
+                if prev_step_count > 0 and prev_max_step > 0:
+                    if len(curr_steps_le) == prev_step_count and len(curr_blocks_le) == prev_block_count:
+                        last_block_row = cur.execute(
+                            "SELECT block_hash FROM transcript_blocks WHERE conversation_id = ? ORDER BY step_index DESC, id DESC LIMIT 1",
+                            (cid,),
+                        ).fetchone()
+                        first_block_row = cur.execute(
+                            "SELECT block_hash FROM transcript_blocks WHERE conversation_id = ? ORDER BY step_index ASC, id ASC LIMIT 1",
+                            (cid,),
+                        ).fetchone()
+
+                        last_step_row = cur.execute(
+                            "SELECT step_index, est_tokens FROM steps WHERE conversation_id = ? AND step_index = ?",
+                            (cid, prev_max_step),
+                        ).fetchone()
+                        first_step_row = cur.execute(
+                            "SELECT step_index, est_tokens FROM steps WHERE conversation_id = ? ORDER BY step_index ASC LIMIT 1",
+                            (cid,),
+                        ).fetchone()
+
+                        blocks_match = True
+                        if prev_block_count > 0:
+                            if (
+                                not last_block_row
+                                or not curr_blocks_le
+                                or curr_blocks_le[-1].hash != last_block_row[0]
+                                or not first_block_row
+                                or curr_blocks_le[0].hash != first_block_row[0]
+                            ):
+                                blocks_match = False
+                        else:
+                            if curr_blocks_le:
+                                blocks_match = False
+
+                        steps_match = True
+                        if (
+                            not last_step_row
+                            or curr_steps_le[-1]["step_index"] != last_step_row[0]
+                            or curr_steps_le[-1]["est_tokens"] != last_step_row[1]
+                            or not first_step_row
+                            or curr_steps_le[0]["step_index"] != first_step_row[0]
+                            or curr_steps_le[0]["est_tokens"] != first_step_row[1]
+                        ):
+                            steps_match = False
+
+                        if blocks_match and steps_match:
+                            is_append_only = True
+
+                if is_append_only:
+                    new_blocks = [b for b in curr_blocks if b.step_index > prev_max_step]
+                    if new_blocks:
+                        diff_res = diff_block_lists([], new_blocks)
+                    else:
+                        diff_res = DiffResult()
+                else:
+                    prev_blocks = cur.execute(
+                        """
+                        SELECT step_index, block_type, content, block_hash, call_id
+                        FROM transcript_blocks
+                        WHERE conversation_id = ?
+                        ORDER BY step_index ASC, id ASC
+                        """,
+                        (cid,),
+                    ).fetchall()
+                    if curr_blocks and prev_blocks:
+                        diff_res = diff_block_lists(prev_blocks, curr_blocks)
+                    elif curr_blocks:
+                        diff_res = diff_block_lists([], curr_blocks)
+                    else:
+                        diff_res = DiffResult()
 
                 active_model = analysis.get("latest_model", model_name)
                 parent_id = analysis.get("parent_id")
@@ -1036,122 +1143,231 @@ def sync_to_sqlite(cid: str, model_name: str, analysis: dict):
                         ),
                     )
 
-                # Upsert steps with step-level model_name
-                step_params = [
-                    (
-                        cid,
-                        s["step_index"],
-                        s["created_at"],
-                        s["source"],
-                        s["step_type"],
-                        s["category"],
-                        s["activity"],
-                        s["tool_or_source"],
-                        s["characters"],
-                        s["est_tokens"],
-                        s.get("thinking_tokens", 0),
-                        s.get("phase", "reasoning"),
-                        s.get("model_name", active_model),
-                        s["detail"],
-                        s.get("billed_cost", 0.0),
-                        s.get("billed_input_tokens", 0),
-                        s.get("billed_output_tokens", 0),
-                    )
-                    for s in analysis["steps"]
-                ]
-                conn.executemany(
-                    """
-                    INSERT INTO steps (
-                        conversation_id, step_index, created_at, source, step_type, category, activity,
-                        tool_or_source, characters, est_tokens, thinking_tokens, phase, model_name, detail,
-                        billed_cost, billed_input_tokens, billed_output_tokens
-                    )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(conversation_id, step_index) DO UPDATE SET
-                        characters = excluded.characters,
-                        est_tokens = excluded.est_tokens,
-                        thinking_tokens = excluded.thinking_tokens,
-                        phase = excluded.phase,
-                        model_name = excluded.model_name,
-                        detail = excluded.detail,
-                        billed_cost = excluded.billed_cost,
-                        billed_input_tokens = excluded.billed_input_tokens,
-                        billed_output_tokens = excluded.billed_output_tokens
-                """,
-                    step_params,
-                )
+                if is_append_only:
+                    steps_to_insert = [
+                        s for s in curr_steps if s["step_index"] > prev_max_step
+                    ]
+                    if steps_to_insert:
+                        step_params = [
+                            (
+                                cid,
+                                s["step_index"],
+                                s["created_at"],
+                                s["source"],
+                                s["step_type"],
+                                s["category"],
+                                s["activity"],
+                                s["tool_or_source"],
+                                s["characters"],
+                                s["est_tokens"],
+                                s.get("thinking_tokens", 0),
+                                s.get("phase", "reasoning"),
+                                s.get("model_name", active_model),
+                                s["detail"],
+                                s.get("billed_cost", 0.0),
+                                s.get("billed_input_tokens", 0),
+                                s.get("billed_output_tokens", 0),
+                            )
+                            for s in steps_to_insert
+                        ]
+                        conn.executemany(
+                            """
+                            INSERT INTO steps (
+                                conversation_id, step_index, created_at, source, step_type, category, activity,
+                                tool_or_source, characters, est_tokens, thinking_tokens, phase, model_name, detail,
+                                billed_cost, billed_input_tokens, billed_output_tokens
+                            )
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                            step_params,
+                        )
 
-                # Sync tool executions
-                if analysis.get("tool_executions"):
+                    tools_to_insert = [
+                        te
+                        for te in analysis.get("tool_executions", [])
+                        if te["step_index"] > prev_max_step
+                    ]
+                    if tools_to_insert:
+                        tool_params = [
+                            (
+                                cid,
+                                te["step_index"],
+                                te["tool_name"],
+                                te.get("mcp_server"),
+                                te.get("mcp_tool"),
+                                te.get("target_path"),
+                                te.get("command_line"),
+                                te.get("exit_code"),
+                                te.get("is_error", 0),
+                            )
+                            for te in tools_to_insert
+                        ]
+                        conn.executemany(
+                            """
+                            INSERT INTO tool_executions (
+                                conversation_id, step_index, tool_name, mcp_server, mcp_tool,
+                                target_path, command_line, exit_code, is_error
+                            )
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                            tool_params,
+                        )
+
+                    blocks_to_insert = [
+                        b for b in curr_blocks if b.step_index > prev_max_step
+                    ]
+                    if blocks_to_insert:
+                        block_params = []
+                        for b in blocks_to_insert:
+                            content_str = b.text
+                            if b.arguments is not None:
+                                import json
+
+                                content_str += "\n" + json.dumps(b.arguments)
+
+                            block_params.append(
+                                (
+                                    cid,
+                                    b.step_index,
+                                    b.kind.value,
+                                    content_str,
+                                    b.hash,
+                                    b.call_id,
+                                )
+                            )
+
+                        conn.executemany(
+                            """
+                            INSERT INTO transcript_blocks (
+                                conversation_id, step_index, block_type, content, block_hash, call_id
+                            )
+                            VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                            block_params,
+                        )
+                else:
                     conn.execute(
-                        "DELETE FROM tool_executions WHERE conversation_id = ?", (cid,)
+                        "DELETE FROM steps WHERE conversation_id = ?",
+                        (cid,),
                     )
-                    tool_params = [
+                    step_params = [
                         (
                             cid,
-                            te["step_index"],
-                            te["tool_name"],
-                            te.get("mcp_server"),
-                            te.get("mcp_tool"),
-                            te.get("target_path"),
-                            te.get("command_line"),
-                            te.get("exit_code"),
-                            te.get("is_error", 0),
+                            s["step_index"],
+                            s["created_at"],
+                            s["source"],
+                            s["step_type"],
+                            s["category"],
+                            s["activity"],
+                            s["tool_or_source"],
+                            s["characters"],
+                            s["est_tokens"],
+                            s.get("thinking_tokens", 0),
+                            s.get("phase", "reasoning"),
+                            s.get("model_name", active_model),
+                            s["detail"],
+                            s.get("billed_cost", 0.0),
+                            s.get("billed_input_tokens", 0),
+                            s.get("billed_output_tokens", 0),
                         )
-                        for te in analysis["tool_executions"]
+                        for s in curr_steps
                     ]
                     conn.executemany(
                         """
-                        INSERT INTO tool_executions (
-                            conversation_id, step_index, tool_name, mcp_server, mcp_tool,
-                            target_path, command_line, exit_code, is_error
+                        INSERT INTO steps (
+                            conversation_id, step_index, created_at, source, step_type, category, activity,
+                            tool_or_source, characters, est_tokens, thinking_tokens, phase, model_name, detail,
+                            billed_cost, billed_input_tokens, billed_output_tokens
                         )
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(conversation_id, step_index) DO UPDATE SET
+                            characters = excluded.characters,
+                            est_tokens = excluded.est_tokens,
+                            thinking_tokens = excluded.thinking_tokens,
+                            phase = excluded.phase,
+                            model_name = excluded.model_name,
+                            detail = excluded.detail,
+                            billed_cost = excluded.billed_cost,
+                            billed_input_tokens = excluded.billed_input_tokens,
+                            billed_output_tokens = excluded.billed_output_tokens
                     """,
-                        tool_params,
+                        step_params,
                     )
 
-                # Sync transcript blocks
-                if analysis.get("parsed_blocks"):
+                    conn.execute(
+                        "DELETE FROM tool_executions WHERE conversation_id = ?", (cid,)
+                    )
+                    if analysis.get("tool_executions"):
+                        tool_params = [
+                            (
+                                cid,
+                                te["step_index"],
+                                te["tool_name"],
+                                te.get("mcp_server"),
+                                te.get("mcp_tool"),
+                                te.get("target_path"),
+                                te.get("command_line"),
+                                te.get("exit_code"),
+                                te.get("is_error", 0),
+                            )
+                            for te in analysis["tool_executions"]
+                        ]
+                        conn.executemany(
+                            """
+                            INSERT INTO tool_executions (
+                                conversation_id, step_index, tool_name, mcp_server, mcp_tool,
+                                target_path, command_line, exit_code, is_error
+                            )
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                            tool_params,
+                        )
+
                     conn.execute(
                         "DELETE FROM transcript_blocks WHERE conversation_id = ?",
                         (cid,),
                     )
-                    block_params = []
-                    for b in analysis["parsed_blocks"]:
-                        content_str = b.text
-                        if b.arguments is not None:
-                            import json
+                    if curr_blocks:
+                        block_params = []
+                        for b in curr_blocks:
+                            content_str = b.text
+                            if b.arguments is not None:
+                                import json
 
-                            content_str += "\n" + json.dumps(b.arguments)
+                                content_str += "\n" + json.dumps(b.arguments)
 
-                        block_params.append(
-                            (
-                                cid,
-                                b.step_index,
-                                b.kind.value,
-                                content_str,
-                                b.hash,
-                                b.call_id,
+                            block_params.append(
+                                (
+                                    cid,
+                                    b.step_index,
+                                    b.kind.value,
+                                    content_str,
+                                    b.hash,
+                                    b.call_id,
+                                )
                             )
+
+                        conn.executemany(
+                            """
+                            INSERT INTO transcript_blocks (
+                                conversation_id, step_index, block_type, content, block_hash, call_id
+                            )
+                            VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                            block_params,
                         )
 
-                    conn.executemany(
-                        """
-                        INSERT INTO transcript_blocks (
-                            conversation_id, step_index, block_type, content, block_hash, call_id
-                        )
-                        VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                        block_params,
-                    )
-
+                # Refresh rollups for this conversation
+                refresh_conversation_rollups(conn, cid)
                 conn.commit()
 
             # Refresh and cache quota state and activity profile
             try:
-                analysis["quota_state"] = sync_and_get_quota_state(conn)
-                analysis["activity_profile"] = get_hourly_activity_profile(conn)
+                analysis["quota_state"] = sync_and_get_quota_state(
+                    conn, ttl_seconds=300
+                )
+                if attach_profile:
+                    analysis["activity_profile"] = get_hourly_activity_profile(conn)
             except Exception:
                 pass
 
@@ -1205,13 +1421,16 @@ def _extract_bucket_view(
 def _resolve_quota_and_activity(
     analysis: dict[str, Any],
     db_path: Path | None = None,
+    *,
+    force_profile: bool = False,
 ) -> tuple[Any, Any]:
     """Resolve quota state and activity profile from analysis or database fallback."""
     quota_state = analysis.get("quota_state")
     activity_profile = analysis.get("activity_profile")
     target_db = db_path if db_path is not None else DEFAULT_DB_PATH
+    need_profile = force_profile or should_generate_artifacts()
     if (
-        (quota_state is None or activity_profile is None)
+        (quota_state is None or (activity_profile is None and need_profile))
         and target_db
         and target_db.exists()
     ):
@@ -1219,9 +1438,9 @@ def _resolve_quota_and_activity(
             conn = get_db_connection(target_db, timeout=2.0)
             try:
                 if quota_state is None:
-                    quota_state = sync_and_get_quota_state(conn)
+                    quota_state = sync_and_get_quota_state(conn, ttl_seconds=300)
                     analysis["quota_state"] = quota_state
-                if activity_profile is None:
+                if activity_profile is None and need_profile:
                     activity_profile = get_hourly_activity_profile(conn)
                     analysis["activity_profile"] = activity_profile
             finally:
@@ -1298,7 +1517,9 @@ def generate_context_usage_report(
             pass
 
         # Quota metrics resolution
-        quota_state, activity_profile = _resolve_quota_and_activity(analysis)
+        quota_state, activity_profile = _resolve_quota_and_activity(
+            analysis, force_profile=True
+        )
 
         state_dict: dict[str, dict] = {}
         if quota_state:
@@ -1543,10 +1764,18 @@ def main():
                 conversation_id = parts[idx + 1]
 
     transcript_path = Path(transcript_path_str)
-    first_model, latest_model, max_tokens = detect_model(transcript_path)
-    analysis = analyze_transcript(transcript_path, initial_model=first_model)
+    analysis = analyze_transcript(transcript_path)
+    latest_model = analysis.get("latest_model", DEFAULT_MODEL)
+    max_tokens = analysis.get(
+        "latest_max_tokens", get_model_context_limit(latest_model)
+    )
 
-    diff_res = sync_to_sqlite(conversation_id, latest_model, analysis)
+    diff_res = sync_to_sqlite(
+        conversation_id,
+        latest_model,
+        analysis,
+        attach_profile=should_generate_artifacts(),
+    )
 
     # Artifact reports (context_usage.md / .html) are deprecated in favor of the native
     # Antigravity side panel extension. They are disabled by default and only generated
