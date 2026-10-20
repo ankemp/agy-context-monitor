@@ -24,6 +24,12 @@
       </div>
     </header>
 
+    <!-- Inspect Banner (visible when viewing an inspected subagent node) -->
+    <section id="inspect-banner" class="inspect-banner" hidden>
+      <span id="inspect-banner-label">Viewing: Sub-Agent</span>
+      <button id="btn-reset-inspect" type="button" class="reset-inspect-btn">Back to Active Session</button>
+    </section>
+
     <!-- Global Aggregate View (visible when no conversation is active) -->
     <section id="global-card" class="card" aria-labelledby="global-title" hidden>
       <div class="card-header">
@@ -127,6 +133,29 @@
       <div id="category-list" class="category-list">
         <div class="empty-state small muted">No telemetry recorded yet</div>
       </div>
+    </section>
+
+    <!-- Swarm Fleet Card -->
+    <section id="fleet-card" class="card" aria-labelledby="fleet-title" hidden>
+      <div class="card-header">
+        <h2 id="fleet-title">Swarm Fleet</h2>
+        <span id="fleet-count-badge" class="badge">0 Agents</span>
+      </div>
+      <div id="fleet-summary-strip" class="fleet-summary-strip">
+        <div class="fleet-kpi">
+          <span class="kpi-label">Fleet Cost</span>
+          <span id="fleet-total-cost" class="kpi-val">$0.00</span>
+        </div>
+        <div class="fleet-kpi">
+          <span class="kpi-label">Fleet Tokens</span>
+          <span id="fleet-total-tokens" class="kpi-val">0</span>
+        </div>
+        <div class="fleet-kpi">
+          <span class="kpi-label">Context Shielding</span>
+          <span id="fleet-shielding" class="kpi-val">1.0x</span>
+        </div>
+      </div>
+      <div id="fleet-node-list" class="fleet-list"></div>
     </section>
 
     <!-- Top Contributors Card -->

@@ -9,7 +9,7 @@ from typing import Any, NamedTuple
 from zoneinfo import ZoneInfo
 
 from context_monitor.db import get_quota_state, ensure_rollups_synced
-from context_monitor.pricing import get_pricing_key
+from context_monitor.pricing import get_pricing_key, get_model_context_limit
 from context_monitor.quota import (
     _get_default_capacity,
     _to_utc_datetime,
@@ -19,6 +19,33 @@ from context_monitor.quota import (
 )
 
 CHARS_PER_TOKEN = 3.8
+
+
+def _clean_arg_str(val: Any) -> str:
+    """Strips whitespace and unquotes double/single-encoded JSON strings."""
+    if val is None:
+        return ""
+    s = str(val).strip()
+    while True:
+        if s.startswith('"') and s.endswith('"') and len(s) >= 2:
+            try:
+                unquoted = json.loads(s)
+                if isinstance(unquoted, str):
+                    s = unquoted.strip()
+                    continue
+            except Exception:
+                pass
+            inner = s[1:-1].strip()
+            if not re.search(r'(?<!\\)"', inner):
+                s = inner.replace(r'\"', '"').strip()
+                continue
+        if s.startswith("'") and s.endswith("'") and len(s) >= 2:
+            inner = s[1:-1].strip()
+            if not re.search(r"(?<!\\)'", inner):
+                s = inner.replace(r"\'", "'").strip()
+                continue
+        break
+    return s
 
 
 class QuotaPercentages(NamedTuple):
@@ -636,38 +663,114 @@ def query_cost_by_project(conn, tz=None, project=None, limit_sessions=6):
             }
         )
 
-    # Query top expensive sessions (narrowed to project if filtered)
+    # Query top expensive sessions grouped by Campaign (narrowed to project if filtered)
     where_sess = ""
     params_sess = ()
     if project and project != "all":
         if project == "(unassigned)":
-            where_sess = "WHERE (project IS NULL OR project = '')"
+            where_sess = "WHERE (c.project IS NULL OR c.project = '')"
         else:
-            where_sess = "WHERE project = ?"
+            where_sess = "WHERE c.project = ?"
             params_sess = (project,)
 
     try:
         sess_rows = cur.execute(
             f"""
-            SELECT id, title, project, model_name, models_used, created_at, total_steps, total_tokens, duration_seconds, active_agent_seconds, billed_cost, billed_input_tokens, billed_output_tokens
-            FROM conversations
+            WITH campaign_rollups AS (
+                SELECT 
+                    COALESCE(NULLIF(root_id, ''), id) AS campaign_id,
+                    SUM(COALESCE(billed_cost, 0.0)) AS billed_cost,
+                    SUM(CASE WHEN id = COALESCE(NULLIF(root_id, ''), id) THEN COALESCE(billed_cost, 0.0) ELSE 0.0 END) AS local_cost,
+                    COUNT(CASE WHEN id != COALESCE(NULLIF(root_id, ''), id) THEN 1 END) AS subagent_count,
+                    SUM(COALESCE(billed_input_tokens, 0)) AS billed_input_tokens,
+                    SUM(COALESCE(billed_output_tokens, 0)) AS billed_output_tokens,
+                    SUM(COALESCE(total_tokens, 0)) AS total_tokens,
+                    SUM(COALESCE(total_steps, 0)) AS total_steps,
+                    SUM(COALESCE(duration_seconds, 0)) AS duration_seconds,
+                    SUM(COALESCE(active_agent_seconds, 0)) AS active_agent_seconds,
+                    MAX(created_at) AS max_created_at
+                FROM conversations
+                GROUP BY COALESCE(NULLIF(root_id, ''), id)
+            )
+            SELECT 
+                cr.campaign_id AS id,
+                COALESCE(c.title, 'Session ' || substr(cr.campaign_id, 1, 8)) AS title,
+                c.project AS project,
+                c.model_name AS model_name,
+                c.models_used AS models_used,
+                COALESCE(c.created_at, cr.max_created_at) AS created_at,
+                cr.total_steps AS total_steps,
+                cr.total_tokens AS total_tokens,
+                cr.duration_seconds AS duration_seconds,
+                cr.active_agent_seconds AS active_agent_seconds,
+                cr.billed_cost AS billed_cost,
+                cr.local_cost AS local_cost,
+                cr.subagent_count AS subagent_count,
+                cr.billed_input_tokens AS billed_input_tokens,
+                cr.billed_output_tokens AS billed_output_tokens
+            FROM campaign_rollups cr
+            LEFT JOIN conversations c ON c.id = cr.campaign_id
             {where_sess}
-            ORDER BY billed_cost DESC, (COALESCE(billed_input_tokens, 0) + COALESCE(billed_output_tokens, 0)) DESC, total_tokens DESC
+            ORDER BY cr.billed_cost DESC, (COALESCE(cr.billed_input_tokens, 0) + COALESCE(cr.billed_output_tokens, 0)) DESC, cr.total_tokens DESC
             LIMIT {limit_sessions}
         """,
             params_sess,
         ).fetchall()
     except Exception:
-        sess_rows = cur.execute(
-            f"""
-            SELECT id, title, project, model_name, created_at, total_steps, total_tokens, duration_seconds, active_agent_seconds, billed_cost, billed_input_tokens, billed_output_tokens
-            FROM conversations
-            {where_sess}
-            ORDER BY billed_cost DESC, (COALESCE(billed_input_tokens, 0) + COALESCE(billed_output_tokens, 0)) DESC, total_tokens DESC
-            LIMIT {limit_sessions}
-        """,
-            params_sess,
-        ).fetchall()
+        try:
+            sess_rows = cur.execute(
+                f"""
+                WITH campaign_rollups AS (
+                    SELECT 
+                        COALESCE(NULLIF(root_id, ''), id) AS campaign_id,
+                        SUM(COALESCE(billed_cost, 0.0)) AS billed_cost,
+                        SUM(CASE WHEN id = COALESCE(NULLIF(root_id, ''), id) THEN COALESCE(billed_cost, 0.0) ELSE 0.0 END) AS local_cost,
+                        COUNT(CASE WHEN id != COALESCE(NULLIF(root_id, ''), id) THEN 1 END) AS subagent_count,
+                        SUM(COALESCE(billed_input_tokens, 0)) AS billed_input_tokens,
+                        SUM(COALESCE(billed_output_tokens, 0)) AS billed_output_tokens,
+                        SUM(COALESCE(total_tokens, 0)) AS total_tokens,
+                        SUM(COALESCE(total_steps, 0)) AS total_steps,
+                        SUM(COALESCE(duration_seconds, 0)) AS duration_seconds,
+                        SUM(COALESCE(active_agent_seconds, 0)) AS active_agent_seconds,
+                        MAX(created_at) AS max_created_at
+                    FROM conversations
+                    GROUP BY COALESCE(NULLIF(root_id, ''), id)
+                )
+                SELECT 
+                    cr.campaign_id AS id,
+                    COALESCE(c.title, 'Session ' || substr(cr.campaign_id, 1, 8)) AS title,
+                    c.project AS project,
+                    c.model_name AS model_name,
+                    COALESCE(c.created_at, cr.max_created_at) AS created_at,
+                    cr.total_steps AS total_steps,
+                    cr.total_tokens AS total_tokens,
+                    cr.duration_seconds AS duration_seconds,
+                    cr.active_agent_seconds AS active_agent_seconds,
+                    cr.billed_cost AS billed_cost,
+                    cr.local_cost AS local_cost,
+                    cr.subagent_count AS subagent_count,
+                    cr.billed_input_tokens AS billed_input_tokens,
+                    cr.billed_output_tokens AS billed_output_tokens
+                FROM campaign_rollups cr
+                LEFT JOIN conversations c ON c.id = cr.campaign_id
+                {where_sess}
+                ORDER BY cr.billed_cost DESC, (COALESCE(cr.billed_input_tokens, 0) + COALESCE(cr.billed_output_tokens, 0)) DESC, cr.total_tokens DESC
+                LIMIT {limit_sessions}
+            """,
+                params_sess,
+            ).fetchall()
+        except Exception:
+            where_plain = where_sess.replace("c.project", "project")
+            sess_rows = cur.execute(
+                f"""
+                SELECT id, title, project, model_name, created_at, total_steps, total_tokens, duration_seconds, active_agent_seconds, billed_cost, billed_input_tokens, billed_output_tokens
+                FROM conversations
+                {where_plain}
+                ORDER BY billed_cost DESC, (COALESCE(billed_input_tokens, 0) + COALESCE(billed_output_tokens, 0)) DESC, total_tokens DESC
+                LIMIT {limit_sessions}
+            """,
+                params_sess,
+            ).fetchall()
 
     top_sessions = []
     target_tz = get_target_tz(tz)
@@ -680,6 +783,16 @@ def query_cost_by_project(conn, tz=None, project=None, limit_sessions=6):
                 models_used_val = sr["models_used"]
         except Exception:
             pass
+        local_cost_val = (
+            round(sr["local_cost"] or 0.0, 2)
+            if "local_cost" in sr.keys() and sr["local_cost"] is not None
+            else round(sr["billed_cost"] or 0.0, 2)
+        )
+        subagent_count_val = (
+            int(sr["subagent_count"] or 0)
+            if "subagent_count" in sr.keys() and sr["subagent_count"] is not None
+            else 0
+        )
         top_sessions.append(
             {
                 "id": sr["id"],
@@ -697,6 +810,8 @@ def query_cost_by_project(conn, tz=None, project=None, limit_sessions=6):
                 "duration_seconds": sr["duration_seconds"] or 0,
                 "active_agent_seconds": sr["active_agent_seconds"] or 0,
                 "billed_cost": round(sr["billed_cost"] or 0.0, 2),
+                "local_cost": local_cost_val,
+                "subagent_count": subagent_count_val,
             }
         )
 
@@ -1701,17 +1816,63 @@ def query_session_details(conn, cid, tz=None):
             if tool_name == "invoke_subagent":
                 b_dict["is_subagent"] = True
                 try:
-                    raw_content = b_dict.get("content", "").strip()
-                    parsed_args = (
-                        json.loads(raw_content) if raw_content.startswith("{") else {}
-                    )
-                    subagents_raw = parsed_args.get("Subagents", "")
-                    if isinstance(subagents_raw, str) and subagents_raw.startswith("["):
-                        subagents_list = json.loads(subagents_raw)
-                    elif isinstance(subagents_raw, list):
-                        subagents_list = subagents_raw
-                    else:
-                        subagents_list = []
+                    raw_content = (b_dict.get("content") or "").strip()
+                    parsed_args = {}
+                    if raw_content:
+                        try:
+                            parsed_args = json.loads(raw_content)
+                            if isinstance(parsed_args, str):
+                                parsed_args = json.loads(parsed_args)
+                        except Exception:
+                            parsed_args = {}
+                    if not isinstance(parsed_args, dict):
+                        parsed_args = {}
+
+                    subagents_list = []
+                    subagents_raw = parsed_args.get("Subagents") or parsed_args.get("subagents")
+                    if subagents_raw:
+                        if isinstance(subagents_raw, str):
+                            s = _clean_arg_str(subagents_raw)
+                            try:
+                                parsed = json.loads(s)
+                                if isinstance(parsed, str):
+                                    parsed = json.loads(parsed)
+                                if isinstance(parsed, list):
+                                    subagents_list = parsed
+                            except Exception:
+                                pass
+                        elif isinstance(subagents_raw, list):
+                            subagents_list = subagents_raw
+
+                    if not subagents_list:
+                        flat_keys = (
+                            "Role", "role", "TypeName", "type",
+                            "subagent_type", "subagentType",
+                            "Prompt", "prompt", "Model", "model"
+                        )
+                        if any(k in parsed_args for k in flat_keys):
+                            role = _clean_arg_str(parsed_args.get("Role") or parsed_args.get("role") or "")
+                            sub_type = _clean_arg_str(
+                                parsed_args.get("TypeName")
+                                or parsed_args.get("type")
+                                or parsed_args.get("subagent_type")
+                                or parsed_args.get("subagentType")
+                                or ""
+                            )
+                            model = _clean_arg_str(parsed_args.get("Model") or parsed_args.get("model") or "")
+                            prompt = _clean_arg_str(parsed_args.get("Prompt") or parsed_args.get("prompt") or "")
+                            subagents_list = [
+                                {
+                                    "role": role or "Autonomous Worker",
+                                    "type": sub_type or "self",
+                                    "model": model or "inherit",
+                                    "prompt": prompt,
+                                    "Role": role or "Autonomous Worker",
+                                    "TypeName": sub_type or "self",
+                                    "Model": model or "inherit",
+                                    "Prompt": prompt,
+                                }
+                            ]
                     b_dict["subagents"] = subagents_list
                     b_dict["tool_action"] = parsed_args.get("toolAction")
                     b_dict["tool_summary"] = parsed_args.get("toolSummary")
@@ -1719,13 +1880,14 @@ def query_session_details(conn, cid, tz=None):
                     b_dict["subagents"] = []
 
             # Skill detection
+            raw_c = b_dict.get("content") or ""
             if target_path and ("skills/" in target_path or "SKILL.md" in target_path):
                 b_dict["is_skill"] = True
                 m = re.search(r"skills/([^/]+)/SKILL\.md", target_path)
                 if m:
                     b_dict["skill_name"] = m.group(1)
-            elif "skills/" in b_dict.get("content", ""):
-                m = re.search(r"skills/([^/]+)/SKILL\.md", b_dict.get("content", ""))
+            elif "skills/" in raw_c:
+                m = re.search(r"skills/([^/]+)/SKILL\.md", raw_c)
                 if m:
                     b_dict["is_skill"] = True
                     b_dict["skill_name"] = m.group(1)
@@ -1758,7 +1920,7 @@ def query_session_details(conn, cid, tz=None):
                     paired_use["use_block"]["result_step_index"] = idx
 
             # Extract subagent conversation ID from result content
-            content_str = b_dict.get("content", "")
+            content_str = b_dict.get("content") or ""
             cid_match = re.search(
                 r"([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})",
                 content_str,
@@ -1912,17 +2074,30 @@ def query_session_details(conn, cid, tz=None):
 
     # Swarm fleet rollup for whole tree
     effective_root = conv_dict.get("root_id") or cid
-    swarm_rows = cur.execute(
-        """
-        SELECT id, title, parent_id, root_id, depth, subagent_role, subagent_type,
-               total_steps, total_tokens, billed_cost, billed_input_tokens, billed_output_tokens,
-               duration_seconds, model_name
-        FROM conversations
-        WHERE root_id = ? OR id = ?
-        ORDER BY depth ASC, created_at ASC
-    """,
-        (effective_root, effective_root),
-    ).fetchall()
+    try:
+        swarm_rows = cur.execute(
+            """
+            SELECT id, title, parent_id, root_id, depth, subagent_role, subagent_type,
+                   total_steps, total_tokens, billed_cost, billed_input_tokens, billed_output_tokens,
+                   duration_seconds, active_agent_seconds, model_name, compaction_count, pruned_tokens
+            FROM conversations
+            WHERE root_id = ? OR id = ?
+            ORDER BY depth ASC, created_at ASC
+        """,
+            (effective_root, effective_root),
+        ).fetchall()
+    except Exception:
+        swarm_rows = cur.execute(
+            """
+            SELECT id, title, parent_id, root_id, depth, subagent_role, subagent_type,
+                   total_steps, total_tokens, billed_cost, billed_input_tokens, billed_output_tokens,
+                   duration_seconds, model_name
+            FROM conversations
+            WHERE root_id = ? OR id = ?
+            ORDER BY depth ASC, created_at ASC
+        """,
+            (effective_root, effective_root),
+        ).fetchall()
 
     swarm_nodes = [dict(sr) for sr in swarm_rows]
     total_swarm_cost = sum(n["billed_cost"] or 0.0 for n in swarm_nodes)
@@ -1957,6 +2132,19 @@ def query_session_details(conn, cid, tz=None):
         n_cost = round(n["billed_cost"] or 0.0, 2)
         n_m = n.get("model_name") or conv_model
         n_w_pct, n_5h_pct = _compute_quota_pcts(n_cost, n_m, bucket_caps)
+
+        max_tokens = get_model_context_limit(n_m)
+        active_tokens = n.get("total_tokens") or 0
+        context_pct = (
+            round((active_tokens / max_tokens) * 100, 1) if max_tokens else 0.0
+        )
+        cost_share_pct = (
+            round((n_cost / total_swarm_cost * 100), 1) if total_swarm_cost > 0 else 0.0
+        )
+        token_share_pct = (
+            round((n_act / total_swarm_tokens * 100), 1) if total_swarm_tokens > 0 else 0.0
+        )
+
         nodes_by_id[n_id] = {
             "id": n_id,
             "title": n["title"] or f"Session {n_id[:8]}",
@@ -1966,9 +2154,19 @@ def query_session_details(conn, cid, tz=None):
             "depth": n.get("depth") or 0,
             "steps": n["total_steps"] or 0,
             "tokens": n_act,
+            "total_tokens": active_tokens,
             "cost": n_cost,
+            "model_name": n_m,
+            "compaction_count": n.get("compaction_count") or 0,
+            "pruned_tokens": n.get("pruned_tokens") or 0,
+            "active_agent_seconds": round(n.get("active_agent_seconds") or 0.0, 1),
+            "max_tokens": max_tokens,
+            "active_tokens": active_tokens,
+            "context_pct": context_pct,
             "weekly_quota_pct": n_w_pct,
             "five_hour_quota_pct": n_5h_pct,
+            "cost_share_pct": cost_share_pct,
+            "token_share_pct": token_share_pct,
             "duration": round(n["duration_seconds"] or 0.0),
             "is_current": (n_id == cid),
             "children": [],
@@ -1981,6 +2179,12 @@ def query_session_details(conn, cid, tz=None):
         if p_id and p_id in nodes_by_id and n_id != p_id:
             nodes_by_id[p_id]["children"].append(nodes_by_id[n_id])
 
+    fleet_nodes = sorted(
+        nodes_by_id.values(),
+        key=lambda x: (x.get("cost") or 0.0, x.get("tokens") or 0),
+        reverse=True,
+    )
+
     return {
         "conversation": conv_dict,
         "steps": steps,
@@ -1991,6 +2195,7 @@ def query_session_details(conn, cid, tz=None):
         "children": children,
         "fleet_summary": fleet_summary,
         "fleet_tree": root_node,
+        "fleet_nodes": fleet_nodes,
         "compaction": compaction_meta,
         "quota": conv_quota,
         "weekly_quota_pct": conv_quota["weekly_pct"],

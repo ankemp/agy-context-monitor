@@ -351,3 +351,138 @@ def test_query_cost_by_project_tokens_reflects_actual_api_consumption(tmp_path):
     assert top_sess["id"] == "c-act"
     assert top_sess["tokens"] == 82000
     assert top_sess["disk_tokens"] == 15000
+
+
+def test_query_cost_by_project_campaign_grouping_and_subagent_rollup(tmp_path):
+    """
+    Verifies that query_cost_by_project groups top_sessions by Campaign:
+    - Rolls up billed_cost, billed_input_tokens, billed_output_tokens, total_tokens, total_steps
+    - Computes local_cost (root session cost) and subagent_count
+    - Retains root metadata (id, title, project, model_name)
+    - Standalone sessions retain subagent_count = 0 and exact original values
+    - Project filtering applies to the campaign
+    """
+    db_file = tmp_path / "test_campaign_rollup.db"
+    init_db(db_file)
+    conn = get_db_connection(db_file)
+
+    conn.execute("""
+        INSERT INTO conversations (
+            id, root_id, parent_id, title, project, model_name, created_at,
+            total_steps, total_tokens, billed_cost, billed_input_tokens, billed_output_tokens
+        ) VALUES 
+        ('camp-root', NULL, NULL, 'Root Campaign', 'apollo', 'Gemini Pro', '2026-08-26T10:00:00Z',
+         10, 20000, 5.00, 15000, 5000),
+        ('sub-1', 'camp-root', 'camp-root', 'Child Worker 1', 'apollo', 'Gemini Flash', '2026-08-26T10:05:00Z',
+         6, 10000, 3.00, 8000, 2000),
+        ('sub-2', 'camp-root', 'sub-1', 'Child Worker 2', 'apollo', 'Gemini Flash', '2026-08-26T10:10:00Z',
+         4, 5000, 1.50, 4000, 1000),
+        ('solo', NULL, NULL, 'Solo Task', 'artemis', 'Gemini Flash', '2026-08-26T11:00:00Z',
+         5, 8000, 2.00, 6000, 2000)
+    """)
+    conn.commit()
+
+    res = query_cost_by_project(conn)
+    top = res["top_sessions"]
+    assert len(top) == 2  # camp-root (campaign) and solo
+
+    # First session: rolled-up campaign
+    camp = top[0]
+    assert camp["id"] == "camp-root"
+    assert camp["title"] == "Root Campaign"
+    assert camp["project"] == "apollo"
+    assert camp["model_name"] == "Gemini Pro"
+    assert camp["subagent_count"] == 2
+    assert camp["local_cost"] == 5.00
+    assert camp["billed_cost"] == 9.50
+    assert camp["tokens"] == 35000  # (15k+5k) + (8k+2k) + (4k+1k)
+    assert camp["disk_tokens"] == 35000  # 20k + 10k + 5k
+    assert camp["total_steps"] == 20  # 10 + 6 + 4
+
+    # Second session: standalone
+    solo = top[1]
+    assert solo["id"] == "solo"
+    assert solo["title"] == "Solo Task"
+    assert solo["project"] == "artemis"
+    assert solo["subagent_count"] == 0
+    assert solo["local_cost"] == 2.00
+    assert solo["billed_cost"] == 2.00
+    assert solo["tokens"] == 8000
+    assert solo["disk_tokens"] == 8000
+    assert solo["total_steps"] == 5
+
+    # Filter to apollo
+    res_apollo = query_cost_by_project(conn, project="apollo")
+    assert len(res_apollo["top_sessions"]) == 1
+    assert res_apollo["top_sessions"][0]["id"] == "camp-root"
+    assert res_apollo["top_sessions"][0]["subagent_count"] == 2
+    assert res_apollo["top_sessions"][0]["billed_cost"] == 9.50
+
+    conn.close()
+
+
+def test_query_cost_by_project_campaign_fallback_max_created_at(tmp_path):
+    """
+    Verifies that when a root conversation's created_at is NULL or missing,
+    query_cost_by_project falls back to MAX(created_at) across the campaign.
+    """
+    db_file = tmp_path / "test_campaign_fallback_date.db"
+    init_db(db_file)
+    conn = get_db_connection(db_file)
+
+    conn.execute("""
+        INSERT INTO conversations (
+            id, root_id, parent_id, title, project, model_name, created_at,
+            total_steps, total_tokens, billed_cost, billed_input_tokens, billed_output_tokens
+        ) VALUES 
+        ('root-no-date', NULL, NULL, 'Root No Date', 'apollo', 'Gemini Pro', NULL,
+         5, 5000, 1.00, 4000, 1000),
+        ('sub-dated', 'root-no-date', 'root-no-date', 'Sub Dated', 'apollo', 'Gemini Flash', '2026-10-20T15:30:00Z',
+         3, 3000, 0.50, 2000, 1000)
+    """)
+    conn.commit()
+
+    res = query_cost_by_project(conn)
+    conn.close()
+
+    assert len(res["top_sessions"]) == 1
+    top = res["top_sessions"][0]
+    assert top["id"] == "root-no-date"
+    assert top["created_at"] != "--"
+    assert "2026-10-20" in top["created_at"]
+    assert top["subagent_count"] == 1
+    assert top["billed_cost"] == 1.50
+
+
+def test_query_cost_by_project_all_zero_cost_and_tokens(tmp_path):
+    """
+    Verifies query_cost_by_project handles swarms where all subagents and root have $0.0 cost
+    and 0 tokens without division by zero.
+    """
+    db_file = tmp_path / "test_campaign_zero.db"
+    init_db(db_file)
+    conn = get_db_connection(db_file)
+
+    conn.execute("""
+        INSERT INTO conversations (
+            id, root_id, parent_id, title, project, model_name, created_at,
+            total_steps, total_tokens, billed_cost, billed_input_tokens, billed_output_tokens
+        ) VALUES 
+        ('zero-root', NULL, NULL, 'Zero Root', 'beta', 'Gemini Pro', '2026-10-20T10:00:00Z',
+         0, 0, 0.0, 0, 0),
+        ('zero-sub', 'zero-root', 'zero-root', 'Zero Sub', 'beta', 'Gemini Flash', '2026-10-20T10:01:00Z',
+         0, 0, 0.0, 0, 0)
+    """)
+    conn.commit()
+
+    res = query_cost_by_project(conn)
+    conn.close()
+
+    assert len(res["top_sessions"]) == 1
+    top = res["top_sessions"][0]
+    assert top["id"] == "zero-root"
+    assert top["billed_cost"] == 0.0
+    assert top["local_cost"] == 0.0
+    assert top["tokens"] == 0
+    assert top["subagent_count"] == 1
+

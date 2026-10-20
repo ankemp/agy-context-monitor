@@ -361,7 +361,171 @@ class TestSubagentHierarchy(unittest.TestCase):
             self.assertEqual(worker_node["id"], "worker-1")
             self.assertFalse(worker_node["is_current"])
 
+            # 5. Fleet nodes: flat list sorted by cost DESC, tokens DESC
+            fleet_nodes = details["fleet_nodes"]
+            self.assertEqual(len(fleet_nodes), 3)
+            self.assertEqual(fleet_nodes[0]["id"], "worker-1")  # $3.50
+            self.assertEqual(fleet_nodes[1]["id"], "root-1")    # $2.00
+            self.assertEqual(fleet_nodes[2]["id"], "coord-1")   # $1.00
+
+            w_node = fleet_nodes[0]
+            self.assertEqual(w_node["cost"], 3.50)
+            self.assertEqual(w_node["tokens"], 1500)
+            self.assertEqual(w_node["active_tokens"], 1500)
+            self.assertEqual(w_node["cost_share_pct"], round(3.50 / 6.50 * 100, 1))
+            self.assertEqual(w_node["token_share_pct"], round(1500 / 3000 * 100, 1))
+            self.assertGreater(w_node["max_tokens"], 0)
+            self.assertGreater(w_node["context_pct"], 0.0)
+            self.assertIsNotNone(w_node["weekly_quota_pct"])
+
             conn.close()
+
+    def test_session_details_flat_and_double_encoded_invoke_subagent_blocks(self):
+        """Verify query_session_details properly parses flat Antigravity 2.0 args and double-encoded JSON for invoke_subagent."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_file = Path(tmp_dir) / "test_invoke_parsing.db"
+            init_db(db_file)
+            conn = get_db_connection(db_file)
+
+            conn.execute("""
+                INSERT INTO conversations (id, title, model_name, created_at, total_steps, total_tokens, billed_cost)
+                VALUES ('conv-flat', 'Parent Session', 'Gemini Pro', '2026-10-18T10:00:00Z', 2, 2000, 0.50)
+            """)
+            conn.execute("""
+                INSERT INTO steps (conversation_id, step_index, phase, created_at, est_tokens, billed_cost)
+                VALUES ('conv-flat', 1, 'exec', '2026-10-18T10:00:05Z', 500, 0.25)
+            """)
+            conn.execute("""
+                INSERT INTO steps (conversation_id, step_index, phase, created_at, est_tokens, billed_cost)
+                VALUES ('conv-flat', 2, 'exec', '2026-10-18T10:00:10Z', 500, 0.25)
+            """)
+
+            # Step 1: Flat args invoke_subagent
+            flat_args = json.dumps({"Role": "DeepCoder", "TypeName": "autonomous", "Model": "gemini-1.5-pro", "Prompt": "Fix bug"})
+            conn.execute("""
+                INSERT INTO transcript_blocks (conversation_id, step_index, block_type, call_id, content, block_hash)
+                VALUES ('conv-flat', 1, 'tool_use', 'call_flat_1', ?, 'h1')
+            """, (flat_args,))
+            conn.execute("""
+                INSERT INTO tool_executions (conversation_id, step_index, tool_name)
+                VALUES ('conv-flat', 1, 'invoke_subagent')
+            """)
+
+            # Step 1: Double-encoded JSON string invoke_subagent
+            double_encoded = json.dumps(json.dumps({"Role": "Planner", "TypeName": "lead", "Model": "gemini-1.5-flash"}))
+            conn.execute("""
+                INSERT INTO transcript_blocks (conversation_id, step_index, block_type, call_id, content, block_hash)
+                VALUES ('conv-flat', 1, 'tool_use', 'call_flat_2', ?, 'h2')
+            """, (double_encoded,))
+            conn.execute("""
+                INSERT INTO tool_executions (conversation_id, step_index, tool_name)
+                VALUES ('conv-flat', 1, 'invoke_subagent')
+            """)
+
+            # Step 2: Tool result pairing with call_flat_1
+            conn.execute("""
+                INSERT INTO transcript_blocks (conversation_id, step_index, block_type, call_id, content, block_hash)
+                VALUES ('conv-flat', 2, 'tool_result', 'call_flat_1', 'Subagent created conversationId: 11111111-2222-3333-4444-555555555555', 'h3')
+            """)
+
+            conn.commit()
+
+            details = query_session_details(conn, "conv-flat")
+            conn.close()
+
+            self.assertIsNotNone(details)
+            steps = details["steps"]
+            step1_blocks = steps[0]["blocks"]
+            self.assertEqual(len(step1_blocks), 2)
+
+            # Block 0: Flat args
+            b0 = step1_blocks[0]
+            self.assertTrue(b0.get("is_subagent"))
+            self.assertEqual(len(b0["subagents"]), 1)
+            self.assertEqual(b0["subagents"][0]["Role"], "DeepCoder")
+            self.assertEqual(b0["subagents"][0]["TypeName"], "autonomous")
+            self.assertEqual(b0["subagents"][0]["Model"], "gemini-1.5-pro")
+
+            # Block 1: Double-encoded
+            b1 = step1_blocks[1]
+            self.assertTrue(b1.get("is_subagent"))
+            self.assertEqual(len(b1["subagents"]), 1)
+            self.assertEqual(b1["subagents"][0]["Role"], "Planner")
+            self.assertEqual(b1["subagents"][0]["TypeName"], "lead")
+            self.assertEqual(b1["subagents"][0]["Model"], "gemini-1.5-flash")
+
+            # Step 2 Block 0: Result paired
+            step2_blocks = steps[1]["blocks"]
+            b_res = step2_blocks[0]
+            self.assertEqual(b_res.get("paired_tool_name"), "invoke_subagent")
+            self.assertTrue(b_res.get("is_subagent"))
+            self.assertEqual(b_res.get("subagent_conversation_id"), "11111111-2222-3333-4444-555555555555")
+            self.assertEqual(len(b_res["subagents"]), 1)
+            self.assertEqual(b_res["subagents"][0]["Role"], "DeepCoder")
+
+    def test_session_details_all_zero_cost_swarm(self):
+        """Verify query_session_details cleanly handles swarms where all subagents have 0 cost and 0 tokens."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_file = Path(tmp_dir) / "test_zero_swarm.db"
+            init_db(db_file)
+            conn = get_db_connection(db_file)
+
+            conn.execute("""
+                INSERT INTO conversations (id, root_id, parent_id, title, model_name, created_at, total_steps, total_tokens, billed_cost, billed_input_tokens, billed_output_tokens)
+                VALUES 
+                ('zero-root', NULL, NULL, 'Zero Root', 'Gemini Pro', '2026-10-18T10:00:00Z', 0, 0, 0.0, 0, 0),
+                ('zero-child', 'zero-root', 'zero-root', 'Zero Child', 'Gemini Flash', '2026-10-18T10:05:00Z', 0, 0, 0.0, 0, 0)
+            """)
+            conn.commit()
+
+            details = query_session_details(conn, "zero-root")
+            conn.close()
+
+            self.assertIsNotNone(details)
+            fleet_nodes = details["fleet_nodes"]
+            self.assertEqual(len(fleet_nodes), 2)
+            for node in fleet_nodes:
+                self.assertEqual(node["cost"], 0.0)
+                self.assertEqual(node["tokens"], 0)
+                self.assertEqual(node["cost_share_pct"], 0.0)
+                self.assertEqual(node["token_share_pct"], 0.0)
+
+    def test_session_details_with_empty_transcript_content(self):
+        """Verify query_session_details handles transcript blocks with empty string content gracefully."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_file = Path(tmp_dir) / "test_empty_blocks.db"
+            init_db(db_file)
+            conn = get_db_connection(db_file)
+
+            conn.execute("""
+                INSERT INTO conversations (id, title, model_name, created_at, total_steps, total_tokens, billed_cost)
+                VALUES ('conv-empty-blocks', 'Empty Blocks Session', 'Gemini Pro', '2026-10-18T10:00:00Z', 1, 100, 0.05)
+            """)
+            conn.execute("""
+                INSERT INTO steps (conversation_id, step_index, phase, created_at, est_tokens, billed_cost)
+                VALUES ('conv-empty-blocks', 1, 'exec', '2026-10-18T10:00:05Z', 100, 0.05)
+            """)
+            conn.execute("""
+                INSERT INTO transcript_blocks (conversation_id, step_index, block_type, call_id, content, block_hash)
+                VALUES 
+                ('conv-empty-blocks', 1, 'tool_use', 'call_empty_1', '', 'h1'),
+                ('conv-empty-blocks', 1, 'tool_result', 'call_empty_1', '', 'h2')
+            """)
+            conn.execute("""
+                INSERT INTO tool_executions (conversation_id, step_index, tool_name)
+                VALUES ('conv-empty-blocks', 1, 'invoke_subagent')
+            """)
+            conn.commit()
+
+            details = query_session_details(conn, "conv-empty-blocks")
+            conn.close()
+
+            self.assertIsNotNone(details)
+            steps = details["steps"]
+            self.assertEqual(len(steps), 1)
+            blocks = steps[0]["blocks"]
+            self.assertEqual(len(blocks), 2)
+            self.assertEqual(blocks[0]["subagents"], [])
 
     def test_kpi_summary_root_and_subagent_counts(self):
         """Test query_summary_data reports root_convs and subagent_convs counts."""

@@ -581,3 +581,191 @@ button.action-btn.secondary:hover:not(:disabled) {
   border-color: #d93025;
   color: #d93025;
 }
+
+/* Inspection Banner ------------------------------------------------------- */
+
+#inspect-banner,
+.inspect-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 10px;
+  background: color-mix(in srgb, #1a73e8 12%, var(--card, #ffffff));
+  border: 1px solid color-mix(in srgb, #1a73e8 35%, var(--border, #e0e0e0));
+  border-radius: var(--radius);
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--foreground, #1f1f1f);
+}
+
+#btn-reset-inspect,
+.reset-inspect-btn {
+  background: var(--primary, #1a73e8);
+  color: var(--primary-foreground, #ffffff);
+  border: none;
+  border-radius: 4px;
+  padding: 3px 8px;
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+#btn-reset-inspect:hover,
+.reset-inspect-btn:hover {
+  background: color-mix(in srgb, var(--primary, #1a73e8) 88%, var(--foreground, #000000));
+}
+
+/* Swarm Fleet Card -------------------------------------------------------- */
+
+#fleet-card {
+  /* Fleet card follows standard card layout with theme border */
+}
+
+.fleet-summary-strip {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+  padding: 6px 8px;
+  background: color-mix(in srgb, var(--secondary, #f1f3f4) 50%, var(--card, #ffffff));
+  border: 1px solid var(--border, #e0e0e0);
+  border-radius: 6px;
+}
+
+.fleet-kpi {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.kpi-label {
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--muted-foreground, #5f6368);
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+}
+
+.kpi-val {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--foreground, #1f1f1f);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+.fleet-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 280px;
+  overflow-y: auto;
+  padding-right: 2px;
+}
+
+.fleet-node-item {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px 8px;
+  background: var(--card, #ffffff);
+  border: 1px solid var(--border, #e0e0e0);
+  border-radius: 6px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.fleet-node-item:hover {
+  background: color-mix(in srgb, var(--secondary, #f1f3f4) 60%, var(--card, #ffffff));
+}
+
+.fleet-node-item.inspected {
+  border-color: var(--primary, #1a73e8);
+  background: color-mix(in srgb, #1a73e8 8%, var(--card, #ffffff));
+  box-shadow: 0 0 0 1px var(--primary, #1a73e8);
+}
+
+.fleet-node-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.fleet-node-meta {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex-wrap: wrap;
+}
+
+.fleet-role-pill {
+  font-weight: 600;
+  font-size: 11px;
+  color: var(--foreground, #1f1f1f);
+}
+
+.badge.root {
+  background: color-mix(in srgb, #a142f4 18%, transparent);
+  color: color-mix(in srgb, #a142f4 85%, var(--foreground, #1f1f1f));
+  border: 1px solid color-mix(in srgb, #a142f4 30%, transparent);
+  font-weight: 600;
+}
+
+.badge.active {
+  background: color-mix(in srgb, #1e8e3e 18%, transparent);
+  color: color-mix(in srgb, #1e8e3e 85%, var(--foreground, #1f1f1f));
+  border: 1px solid color-mix(in srgb, #1e8e3e 30%, transparent);
+  font-weight: 600;
+}
+
+.badge.model {
+  font-size: 10px;
+  padding: 1px 5px;
+}
+
+.fleet-node-cost {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--foreground, #1f1f1f);
+  white-space: nowrap;
+}
+
+.fleet-node-bar-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.fleet-mini-track {
+  flex: 1;
+  height: 6px;
+  background: var(--secondary, #e8eaed);
+  border-radius: 3px;
+  overflow: hidden;
+  position: relative;
+}
+
+.fleet-mini-bar {
+  height: 100%;
+  min-width: 2px;
+  border-radius: 3px;
+}
+
+.fleet-mini-bar.ok {
+  background: #1e8e3e;
+}
+
+.fleet-mini-bar.warning {
+  background: #e37400;
+}
+
+.fleet-mini-bar.error {
+  background: #d93025;
+}
+
+.fleet-node-tokens {
+  font-size: 10px;
+  white-space: nowrap;
+}

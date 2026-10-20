@@ -29,6 +29,17 @@ def test_frontend_files_exist_and_invariants():
     assert 'id="quota-5h-bar"' in html
     assert 'id="quota-tab-gemini"' in html
     assert 'id="quota-tab-3p"' in html
+    assert 'id="inspect-banner"' in html
+    assert 'id="inspect-banner-label"' in html
+    assert 'id="btn-reset-inspect"' in html
+    assert 'id="fleet-card"' in html
+    assert 'id="fleet-title"' in html
+    assert 'id="fleet-count-badge"' in html
+    assert 'id="fleet-summary-strip"' in html
+    assert 'id="fleet-total-cost"' in html
+    assert 'id="fleet-total-tokens"' in html
+    assert 'id="fleet-shielding"' in html
+    assert 'id="fleet-node-list"' in html
 
     # Styles CSS checks: Theme tokens & static visual invariant
     assert "var(--background" in css
@@ -49,6 +60,16 @@ def test_frontend_files_exist_and_invariants():
     assert 'class="cost-quota-group"' in html, (
         "HTML header must contain cost-quota-group"
     )
+    assert "#inspect-banner" in css
+    assert "#btn-reset-inspect" in css
+    assert "#fleet-card" in css
+    assert ".inspect-banner" in css
+    assert ".reset-inspect-btn" in css
+    assert ".fleet-summary-strip" in css
+    assert ".fleet-list" in css
+    assert ".fleet-node-item" in css
+    assert ".fleet-mini-track" in css
+    assert ".fleet-mini-bar" in css
 
     # App JS checks: Sidecar API, multi-segment, global mode, quota, and lifecycle guards
     assert "window.sidecar" in js
@@ -57,6 +78,12 @@ def test_frontend_files_exist_and_invariants():
     assert "renderMultiSegmentBar" in js
     assert "renderQuota" in js
     assert "updateQuotaHeaderBadge" in js
+    assert "updateCostHeaderBadge" in js
+    assert "renderFleetCard" in js
+    assert "renderGlobal" in js
+    assert "fetchSessionData" in js
+    assert "shortenModelName" in js
+    assert "inspectedCid" in js
     assert "quota-weekly-pct" in js
     assert "quota-tab-gemini" in js
     assert "visibilitychange" in js, (
@@ -112,6 +139,8 @@ def test_sidecar_frontend_render_quota_execution():
 
     const ids = [
       'status-badge', 'model-badge', 'cost-badge', 'quota-badge',
+      'inspect-banner', 'inspect-banner-label', 'btn-reset-inspect',
+      'fleet-card', 'fleet-title', 'fleet-count-badge', 'fleet-summary-strip', 'fleet-total-cost', 'fleet-total-tokens', 'fleet-shielding', 'fleet-node-list',
       'global-card', 'global-convs', 'global-tokens', 'global-cost', 'global-quota', 'global-compactions', 'global-pruned',
       'compaction-banner', 'compaction-count', 'compaction-pruned', 'compaction-window',
       'quota-card', 'quota-title', 'quota-session-impact', 'quota-tab-gemini', 'quota-tab-3p',
@@ -292,6 +321,8 @@ def test_sidecar_frontend_global_mode_execution():
 
     const ids = [
       'status-badge', 'model-badge', 'cost-badge', 'quota-badge',
+      'inspect-banner', 'inspect-banner-label', 'btn-reset-inspect',
+      'fleet-card', 'fleet-title', 'fleet-count-badge', 'fleet-summary-strip', 'fleet-total-cost', 'fleet-total-tokens', 'fleet-shielding', 'fleet-node-list',
       'global-card', 'global-convs', 'global-tokens', 'global-cost', 'global-quota', 'global-compactions', 'global-pruned',
       'compaction-banner', 'compaction-count', 'compaction-pruned', 'compaction-window',
       'quota-card', 'quota-title', 'quota-session-impact', 'quota-tab-gemini', 'quota-tab-3p',
@@ -321,6 +352,8 @@ def test_sidecar_frontend_global_mode_execution():
           ok: true,
           json: async () => ({
             total_conversations: 5,
+            root_conversations: 2,
+            subagent_conversations: 3,
             total_tokens: 250000,
             total_cost: 13.44,
             weekly_quota_pct: 2.0,
@@ -362,7 +395,8 @@ def test_sidecar_frontend_global_mode_execution():
         quotaBadge: elements['quota-badge'].textContent,
         quotaBadgeTitle: elements['quota-badge'].title,
         quotaBadgeClass: elements['quota-badge'].className,
-        globalQuota: elements['global-quota'].textContent
+        globalQuota: elements['global-quota'].textContent,
+        globalConvs: elements['global-convs'].textContent
       };
 
       // Click 3P Tab in global mode - badge should stay pinned to fleet total
@@ -392,6 +426,7 @@ def test_sidecar_frontend_global_mode_execution():
     assert data["quotaBadgeTitle"] == "Fleet Quota Impact"
     assert "ok" in data["quotaBadgeClass"]
     assert "2.00% wk" in data["globalQuota"]
+    assert data["globalConvs"] == "2 Campaigns · 3 Sub-Agents"
 
     # Verify quota-badge stays pinned to fleet total after clicking 3P tab in global mode
     after = data["afterClick3p"]
@@ -498,3 +533,899 @@ def test_sidecar_frontend_update_quota_header_badge_unit():
     assert data["nanSession"]["className"] == "badge ok"
 
     assert data["missingNoError"] is True
+
+
+def test_sidecar_frontend_swarm_fleet_execution():
+    """Executes app.js in Node with a simulated DOM to deeply verify swarm fleet rendering,
+    node switching, inspect banner, and reset behavior."""
+    import json
+    import subprocess
+
+    node_script = """
+    const fs = require('fs');
+    const code = fs.readFileSync('sidecars/panel/app.js', 'utf8');
+
+    const elements = {};
+    function makeEl(id) {
+      let _html = '';
+      return {
+        id,
+        textContent: '',
+        className: '',
+        style: {},
+        hidden: false,
+        attributes: {},
+        listeners: {},
+        children: [],
+        get innerHTML() { return _html; },
+        set innerHTML(val) {
+          _html = val;
+          if (val === '') this.children = [];
+        },
+        appendChild(c) { this.children.push(c); },
+        removeChild(c) { this.children = this.children.filter(x => x !== c); },
+        setAttribute(k, v) { this.attributes[k] = v; },
+        getAttribute(k) { return this.attributes[k]; },
+        classList: {
+          classes: new Set(),
+          add(c) { this.classes.add(c); },
+          remove(c) { this.classes.delete(c); },
+          toggle(c, force) {
+            if (force === undefined) {
+              if (this.classes.has(c)) this.classes.delete(c);
+              else this.classes.add(c);
+            } else if (force) {
+              this.classes.add(c);
+            } else {
+              this.classes.delete(c);
+            }
+          },
+          contains(c) { return this.classes.has(c); }
+        },
+        addEventListener(evt, fn) { this.listeners[evt] = fn; },
+        dispatchEvent(evt) { if (this.listeners[evt]) this.listeners[evt](); }
+      };
+    }
+
+    const ids = [
+      'status-badge', 'model-badge', 'cost-badge', 'quota-badge',
+      'inspect-banner', 'inspect-banner-label', 'btn-reset-inspect',
+      'fleet-card', 'fleet-title', 'fleet-count-badge', 'fleet-summary-strip', 'fleet-total-cost', 'fleet-total-tokens', 'fleet-shielding', 'fleet-node-list',
+      'global-card', 'global-convs', 'global-tokens', 'global-cost', 'global-quota', 'global-compactions', 'global-pruned',
+      'compaction-banner', 'compaction-count', 'compaction-pruned', 'compaction-window',
+      'quota-card', 'quota-title', 'quota-session-impact', 'quota-tab-gemini', 'quota-tab-3p',
+      'quota-weekly-pct', 'quota-weekly-reset', 'quota-weekly-bar', 'quota-weekly-sub',
+      'quota-5h-pct', 'quota-5h-reset', 'quota-5h-bar', 'quota-5h-sub',
+      'capacity-card', 'capacity-pct', 'capacity-sub', 'capacity-bar', 'category-list',
+      'top-steps-card', 'top-steps-list', 'steps-range',
+      'actions-card', 'btn-audit', 'btn-plan', 'btn-compact', 'toast'
+    ];
+
+    for (const id of ids) {
+      elements[id] = makeEl(id);
+    }
+
+    const mockDocument = {
+      getElementById: (id) => elements[id],
+      createElement: (tag) => makeEl(tag),
+      addEventListener: () => {},
+      readyState: 'complete',
+      hidden: false
+    };
+
+    let fetchCalls = [];
+    const mockWindow = {
+      sidecar: {
+        conversationId: 'conv-root-1',
+        fetch: async (url) => {
+          fetchCalls.push(url);
+          const isInspectingWorker = url.includes('inspect_cid=subagent-worker-1');
+          return {
+            ok: true,
+            json: async () => ({
+              cid: 'conv-root-1',
+              model_name: isInspectingWorker ? 'Claude 3.7 Sonnet' : 'Gemini 3.7 Flash',
+              billed_cost: isInspectingWorker ? 6.80 : 6.00,
+              pct: isInspectingWorker ? 45.0 : 15.0,
+              active_tokens: isInspectingWorker ? 90000 : 150000,
+              max_tokens: isInspectingWorker ? 200000 : 1000000,
+              weekly_quota_pct: isInspectingWorker ? 1.01 : 0.89,
+              categories: [],
+              top_steps: [],
+              quota: {
+                prefix: 'gemini',
+                weekly_remaining_pct: 85.0,
+                five_hour_remaining_pct: 90.0,
+                session_weekly_pct: isInspectingWorker ? 1.01 : 0.89,
+                buckets: {
+                  'gemini-weekly': { remaining_pct: 85.0, session_impact_pct: isInspectingWorker ? 1.01 : 0.89, calibrated_capacity: 672.0 }
+                }
+              },
+              fleet: {
+                is_swarm: true,
+                root_id: 'conv-root-1',
+                active_cid: 'conv-root-1',
+                inspected_cid: isInspectingWorker ? 'subagent-worker-1' : 'conv-root-1',
+                is_inspecting_other: isInspectingWorker,
+                inspected_role: isInspectingWorker ? 'Worker' : 'Root Coordinator',
+                agent_count: 2,
+                subagent_count: 1,
+                total_cost: 12.80,
+                total_tokens: 450000,
+                total_disk_tokens: 450000,
+                total_steps: 40,
+                weekly_quota_pct: 1.90,
+                five_hour_quota_pct: 5.41,
+                shielded_tokens: 300000,
+                shielding_ratio: 3.0,
+                nodes: [
+                  {
+                    id: 'subagent-worker-1',
+                    model_name: 'Claude 3.7 Sonnet',
+                    billed_cost: 6.80,
+                    total_tokens: 300000,
+                    active_tokens: 90000,
+                    max_tokens: 200000,
+                    context_pct: 45.0,
+                    weekly_quota_pct: 1.01,
+                    role: 'Worker',
+                    subagent_role: 'Worker',
+                    is_root: false,
+                    is_active: false,
+                    is_active_session: false
+                  },
+                  {
+                    id: 'conv-root-1',
+                    model_name: 'Gemini 3.7 Flash',
+                    billed_cost: 6.00,
+                    total_tokens: 150000,
+                    active_tokens: 150000,
+                    max_tokens: 1000000,
+                    context_pct: 15.0,
+                    weekly_quota_pct: 0.89,
+                    role: 'Root Coordinator',
+                    subagent_role: 'Root Coordinator',
+                    is_root: true,
+                    is_active: true,
+                    is_active_session: true
+                  }
+                ]
+              }
+            })
+          };
+        }
+      }
+    };
+
+    let intervals = [];
+    const customSetInterval = (fn, ms) => {
+      const id = setTimeout(fn, ms);
+      intervals.push(id);
+      return id;
+    };
+
+    const fn = new Function('window', 'document', 'fetch', 'setInterval', code);
+    fn(mockWindow, mockDocument, mockWindow.sidecar.fetch, customSetInterval);
+
+    setTimeout(() => {
+      intervals.forEach(clearTimeout);
+
+      const initial = {
+        fetchCalls: [...fetchCalls],
+        costBadge: elements['cost-badge'].textContent,
+        quotaBadge: elements['quota-badge'].textContent,
+        sessionImpact: elements['quota-session-impact'].textContent,
+        fleetCardHidden: elements['fleet-card'].hidden,
+        fleetCountBadge: elements['fleet-count-badge'].textContent,
+        fleetTotalCost: elements['fleet-total-cost'].textContent,
+        fleetTotalTokens: elements['fleet-total-tokens'].textContent,
+        fleetShielding: elements['fleet-shielding'].textContent,
+        inspectBannerHidden: elements['inspect-banner'].hidden,
+        nodeCount: elements['fleet-node-list'].children.length,
+        nodes: elements['fleet-node-list'].children.map(c => ({
+          className: c.className,
+          innerHTML: c.innerHTML,
+          nodeId: c.getAttribute('data-node-id')
+        }))
+      };
+
+      // Step 2: Click worker node (first in list)
+      const workerEl = elements['fleet-node-list'].children[0];
+      workerEl.dispatchEvent('click');
+
+      // Wait a tick for async refreshTelemetry
+      setTimeout(() => {
+        const afterClickWorker = {
+          fetchCalls: [...fetchCalls],
+          costBadge: elements['cost-badge'].textContent,
+          quotaBadge: elements['quota-badge'].textContent,
+          inspectBannerHidden: elements['inspect-banner'].hidden,
+          inspectBannerLabel: elements['inspect-banner-label'].textContent,
+          workerInspected: elements['fleet-node-list'].children[0].className.includes('inspected'),
+          rootInspected: elements['fleet-node-list'].children[1].className.includes('inspected')
+        };
+
+        // Step 3: Click Reset Inspect button
+        elements['btn-reset-inspect'].dispatchEvent('click');
+
+        setTimeout(() => {
+          const afterReset = {
+            fetchCalls: [...fetchCalls],
+            inspectBannerHidden: elements['inspect-banner'].hidden,
+            costBadge: elements['cost-badge'].textContent,
+            workerInspected: elements['fleet-node-list'].children[0].className.includes('inspected'),
+            rootInspected: elements['fleet-node-list'].children[1].className.includes('inspected')
+          };
+
+          console.log(JSON.stringify({ initial, afterClickWorker, afterReset }));
+          process.exit(0);
+        }, 50);
+      }, 50);
+    }, 50);
+    """
+
+    res = subprocess.run(
+        ["node", "-e", node_script], capture_output=True, text=True, cwd=Path.cwd()
+    )
+    assert res.returncode == 0, f"Node DOM swarm execution failed: {res.stderr}"
+    data = json.loads(res.stdout)
+
+    initial = data["initial"]
+    assert initial["costBadge"] == "$6.00 · $12.80 fleet"
+    assert initial["quotaBadge"] == "0.89% · 1.90% fleet wk"
+    assert initial["sessionImpact"] == "0.89% session · 1.90% fleet"
+    assert initial["fleetCardHidden"] is False
+    assert initial["fleetCountBadge"] == "2 Agents"
+    assert initial["fleetTotalCost"] == "$12.80"
+    assert initial["fleetTotalTokens"] == "450.0k"
+    assert initial["fleetShielding"] == "3.0x"
+    assert initial["inspectBannerHidden"] is True
+    assert initial["nodeCount"] == 2
+
+    # Node 0 is Worker, Node 1 is Root
+    worker_node = initial["nodes"][0]
+    root_node = initial["nodes"][1]
+    assert "Worker" in worker_node["innerHTML"]
+    assert "3.7 Sonnet" in worker_node["innerHTML"]
+    assert "$6.80 · 1.01% wk" in worker_node["innerHTML"]
+    assert "fleet-mini-bar" in worker_node["innerHTML"]
+    assert "45.0%" in worker_node["innerHTML"]
+
+    assert "Root" in root_node["innerHTML"]
+    assert "Root Coordinator" in root_node["innerHTML"]
+    assert "inspected" in root_node["className"]
+
+    # After clicking worker node
+    after_click = data["afterClickWorker"]
+    assert any("inspect_cid=subagent-worker-1" in call for call in after_click["fetchCalls"])
+    assert after_click["inspectBannerHidden"] is False
+    assert after_click["inspectBannerLabel"] == "Viewing: Worker"
+    assert after_click["workerInspected"] is True
+    assert after_click["rootInspected"] is False
+
+    # After clicking Back to Active Session button
+    after_reset = data["afterReset"]
+    assert after_reset["inspectBannerHidden"] is True
+    assert after_reset["workerInspected"] is False
+    assert after_reset["rootInspected"] is True
+
+
+def test_sidecar_frontend_dual_badges_unit():
+    """Unit tests updateCostHeaderBadge and updateQuotaHeaderBadge with swarm fleet data and thresholds."""
+    import json
+    import subprocess
+
+    node_script = """
+    const fs = require('fs');
+    const code = fs.readFileSync('sidecars/panel/app.js', 'utf8');
+
+    let costBadgeEl = { textContent: '', className: '', title: '' };
+    let quotaBadgeEl = { textContent: '', className: '', title: '' };
+    const elements = { 'cost-badge': costBadgeEl, 'quota-badge': quotaBadgeEl };
+    const $ = (id) => elements[id];
+
+    let isGlobalMode = false;
+    eval(code.slice(code.indexOf('function formatTokens'), code.indexOf('let toastTimer;')));
+
+    const runs = {};
+
+    // Cost badge: Non-swarm
+    updateCostHeaderBadge(4.25, { is_swarm: false, total_cost: 12.80 }, false);
+    runs.costNonSwarm = { ...costBadgeEl };
+
+    // Cost badge: Swarm
+    updateCostHeaderBadge(4.25, { is_swarm: true, total_cost: 12.80 }, false);
+    runs.costSwarm = { ...costBadgeEl };
+
+    // Cost badge: Swarm zero
+    updateCostHeaderBadge(0, { is_swarm: true, total_cost: 0 }, false);
+    runs.costSwarmZero = { ...costBadgeEl };
+
+    // Cost badge: Global mode
+    updateCostHeaderBadge(12.80, null, true);
+    runs.costGlobal = { ...costBadgeEl };
+
+    // Quota badge: Swarm ok (both < 5%)
+    updateQuotaHeaderBadge(0.63, false, { is_swarm: true, weekly_quota_pct: 1.90 });
+    runs.quotaSwarmOk = { ...quotaBadgeEl };
+
+    // Quota badge: Swarm warning by fleet (>= 5%)
+    updateQuotaHeaderBadge(2.00, false, { is_swarm: true, weekly_quota_pct: 6.50 });
+    runs.quotaSwarmWarnFleet = { ...quotaBadgeEl };
+
+    // Quota badge: Swarm warning by session (>= 5%)
+    updateQuotaHeaderBadge(7.50, false, { is_swarm: true, weekly_quota_pct: 2.00 });
+    runs.quotaSwarmWarnSession = { ...quotaBadgeEl };
+
+    // Quota badge: Swarm error by fleet (>= 10%)
+    updateQuotaHeaderBadge(2.00, false, { is_swarm: true, weekly_quota_pct: 11.20 });
+    runs.quotaSwarmErrorFleet = { ...quotaBadgeEl };
+
+    // Quota badge: Swarm error by session (>= 10%)
+    updateQuotaHeaderBadge(12.50, false, { is_swarm: true, weekly_quota_pct: 3.00 });
+    runs.quotaSwarmErrorSession = { ...quotaBadgeEl };
+
+    console.log(JSON.stringify(runs));
+    """
+
+    res = subprocess.run(
+        ["node", "-e", node_script], capture_output=True, text=True, cwd=Path.cwd()
+    )
+    assert res.returncode == 0, f"Node script failed: {res.stderr}"
+    data = json.loads(res.stdout)
+
+    assert data["costNonSwarm"]["textContent"] == "$4.25"
+    assert data["costSwarm"]["textContent"] == "$4.25 · $12.80 fleet"
+    assert data["costSwarm"]["title"] == "Session Cost · Fleet Cost"
+    assert data["costSwarmZero"]["textContent"] == "$0.00 · $0.00 fleet"
+    assert data["costGlobal"]["textContent"] == "$12.80"
+
+    assert data["quotaSwarmOk"]["textContent"] == "0.63% · 1.90% fleet wk"
+    assert data["quotaSwarmOk"]["className"] == "badge ok"
+
+    assert data["quotaSwarmWarnFleet"]["textContent"] == "2.00% · 6.50% fleet wk"
+    assert data["quotaSwarmWarnFleet"]["className"] == "badge warning"
+
+    assert data["quotaSwarmWarnSession"]["textContent"] == "7.50% · 2.00% fleet wk"
+    assert data["quotaSwarmWarnSession"]["className"] == "badge warning"
+
+    assert data["quotaSwarmErrorFleet"]["textContent"] == "2.00% · 11.20% fleet wk"
+    assert data["quotaSwarmErrorFleet"]["className"] == "badge error"
+
+    assert data["quotaSwarmErrorSession"]["textContent"] == "12.50% · 3.00% fleet wk"
+    assert data["quotaSwarmErrorSession"]["className"] == "badge error"
+
+
+def test_sidecar_frontend_shorten_model_name_unit():
+    """Unit tests shortenModelName with Gemini, Claude, hyphenated prefixes, medium, and truncation."""
+    import json
+    import subprocess
+
+    node_script = """
+    const fs = require('fs');
+    const code = fs.readFileSync('sidecars/panel/app.js', 'utf8');
+
+    eval(code.slice(code.indexOf('function shortenModelName'), code.indexOf('function updateCostHeaderBadge')));
+
+    const runs = {
+      defaultVal: shortenModelName(null),
+      emptyVal: shortenModelName(''),
+      geminiSpace: shortenModelName('Gemini 3.7 Flash'),
+      geminiHyphen: shortenModelName('gemini-2.5-flash'),
+      claudeSpace: shortenModelName('Claude 3.7 Sonnet'),
+      claudeHyphen: shortenModelName('claude-3-5-sonnet'),
+      mediumFlag: shortenModelName('Gemini 3.8 Flash (Medium)'),
+      customShort: shortenModelName('custom-gpt-4o'),
+      customLong: shortenModelName('deepseek-r1-distill-llama-70b')
+    };
+
+    console.log(JSON.stringify(runs));
+    """
+
+    res = subprocess.run(
+        ["node", "-e", node_script], capture_output=True, text=True, cwd=Path.cwd()
+    )
+    assert res.returncode == 0, f"Node script failed: {res.stderr}"
+    data = json.loads(res.stdout)
+
+    assert data["defaultVal"] == "Gemini"
+    assert data["emptyVal"] == "Gemini"
+    assert data["geminiSpace"] == "3.7 Flash"
+    assert data["geminiHyphen"] == "2.5-flash"
+    assert data["claudeSpace"] == "3.7 Sonnet"
+    assert data["claudeHyphen"] == "3-5-sonnet"
+    assert data["mediumFlag"] == "3.8 Flash (Med)"
+    assert data["customShort"] == "custom-gpt-4o"
+    assert len(data["customLong"]) <= 20
+    assert data["customLong"].endswith("…")
+
+
+def test_sidecar_frontend_node_click_and_reset_inspect():
+    """Verifies clicking root node resets inspect, switching conversations clears inspect,
+    and non-swarm sessions hide fleet card and reset inspect."""
+    import json
+    import subprocess
+
+    node_script = """
+    const fs = require('fs');
+    const code = fs.readFileSync('sidecars/panel/app.js', 'utf8');
+
+    const elements = {};
+    function makeEl(id) {
+      let _html = '';
+      return {
+        id,
+        textContent: '',
+        className: '',
+        style: {},
+        hidden: false,
+        attributes: {},
+        listeners: {},
+        children: [],
+        get innerHTML() { return _html; },
+        set innerHTML(val) {
+          _html = val;
+          if (val === '') this.children = [];
+        },
+        appendChild(c) { this.children.push(c); },
+        removeChild(c) { this.children = this.children.filter(x => x !== c); },
+        setAttribute(k, v) { this.attributes[k] = v; },
+        getAttribute(k) { return this.attributes[k]; },
+        classList: {
+          classes: new Set(),
+          add(c) { this.classes.add(c); },
+          remove(c) { this.classes.delete(c); },
+          toggle(c, force) {
+            if (force === undefined) {
+              if (this.classes.has(c)) this.classes.delete(c);
+              else this.classes.add(c);
+            } else if (force) {
+              this.classes.add(c);
+            } else {
+              this.classes.delete(c);
+            }
+          },
+          contains(c) { return this.classes.has(c); }
+        },
+        addEventListener(evt, fn) { this.listeners[evt] = fn; },
+        dispatchEvent(evt, data) { if (this.listeners[evt]) this.listeners[evt](data); }
+      };
+    }
+
+    const ids = [
+      'status-badge', 'model-badge', 'cost-badge', 'quota-badge',
+      'inspect-banner', 'inspect-banner-label', 'btn-reset-inspect',
+      'fleet-card', 'fleet-title', 'fleet-count-badge', 'fleet-summary-strip', 'fleet-total-cost', 'fleet-total-tokens', 'fleet-shielding', 'fleet-node-list',
+      'global-card', 'global-convs', 'global-tokens', 'global-cost', 'global-quota', 'global-compactions', 'global-pruned',
+      'compaction-banner', 'compaction-count', 'compaction-pruned', 'compaction-window',
+      'quota-card', 'quota-title', 'quota-session-impact', 'quota-tab-gemini', 'quota-tab-3p',
+      'quota-weekly-pct', 'quota-weekly-reset', 'quota-weekly-bar', 'quota-weekly-sub',
+      'quota-5h-pct', 'quota-5h-reset', 'quota-5h-bar', 'quota-5h-sub',
+      'capacity-card', 'capacity-pct', 'capacity-sub', 'capacity-bar', 'category-list',
+      'top-steps-card', 'top-steps-list', 'steps-range',
+      'actions-card', 'btn-audit', 'btn-plan', 'btn-compact', 'toast'
+    ];
+
+    for (const id of ids) {
+      elements[id] = makeEl(id);
+    }
+
+    const mockDocument = {
+      getElementById: (id) => elements[id],
+      createElement: (tag) => makeEl(tag),
+      addEventListener: () => {},
+      readyState: 'complete',
+      hidden: false
+    };
+
+    let fetchCalls = [];
+    const mockWindow = {
+      sidecar: {
+        conversationId: 'conv-root-1',
+        fetch: async (url) => {
+          fetchCalls.push(url);
+          const isInspectingWorker = url.includes('inspect_cid=subagent-worker-1');
+          return {
+            ok: true,
+            json: async () => ({
+              cid: 'conv-root-1',
+              model_name: 'Gemini 3.7 Flash',
+              billed_cost: 6.00,
+              pct: 20.0,
+              active_tokens: 200000,
+              max_tokens: 1000000,
+              weekly_quota_pct: 0.89,
+              fleet: {
+                is_swarm: true,
+                root_id: 'conv-root-1',
+                active_cid: 'conv-root-1',
+                inspected_cid: isInspectingWorker ? 'subagent-worker-1' : 'conv-root-1',
+                is_inspecting_other: isInspectingWorker,
+                inspected_role: isInspectingWorker ? 'Worker' : 'Root Coordinator',
+                agent_count: 2,
+                total_cost: 12.00,
+                total_tokens: 400000,
+                weekly_quota_pct: 1.78,
+                shielding_ratio: 2.0,
+                nodes: [
+                  {
+                    id: 'subagent-worker-1',
+                    model_name: 'Claude 3.7 Sonnet',
+                    billed_cost: 6.00,
+                    active_tokens: 100000,
+                    max_tokens: 200000,
+                    context_pct: 50.0,
+                    weekly_quota_pct: 0.89,
+                    role: 'Worker',
+                    is_root: false,
+                    is_active: false
+                  },
+                  {
+                    id: 'conv-root-1',
+                    model_name: 'Gemini 3.7 Flash',
+                    billed_cost: 6.00,
+                    active_tokens: 200000,
+                    max_tokens: 1000000,
+                    context_pct: 20.0,
+                    weekly_quota_pct: 0.89,
+                    role: 'Root Coordinator',
+                    is_root: true,
+                    is_active: true
+                  }
+                ]
+              }
+            })
+          };
+        }
+      }
+    };
+
+    let intervals = [];
+    const customSetInterval = (fn, ms) => {
+      const id = setTimeout(fn, ms);
+      intervals.push(id);
+      return id;
+    };
+
+    const fn = new Function('window', 'document', 'fetch', 'setInterval', code);
+    fn(mockWindow, mockDocument, mockWindow.sidecar.fetch, customSetInterval);
+
+    setTimeout(() => {
+      intervals.forEach(clearTimeout);
+
+      // Step 1: Click worker node
+      const workerEl = elements['fleet-node-list'].children[0];
+      workerEl.dispatchEvent('click');
+
+      setTimeout(() => {
+        const afterWorker = {
+          bannerHidden: elements['inspect-banner'].hidden,
+          bannerLabel: elements['inspect-banner-label'].textContent
+        };
+
+        // Step 2: Click Root node directly in the fleet node list (node 1)
+        const rootEl = elements['fleet-node-list'].children[1];
+        rootEl.dispatchEvent('click');
+
+        setTimeout(() => {
+          const afterRootClick = {
+            bannerHidden: elements['inspect-banner'].hidden,
+            rootInspected: elements['fleet-node-list'].children[1].className.includes('inspected')
+          };
+
+          // Step 3: Switch conversation ID
+          mockWindow.sidecar.conversationId = 'conv-root-2';
+          mockWindow.sidecar.fetch = async (url) => ({
+            ok: true,
+            json: async () => ({
+              cid: 'conv-root-2',
+              model_name: 'Gemini 3.7 Flash',
+              billed_cost: 2.00,
+              pct: 5.0,
+              active_tokens: 50000,
+              max_tokens: 1000000,
+              fleet: { is_swarm: false, nodes: [] }
+            })
+          });
+
+          // Trigger poll via visibilitychange
+          mockDocument.hidden = false;
+          // Run refreshTelemetry indirectly or via interval
+          elements['btn-reset-inspect'].dispatchEvent('click');
+
+          setTimeout(() => {
+            const afterSwitch = {
+              fleetCardHidden: elements['fleet-card'].hidden,
+              inspectBannerHidden: elements['inspect-banner'].hidden
+            };
+
+            console.log(JSON.stringify({ afterWorker, afterRootClick, afterSwitch }));
+            process.exit(0);
+          }, 50);
+        }, 50);
+      }, 50);
+    }, 50);
+    """
+
+    res = subprocess.run(
+        ["node", "-e", node_script], capture_output=True, text=True, cwd=Path.cwd()
+    )
+    assert res.returncode == 0, f"Node script failed: {res.stderr}"
+    data = json.loads(res.stdout)
+
+    assert data["afterWorker"]["bannerHidden"] is False
+    assert data["afterWorker"]["bannerLabel"] == "Viewing: Worker"
+
+    # Clicking root node directly resets inspect
+    assert data["afterRootClick"]["bannerHidden"] is True
+    assert data["afterRootClick"]["rootInspected"] is True
+
+    # After switching to non-swarm conversation
+    assert data["afterSwitch"]["fleetCardHidden"] is True
+    assert data["afterSwitch"]["inspectBannerHidden"] is True
+
+
+def test_sidecar_frontend_inspect_error_fallback():
+    """Verifies that if fetching an inspected subagent fails, refreshTelemetry recovers by
+    resetting inspectedCid and fetching the active session, keeping status Live."""
+    import json
+    import subprocess
+
+    node_script = """
+    const fs = require('fs');
+    const code = fs.readFileSync('sidecars/panel/app.js', 'utf8');
+
+    const elements = {};
+    function makeEl(id) {
+      let _html = '';
+      return {
+        id,
+        textContent: '',
+        className: '',
+        style: {},
+        hidden: false,
+        attributes: {},
+        listeners: {},
+        children: [],
+        get innerHTML() { return _html; },
+        set innerHTML(val) {
+          _html = val;
+          if (val === '') this.children = [];
+        },
+        appendChild(c) { this.children.push(c); },
+        setAttribute(k, v) { this.attributes[k] = v; },
+        getAttribute(k) { return this.attributes[k]; },
+        classList: {
+          classes: new Set(),
+          add(c) { this.classes.add(c); },
+          remove(c) { this.classes.delete(c); }
+        },
+        addEventListener(evt, fn) { this.listeners[evt] = fn; },
+        dispatchEvent(evt) { if (this.listeners[evt]) this.listeners[evt](); }
+      };
+    }
+
+    const ids = [
+      'status-badge', 'model-badge', 'cost-badge', 'quota-badge',
+      'inspect-banner', 'inspect-banner-label', 'btn-reset-inspect',
+      'fleet-card', 'fleet-title', 'fleet-count-badge', 'fleet-summary-strip', 'fleet-total-cost', 'fleet-total-tokens', 'fleet-shielding', 'fleet-node-list',
+      'global-card', 'global-convs', 'global-tokens', 'global-cost', 'global-quota', 'global-compactions', 'global-pruned',
+      'compaction-banner', 'compaction-count', 'compaction-pruned', 'compaction-window',
+      'quota-card', 'quota-title', 'quota-session-impact', 'quota-tab-gemini', 'quota-tab-3p',
+      'quota-weekly-pct', 'quota-weekly-reset', 'quota-weekly-bar', 'quota-weekly-sub',
+      'quota-5h-pct', 'quota-5h-reset', 'quota-5h-bar', 'quota-5h-sub',
+      'capacity-card', 'capacity-pct', 'capacity-sub', 'capacity-bar', 'category-list',
+      'top-steps-card', 'top-steps-list', 'steps-range',
+      'actions-card', 'btn-audit', 'btn-plan', 'btn-compact', 'toast'
+    ];
+    for (const id of ids) elements[id] = makeEl(id);
+
+    const mockDocument = {
+      getElementById: (id) => elements[id],
+      createElement: (tag) => makeEl(tag),
+      addEventListener: () => {},
+      readyState: 'complete',
+      hidden: false
+    };
+
+    let fetchAttempt = 0;
+    let fallbackHappened = false;
+    const mockWindow = {
+      sidecar: {
+        conversationId: 'conv-root-1',
+        fetch: async (url) => {
+          fetchAttempt++;
+          if (url.includes('inspect_cid=')) {
+            // Simulate 404 for deleted subagent
+            return { ok: false, status: 404 };
+          }
+          fallbackHappened = true;
+          return {
+            ok: true,
+            json: async () => ({
+              cid: 'conv-root-1',
+              model_name: 'Gemini 3.7 Flash',
+              billed_cost: 3.50,
+              pct: 10.0,
+              active_tokens: 100000,
+              max_tokens: 1000000,
+              fleet: { is_swarm: true, agent_count: 2, total_cost: 7.00, nodes: [
+                { id: 'subagent-dead', billed_cost: 3.50, is_root: false, role: 'Worker' },
+                { id: 'conv-root-1', billed_cost: 3.50, is_root: true, role: 'Root Coordinator' }
+              ] }
+            })
+          };
+        }
+      }
+    };
+
+    const fn = new Function('window', 'document', 'fetch', 'setInterval', code);
+    fn(mockWindow, mockDocument, mockWindow.sidecar.fetch, () => 1);
+
+    setTimeout(() => {
+      // Click dead subagent node
+      const workerEl = elements['fleet-node-list'].children[0];
+      workerEl.dispatchEvent('click');
+
+      setTimeout(() => {
+        const results = {
+          fallbackHappened,
+          statusText: elements['status-badge'].textContent,
+          statusClass: elements['status-badge'].className,
+          bannerHidden: elements['inspect-banner'].hidden
+        };
+        console.log(JSON.stringify(results));
+        process.exit(0);
+      }, 50);
+    }, 50);
+    """
+
+    res = subprocess.run(
+        ["node", "-e", node_script], capture_output=True, text=True, cwd=Path.cwd()
+    )
+    assert res.returncode == 0, f"Node script failed: {res.stderr}"
+    data = json.loads(res.stdout)
+
+    assert data["fallbackHappened"] is True
+    assert data["statusText"] == "Live"
+    assert "ok" in data["statusClass"]
+    assert data["bannerHidden"] is True
+
+
+def test_sidecar_frontend_zero_tokens_and_accessibility():
+    """Verifies that nodes with 0 active tokens correctly display ~0 in token labels,
+    and nodes have role='button' and tabindex='0' for accessibility."""
+    import json
+    import subprocess
+
+    node_script = """
+    const fs = require('fs');
+    const code = fs.readFileSync('sidecars/panel/app.js', 'utf8');
+
+    const elements = {};
+    function makeEl(id) {
+      let _html = '';
+      return {
+        id,
+        textContent: '',
+        className: '',
+        style: {},
+        hidden: false,
+        attributes: {},
+        listeners: {},
+        children: [],
+        get innerHTML() { return _html; },
+        set innerHTML(val) {
+          _html = val;
+          if (val === '') this.children = [];
+        },
+        appendChild(c) { this.children.push(c); },
+        setAttribute(k, v) { this.attributes[k] = v; },
+        getAttribute(k) { return this.attributes[k]; },
+        classList: {
+          classes: new Set(),
+          add(c) { this.classes.add(c); },
+          remove(c) { this.classes.delete(c); }
+        },
+        addEventListener(evt, fn) { this.listeners[evt] = fn; },
+        dispatchEvent(evt) { if (this.listeners[evt]) this.listeners[evt](); }
+      };
+    }
+
+    const ids = [
+      'status-badge', 'model-badge', 'cost-badge', 'quota-badge',
+      'inspect-banner', 'inspect-banner-label', 'btn-reset-inspect',
+      'fleet-card', 'fleet-title', 'fleet-count-badge', 'fleet-summary-strip', 'fleet-total-cost', 'fleet-total-tokens', 'fleet-shielding', 'fleet-node-list',
+      'global-card', 'global-convs', 'global-tokens', 'global-cost', 'global-quota', 'global-compactions', 'global-pruned',
+      'compaction-banner', 'compaction-count', 'compaction-pruned', 'compaction-window',
+      'quota-card', 'quota-title', 'quota-session-impact', 'quota-tab-gemini', 'quota-tab-3p',
+      'quota-weekly-pct', 'quota-weekly-reset', 'quota-weekly-bar', 'quota-weekly-sub',
+      'quota-5h-pct', 'quota-5h-reset', 'quota-5h-bar', 'quota-5h-sub',
+      'capacity-card', 'capacity-pct', 'capacity-sub', 'capacity-bar', 'category-list',
+      'top-steps-card', 'top-steps-list', 'steps-range',
+      'actions-card', 'btn-audit', 'btn-plan', 'btn-compact', 'toast'
+    ];
+    for (const id of ids) elements[id] = makeEl(id);
+
+    const mockDocument = {
+      getElementById: (id) => elements[id],
+      createElement: (tag) => makeEl(tag),
+      addEventListener: () => {},
+      readyState: 'complete',
+      hidden: false
+    };
+
+    const mockWindow = {
+      sidecar: {
+        conversationId: 'conv-root-1',
+        fetch: async () => ({
+          ok: true,
+          json: async () => ({
+            cid: 'conv-root-1',
+            model_name: 'Gemini 3.7 Flash',
+            billed_cost: 1.00,
+            pct: 0.0,
+            active_tokens: 0,
+            max_tokens: 1000000,
+            fleet: {
+              is_swarm: true,
+              agent_count: 2,
+              total_cost: 2.00,
+              nodes: [
+                {
+                  id: 'subagent-compacted',
+                  model_name: 'Gemini 3.7 Flash',
+                  billed_cost: 1.00,
+                  active_tokens: 0,
+                  total_tokens: 80000,
+                  max_tokens: 1000000,
+                  context_pct: 0.0,
+                  weekly_quota_pct: 0.15,
+                  role: 'Worker',
+                  is_root: false
+                },
+                {
+                  id: 'conv-root-1',
+                  model_name: 'Gemini 3.7 Flash',
+                  billed_cost: 1.00,
+                  active_tokens: 10000,
+                  total_tokens: 10000,
+                  max_tokens: 1000000,
+                  context_pct: 1.0,
+                  weekly_quota_pct: 0.15,
+                  role: 'Root Coordinator',
+                  is_root: true
+                }
+              ]
+            }
+          })
+        })
+      }
+    };
+
+    const fn = new Function('window', 'document', 'fetch', 'setInterval', code);
+    fn(mockWindow, mockDocument, mockWindow.sidecar.fetch, () => 1);
+
+    setTimeout(() => {
+      const node0 = elements['fleet-node-list'].children[0];
+      const results = {
+        roleAttr: node0.getAttribute('role'),
+        tabindexAttr: node0.getAttribute('tabindex'),
+        innerHTML: node0.innerHTML
+      };
+      console.log(JSON.stringify(results));
+      process.exit(0);
+    }, 50);
+    """
+
+    res = subprocess.run(
+        ["node", "-e", node_script], capture_output=True, text=True, cwd=Path.cwd()
+    )
+    assert res.returncode == 0, f"Node script failed: {res.stderr}"
+    data = json.loads(res.stdout)
+
+    assert data["roleAttr"] == "button"
+    assert data["tabindexAttr"] == "0"
+    assert "~0 / 1.00M (0.0%)" in data["innerHTML"]
+
+

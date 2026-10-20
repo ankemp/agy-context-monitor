@@ -3171,3 +3171,191 @@ def test_frontend_lazy_heatmap_and_abort_execution():
     assert data["calls"]["hourly"] == 2
     assert data["signalsCaptured"] > 0
     assert data.get("debounceVerified") is True
+
+
+def test_frontend_swarm_view_and_campaign_cost_elements():
+    """Verifies Task 4 frontend elements in index.html and script.js:
+    - HTML: #btnSwarmList and #btnSwarmTree buttons with onclick handlers
+    - Script: window.setSwarmLayoutMode toggle functionality
+    - Script: Scaled indentation in filterConversations for nested subagents
+    - Script: Project cost top cost drivers table with +subagent badge and dual tooltips
+    - Script: Inspect session modal with dual Local / Fleet tokens & steps
+    - Script: Swarm modal with list view (mini context bars, quota %, compactions, inspect button) and tree view
+    """
+    dashboard_dir = (
+        Path(__file__).resolve().parent.parent / "src" / "context_monitor" / "dashboard"
+    )
+    html_file = dashboard_dir / "templates" / "index.html"
+    js_file = dashboard_dir / "static" / "script.js"
+
+    html_content = html_file.read_text(encoding="utf-8")
+    js_content = js_file.read_text(encoding="utf-8")
+
+    # 1. HTML assertions
+    assert 'id="btnSwarmList"' in html_content
+    assert 'id="btnSwarmTree"' in html_content
+    assert "window.setSwarmLayoutMode('list')" in html_content
+    assert "window.setSwarmLayoutMode('tree')" in html_content
+    assert 'id="sessionViewSwarm"' in html_content
+    assert 'id="modalSwarmSummary"' in html_content
+    assert 'id="modalSwarmTree"' in html_content
+
+    # 2. Static script.js assertions
+    assert "let currentSwarmLayoutMode = 'list';" in js_content
+    assert "window.setSwarmLayoutMode = setSwarmLayoutMode;" in js_content
+    assert "function setSwarmLayoutMode(mode)" in js_content
+    assert "const padClass = depth === 1 ? 'pl-8' : depth === 2 ? 'pl-12' : 'pl-16';" in js_content
+    assert "+${s.subagent_count}" in js_content
+    assert "Local: $" in js_content
+    assert "Fleet: $" in js_content
+    assert "${formatTokens(tokVal)} / ${formatTokens(data.fleet_summary.total_tokens)} fleet" in js_content
+    assert "${stepVal.toLocaleString()} / ${data.fleet_summary.total_steps.toLocaleString()} fleet" in js_content
+    assert "fleet_nodes" in js_content
+    assert "context_pct" in js_content
+    assert "weekly_quota_pct" in js_content
+    assert "Inspect ➔" in js_content
+
+    # 3. Dynamic Node.js DOM verification
+    node_script = """
+    const fs = require('fs');
+    const code = fs.readFileSync('src/context_monitor/dashboard/static/script.js', 'utf8');
+
+    // Minimal DOM stub
+    function createMockElement() {
+      let _html = '';
+      return {
+        className: '',
+        textContent: '',
+        get innerHTML() { return _html; },
+        set innerHTML(val) {
+          _html = val;
+          if (val === '') this.children = [];
+        },
+        style: {},
+        children: [],
+        appendChild(child) { this.children.push(child); },
+        classList: {
+          add(cls) { if (!this.className.includes(cls)) this.className += ' ' + cls; },
+          remove(cls) { this.className = this.className.replace(cls, '').trim(); }
+        }
+      };
+    }
+
+    const mockElements = {
+      btnSwarmList: createMockElement(),
+      btnSwarmTree: createMockElement(),
+      modalSwarmSummary: createMockElement(),
+      modalSwarmBadge: createMockElement(),
+      modalSwarmTree: createMockElement(),
+      kpiDateRange: createMockElement(),
+      topCostDriversBody: createMockElement(),
+      topCostDriversSub: createMockElement(),
+      topCostScopeBadge: createMockElement(),
+      topCostCountBadge: createMockElement(),
+      modalTokens: createMockElement(),
+      modalTokensSub: createMockElement(),
+      modalSteps: createMockElement(),
+      modalStepsSub: createMockElement()
+    };
+
+    const mockDocument = {
+      getElementById: (id) => mockElements[id] || createMockElement(),
+      createElement: (tag) => createMockElement(),
+      querySelectorAll: () => [],
+      addEventListener: () => {}
+    };
+
+    const mockWindow = {
+      location: { search: '' },
+      addEventListener: () => {},
+      history: { pushState: () => {} }
+    };
+
+    const fn = new Function('window', 'document', 'Chart', 'lucide', `
+      ${code}
+      return {
+        setSwarmLayoutMode,
+        renderSwarmView,
+        renderKPIs,
+        renderProjectCostSection,
+        getSwarmLayoutMode: () => currentSwarmLayoutMode,
+        setSessionData: (d) => { currentSessionData = d; }
+      };
+    `);
+
+    const api = fn(
+      mockWindow,
+      mockDocument,
+      { defaults: { font: {}, elements: {}, plugins: {} }, register: () => {} },
+      { createIcons: () => {} }
+    );
+
+    // Test 1: Layout mode switching
+    if (api.getSwarmLayoutMode() !== 'list') throw new Error('Default mode should be list');
+    api.setSwarmLayoutMode('tree');
+    if (api.getSwarmLayoutMode() !== 'tree') throw new Error('Mode should be tree after setSwarmLayoutMode');
+    if (!mockElements.btnSwarmTree.className.includes('bg-brand-600')) throw new Error('Tree button should have active style');
+    api.setSwarmLayoutMode('list');
+    if (api.getSwarmLayoutMode() !== 'list') throw new Error('Mode should be list after setSwarmLayoutMode');
+    if (!mockElements.btnSwarmList.className.includes('bg-brand-600')) throw new Error('List button should have active style');
+
+    // Test 2: Hero KPI Campaign breakdown and zero-subagents reset
+    api.renderKPIs({ root_convs: 12, subagent_convs: 4, total_conversations: 16 });
+    if (!mockElements.kpiDateRange.textContent.includes('12 campaigns · 4 sub-agents')) {
+      throw new Error(`Expected campaign breakdown in kpiDateRange, got: ${mockElements.kpiDateRange.textContent}`);
+    }
+    api.renderKPIs({ root_convs: 10, subagent_convs: 0, total_conversations: 10 });
+    if (mockElements.kpiDateRange.textContent.includes('sub-agents')) {
+      throw new Error(`Expected kpiDateRange to reset when subagent_convs=0, got: ${mockElements.kpiDateRange.textContent}`);
+    }
+
+    // Test 3: Top Cost Drivers row rendering with +subagent badge
+    api.renderProjectCostSection({
+      top_sessions: [
+        { id: 'c1', title: 'Main Campaign', project: 'test', model_name: 'Gemini Pro', billed_cost: 15.00, local_cost: 5.00, subagent_count: 2, total_tokens: 30000 },
+        { id: 'c2', title: 'Solo Task', project: 'test', model_name: 'Flash', billed_cost: 2.00, local_cost: 2.00, subagent_count: 0, total_tokens: 5000 }
+      ]
+    }, 'all');
+
+    const rows = mockElements.topCostDriversBody.children;
+    if (rows.length !== 2) throw new Error(`Expected 2 rows, got ${rows.length}`);
+    if (!rows[0].innerHTML.includes('+2')) throw new Error('First row should have +2 subagent badge');
+    if (rows[1].innerHTML.includes('+')) throw new Error('Second row should not have subagent badge');
+    if (!rows[0].innerHTML.includes('Local: $5.00 · Fleet: $15.00')) throw new Error('First row should have dual Local/Fleet tooltip');
+
+    // Test 4: Swarm List View Rendering and NaN Resilience
+    const swarmData = {
+      conversation: { id: 'root', title: 'Root Coordinator', billed_cost: 5.00, total_tokens: 10000, total_steps: 10 },
+      fleet_summary: { subagent_count: 1, total_cost: 15.00, total_tokens: 30000, total_steps: 25 },
+      fleet_nodes: [
+        { id: 'sub-1', title: 'Worker Agent', role: 'Worker', model_name: 'Gemini Flash', cost: 10.00, tokens: 20000, steps: 15, context_pct: 65, weekly_quota_pct: 1.48, is_current: false },
+        { id: 'root', title: 'Root Coordinator', role: 'Root Coordinator', model_name: 'Gemini Pro', cost: 5.00, tokens: 10000, steps: 10, context_pct: NaN, weekly_quota_pct: NaN, is_current: true }
+      ]
+    };
+    api.setSessionData(swarmData);
+    api.setSwarmLayoutMode('list');
+    api.renderSwarmView(swarmData);
+
+    const swarmListCards = mockElements.modalSwarmTree.children;
+    if (swarmListCards.length !== 2) throw new Error(`Expected 2 cards in swarm list view, got ${swarmListCards.length}`);
+    if (!swarmListCards[0].innerHTML.includes('#1')) throw new Error('First card should have rank #1');
+    if (!swarmListCards[0].innerHTML.includes('$10.00')) throw new Error('First card should show highest cost ($10.00)');
+    if (!swarmListCards[0].innerHTML.includes('(1.48% wk)')) throw new Error('First card should show weekly quota pct');
+    if (!swarmListCards[0].innerHTML.includes('Inspect ➔')) throw new Error('Non-current card should have Inspect button');
+    if (swarmListCards[1].innerHTML.includes('Inspect ➔')) throw new Error('Current card should not have Inspect button');
+    if (swarmListCards[1].innerHTML.includes('NaN')) throw new Error('Second card should not render NaN for quota or context');
+
+    console.log(JSON.stringify({ status: 'ok', tested: ['layoutMode', 'kpiHero', 'costDrivers', 'swarmList'] }));
+    """
+
+    res = subprocess.run(
+        ["node", "-e", node_script], capture_output=True, text=True, cwd=Path.cwd()
+    )
+    assert res.returncode == 0, f"Node script failed: {res.stderr}"
+    json_line = [
+        line for line in res.stdout.strip().splitlines() if line.startswith("{")
+    ][-1]
+    data = json.loads(json_line)
+    assert data["status"] == "ok"
+    assert len(data["tested"]) == 4
+

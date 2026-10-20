@@ -13,6 +13,9 @@ let activeQuotaFamily = 'gemini';
 let userSelectedQuotaFamily = false;
 let lastCid = undefined;
 let isGlobalMode = false;
+let inspectedCid = null;
+let activeFleet = null;
+let activeSessionImpact = null;
 
 function formatTokens(n) {
   const num = Number(n) || 0;
@@ -26,10 +29,60 @@ function formatCost(n) {
   return `$${num.toFixed(2)}`;
 }
 
-function updateQuotaHeaderBadge(pct, isGlobal) {
+function shortenModelName(name) {
+  if (!name) return 'Gemini';
+  let clean = String(name).trim();
+  const lower = clean.toLowerCase();
+  if (lower.startsWith('gemini ')) {
+    clean = clean.substring(7).trim();
+  } else if (lower.startsWith('gemini-')) {
+    clean = clean.substring(7).trim();
+  } else if (lower.startsWith('claude ')) {
+    clean = clean.substring(7).trim();
+  } else if (lower.startsWith('claude-')) {
+    clean = clean.substring(7).trim();
+  }
+  clean = clean.replace(/\(Medium\)/i, '(Med)');
+  if (clean.length > 20) {
+    clean = clean.slice(0, 19) + '…';
+  }
+  return clean;
+}
+
+function updateCostHeaderBadge(localCost, fleet, isGlobal = isGlobalMode) {
+  const badge = $('cost-badge');
+  if (!badge) return;
+  if (typeof fleet === 'boolean') {
+    isGlobal = fleet;
+    fleet = arguments[2] || null;
+  }
+  if (!isGlobal && fleet?.is_swarm) {
+    badge.textContent = `${formatCost(localCost)} · ${formatCost(fleet.total_cost)} fleet`;
+    badge.title = 'Session Cost · Fleet Cost';
+  } else {
+    badge.textContent = formatCost(localCost);
+    badge.title = isGlobal ? 'Total Fleet Cost' : 'Estimated Value';
+  }
+}
+
+function updateQuotaHeaderBadge(localPct, isGlobal = isGlobalMode, fleet = null) {
   const badge = $('quota-badge');
   if (!badge) return;
-  const num = Number(pct) || 0;
+  if (typeof isGlobal === 'object' && isGlobal !== null) {
+    fleet = isGlobal;
+    isGlobal = isGlobalMode;
+  }
+  const localNum = Number(localPct) || 0;
+  if (!isGlobal && fleet?.is_swarm) {
+    const fleetNum = Number(fleet.weekly_quota_pct) || 0;
+    const thresholdNum = Math.max(localNum, fleetNum);
+    const cssClass = thresholdNum >= 10 ? 'error' : (thresholdNum >= 5 ? 'warning' : 'ok');
+    badge.textContent = `${localNum.toFixed(2)}% · ${fleetNum.toFixed(2)}% fleet wk`;
+    badge.title = 'Session Quota · Fleet Quota Impact';
+    badge.className = `badge ${cssClass}`;
+    return;
+  }
+  const num = localNum;
   const suffix = isGlobal ? 'fleet' : 'wk';
   const title = isGlobal ? 'Fleet Quota Impact' : 'Session Quota Impact';
   const cssClass = num >= 10 ? 'error' : (num >= 5 ? 'warning' : 'ok');
@@ -71,6 +124,14 @@ async function callApi(path) {
   return res.json();
 }
 
+async function fetchSessionData(cid, inspectCid = null) {
+  let url = `/api/session?cid=${encodeURIComponent(cid)}`;
+  if (inspectCid) {
+    url += `&inspect_cid=${encodeURIComponent(inspectCid)}`;
+  }
+  return callApi(url);
+}
+
 function renderMultiSegmentBar(container, categories, maxTokens, totalPct) {
   if (!container) return;
   container.innerHTML = '';
@@ -97,9 +158,12 @@ function renderMultiSegmentBar(container, categories, maxTokens, totalPct) {
   }
 }
 
-function renderQuota(quotaData, sessionImpactPct) {
+function renderQuota(quotaData, sessionImpactPct, fleet = null) {
   if (!quotaData) return;
   activeQuota = quotaData;
+  if (sessionImpactPct !== undefined) activeSessionImpact = sessionImpactPct;
+  if (fleet !== undefined) activeFleet = fleet;
+  const currentFleet = fleet || activeFleet;
 
   // Auto-switch to model's prefix if user hasn't explicitly clicked a tab
   if (!userSelectedQuotaFamily && quotaData.prefix) {
@@ -135,9 +199,17 @@ function renderQuota(quotaData, sessionImpactPct) {
   // Session impact badge
   const impactEl = $('quota-session-impact');
   if (impactEl) {
-    const label = isGlobalMode ? 'fleet total' : 'session share';
-    impactEl.textContent = `${Number(sessionImpact).toFixed(2)}% ${label}`;
-    impactEl.className = `badge ${sessionImpact >= 10 ? 'error' : sessionImpact >= 5 ? 'warning' : 'ok'}`;
+    const sNum = Number(sessionImpact) || 0.0;
+    if (!isGlobalMode && currentFleet?.is_swarm) {
+      const fNum = Number(currentFleet.weekly_quota_pct) || 0.0;
+      impactEl.textContent = `${sNum.toFixed(2)}% session · ${fNum.toFixed(2)}% fleet`;
+      const maxImpact = Math.max(sNum, fNum);
+      impactEl.className = `badge ${maxImpact >= 10 ? 'error' : maxImpact >= 5 ? 'warning' : 'ok'}`;
+    } else {
+      const label = isGlobalMode ? 'fleet total' : 'session share';
+      impactEl.textContent = `${sNum.toFixed(2)}% ${label}`;
+      impactEl.className = `badge ${sNum >= 10 ? 'error' : sNum >= 5 ? 'warning' : 'ok'}`;
+    }
   }
 
   // Weekly bucket
@@ -228,6 +300,181 @@ function renderTopSteps(container, topSteps, rangeSpan, minStep, maxStep) {
   }).join('');
 }
 
+function renderGlobal(globalData) {
+  const statusBadge = $('status-badge');
+  const globalCard = $('global-card');
+  const capacityCard = $('capacity-card');
+  const topStepsCard = $('top-steps-card');
+  const banner = $('compaction-banner');
+  const actionsCard = $('actions-card');
+  const quotaCard = $('quota-card');
+  const fleetCard = $('fleet-card');
+  const inspectBanner = $('inspect-banner');
+
+  if (statusBadge) {
+    statusBadge.textContent = 'Live';
+    statusBadge.className = 'badge ok';
+  }
+  const modelBadge = $('model-badge');
+  if (modelBadge) modelBadge.textContent = 'Global Overview';
+  updateCostHeaderBadge(globalData.total_cost, null, true);
+  const globalQuotaPct = globalData.weekly_quota_pct ?? (globalData.quota?.session_weekly_pct ?? 0);
+  updateQuotaHeaderBadge(globalQuotaPct, true);
+
+  if (globalCard) globalCard.hidden = false;
+  if (capacityCard) capacityCard.hidden = true;
+  if (topStepsCard) topStepsCard.hidden = true;
+  if (banner) banner.hidden = true;
+  if (actionsCard) actionsCard.hidden = true;
+  if (quotaCard) quotaCard.hidden = false;
+  if (fleetCard) fleetCard.hidden = true;
+  if (inspectBanner) inspectBanner.hidden = true;
+
+  const convsEl = $('global-convs');
+  if (convsEl) {
+    const subCount = globalData.subagent_conversations || 0;
+    const rootCount = globalData.root_conversations ?? globalData.total_conversations;
+    if (subCount > 0) {
+      convsEl.textContent = `${rootCount} Campaigns · ${subCount} Sub-Agents`;
+    } else {
+      convsEl.textContent = `${globalData.total_conversations} Sessions`;
+    }
+  }
+
+  const tokensEl = $('global-tokens');
+  if (tokensEl) tokensEl.textContent = formatTokens(globalData.total_tokens);
+  const costEl = $('global-cost');
+  if (costEl) costEl.textContent = formatCost(globalData.total_cost);
+  const globalQuotaEl = $('global-quota');
+  if (globalQuotaEl) {
+    globalQuotaEl.textContent = `${(globalData.weekly_quota_pct || 0).toFixed(2)}% wk`;
+  }
+  const compactionsEl = $('global-compactions');
+  if (compactionsEl) compactionsEl.textContent = `${globalData.total_compactions} events`;
+  const prunedEl = $('global-pruned');
+  if (prunedEl) prunedEl.textContent = `~${formatTokens(globalData.total_pruned_tokens)} tokens`;
+
+  if (globalData.quota) {
+    renderQuota(globalData.quota, globalData.weekly_quota_pct, null);
+  }
+}
+
+function renderFleetCard(fleet) {
+  const card = $('fleet-card');
+  const banner = $('inspect-banner');
+  const list = $('fleet-node-list');
+
+  if (!fleet || !fleet.is_swarm) {
+    if (card) card.hidden = true;
+    if (banner) banner.hidden = true;
+    if (list) list.innerHTML = '';
+    inspectedCid = null;
+    return;
+  }
+
+  if (card) card.hidden = false;
+
+  const countBadge = $('fleet-count-badge');
+  if (countBadge) {
+    countBadge.textContent = `${fleet.agent_count} Agents`;
+  }
+
+  if (banner) {
+    if (fleet.is_inspecting_other) {
+      banner.hidden = false;
+      const label = $('inspect-banner-label');
+      if (label) {
+        label.textContent = `Viewing: ${fleet.inspected_role || 'Sub-Agent'}`;
+      }
+    } else {
+      banner.hidden = true;
+    }
+  }
+
+  const costEl = $('fleet-total-cost');
+  if (costEl) costEl.textContent = formatCost(fleet.total_cost);
+
+  const tokensEl = $('fleet-total-tokens');
+  if (tokensEl) tokensEl.textContent = formatTokens(fleet.total_tokens);
+
+  const shieldEl = $('fleet-shielding');
+  if (shieldEl) {
+    const rawRatio = Number(fleet.shielding_ratio);
+    const ratioStr = (!isNaN(rawRatio) && rawRatio > 0) ? rawRatio.toFixed(1) : '1.0';
+    shieldEl.textContent = `${ratioStr}x`;
+  }
+
+  if (!list) return;
+  list.innerHTML = '';
+
+  const cid = (sidecar && sidecar.conversationId) || null;
+  const currentInspectedId = inspectedCid || cid;
+
+  const nodes = fleet.nodes || [];
+  for (const node of nodes) {
+    const isInspected = node.id === currentInspectedId;
+    const item = document.createElement('div');
+    item.className = `fleet-node-item${isInspected ? ' inspected' : ''}`;
+    item.setAttribute('data-node-id', node.id);
+    item.setAttribute('role', 'button');
+    item.setAttribute('tabindex', '0');
+    item.setAttribute('aria-pressed', String(isInspected));
+
+    const isRoot = Boolean(node.is_root);
+    const isActiveSession = Boolean(node.is_active || node.is_active_session);
+    let statusBadgeHtml = '';
+    if (isRoot) {
+      statusBadgeHtml = '<span class="badge root">Root</span>';
+    } else if (isActiveSession) {
+      statusBadgeHtml = '<span class="badge active">Active</span>';
+    }
+
+    const roleName = node.role || node.subagent_role || 'Worker';
+    const modelShort = shortenModelName(node.model_name);
+    const costText = `${formatCost(node.billed_cost)} · ${Number(node.weekly_quota_pct || 0).toFixed(2)}% wk`;
+    const pct = Math.min(100, Math.max(0, Number(node.context_pct) || 0));
+    const pctClass = pct >= 80 ? 'error' : (pct >= 50 ? 'warning' : 'ok');
+    const activeTok = (node.active_tokens !== undefined && node.active_tokens !== null)
+      ? Number(node.active_tokens)
+      : (Number(node.total_tokens) || 0);
+    const maxTok = Number(node.max_tokens) || 1000000;
+    const tokenLabel = `~${formatTokens(activeTok)} / ${formatTokens(maxTok)} (${pct.toFixed(1)}%)`;
+
+    item.innerHTML = `
+      <div class="fleet-node-header">
+        <div class="fleet-node-meta">
+          <span class="fleet-role-pill">${escapeHtml(roleName)}</span>
+          ${statusBadgeHtml}
+          <span class="badge secondary model">${escapeHtml(modelShort)}</span>
+        </div>
+        <span class="fleet-node-cost">${costText}</span>
+      </div>
+      <div class="fleet-node-bar-row">
+        <div class="fleet-mini-track">
+          <div class="fleet-mini-bar ${pctClass}" style="width: ${pct}%;"></div>
+        </div>
+        <span class="fleet-node-tokens muted small">${tokenLabel}</span>
+      </div>
+    `;
+
+    const selectNode = () => {
+      const activeCid = (sidecar && sidecar.conversationId) || cid;
+      inspectedCid = (node.id === activeCid ? null : node.id);
+      refreshTelemetry();
+    };
+
+    item.addEventListener('click', selectNode);
+    item.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault();
+        selectNode();
+      }
+    });
+
+    list.appendChild(item);
+  }
+}
+
 async function refreshTelemetry() {
   // Respect visibility state: pause work when side panel or tab is hidden
   if (document.hidden) return;
@@ -236,6 +483,7 @@ async function refreshTelemetry() {
   if (lastCid !== cid) {
     lastCid = cid;
     userSelectedQuotaFamily = false;
+    inspectedCid = null;
   }
   isGlobalMode = !cid;
 
@@ -251,35 +499,7 @@ async function refreshTelemetry() {
     if (!cid) {
       // Global Aggregate Overview
       const globalData = await callApi('/api/global');
-      if (statusBadge) {
-        statusBadge.textContent = 'Live';
-        statusBadge.className = 'badge ok';
-      }
-      $('model-badge').textContent = 'Global Overview';
-      $('cost-badge').textContent = formatCost(globalData.total_cost);
-      const globalQuotaPct = globalData.weekly_quota_pct ?? (globalData.quota?.session_weekly_pct ?? 0);
-      updateQuotaHeaderBadge(globalQuotaPct, true);
-
-      if (globalCard) globalCard.hidden = false;
-      if (capacityCard) capacityCard.hidden = true;
-      if (topStepsCard) topStepsCard.hidden = true;
-      if (banner) banner.hidden = true;
-      if (actionsCard) actionsCard.hidden = true;
-      if (quotaCard) quotaCard.hidden = false;
-
-      $('global-convs').textContent = `${globalData.total_conversations} Sessions`;
-      $('global-tokens').textContent = formatTokens(globalData.total_tokens);
-      $('global-cost').textContent = formatCost(globalData.total_cost);
-      const globalQuotaEl = $('global-quota');
-      if (globalQuotaEl) {
-        globalQuotaEl.textContent = `${(globalData.weekly_quota_pct || 0).toFixed(2)}% wk`;
-      }
-      $('global-compactions').textContent = `${globalData.total_compactions} events`;
-      $('global-pruned').textContent = `~${formatTokens(globalData.total_pruned_tokens)} tokens`;
-
-      if (globalData.quota) {
-        renderQuota(globalData.quota, globalData.weekly_quota_pct);
-      }
+      renderGlobal(globalData);
       return;
     }
 
@@ -290,35 +510,55 @@ async function refreshTelemetry() {
     if (actionsCard) actionsCard.hidden = false;
     if (quotaCard) quotaCard.hidden = false;
 
-    const sessionData = await callApi(`/api/session?cid=${encodeURIComponent(cid)}`);
+    let sessionData;
+    try {
+      sessionData = await fetchSessionData(cid, inspectedCid);
+    } catch (fetchErr) {
+      if (inspectedCid) {
+        console.warn(`Inspected CID ${inspectedCid} failed to load, falling back to active CID ${cid}:`, fetchErr);
+        inspectedCid = null;
+        sessionData = await fetchSessionData(cid, null);
+      } else {
+        throw fetchErr;
+      }
+    }
 
     if (statusBadge) {
       statusBadge.textContent = 'Live';
       statusBadge.className = 'badge ok';
     }
-    $('model-badge').textContent = sessionData.model_name || 'Gemini 3.7 Flash';
-    $('cost-badge').textContent = formatCost(sessionData.billed_cost);
+    const modelBadge = $('model-badge');
+    if (modelBadge) modelBadge.textContent = sessionData.model_name || 'Gemini 3.7 Flash';
+    updateCostHeaderBadge(sessionData.billed_cost, sessionData.fleet, false);
     const sessionQuotaPct = sessionData.weekly_quota_pct ?? (sessionData.quota?.session_weekly_pct ?? 0);
-    updateQuotaHeaderBadge(sessionQuotaPct, false);
+    updateQuotaHeaderBadge(sessionQuotaPct, false, sessionData.fleet);
 
-    $('capacity-pct').textContent = `${(sessionData.pct || 0).toFixed(1)}%`;
-    $('capacity-sub').textContent = `${formatTokens(sessionData.active_tokens)} / ${formatTokens(sessionData.max_tokens)} tokens`;
+    const capPctEl = $('capacity-pct');
+    if (capPctEl) capPctEl.textContent = `${(sessionData.pct || 0).toFixed(1)}%`;
+    const capSubEl = $('capacity-sub');
+    if (capSubEl) capSubEl.textContent = `${formatTokens(sessionData.active_tokens)} / ${formatTokens(sessionData.max_tokens)} tokens`;
 
     // Multi-segment capacity bar
     renderMultiSegmentBar($('capacity-bar'), sessionData.categories, sessionData.max_tokens, sessionData.pct);
 
     // Subscription Quota rendering
     if (sessionData.quota) {
-      renderQuota(sessionData.quota, sessionData.weekly_quota_pct);
+      renderQuota(sessionData.quota, sessionData.weekly_quota_pct, sessionData.fleet);
     }
+
+    // Swarm Fleet card
+    renderFleetCard(sessionData.fleet);
 
     // Compaction banner
     if (banner) {
       if (sessionData.compaction_detected) {
         banner.hidden = false;
-        $('compaction-count').textContent = `${sessionData.compaction_count} ${sessionData.compaction_count === 1 ? 'event' : 'events'}`;
-        $('compaction-pruned').textContent = `~${formatTokens(sessionData.pruned_tokens)} freed`;
-        $('compaction-window').textContent = `Steps #${sessionData.min_step}–#${sessionData.max_step} active`;
+        const compCountEl = $('compaction-count');
+        if (compCountEl) compCountEl.textContent = `${sessionData.compaction_count} ${sessionData.compaction_count === 1 ? 'event' : 'events'}`;
+        const compPrunedEl = $('compaction-pruned');
+        if (compPrunedEl) compPrunedEl.textContent = `~${formatTokens(sessionData.pruned_tokens)} freed`;
+        const compWindowEl = $('compaction-window');
+        if (compWindowEl) compWindowEl.textContent = `Steps #${sessionData.min_step}–#${sessionData.max_step} active`;
       } else {
         banner.hidden = true;
       }
@@ -340,7 +580,7 @@ async function refreshTelemetry() {
 }
 
 function escapeHtml(str) {
-  if (!str) return '';
+  if (str === undefined || str === null) return '';
   return String(str)
     .replace(/&/g, '&amp;')
     .replace(/</g, '&lt;')
@@ -401,7 +641,7 @@ function init() {
     tabGemini.addEventListener('click', () => {
       userSelectedQuotaFamily = true;
       activeQuotaFamily = 'gemini';
-      if (activeQuota) renderQuota(activeQuota);
+      if (activeQuota) renderQuota(activeQuota, activeSessionImpact, activeFleet);
     });
   }
 
@@ -410,7 +650,15 @@ function init() {
     tab3p.addEventListener('click', () => {
       userSelectedQuotaFamily = true;
       activeQuotaFamily = '3p';
-      if (activeQuota) renderQuota(activeQuota);
+      if (activeQuota) renderQuota(activeQuota, activeSessionImpact, activeFleet);
+    });
+  }
+
+  const btnResetInspect = $('btn-reset-inspect');
+  if (btnResetInspect) {
+    btnResetInspect.addEventListener('click', () => {
+      inspectedCid = null;
+      refreshTelemetry();
     });
   }
 

@@ -16,6 +16,7 @@
     let phaseChart = null;
     let mcpServerChart = null;
     let activeHeatmapHover = null;
+    let currentSessionData = null;
 
     function trackCanvasPointer(canvas) {
       if (!canvas || canvas._hasPointerTracker) return;
@@ -668,6 +669,14 @@
       document.getElementById('kpiTokens').textContent = formatTokens(data.total_tokens);
       document.getElementById('kpiChars').textContent = (data.total_chars || 0).toLocaleString() + ' chars';
       document.getElementById('kpiConvs').textContent = (data.total_convs || 0).toLocaleString();
+      const elDateRange = document.getElementById('kpiDateRange');
+      if (elDateRange) {
+        if (data.subagent_convs > 0) {
+          elDateRange.textContent = `${(data.root_convs || 0).toLocaleString()} campaigns · ${(data.subagent_convs || 0).toLocaleString()} sub-agents`;
+        } else {
+          elDateRange.textContent = (typeof currentProject !== 'undefined' && currentProject && currentProject !== 'all') ? currentProject : 'Across all repos';
+        }
+      }
       document.getElementById('kpiSteps').textContent = (data.total_steps || 0).toLocaleString();
       document.getElementById('kpiAvgSteps').textContent = data.avg_steps + ' avg/session';
       document.getElementById('kpiTools').textContent = (data.total_tools || 0).toLocaleString();
@@ -1828,12 +1837,28 @@
           topSessions.forEach(s => {
             const tr = document.createElement('tr');
             tr.className = 'hover:bg-dark-800/60 transition';
+            const hasSubagents = (s.subagent_count && s.subagent_count > 0);
+            const subagentBadge = hasSubagents
+              ? ` <span class="px-1.5 py-0.2 rounded text-[9px] font-mono font-semibold bg-pink-950/80 text-pink-300 border border-pink-500/40 inline-flex items-center shrink-0">+${s.subagent_count}</span>`
+              : '';
+            const costTooltip = hasSubagents
+              ? `Local: $${(s.local_cost != null ? s.local_cost : s.billed_cost).toFixed(2)} · Fleet: $${s.billed_cost.toFixed(2)}`
+              : `$${s.billed_cost.toFixed(2)}`;
+            const titleTooltip = hasSubagents
+              ? `${s.title} (+${s.subagent_count} sub-agents) · ${costTooltip}`
+              : s.title;
+
             tr.innerHTML = `
-              <td class="py-2 px-2 font-medium text-white max-w-[140px] truncate" title="${s.title}">${s.title}</td>
+              <td class="py-2 px-2 font-medium text-white max-w-[160px]" title="${titleTooltip}">
+                <div class="flex items-center space-x-1.5 min-w-0">
+                  <span class="truncate">${s.title}</span>
+                  ${subagentBadge}
+                </div>
+              </td>
               <td class="py-2 px-2 whitespace-nowrap"><span class="px-1.5 py-0.5 rounded text-[10px] font-mono bg-dark-900 border border-dark-700 text-gray-300">${s.project}</span></td>
               <td class="py-2 px-2 text-purple-300 whitespace-nowrap text-[11px]">${s.model_name}</td>
               <td class="py-2 px-2 text-right font-semibold text-indigo-400 font-mono text-[11px]" title="${formatTokens(s.disk_tokens || 0)} disk footprint">${formatTokens(s.tokens || s.total_tokens)}</td>
-              <td class="py-2 px-2 text-right font-mono font-bold text-rose-400 text-[11px]">$${s.billed_cost.toFixed(2)}</td>
+              <td class="py-2 px-2 text-right font-mono font-bold text-rose-400 text-[11px]" title="${costTooltip}">$${s.billed_cost.toFixed(2)}</td>
               <td class="py-2 px-2 text-center">
                 ${isStatic ? '' : `<button onclick="inspectSession('${s.id}')" class="px-2 py-0.5 rounded bg-brand-600/80 hover:bg-brand-600 text-[10px] font-medium text-white transition">Inspect</button>`}
               </td>
@@ -2319,9 +2344,12 @@
               subCompactionBadge = `<span class="px-1.5 py-0.5 rounded text-[10px] font-mono font-medium bg-amber-950/80 text-amber-300 border border-amber-500/40 shrink-0" title="${sub.compaction_count} compaction events (~${formatTokens(sub.pruned_tokens)} tokens pruned)">⚡ ${sub.compaction_count} pruned</span>`;
             }
 
+            const depth = sub.depth || 1;
+            const padClass = depth === 1 ? 'pl-8' : depth === 2 ? 'pl-12' : 'pl-16';
+
             childTr.innerHTML = `
               <td class="py-2 px-3 text-gray-500 whitespace-nowrap font-mono text-[10px] pl-6">${sub.created_at || '--'}</td>
-              <td class="py-2 px-3 pl-8">
+              <td class="py-2 px-3 ${padClass}">
                 <div class="flex items-center space-x-2 max-w-sm flex-wrap gap-y-1">
                   <span class="text-pink-400 font-mono text-xs">↳</span>
                   <span class="px-1.5 py-0.5 rounded text-[10px] font-semibold bg-pink-950/80 text-pink-300 border border-pink-500/40 font-mono shrink-0">${sub.subagent_role || 'Worker'}</span>
@@ -2375,15 +2403,25 @@
         const modalTokensEl = document.getElementById('modalTokens');
         if (modalTokensEl) {
           const tokVal = conv.tokens || conv.total_tokens || 0;
-          modalTokensEl.textContent = formatTokens(tokVal);
-          modalTokensEl.title = `${tokVal.toLocaleString()} active tokens (Disk Footprint: ${(conv.disk_tokens || conv.total_tokens || 0).toLocaleString()} tokens)`;
+          if (data.fleet_summary && data.fleet_summary.subagent_count > 0) {
+            modalTokensEl.textContent = `${formatTokens(tokVal)} / ${formatTokens(data.fleet_summary.total_tokens)} fleet`;
+            modalTokensEl.title = `Local: ${tokVal.toLocaleString()} tokens · Fleet: ${data.fleet_summary.total_tokens.toLocaleString()} tokens (${data.fleet_summary.subagent_count} sub-agents)`;
+          } else {
+            modalTokensEl.textContent = formatTokens(tokVal);
+            modalTokensEl.title = `${tokVal.toLocaleString()} active tokens (Disk Footprint: ${(conv.disk_tokens || conv.total_tokens || 0).toLocaleString()} tokens)`;
+          }
         }
 
         const modalStepsEl = document.getElementById('modalSteps');
         if (modalStepsEl) {
           const stepVal = conv.total_steps || (data.steps ? data.steps.length : 0);
-          modalStepsEl.textContent = stepVal.toLocaleString();
-          modalStepsEl.title = `${stepVal.toLocaleString()} logged steps in this conversation`;
+          if (data.fleet_summary && data.fleet_summary.subagent_count > 0) {
+            modalStepsEl.textContent = `${stepVal.toLocaleString()} / ${data.fleet_summary.total_steps.toLocaleString()} fleet`;
+            modalStepsEl.title = `Local: ${stepVal.toLocaleString()} steps · Fleet: ${data.fleet_summary.total_steps.toLocaleString()} steps (${data.fleet_summary.subagent_count} sub-agents)`;
+          } else {
+            modalStepsEl.textContent = stepVal.toLocaleString();
+            modalStepsEl.title = `${stepVal.toLocaleString()} logged steps in this conversation`;
+          }
         }
 
         // Context Compaction & Working Memory Status
@@ -2636,11 +2674,44 @@
       }
     }
 
+    let currentSwarmLayoutMode = 'list';
+
+    function setSwarmLayoutMode(mode) {
+      currentSwarmLayoutMode = mode;
+      const btnList = document.getElementById('btnSwarmList');
+      const btnTree = document.getElementById('btnSwarmTree');
+      if (btnList && btnTree) {
+        if (mode === 'list') {
+          btnList.className = 'px-2.5 py-1 rounded bg-brand-600 text-white font-medium transition text-xs flex items-center space-x-1 shadow';
+          btnTree.className = 'px-2.5 py-1 rounded text-gray-400 hover:text-white transition text-xs flex items-center space-x-1';
+        } else {
+          btnTree.className = 'px-2.5 py-1 rounded bg-brand-600 text-white font-medium transition text-xs flex items-center space-x-1 shadow';
+          btnList.className = 'px-2.5 py-1 rounded text-gray-400 hover:text-white transition text-xs flex items-center space-x-1';
+        }
+      }
+      if (currentSessionData) {
+        renderSwarmView(currentSessionData);
+      }
+    }
+    window.setSwarmLayoutMode = setSwarmLayoutMode;
+
     function renderSwarmView(data) {
       const summaryEl = document.getElementById('modalSwarmSummary');
       const badgeEl = document.getElementById('modalSwarmBadge');
       const treeEl = document.getElementById('modalSwarmTree');
       if (!summaryEl || !treeEl) return;
+
+      const btnList = document.getElementById('btnSwarmList');
+      const btnTree = document.getElementById('btnSwarmTree');
+      if (btnList && btnTree) {
+        if (currentSwarmLayoutMode === 'list') {
+          btnList.className = 'px-2.5 py-1 rounded bg-brand-600 text-white font-medium transition text-xs flex items-center space-x-1 shadow';
+          btnTree.className = 'px-2.5 py-1 rounded text-gray-400 hover:text-white transition text-xs flex items-center space-x-1';
+        } else {
+          btnTree.className = 'px-2.5 py-1 rounded bg-brand-600 text-white font-medium transition text-xs flex items-center space-x-1 shadow';
+          btnList.className = 'px-2.5 py-1 rounded text-gray-400 hover:text-white transition text-xs flex items-center space-x-1';
+        }
+      }
 
       const conv = data.conversation || {};
       const summary = data.fleet_summary || {};
@@ -2680,42 +2751,58 @@
       }
 
       treeEl.innerHTML = '';
+      const isStatic = (typeof IS_STATIC_EXPORT !== "undefined" && IS_STATIC_EXPORT);
 
-      function renderTreeNode(node, depth = 0, isLast = false) {
-        const nodeCard = document.createElement('div');
-        const isCurrent = node.is_current;
-        const indentClass = depth === 0 ? '' : depth === 1 ? 'ml-6 border-l-2 border-pink-500/40 pl-3' : 'ml-12 border-l-2 border-purple-500/40 pl-3';
-        
-        nodeCard.className = `p-3 rounded-lg border transition ${indentClass} ${
-          isCurrent 
-            ? 'bg-brand-950/40 border-brand-500 ring-1 ring-brand-500/50 shadow-md' 
-            : 'bg-dark-900/70 border-dark-700 hover:border-dark-600'
-        }`;
-
+      function renderNodeCardContent(node, depth = 0, isCurrent = false, showRank = false, rankIdx = 0) {
         const roleBadgeClass = depth === 0 
           ? 'bg-brand-500/20 text-brand-300 border-brand-500/40' 
           : depth === 1 
             ? 'bg-pink-500/20 text-pink-300 border-pink-500/40' 
             : 'bg-purple-500/20 text-purple-300 border-purple-500/40';
 
-        nodeCard.innerHTML = `
+        const ctxPct = (node.context_pct != null && !isNaN(node.context_pct)) ? node.context_pct : 0;
+        const barColor = ctxPct > 80 ? 'bg-rose-500' : (ctxPct > 50 ? 'bg-amber-400' : 'bg-emerald-400');
+        const maxTok = node.max_tokens || 1000000;
+        const actTok = node.active_tokens != null ? node.active_tokens : (node.tokens || node.total_tokens || 0);
+        const miniBarHtml = `
+          <div class="flex items-center space-x-1.5 shrink-0" title="Context: ${ctxPct}% (~${formatTokens(actTok)} / ${formatTokens(maxTok)})">
+            <div class="w-14 bg-dark-700 rounded-full h-1.5 overflow-hidden">
+              <div class="h-full rounded-full ${barColor}" style="width: ${Math.min(ctxPct, 100)}%"></div>
+            </div>
+            <span class="text-[10px] font-mono text-gray-400 w-8 text-right">${ctxPct}%</span>
+          </div>
+        `;
+
+        let compactionBadge = '';
+        if (node.compaction_count > 0) {
+          compactionBadge = `<span class="px-1.5 py-0.5 rounded text-[10px] font-mono font-medium bg-amber-950/80 text-amber-300 border border-amber-500/40 shrink-0" title="${node.compaction_count} compaction events (~${formatTokens(node.pruned_tokens || 0)} tokens pruned)">⚡ ${node.compaction_count} pruned</span>`;
+        }
+
+        const hasWk = (node.weekly_quota_pct != null && !isNaN(node.weekly_quota_pct));
+        const wkStr = hasWk ? ` <span class="text-[10px] text-cyan-300 font-mono">(${Number(node.weekly_quota_pct).toFixed(2)}% wk)</span>` : '';
+
+        return `
           <div class="flex items-center justify-between flex-wrap gap-2">
-            <div class="flex items-center space-x-2">
-              ${depth > 0 ? `<span class="text-pink-400 font-mono text-xs">↳</span>` : ''}
+            <div class="flex items-center space-x-2 flex-wrap gap-y-1">
+              ${showRank ? `<span class="text-gray-500 font-mono text-xs w-4">#${rankIdx + 1}</span>` : ''}
+              ${(!showRank && depth > 0) ? `<span class="text-pink-400 font-mono text-xs">↳</span>` : ''}
               <span class="px-2 py-0.5 rounded text-[11px] font-semibold font-mono border ${roleBadgeClass}">
                 ${node.role || (depth === 0 ? 'Root Coordinator' : 'Worker')}
               </span>
-              <span class="font-medium text-white text-xs truncate max-w-sm" title="${node.title}">
+              <span class="font-medium text-white text-xs truncate max-w-xs" title="${node.title}">
                 ${node.title}
               </span>
+              ${formatModelBadgeHtml(node.model_name || 'Gemini')}
+              ${compactionBadge}
               ${isCurrent ? `<span class="px-1.5 py-0.2 rounded text-[10px] bg-emerald-500/20 text-emerald-300 font-mono border border-emerald-500/40">Active</span>` : ''}
             </div>
             <div class="flex items-center space-x-3 text-xs font-mono">
+              ${miniBarHtml}
               <span class="text-gray-400">${node.steps} steps</span>
-              <span class="text-indigo-400">${formatTokens(node.tokens)} tok</span>
-              <span class="text-rose-400 font-bold">$${Number(node.cost || 0).toFixed(2)}</span>
+              <span class="text-indigo-400">${formatTokens(node.tokens || node.total_tokens || 0)} tok</span>
+              <span class="text-rose-400 font-bold">$${Number(node.cost || 0).toFixed(2)}${wkStr}</span>
               ${node.duration ? `<span class="text-emerald-400">${formatDuration(node.duration)}</span>` : ''}
-              ${!isCurrent ? `
+              ${(!isStatic && !isCurrent) ? `
                 <button onclick="inspectSession('${node.id}')" class="px-2 py-0.5 rounded bg-brand-600/80 hover:bg-brand-600 text-[10px] text-white font-sans transition">
                   Inspect ➔
                 </button>
@@ -2723,48 +2810,102 @@
             </div>
           </div>
         `;
-        treeEl.appendChild(nodeCard);
+      }
 
-        if (node.children && node.children.length > 0) {
-          node.children.forEach((child, i) => {
-            renderTreeNode(child, depth + 1, i === node.children.length - 1);
-          });
+      if (currentSwarmLayoutMode === 'list') {
+        let nodes = data.fleet_nodes;
+        if (!nodes || nodes.length === 0) {
+          if (data.fleet_tree) {
+            nodes = [];
+            const collect = (n) => {
+              nodes.push(n);
+              if (n.children) n.children.forEach(collect);
+            };
+            collect(data.fleet_tree);
+            nodes.sort((a, b) => ((b.cost || 0) - (a.cost || 0)) || ((b.tokens || 0) - (a.tokens || 0)));
+          }
+        }
+        if (!nodes || nodes.length === 0) {
+          treeEl.innerHTML = `
+            <div class="text-center py-6 text-gray-500 font-mono text-xs">
+              This session operated as a standalone agent with no delegated sub-agents.
+            </div>
+          `;
+          return;
+        }
+
+        nodes.forEach((node, idx) => {
+          const nodeCard = document.createElement('div');
+          const isCurrent = Boolean(node.is_current);
+          nodeCard.className = `p-3 rounded-lg border transition ${
+            isCurrent 
+              ? 'bg-brand-950/40 border-brand-500 ring-1 ring-brand-500/50 shadow-md' 
+              : 'bg-dark-900/70 border-dark-700 hover:border-dark-600'
+          }`;
+          nodeCard.innerHTML = renderNodeCardContent(node, node.depth || 0, isCurrent, true, idx);
+          treeEl.appendChild(nodeCard);
+        });
+      } else {
+        function renderTreeNode(node, depth = 0, isLast = false) {
+          const nodeCard = document.createElement('div');
+          const isCurrent = Boolean(node.is_current);
+          const indentClass = depth === 0 ? '' : depth === 1 ? 'ml-6 border-l-2 border-pink-500/40 pl-3' : 'ml-12 border-l-2 border-purple-500/40 pl-3';
+          
+          nodeCard.className = `p-3 rounded-lg border transition ${indentClass} ${
+            isCurrent 
+              ? 'bg-brand-950/40 border-brand-500 ring-1 ring-brand-500/50 shadow-md' 
+              : 'bg-dark-900/70 border-dark-700 hover:border-dark-600'
+          }`;
+
+          nodeCard.innerHTML = renderNodeCardContent(node, depth, isCurrent, false, 0);
+          treeEl.appendChild(nodeCard);
+
+          if (node.children && node.children.length > 0) {
+            node.children.forEach((child, i) => {
+              renderTreeNode(child, depth + 1, i === node.children.length - 1);
+            });
+          }
+        }
+
+        if (data.fleet_tree) {
+          renderTreeNode(data.fleet_tree, 0, true);
+        } else if (data.children && data.children.length > 0) {
+          renderTreeNode({
+            id: conv.id,
+            title: conv.title,
+            role: conv.subagent_role || 'Root Coordinator',
+            depth: 0,
+            steps: conv.total_steps || 0,
+            tokens: conv.tokens || conv.total_tokens || 0,
+            cost: conv.billed_cost || 0,
+            duration: conv.duration_seconds || 0,
+            model_name: conv.model_name || 'Gemini',
+            compaction_count: conv.compaction_count || 0,
+            pruned_tokens: conv.pruned_tokens || 0,
+            is_current: true,
+            children: data.children.map(ch => ({
+              id: ch.id,
+              title: ch.title,
+              role: ch.role,
+              depth: ch.depth || 1,
+              steps: ch.steps,
+              tokens: ch.tokens,
+              cost: ch.cost,
+              model_name: ch.model_name || 'Gemini',
+              duration: 0,
+              is_current: false,
+              children: []
+            }))
+          }, 0, true);
+        } else {
+          treeEl.innerHTML = `
+            <div class="text-center py-6 text-gray-500 font-mono text-xs">
+              This session operated as a standalone agent with no delegated sub-agents.
+            </div>
+          `;
         }
       }
 
-      if (data.fleet_tree) {
-        renderTreeNode(data.fleet_tree, 0, true);
-      } else if (data.children && data.children.length > 0) {
-        renderTreeNode({
-          id: conv.id,
-          title: conv.title,
-          role: conv.subagent_role || 'Root Coordinator',
-          depth: 0,
-          steps: conv.total_steps || 0,
-          tokens: conv.tokens || conv.total_tokens || 0,
-          cost: conv.billed_cost || 0,
-          duration: conv.duration_seconds || 0,
-          is_current: true,
-          children: data.children.map(ch => ({
-            id: ch.id,
-            title: ch.title,
-            role: ch.role,
-            depth: ch.depth || 1,
-            steps: ch.steps,
-            tokens: ch.tokens,
-            cost: ch.cost,
-            duration: 0,
-            is_current: false,
-            children: []
-          }))
-        }, 0, true);
-      } else {
-        treeEl.innerHTML = `
-          <div class="text-center py-6 text-gray-500 font-mono text-xs">
-            This session operated as a standalone agent with no delegated sub-agents.
-          </div>
-        `;
-      }
       if (typeof lucide !== 'undefined' && lucide.createIcons) {
         lucide.createIcons({ root: treeEl });
       }
