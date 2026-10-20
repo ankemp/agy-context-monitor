@@ -1152,3 +1152,545 @@ def test_clear_api_cache_cleans_inflight_keys(tmp_path):
         assert len(_INFLIGHT_KEYS) == 0
 
 
+def test_tool_execution_covering_indexes_and_plans(tmp_path):
+    from context_monitor.dashboard.api_routes import (
+        query_tools_data,
+        query_hot_files_data,
+        query_mcp_data,
+    )
+
+    db_file = tmp_path / "test_tool_cov.db"
+    init_db(db_file)
+    conn = get_db_connection(db_file)
+    cur = conn.cursor()
+
+    # 1. Verify idx_tool_exec_name_cov, idx_tool_exec_path_cov, and idx_tool_exec_mcp_cov are created in init_db
+    indexes = [
+        r[0]
+        for r in cur.execute(
+            "SELECT name FROM sqlite_master WHERE type='index'"
+        ).fetchall()
+    ]
+    assert "idx_tool_exec_name_cov" in indexes
+    assert "idx_tool_exec_path_cov" in indexes
+    assert "idx_tool_exec_mcp_cov" in indexes
+
+    # 2. Insert sample tool_executions rows including NULL and empty target_paths
+    # to test partial covering index boundaries (idx_tool_exec_path_cov and idx_tool_exec_mcp_cov)
+    cur.execute(
+        "INSERT INTO conversations (id, title, created_at) VALUES ('c1', 'Conv 1', '2026-10-18T10:00:00Z')"
+    )
+    for i in range(1, 51):
+        is_mcp = i % 2 == 0
+        server = "filesystem" if is_mcp else None
+        tool = "read_file" if is_mcp else "view_file"
+        full_tool = f"mcp__{server}__{tool}" if is_mcp else tool
+        # Every 5th row has NULL or empty target_path (e.g. non-file tools)
+        if i % 5 == 0:
+            target_path = None if i % 10 == 0 else ""
+        else:
+            target_path = f"/src/module_{i % 5}.py"
+
+        cur.execute(
+            """
+            INSERT INTO tool_executions (
+                conversation_id, step_index, tool_name, target_path,
+                mcp_server, mcp_tool, is_error
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "c1",
+                i,
+                full_tool,
+                target_path,
+                server,
+                tool if is_mcp else None,
+                1 if (is_mcp and i % 4 == 0) else 0,
+            ),
+        )
+    conn.commit()
+
+    # 3. Spy on queries and verify EXPLAIN QUERY PLAN for query_tools_data, query_hot_files_data, and query_mcp_data
+    executed_queries: list[tuple[str, tuple]] = []
+
+    class SpyCursor:
+        def __init__(self, r):
+            self._r = r
+
+        def execute(self, s, p=()):
+            executed_queries.append((s, p))
+            return self._r.execute(s, p)
+
+        def fetchall(self):
+            return self._r.fetchall()
+
+        def fetchone(self):
+            return self._r.fetchone()
+
+        def __getattr__(self, n):
+            return getattr(self._r, n)
+
+    class SpyConn:
+        def __init__(self, r):
+            self._r = r
+
+        def cursor(self):
+            return SpyCursor(self._r.cursor())
+
+        def execute(self, s, p=()):
+            executed_queries.append((s, p))
+            return self._r.execute(s, p)
+
+        def __getattr__(self, n):
+            return getattr(self._r, n)
+
+    spy = SpyConn(conn)
+
+    # Test query_tools_data uses idx_tool_exec_name_cov
+    executed_queries.clear()
+    tools = query_tools_data(spy)
+    assert len(tools) > 0
+    tools_sql, tools_params = next(
+        (s, p) for s, p in executed_queries if "FROM tool_executions" in s and "GROUP BY tool_name" in s
+    )
+    tools_plan = cur.execute(f"EXPLAIN QUERY PLAN {tools_sql}", tools_params).fetchall()
+    tools_plan_str = " ".join(r["detail"] for r in tools_plan)
+    assert "idx_tool_exec_name_cov" in tools_plan_str
+    assert "COVERING INDEX" in tools_plan_str
+    assert any(t["tool_name"] == "view_file" and t["total_calls"] == 25 for t in tools)
+    assert any(t["tool_name"] == "mcp__filesystem__read_file" and t["total_calls"] == 25 for t in tools)
+
+    # Test query_hot_files_data uses partial covering index idx_tool_exec_path_cov
+    executed_queries.clear()
+    hot_files = query_hot_files_data(spy)
+    assert len(hot_files) > 0
+    hot_sql, hot_params = next(
+        (s, p) for s, p in executed_queries if "FROM tool_executions" in s and "GROUP BY target_path" in s
+    )
+    hot_plan = cur.execute(f"EXPLAIN QUERY PLAN {hot_sql}", hot_params).fetchall()
+    hot_plan_str = " ".join(r["detail"] for r in hot_plan)
+    assert "idx_tool_exec_path_cov" in hot_plan_str
+    assert "COVERING INDEX" in hot_plan_str
+    # Verify NULL and empty paths were excluded
+    assert not any(hf["path"] == "" or hf["path"] is None for hf in hot_files)
+    assert sum(hf["touches"] for hf in hot_files) == 40  # 50 total minus 10 null/empty rows
+
+    # Test query_mcp_data uses idx_tool_exec_mcp_cov
+    executed_queries.clear()
+    mcp_servers = query_mcp_data(spy)
+    assert len(mcp_servers) == 1
+    assert mcp_servers[0]["server"] == "filesystem"
+    assert mcp_servers[0]["calls"] == 25
+    assert len(mcp_servers[0]["tools"]) == 1
+    assert mcp_servers[0]["tools"][0]["tool"] == "read_file"
+
+    mcp_server_sql, mcp_server_params = next(
+        (s, p) for s, p in executed_queries if "FROM tool_executions" in s and "GROUP BY mcp_server" in s
+    )
+    mcp_server_plan = cur.execute(f"EXPLAIN QUERY PLAN {mcp_server_sql}", mcp_server_params).fetchall()
+    mcp_server_plan_str = " ".join(r["detail"] for r in mcp_server_plan)
+    assert "idx_tool_exec_mcp_cov" in mcp_server_plan_str or "idx_tool_exec_server" in mcp_server_plan_str
+    assert "COVERING INDEX" in mcp_server_plan_str
+
+    mcp_tool_sql, mcp_tool_params = next(
+        (s, p) for s, p in executed_queries if "FROM tool_executions" in s and "GROUP BY mcp_tool" in s
+    )
+    mcp_tool_plan = cur.execute(f"EXPLAIN QUERY PLAN {mcp_tool_sql}", mcp_tool_params).fetchall()
+    mcp_tool_plan_str = " ".join(r["detail"] for r in mcp_tool_plan)
+    assert "idx_tool_exec_mcp_cov" in mcp_tool_plan_str
+    assert "COVERING INDEX" in mcp_tool_plan_str
+
+    conn.close()
+
+
+def test_summary_models_query_plan_avoids_temp_btree(tmp_path):
+    from context_monitor.dashboard.api_routes import query_summary_data
+
+    db_file = tmp_path / "test_summary_models.db"
+    init_db(db_file)
+    conn = get_db_connection(db_file)
+    cur = conn.cursor()
+
+    cur.execute(
+        "INSERT INTO conversations (id, title, created_at, total_steps) VALUES ('c1', 'Conv 1', '2026-10-18T10:00:00Z', 10)"
+    )
+    # Insert a mix of explicit model names, NULL model_names, and empty strings
+    for i in range(10):
+        if i < 4:
+            model = "Gemini Pro"
+        elif i < 7:
+            model = "Gemini Flash"
+        elif i < 9:
+            model = None
+        else:
+            model = ""
+        cur.execute(
+            """
+            INSERT INTO steps (
+                conversation_id, step_index, model_name, billed_input_tokens,
+                billed_output_tokens, est_tokens, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, '2026-10-18T10:10:00Z')
+            """,
+            ("c1", i, model, 100, 50, 150),
+        )
+    conn.commit()
+
+    executed_queries: list[tuple[str, tuple]] = []
+
+    class SpyCursor:
+        def __init__(self, r):
+            self._r = r
+
+        def execute(self, s, p=()):
+            executed_queries.append((s, p))
+            return self._r.execute(s, p)
+
+        def fetchall(self):
+            return self._r.fetchall()
+
+        def fetchone(self):
+            return self._r.fetchone()
+
+        def __getattr__(self, n):
+            return getattr(self._r, n)
+
+    class SpyConn:
+        def __init__(self, r):
+            self._r = r
+
+        def cursor(self):
+            return SpyCursor(self._r.cursor())
+
+        def execute(self, s, p=()):
+            executed_queries.append((s, p))
+            return self._r.execute(s, p)
+
+        def commit(self):
+            return self._r.commit()
+
+        def __enter__(self):
+            self._r.__enter__()
+            return self
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            return self._r.__exit__(exc_type, exc_val, exc_tb)
+
+        def __getattr__(self, n):
+            return getattr(self._r, n)
+
+    spy = SpyConn(conn)
+    summary = query_summary_data(spy)
+    assert summary["total_steps"] == 10
+    # In Python, NULL and empty strings coalesce into 'Gemini Flash'
+    assert len(summary["models"]) == 2
+    pro_model = next((m for m in summary["models"] if m["model_name"] == "Gemini Pro"), None)
+    flash_model = next((m for m in summary["models"] if m["model_name"] == "Gemini Flash"), None)
+    assert pro_model is not None and pro_model["steps"] == 4
+    assert flash_model is not None and flash_model["steps"] == 6
+
+    model_query, model_params = next(
+        (s, p) for s, p in executed_queries if "SELECT model_name as mname" in s and "GROUP BY model_name" in s
+    )
+    plan_rows = cur.execute(f"EXPLAIN QUERY PLAN {model_query}", model_params).fetchall()
+    plan_details = [r["detail"] for r in plan_rows]
+    plan_str = " ".join(plan_details)
+
+    assert "SCAN steps USING COVERING INDEX idx_steps_model_billed" in plan_str
+    assert not any("USE TEMP B-TREE FOR GROUP BY" in d for d in plan_details)
+
+    conn.close()
+
+
+def test_cycle_timeline_boundary_hour_bounded_seek(tmp_path):
+    from datetime import datetime, timezone, timedelta
+    from context_monitor.dashboard import api_routes
+    from context_monitor.db import upsert_quota_state, refresh_conversation_rollups
+
+    db_file = tmp_path / "test_boundary_seek.db"
+    init_db(db_file)
+    conn = get_db_connection(db_file)
+    cur = conn.cursor()
+
+    now_utc = datetime.now(timezone.utc).replace(microsecond=0)
+    reset_utc = (now_utc + timedelta(days=3)).replace(minute=35, second=42)
+    start_utc = reset_utc - timedelta(days=7)
+
+    upsert_quota_state(
+        conn,
+        [
+            {
+                "bucket_id": "gemini-weekly",
+                "group_name": "Gemini Models",
+                "window": "weekly",
+                "remaining_fraction": 0.6,
+                "reset_time": reset_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "calibrated_capacity": 672.0,
+                "fetched_at": now_utc.isoformat(),
+            }
+        ],
+    )
+    conn.execute(
+        "INSERT INTO conversations (id, title, model_name, created_at) VALUES ('c1', 'Conv 1', 'Gemini Flash', ?)",
+        (now_utc.isoformat(),),
+    )
+    step_ts_before = (start_utc - timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    step_ts_after = (start_utc + timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    cur.execute(
+        """
+        INSERT INTO steps (
+            conversation_id, step_index, phase, category, activity,
+            tool_or_source, model_name, est_tokens, detail, created_at,
+            billed_cost, billed_input_tokens, billed_output_tokens
+        ) VALUES 
+        ('c1', 1, 'exec', 'cat', 'act', 't', 'm', 100, '', ?, 0.01, 100, 50),
+        ('c1', 2, 'exec', 'cat', 'act', 't', 'm', 200, '', ?, 0.02, 200, 100)
+        """,
+        (step_ts_before, step_ts_after),
+    )
+    conn.commit()
+    refresh_conversation_rollups(conn, "c1")
+
+    executed_queries: list[tuple[str, tuple]] = []
+
+    class SpyCursor:
+        def __init__(self, r):
+            self._r = r
+
+        def execute(self, s, p=()):
+            executed_queries.append((s, p))
+            return self._r.execute(s, p)
+
+        def fetchall(self):
+            return self._r.fetchall()
+
+        def fetchone(self):
+            return self._r.fetchone()
+
+        def __getattr__(self, n):
+            return getattr(self._r, n)
+
+    class SpyConn:
+        def __init__(self, r):
+            self._r = r
+
+        def cursor(self):
+            return SpyCursor(self._r.cursor())
+
+        def execute(self, s, p=()):
+            executed_queries.append((s, p))
+            return self._r.execute(s, p)
+
+        def __getattr__(self, n):
+            return getattr(self._r, n)
+
+    spy = SpyConn(conn)
+    timeline = api_routes.query_timeline_data(spy, days="cycle", tz="UTC")
+    assert len(timeline) > 0
+
+    # 1. Verify functional boundary exclusion:
+    # step_ts_before (10 minutes before cycle reset) is excluded
+    # step_ts_after (5 minutes after cycle reset) is included
+    start_item = next(d for d in timeline if d.get("is_start"))
+    assert start_item["steps"] == 1
+    assert start_item["tokens"] == 300
+    assert abs(start_item["cost"] - 0.02) < 1e-6
+    total_timeline_steps = sum(d.get("steps", 0) for d in timeline)
+    assert total_timeline_steps == 1
+
+    # 2. Verify bounded boundary SQL query and plan
+    boundary_query, boundary_params = next(
+        (s, p) for s, p in executed_queries if "FROM steps" in s and "created_at >= ?" in s
+    )
+
+    assert "created_at >= ?" in boundary_query
+    assert "created_at < ?" in boundary_query
+
+    plan_rows = cur.execute(f"EXPLAIN QUERY PLAN {boundary_query}", boundary_params).fetchall()
+    plan_details = [r["detail"] for r in plan_rows]
+    plan_str = " ".join(plan_details)
+
+    assert "idx_steps_created" in plan_str
+    assert "SEARCH steps USING INDEX idx_steps_created" in plan_str
+    assert not any("SCAN steps" in d for d in plan_details)
+
+    # 3. Verify that when reset is exactly on the hour, boundary hour seek on steps is skipped
+    reset_on_hour = (now_utc + timedelta(days=3)).replace(minute=0, second=0, microsecond=0)
+    upsert_quota_state(
+        conn,
+        [
+            {
+                "bucket_id": "gemini-weekly",
+                "group_name": "Gemini Models",
+                "window": "weekly",
+                "remaining_fraction": 0.6,
+                "reset_time": reset_on_hour.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "calibrated_capacity": 672.0,
+                "fetched_at": now_utc.isoformat(),
+            }
+        ],
+    )
+    executed_queries.clear()
+    timeline_on_hour = api_routes.query_timeline_data(spy, days="cycle", tz="UTC")
+    assert len(timeline_on_hour) > 0
+    assert not any("substr(replace(created_at" in s and "FROM steps" in s for s, _ in executed_queries), (
+        "Cycle timeline with exact on-the-hour reset must not query steps table for boundary hour adjustment!"
+    )
+
+    conn.close()
+
+
+def test_rollup_sync_latest_conv_heuristic_fast_path(tmp_path):
+    from context_monitor.db import (
+        ensure_rollups_synced,
+        invalidate_rollups_sync_cache,
+    )
+
+    db_file = tmp_path / "test_heuristic_sync.db"
+    init_db(db_file)
+    conn = get_db_connection(db_file)
+    cur = conn.cursor()
+
+    # 1. Seed conversation c0 and step with id=1
+    cur.execute(
+        "INSERT INTO conversations (id, title, created_at) VALUES ('c0', 'Older Conv', '2026-10-18T09:00:00Z')"
+    )
+    cur.execute(
+        """
+        INSERT INTO steps (id, conversation_id, step_index, created_at, est_tokens, billed_cost)
+        VALUES (1, 'c0', 1, '2026-10-18T09:10:00Z', 100, 0.01)
+        """
+    )
+    conn.commit()
+
+    ensure_rollups_synced(conn)
+    c0_rollups = cur.execute(
+        "SELECT COUNT(*) FROM hourly_step_rollups WHERE conversation_id = 'c0'"
+    ).fetchone()[0]
+    assert c0_rollups == 1
+
+    # 2. Insert new conversation c_latest with step id=6000 (> 5000)
+    cur.execute(
+        "INSERT INTO conversations (id, title, created_at) VALUES ('c_latest', 'Latest Conv', '2026-10-18T10:00:00Z')"
+    )
+    cur.execute(
+        """
+        INSERT INTO steps (id, conversation_id, step_index, created_at, est_tokens, billed_cost, billed_input_tokens, billed_output_tokens)
+        VALUES (6000, 'c_latest', 1, '2026-10-18T10:15:00Z', 500, 0.05, 300, 200)
+        """
+    )
+    conn.commit()
+
+    pre_cnt = cur.execute(
+        "SELECT COUNT(*) FROM hourly_step_rollups WHERE conversation_id = 'c_latest'"
+    ).fetchone()[0]
+    assert pre_cnt == 0
+
+    invalidate_rollups_sync_cache()
+
+    executed_queries: list[str] = []
+
+    class SpyCursor:
+        def __init__(self, r):
+            self._r = r
+
+        def execute(self, s, p=()):
+            executed_queries.append(s)
+            return self._r.execute(s, p)
+
+        def fetchall(self):
+            return self._r.fetchall()
+
+        def fetchone(self):
+            return self._r.fetchone()
+
+        def __getattr__(self, n):
+            return getattr(self._r, n)
+
+    class SpyConn:
+        def __init__(self, r):
+            self._r = r
+
+        def cursor(self):
+            return SpyCursor(self._r.cursor())
+
+        def execute(self, s, p=()):
+            executed_queries.append(s)
+            return self._r.execute(s, p)
+
+        def commit(self):
+            return self._r.commit()
+
+        def __getattr__(self, n):
+            return getattr(self._r, n)
+
+    spy = SpyConn(conn)
+    ensure_rollups_synced(spy)
+
+    # 3. Verify max_id was checked, latest cid was fetched, and conversation was synchronized
+    assert any("SELECT MAX(id) FROM steps" in q for q in executed_queries)
+    assert any("SELECT conversation_id FROM steps WHERE id = ?" in q for q in executed_queries)
+    assert not any(
+        "SELECT COUNT(*), COALESCE(SUM(est_tokens), 0)" in q
+        and "WHERE created_at IS NOT NULL AND created_at != ''" in q
+        and "conversation_id = ?" not in q
+        for q in executed_queries
+    )
+
+    # 4. Verify c_latest rollups are cleanly synchronized
+    post_row = cur.execute(
+        """
+        SELECT step_count, est_tokens, billed_tokens, billed_cost
+        FROM hourly_step_rollups
+        WHERE conversation_id = 'c_latest'
+        """
+    ).fetchone()
+    assert post_row is not None
+    assert post_row["step_count"] == 1
+    assert post_row["est_tokens"] == 500
+    assert post_row["billed_tokens"] == 500
+    assert abs(post_row["billed_cost"] - 0.05) < 1e-6
+
+    # 5. Incremental Turn Append: add step 6001 to existing c_latest
+    cur.execute(
+        """
+        INSERT INTO steps (id, conversation_id, step_index, created_at, est_tokens, billed_cost, billed_input_tokens, billed_output_tokens)
+        VALUES (6001, 'c_latest', 2, '2026-10-18T10:20:00Z', 700, 0.07, 400, 300)
+        """
+    )
+    conn.commit()
+
+    invalidate_rollups_sync_cache()
+    executed_queries.clear()
+    ensure_rollups_synced(spy)
+
+    post_row_turn2 = cur.execute(
+        """
+        SELECT step_count, est_tokens, billed_tokens, billed_cost
+        FROM hourly_step_rollups
+        WHERE conversation_id = 'c_latest'
+        """
+    ).fetchone()
+    assert post_row_turn2 is not None
+    assert post_row_turn2["step_count"] == 2
+    assert post_row_turn2["est_tokens"] == 1200
+    assert post_row_turn2["billed_tokens"] == 1200
+    assert abs(post_row_turn2["billed_cost"] - 0.12) < 1e-6
+
+    # 6. In-Memory Fast Path: subsequent call with warm cache executes 0 queries against steps/rollups
+    executed_queries.clear()
+    ensure_rollups_synced(spy)
+    assert not any("steps" in q.lower() for q in executed_queries), (
+        f"Warm cache should hit O(1) in-memory check without querying steps, but executed: {executed_queries}"
+    )
+
+    # 7. Already-synced path with invalidated cache verifies rollups match and avoids rebuild
+    invalidate_rollups_sync_cache()
+    executed_queries.clear()
+    ensure_rollups_synced(spy)
+    assert not any("DELETE FROM hourly_step_rollups" in q for q in executed_queries)
+
+    conn.close()
+
+
+
