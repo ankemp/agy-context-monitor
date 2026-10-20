@@ -3404,7 +3404,6 @@
     }
 
     let dbUpdateDebounceTimer = null;
-    let lastDbUpdateTime = 0;
     let pendingDashboardRefresh = false;
 
     if (typeof document !== 'undefined') {
@@ -3412,7 +3411,6 @@
         if (!document.hidden && pendingDashboardRefresh) {
           console.log("⚡ Tab became visible with pending SQLite update. Refreshing UI...");
           pendingDashboardRefresh = false;
-          lastDbUpdateTime = Date.now();
           fetchDashboardData();
         }
       });
@@ -3457,7 +3455,6 @@
           // 2000ms SSE debounce window (previously 300ms) to coalesce rapid sub-agent writes
           const sseDebounceMs = 2000;
           dbUpdateDebounceTimer = setTimeout(() => {
-            lastDbUpdateTime = Date.now();
             fetchDashboardData();
             dbUpdateDebounceTimer = null;
           }, sseDebounceMs);

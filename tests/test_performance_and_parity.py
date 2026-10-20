@@ -619,7 +619,6 @@ def test_legacy_tools_blocks_cleanup(tmp_path):
 
 
 def test_rollup_query_plans_and_calibrate_capacity(tmp_path):
-    from context_monitor.db import refresh_conversation_rollups, ensure_rollups_synced
     from context_monitor.quota import calibrate_capacity, get_hourly_activity_profile
     from context_monitor.dashboard import api_routes
 
@@ -665,17 +664,35 @@ def test_rollup_query_plans_and_calibrate_capacity(tmp_path):
     executed_queries: list[tuple[str, tuple]] = []
 
     class SpyCursor:
-        def __init__(self, r): self._r = r
-        def execute(self, s, p=()): executed_queries.append((s, p)); return self._r.execute(s, p)
-        def fetchall(self): return self._r.fetchall()
-        def fetchone(self): return self._r.fetchone()
-        def __getattr__(self, n): return getattr(self._r, n)
+        def __init__(self, r):
+            self._r = r
+
+        def execute(self, s, p=()):
+            executed_queries.append((s, p))
+            return self._r.execute(s, p)
+
+        def fetchall(self):
+            return self._r.fetchall()
+
+        def fetchone(self):
+            return self._r.fetchone()
+
+        def __getattr__(self, n):
+            return getattr(self._r, n)
 
     class SpyConn:
-        def __init__(self, r): self._r = r
-        def cursor(self): return SpyCursor(self._r.cursor())
-        def execute(self, s, p=()): executed_queries.append((s, p)); return self._r.execute(s, p)
-        def __getattr__(self, n): return getattr(self._r, n)
+        def __init__(self, r):
+            self._r = r
+
+        def cursor(self):
+            return SpyCursor(self._r.cursor())
+
+        def execute(self, s, p=()):
+            executed_queries.append((s, p))
+            return self._r.execute(s, p)
+
+        def __getattr__(self, n):
+            return getattr(self._r, n)
 
     spy = SpyConn(conn)
     timeline = api_routes.query_timeline_data(spy, days=7, tz="UTC")
@@ -759,7 +776,6 @@ def test_single_flight_api_cache(tmp_path):
 def test_server_transparent_gzip(tmp_path):
     import io
     import gzip
-    from unittest.mock import MagicMock
     from context_monitor.dashboard.server import DashboardHTTPHandler
 
     db_file = tmp_path / "test_gzip.db"
@@ -810,11 +826,7 @@ def test_server_transparent_gzip(tmp_path):
 
 
 def test_quota_write_suppression_and_ls_cache(tmp_path):
-    from context_monitor.quota import (
-        sync_and_get_quota_state,
-        discover_language_server_credentials,
-        _CACHED_LS_CREDS,
-    )
+    from context_monitor.quota import sync_and_get_quota_state
 
     db_file = tmp_path / "test_suppression.db"
     init_db(db_file)
@@ -877,5 +889,266 @@ def test_quota_write_suppression_and_ls_cache(tmp_path):
 
     observer.close()
     conn.close()
+
+
+def test_cycle_mode_uses_hourly_step_rollups_and_fallback(tmp_path):
+    from datetime import datetime, timezone, timedelta
+    from context_monitor.dashboard import api_routes
+    from context_monitor.db import upsert_quota_state, refresh_conversation_rollups
+
+    db_file = tmp_path / "test_cycle_rollups.db"
+    init_db(db_file)
+    conn = get_db_connection(db_file)
+
+    now_utc = datetime.now(timezone.utc).replace(microsecond=0)
+    reset_utc = now_utc + timedelta(days=3)
+    start_utc = reset_utc - timedelta(days=7)
+
+    upsert_quota_state(
+        conn,
+        [
+            {
+                "bucket_id": "gemini-weekly",
+                "group_name": "Gemini Models",
+                "window": "weekly",
+                "remaining_fraction": 0.5,
+                "reset_time": reset_utc.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "calibrated_capacity": 672.0,
+                "fetched_at": now_utc.isoformat(),
+            }
+        ],
+    )
+    conn.execute(
+        "INSERT INTO conversations (id, title, model_name, created_at) VALUES ('c1', 'Conv 1', 'Gemini Flash', ?)",
+        (now_utc.isoformat(),),
+    )
+    step_ts = (start_utc + timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    conn.execute(
+        """
+        INSERT INTO steps (
+            conversation_id, step_index, phase, category, activity,
+            tool_or_source, model_name, est_tokens, detail, created_at,
+            billed_cost, billed_input_tokens, billed_output_tokens
+        ) VALUES ('c1', 1, 'exec', 'cat', 'act', 't', 'm', 100, '', ?, 0.05, 500, 200)
+        """,
+        (step_ts,),
+    )
+    conn.commit()
+    refresh_conversation_rollups(conn, "c1")
+
+    executed_queries: list[tuple[str, tuple]] = []
+
+    class SpyCursor:
+        def __init__(self, r):
+            self._r = r
+
+        def execute(self, s, p=()):
+            executed_queries.append((s, p))
+            return self._r.execute(s, p)
+
+        def fetchall(self):
+            return self._r.fetchall()
+
+        def fetchone(self):
+            return self._r.fetchone()
+
+        def __getattr__(self, n):
+            return getattr(self._r, n)
+
+    class SpyConn:
+        def __init__(self, r):
+            self._r = r
+
+        def cursor(self):
+            return SpyCursor(self._r.cursor())
+
+        def execute(self, s, p=()):
+            executed_queries.append((s, p))
+            return self._r.execute(s, p)
+
+        def __getattr__(self, n):
+            return getattr(self._r, n)
+
+    spy = SpyConn(conn)
+    timeline = api_routes.query_timeline_data(spy, days="cycle", tz="UTC")
+    assert len(timeline) > 0
+
+    # 1. Verify hourly_step_rollups was queried with hour_key >= ? and hour_key < ?
+    rollup_query = next(
+        (s, p) for s, p in executed_queries if "FROM hourly_step_rollups" in s and "hour_key >= ?" in s
+    )
+    assert "hour_key >= ?" in rollup_query[0]
+    assert "hour_key < ?" in rollup_query[0]
+    # Check start_hour and end_hour formatting '%Y-%m-%dT%H'
+    expected_start_hour = start_utc.strftime("%Y-%m-%dT%H")
+    expected_end_hour = reset_utc.strftime("%Y-%m-%dT%H")
+    assert expected_start_hour in rollup_query[1]
+    assert expected_end_hour in rollup_query[1]
+
+    # 2. Verify fallback to steps on OperationalError
+    conn.execute("DROP TABLE hourly_step_rollups")
+    conn.commit()
+    executed_queries.clear()
+
+    timeline_fb = api_routes.query_timeline_data(spy, days="cycle", tz="UTC")
+    assert len(timeline_fb) > 0
+    fallback_query = next(
+        (s, p) for s, p in executed_queries if "FROM steps" in s and "GROUP BY hour_key" in s
+    )
+    assert fallback_query is not None
+
+    conn.close()
+
+
+def test_ensure_rollups_synced_o1_check_and_cache(tmp_path):
+    from context_monitor.db import ensure_rollups_synced
+
+    db_file = tmp_path / "test_o1_sync.db"
+    init_db(db_file)
+    conn = get_db_connection(db_file)
+
+    # Insert a conversation and step
+    conn.execute(
+        "INSERT INTO conversations (id, title, created_at) VALUES ('c1', 'Conv 1', '2026-10-18T10:00:00Z')"
+    )
+    conn.execute(
+        """
+        INSERT INTO steps (conversation_id, step_index, created_at, model_name, est_tokens, billed_cost)
+        VALUES ('c1', 1, '2026-10-18T10:15:00Z', 'Gemini Pro', 100, 0.01)
+        """
+    )
+    conn.commit()
+
+    # Rollups table is empty initially (simulate new migration with data in steps)
+    conn.execute("DELETE FROM hourly_step_rollups")
+    conn.commit()
+    assert conn.execute("SELECT COUNT(*) FROM hourly_step_rollups").fetchone()[0] == 0
+
+    # ensure_rollups_synced does the initial build
+    ensure_rollups_synced(conn)
+    assert conn.execute("SELECT COUNT(*) FROM hourly_step_rollups").fetchone()[0] == 1
+
+    # Call it again without any DB changes: must hit the O(1) cache check without queries to steps
+    executed_queries = []
+
+    class SpyCursor:
+        def __init__(self, r):
+            self._r = r
+
+        def execute(self, s, p=()):
+            executed_queries.append(s)
+            return self._r.execute(s, p)
+
+        def fetchall(self):
+            return self._r.fetchall()
+
+        def fetchone(self):
+            return self._r.fetchone()
+
+        def __getattr__(self, n):
+            return getattr(self._r, n)
+
+    class SpyConn:
+        def __init__(self, r):
+            self._r = r
+
+        def cursor(self):
+            return SpyCursor(self._r.cursor())
+
+        def execute(self, s, p=()):
+            executed_queries.append(s)
+            return self._r.execute(s, p)
+
+        def __getattr__(self, n):
+            return getattr(self._r, n)
+
+    spy = SpyConn(conn)
+    ensure_rollups_synced(spy)
+
+    # Verify no full scan of steps table occurred
+    assert not any("FROM steps" in q for q in executed_queries)
+    conn.close()
+
+    # Verify a brand new connection also hits the O(1) cache check without scanning steps
+    conn2 = get_db_connection(db_file)
+    executed_queries.clear()
+    spy2 = SpyConn(conn2)
+    ensure_rollups_synced(spy2)
+    assert not any("FROM steps" in q for q in executed_queries)
+    conn2.close()
+
+
+def test_init_db_user_version_avoids_blocks_scan(tmp_path):
+    db_file = tmp_path / "test_user_ver.db"
+    init_db(db_file)
+    conn = get_db_connection(db_file)
+
+    # Insert a block so transcript_blocks is not empty
+    conn.execute("INSERT INTO conversations (id, title) VALUES ('c1', 'Conv 1')")
+    conn.execute(
+        "INSERT INTO transcript_blocks (conversation_id, step_index, block_type, content, block_hash) "
+        "VALUES ('c1', 0, 'user', 'hello', 'hash1')"
+    )
+    conn.commit()
+
+    # Run init_db to set user_version = 2
+    init_db(conn)
+    ver = conn.execute("PRAGMA user_version;").fetchone()[0]
+    assert ver >= 2
+
+    # Spy on subsequent init_db to verify it skips transcript_blocks scan
+    executed_queries = []
+
+    class SpyCursor:
+        def __init__(self, r):
+            self._r = r
+
+        def execute(self, s, p=()):
+            executed_queries.append(s)
+            return self._r.execute(s, p)
+
+        def fetchall(self):
+            return self._r.fetchall()
+
+        def fetchone(self):
+            return self._r.fetchone()
+
+        def __getattr__(self, n):
+            return getattr(self._r, n)
+
+    class SpyConn:
+        def __init__(self, r):
+            self._r = r
+
+        def cursor(self):
+            return SpyCursor(self._r.cursor())
+
+        def execute(self, s, p=()):
+            executed_queries.append(s)
+            return self._r.execute(s, p)
+
+        def __getattr__(self, n):
+            return getattr(self._r, n)
+
+    spy = SpyConn(conn)
+    init_db(spy)
+
+    # No query should search transcript_blocks for tools
+    assert not any("block_type = 'tools'" in q for q in executed_queries)
+    conn.close()
+
+
+def test_clear_api_cache_cleans_inflight_keys(tmp_path):
+    import threading
+    from context_monitor.dashboard.server import _INFLIGHT_KEYS, _INFLIGHT_LOCK, clear_api_cache
+
+    with _INFLIGHT_LOCK:
+        _INFLIGHT_KEYS["dummy:key"] = threading.Lock()
+        assert len(_INFLIGHT_KEYS) > 0
+
+    clear_api_cache()
+
+    with _INFLIGHT_LOCK:
+        assert len(_INFLIGHT_KEYS) == 0
 
 

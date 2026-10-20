@@ -46,10 +46,18 @@ def clear_api_cache():
         _API_CACHE.clear()
         _LAST_DATA_VERSIONS.clear()
         _ACTIVE_DB = None
+    with _INFLIGHT_LOCK:
+        _INFLIGHT_KEYS.clear()
     try:
         from context_monitor.quota import invalidate_activity_profile_cache
 
         invalidate_activity_profile_cache()
+    except Exception:
+        pass
+    try:
+        from context_monitor.db import invalidate_rollups_sync_cache
+
+        invalidate_rollups_sync_cache()
     except Exception:
         pass
 

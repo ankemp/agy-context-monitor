@@ -848,11 +848,10 @@ def sync_to_sqlite(
                 prev_step_count = row_steps[1] if row_steps else 0
 
                 row_blocks = cur.execute(
-                    "SELECT COALESCE(MAX(step_index), 0), COUNT(*) FROM transcript_blocks WHERE conversation_id = ?",
+                    "SELECT COUNT(*) FROM transcript_blocks WHERE conversation_id = ?",
                     (cid,),
                 ).fetchone()
-                prev_max_block_step = row_blocks[0] if row_blocks else 0
-                prev_block_count = row_blocks[1] if row_blocks else 0
+                prev_block_count = row_blocks[0] if row_blocks else 0
 
                 curr_blocks = analysis.get("parsed_blocks", [])
                 curr_steps = analysis.get("steps", [])

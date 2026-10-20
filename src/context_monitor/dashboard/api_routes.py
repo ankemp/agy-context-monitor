@@ -4,7 +4,7 @@ import math
 import os
 import json
 import re
-from datetime import datetime, timedelta, timezone, tzinfo
+from datetime import datetime, timedelta, tzinfo
 from typing import Any, NamedTuple
 from zoneinfo import ZoneInfo
 
@@ -701,7 +701,7 @@ def query_timeline_data(conn, days=None, tz=None, project=None):
     reset_dt_local = None
 
     if is_cycle_mode:
-        where_conditions = ["created_at IS NOT NULL", "created_at != ''"]
+        where_conditions = ["hour_key IS NOT NULL", "hour_key != ''"]
         params = []
         if project and project != "all":
             if project == "(unassigned)":
@@ -748,36 +748,96 @@ def query_timeline_data(conn, days=None, tz=None, project=None):
         if has_valid_reset:
             start_dt_utc_clean = start_dt_utc.replace(microsecond=0)
             reset_dt_utc_clean = reset_dt_utc.replace(microsecond=0)
-            where_conditions.append("created_at >= ?")
-            params.append(start_dt_utc_clean.strftime("%Y-%m-%d"))
-            where_conditions.append("replace(created_at, ' ', 'T') >= ?")
-            params.append(start_dt_utc_clean.strftime("%Y-%m-%dT%H:%M:%S"))
-            where_conditions.append("replace(created_at, ' ', 'T') < ?")
-            params.append(reset_dt_utc_clean.strftime("%Y-%m-%dT%H:%M:%S"))
+            start_hour = start_dt_utc_clean.strftime("%Y-%m-%dT%H")
+            end_hour = reset_dt_utc_clean.strftime("%Y-%m-%dT%H")
+            where_conditions.append("hour_key >= ?")
+            params.append(start_hour)
+            where_conditions.append("hour_key < ?")
+            params.append(end_hour)
             start_date = start_dt_local.date()
             end_date = reset_dt_local.date()
         else:
             start_date = today - timedelta(days=6)
             end_date = today
             cutoff_date = today - timedelta(days=8)
-            where_conditions.append("created_at >= ?")
+            where_conditions.append("hour_key >= ?")
             params.append(cutoff_date.isoformat())
 
         where_clause = "WHERE " + " AND ".join(where_conditions)
-        rows = cur.execute(
-            f"""
-            SELECT 
-                substr(created_at, 1, 13) as hour_key,
-                conversation_id,
-                COUNT(*) as step_count,
-                SUM(COALESCE(billed_input_tokens, 0) + COALESCE(billed_output_tokens, 0)) as tokens,
-                SUM(billed_cost) as cost
-            FROM steps
-            {where_clause}
-            GROUP BY hour_key, conversation_id
-        """,
-            tuple(params),
-        ).fetchall()
+        try:
+            rows = cur.execute(
+                f"""
+                SELECT 
+                    hour_key,
+                    conversation_id,
+                    step_count,
+                    billed_tokens as tokens,
+                    billed_cost as cost
+                FROM hourly_step_rollups
+                {where_clause}
+            """,
+                tuple(params),
+            ).fetchall()
+
+            if has_valid_reset and (
+                start_dt_utc.minute > 0
+                or start_dt_utc.second > 0
+                or start_dt_utc.microsecond > 0
+            ):
+                boundary_where = ["created_at IS NOT NULL", "created_at != ''"]
+                boundary_params = []
+                if project and project != "all":
+                    if project == "(unassigned)":
+                        boundary_where.append(
+                            "conversation_id IN (SELECT id FROM conversations WHERE project IS NULL OR project = '')"
+                        )
+                    else:
+                        boundary_where.append(
+                            "conversation_id IN (SELECT id FROM conversations WHERE project = ?)"
+                        )
+                        boundary_params.append(project)
+
+                boundary_where.append("created_at >= ?")
+                boundary_params.append(start_dt_utc_clean.strftime("%Y-%m-%d"))
+                boundary_where.append("replace(created_at, ' ', 'T') >= ?")
+                boundary_params.append(start_dt_utc_clean.strftime("%Y-%m-%dT%H:%M:%S"))
+                boundary_where.append("substr(replace(created_at, ' ', 'T'), 1, 13) = ?")
+                boundary_params.append(start_hour)
+
+                b_clause = "WHERE " + " AND ".join(boundary_where)
+                b_rows = cur.execute(
+                    f"""
+                    SELECT 
+                        substr(replace(created_at, ' ', 'T'), 1, 13) as hour_key,
+                        conversation_id,
+                        COUNT(*) as step_count,
+                        SUM(COALESCE(billed_input_tokens, 0) + COALESCE(billed_output_tokens, 0)) as tokens,
+                        SUM(billed_cost) as cost
+                    FROM steps
+                    {b_clause}
+                    GROUP BY hour_key, conversation_id
+                """,
+                    tuple(boundary_params),
+                ).fetchall()
+                rows = [r for r in rows if r["hour_key"] != start_hour] + list(b_rows)
+        except (sqlite3.OperationalError, Exception):
+            legacy_where = where_clause.replace(
+                "hour_key", "substr(replace(created_at, ' ', 'T'), 1, 13)"
+            )
+            rows = cur.execute(
+                f"""
+                SELECT 
+                    substr(replace(created_at, ' ', 'T'), 1, 13) as hour_key,
+                    conversation_id,
+                    COUNT(*) as step_count,
+                    SUM(COALESCE(billed_input_tokens, 0) + COALESCE(billed_output_tokens, 0)) as tokens,
+                    SUM(billed_cost) as cost
+                FROM steps
+                {legacy_where}
+                GROUP BY hour_key, conversation_id
+            """,
+                tuple(params),
+            ).fetchall()
     else:
         where_conditions = ["hour_key IS NOT NULL", "hour_key != ''"]
         params = []

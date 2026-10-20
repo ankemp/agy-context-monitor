@@ -13,8 +13,10 @@ and schema migrations for cross-conversation analytics.
 import math
 import os
 import sqlite3
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 __all__ = [
     "DEFAULT_DB_PATH",
@@ -26,6 +28,7 @@ __all__ = [
     "get_quota_state",
     "refresh_conversation_rollups",
     "ensure_rollups_synced",
+    "invalidate_rollups_sync_cache",
 ]
 
 DEFAULT_DB_PATH = Path(os.path.expanduser("~/.gemini/antigravity/analytics.db"))
@@ -161,6 +164,7 @@ CREATE INDEX IF NOT EXISTS idx_tool_exec_mcp_tool ON tool_executions(mcp_tool);
 CREATE INDEX IF NOT EXISTS idx_tool_exec_path ON tool_executions(target_path);
 CREATE INDEX IF NOT EXISTS idx_blocks_conv_hash ON transcript_blocks(conversation_id, block_hash);
 CREATE INDEX IF NOT EXISTS idx_blocks_conv_step ON transcript_blocks(conversation_id, step_index);
+CREATE INDEX IF NOT EXISTS idx_blocks_tools ON transcript_blocks(block_type) WHERE block_type = 'tools';
 CREATE INDEX IF NOT EXISTS idx_rollups_conv ON hourly_step_rollups(conversation_id);
 """
 
@@ -190,7 +194,9 @@ def init_db(db_or_conn: Path | str | sqlite3.Connection = DEFAULT_DB_PATH):
 
     Accepts either a database file path (Path or str) or an existing sqlite3.Connection.
     """
-    if isinstance(db_or_conn, sqlite3.Connection):
+    if isinstance(db_or_conn, sqlite3.Connection) or (
+        hasattr(db_or_conn, "cursor") and not isinstance(db_or_conn, (str, Path))
+    ):
         _init_db_conn(db_or_conn)
     else:
         path = Path(db_or_conn) if isinstance(db_or_conn, str) else db_or_conn
@@ -331,16 +337,25 @@ def _init_db_conn(conn: sqlite3.Connection) -> None:
 
     # Clean up legacy block_type = 'tools' rows in transcript_blocks if present
     try:
-        cur.execute(
-            "SELECT 1 FROM transcript_blocks WHERE block_type = 'tools' LIMIT 1"
-        )
-        if cur.fetchone() is not None:
-            conn.execute("DELETE FROM transcript_blocks WHERE block_type = 'tools'")
-            conn.commit()
-            try:
-                conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
-            except Exception:
-                pass
+        user_ver = cur.execute("PRAGMA user_version;").fetchone()[0]
+        if user_ver < 2:
+            has_blocks = (
+                cur.execute("SELECT 1 FROM transcript_blocks LIMIT 1").fetchone()
+                is not None
+            )
+            if has_blocks:
+                cur.execute(
+                    "SELECT 1 FROM transcript_blocks WHERE block_type = 'tools' LIMIT 1"
+                )
+                if cur.fetchone() is not None:
+                    conn.execute("DELETE FROM transcript_blocks WHERE block_type = 'tools'")
+                    conn.commit()
+                    try:
+                        conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+                    except Exception:
+                        pass
+                conn.execute("PRAGMA user_version = 2;")
+                conn.commit()
     except Exception:
         pass
 
@@ -542,10 +557,113 @@ def refresh_conversation_rollups(
         conn.commit()
 
 
-def ensure_rollups_synced(conn: sqlite3.Connection) -> None:
-    """Verifies that hourly_step_rollups matches the steps table and rebuilds if out of sync."""
+_ROLLUP_SYNC_LOCK = threading.Lock()
+_LAST_SYNCED_STATE: dict[Any, tuple[int | None, int]] = {}
+
+
+def _extract_db_path(conn: sqlite3.Connection) -> str | None:
+    try:
+        rows = conn.execute("PRAGMA database_list;").fetchall()
+        for row in rows:
+            name = row[1] if len(row) > 1 else ""
+            file = row[2] if len(row) > 2 else ""
+            if name == "main" and file:
+                return str(Path(file).resolve())
+    except Exception:
+        pass
+    return None
+
+
+def invalidate_rollups_sync_cache() -> None:
+    """Invalidates the cached rollups sync states across connections."""
+    with _ROLLUP_SYNC_LOCK:
+        _LAST_SYNCED_STATE.clear()
+
+
+def _rebuild_hourly_rollups(conn: sqlite3.Connection) -> None:
     was_in_transaction = getattr(conn, "in_transaction", False)
+    conn.execute("DELETE FROM hourly_step_rollups")
+    conn.execute(
+        """
+        INSERT INTO hourly_step_rollups (
+            hour_key, conversation_id, step_count, est_tokens, billed_tokens, billed_cost
+        )
+        SELECT 
+            substr(replace(created_at, ' ', 'T'), 1, 13) AS hour_key,
+            conversation_id,
+            COUNT(*) AS step_count,
+            COALESCE(SUM(est_tokens), 0) AS est_tokens,
+            COALESCE(SUM(COALESCE(billed_input_tokens, 0) + COALESCE(billed_output_tokens, 0)), 0) AS billed_tokens,
+            COALESCE(SUM(COALESCE(billed_cost, 0.0)), 0.0) AS billed_cost
+        FROM steps
+        WHERE created_at IS NOT NULL AND created_at != ''
+        GROUP BY hour_key, conversation_id
+        """
+    )
+    if not was_in_transaction:
+        conn.commit()
+
+
+def _get_db_sync_state(conn: sqlite3.Connection) -> tuple[Any, Any]:
+    db_path = _extract_db_path(conn)
+    if db_path:
+        try:
+            st = Path(db_path).stat()
+            mtime = st.st_mtime_ns
+            size = st.st_size
+        except OSError:
+            mtime = size = 0
+        try:
+            st_wal = Path(f"{db_path}-wal").stat()
+            wal_mtime = st_wal.st_mtime_ns
+            wal_size = st_wal.st_size
+        except OSError:
+            wal_mtime = wal_size = 0
+        return (db_path, (mtime, size, wal_mtime, wal_size))
+    else:
+        tc = getattr(conn, "total_changes", 0)
+        return (id(conn), tc)
+
+
+def _record_rollup_synced(conn: sqlite3.Connection) -> None:
+    cache_key, state = _get_db_sync_state(conn)
+    with _ROLLUP_SYNC_LOCK:
+        _LAST_SYNCED_STATE[cache_key] = state
+
+
+def ensure_rollups_synced(conn: sqlite3.Connection, force: bool = False) -> None:
+    """Verifies that hourly_step_rollups matches the steps table and rebuilds if out of sync."""
     cur = conn.cursor()
+
+    # 1. Fast check: is hourly_step_rollups empty?
+    has_rollups = (
+        cur.execute("SELECT 1 FROM hourly_step_rollups LIMIT 1").fetchone() is not None
+    )
+    if not has_rollups:
+        # Check if steps table has data; if empty, nothing to build
+        has_steps = (
+            cur.execute(
+                "SELECT 1 FROM steps WHERE created_at IS NOT NULL AND created_at != '' LIMIT 1"
+            ).fetchone()
+            is not None
+        )
+        if not has_steps:
+            return
+        # Initial build
+        _rebuild_hourly_rollups(conn)
+        _record_rollup_synced(conn)
+        return
+
+    # 2. If rollups exist, avoid 124ms full table scan across 672k rows if database is unchanged
+    in_tx = getattr(conn, "in_transaction", False)
+    if not force and not in_tx:
+        cache_key, state = _get_db_sync_state(conn)
+        with _ROLLUP_SYNC_LOCK:
+            last_state = _LAST_SYNCED_STATE.get(cache_key)
+            if last_state is not None and last_state == state:
+                return
+
+    # 3. Check whether steps and hourly_step_rollups are in sync
     step_stats = cur.execute(
         """
         SELECT 
@@ -578,26 +696,10 @@ def ensure_rollups_synced(conn: sqlite3.Connection) -> None:
         or step_tokens != rollup_tokens
         or abs(step_cost - rollup_cost) > 1e-4
     ):
-        conn.execute("DELETE FROM hourly_step_rollups")
-        conn.execute(
-            """
-            INSERT INTO hourly_step_rollups (
-                hour_key, conversation_id, step_count, est_tokens, billed_tokens, billed_cost
-            )
-            SELECT 
-                substr(replace(created_at, ' ', 'T'), 1, 13) AS hour_key,
-                conversation_id,
-                COUNT(*) AS step_count,
-                COALESCE(SUM(est_tokens), 0) AS est_tokens,
-                COALESCE(SUM(COALESCE(billed_input_tokens, 0) + COALESCE(billed_output_tokens, 0)), 0) AS billed_tokens,
-                COALESCE(SUM(COALESCE(billed_cost, 0.0)), 0.0) AS billed_cost
-            FROM steps
-            WHERE created_at IS NOT NULL AND created_at != ''
-            GROUP BY hour_key, conversation_id
-            """
-        )
-        if not was_in_transaction:
-            conn.commit()
+        _rebuild_hourly_rollups(conn)
+
+    if not in_tx:
+        _record_rollup_synced(conn)
 
 
 if __name__ == "__main__":
