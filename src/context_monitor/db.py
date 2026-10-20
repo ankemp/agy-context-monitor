@@ -32,6 +32,7 @@ __all__ = [
 ]
 
 DEFAULT_DB_PATH = Path(os.path.expanduser("~/.gemini/antigravity/analytics.db"))
+MAX_ID_FULL_SYNC_THRESHOLD = 5000
 
 TABLES_SQL = """
 CREATE TABLE IF NOT EXISTS conversations (
@@ -635,6 +636,22 @@ def _record_rollup_synced(conn: sqlite3.Connection) -> None:
         _LAST_SYNCED_STATE[cache_key] = state
 
 
+def _stats_differ(
+    step_cnt: int,
+    step_tokens: int,
+    step_cost: float,
+    rollup_cnt: int,
+    rollup_tokens: int,
+    rollup_cost: float,
+) -> bool:
+    """Returns True if aggregate step stats differ from hourly rollup stats."""
+    return (
+        step_cnt != rollup_cnt
+        or step_tokens != rollup_tokens
+        or abs(step_cost - rollup_cost) > 1e-4
+    )
+
+
 def ensure_rollups_synced(conn: sqlite3.Connection, force: bool = False) -> None:
     """Verifies that hourly_step_rollups matches the steps table and rebuilds if out of sync."""
     with _ROLLUP_SYNC_LOCK:
@@ -681,7 +698,7 @@ def ensure_rollups_synced(conn: sqlite3.Connection, force: bool = False) -> None
         max_id_row = cur.execute("SELECT MAX(id) FROM steps").fetchone()
         max_id = (max_id_row[0] or 0) if max_id_row else 0
 
-        if max_id <= 5000:
+        if max_id <= MAX_ID_FULL_SYNC_THRESHOLD:
             # Small databases / unit tests: run full steps vs hourly_step_rollups comparison
             step_stats = cur.execute(
                 """
@@ -710,17 +727,15 @@ def ensure_rollups_synced(conn: sqlite3.Connection, force: bool = False) -> None
             rollup_tokens = rollup_stats[1] if rollup_stats else 0
             rollup_cost = rollup_stats[2] if rollup_stats else 0.0
 
-            if (
-                step_cnt != rollup_cnt
-                or step_tokens != rollup_tokens
-                or abs(step_cost - rollup_cost) > 1e-4
+            if _stats_differ(
+                step_cnt, step_tokens, step_cost, rollup_cnt, rollup_tokens, rollup_cost
             ):
                 _rebuild_hourly_rollups(conn)
 
             if not in_tx:
                 _record_rollup_synced(conn)
         else:
-            # Production DB with > 5000 steps (and not force): check latest conversation
+            # Production DB with > MAX_ID_FULL_SYNC_THRESHOLD steps (and not force): check latest conversation
             row = cur.execute(
                 "SELECT conversation_id FROM steps WHERE id = ?", (max_id,)
             ).fetchone()
@@ -756,10 +771,13 @@ def ensure_rollups_synced(conn: sqlite3.Connection, force: bool = False) -> None
                 c_rollup_tokens = conv_rollup_stats[1] if conv_rollup_stats else 0
                 c_rollup_cost = conv_rollup_stats[2] if conv_rollup_stats else 0.0
 
-                if (
-                    c_step_cnt != c_rollup_cnt
-                    or c_step_tokens != c_rollup_tokens
-                    or abs(c_step_cost - c_rollup_cost) > 1e-4
+                if _stats_differ(
+                    c_step_cnt,
+                    c_step_tokens,
+                    c_step_cost,
+                    c_rollup_cnt,
+                    c_rollup_tokens,
+                    c_rollup_cost,
                 ):
                     refresh_conversation_rollups(conn, latest_cid)
 

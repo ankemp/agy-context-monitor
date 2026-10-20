@@ -463,51 +463,52 @@ def query_summary_data(conn, tz=None, project=None):
         model_params = ()
 
     model_rows = cur.execute(model_sql, model_params).fetchall()
+    has_resolved_project_nulls = False
     for r in model_rows:
         name = r["mname"]
         if not name:
             if project:
-                if project == "(unassigned)":
-                    null_sql = """
-                        SELECT COALESCE(c.model_name, 'Gemini Flash') as cname,
-                               COUNT(*) as steps,
-                               SUM(COALESCE(s.billed_input_tokens, 0) + COALESCE(s.billed_output_tokens, 0)) as tokens
-                        FROM steps s
-                        JOIN conversations c ON s.conversation_id = c.id
-                        WHERE (s.model_name IS NULL OR s.model_name = '')
-                          AND (c.project IS NULL OR c.project = '')
-                        GROUP BY cname
-                    """
-                    null_params = ()
-                else:
-                    null_sql = """
-                        SELECT COALESCE(c.model_name, 'Gemini Flash') as cname,
-                               COUNT(*) as steps,
-                               SUM(COALESCE(s.billed_input_tokens, 0) + COALESCE(s.billed_output_tokens, 0)) as tokens
-                        FROM steps s
-                        JOIN conversations c ON s.conversation_id = c.id
-                        WHERE (s.model_name IS NULL OR s.model_name = '')
-                          AND c.project = ?
-                        GROUP BY cname
-                    """
-                    null_params = (project,)
-                null_rows = cur.execute(null_sql, null_params).fetchall()
-                if null_rows:
-                    for nr in null_rows:
-                        cname = nr["cname"] or "Gemini Flash"
-                        st = nr["steps"] or 0
-                        tok = nr["tokens"] or 0
+                if not has_resolved_project_nulls:
+                    has_resolved_project_nulls = True
+                    if project == "(unassigned)":
+                        null_sql = """
+                            SELECT COALESCE(c.model_name, 'Gemini Flash') as cname,
+                                   COUNT(*) as steps,
+                                   SUM(COALESCE(s.billed_input_tokens, 0) + COALESCE(s.billed_output_tokens, 0)) as tokens
+                            FROM steps s
+                            JOIN conversations c ON s.conversation_id = c.id
+                            WHERE (s.model_name IS NULL OR s.model_name = '')
+                              AND (c.project IS NULL OR c.project = '')
+                            GROUP BY cname
+                        """
+                        null_params = ()
+                    else:
+                        null_sql = """
+                            SELECT COALESCE(c.model_name, 'Gemini Flash') as cname,
+                                   COUNT(*) as steps,
+                                   SUM(COALESCE(s.billed_input_tokens, 0) + COALESCE(s.billed_output_tokens, 0)) as tokens
+                            FROM steps s
+                            JOIN conversations c ON s.conversation_id = c.id
+                            WHERE (s.model_name IS NULL OR s.model_name = '')
+                              AND c.project = ?
+                            GROUP BY cname
+                        """
+                        null_params = (project,)
+                    null_rows = cur.execute(null_sql, null_params).fetchall()
+                    for null_row in null_rows:
+                        cname = null_row["cname"] or "Gemini Flash"
+                        c_steps = null_row["steps"] or 0
+                        c_tokens = null_row["tokens"] or 0
                         if cname in model_data:
-                            model_data[cname]["steps"] += st
-                            model_data[cname]["tokens"] += tok
+                            model_data[cname]["steps"] += c_steps
+                            model_data[cname]["tokens"] += c_tokens
                         else:
                             model_data[cname] = {
                                 "model_name": cname,
-                                "steps": st,
-                                "tokens": tok,
+                                "steps": c_steps,
+                                "tokens": c_tokens,
                             }
-                    continue
-                name = "Gemini Flash"
+                continue
             else:
                 name = "Gemini Flash"
 
@@ -874,10 +875,13 @@ def query_timeline_data(conn, days=None, tz=None, project=None):
                         )
                         boundary_params.append(project)
 
-                boundary_where.append("created_at >= ?")
-                boundary_params.append(start_hour.replace("T", " "))
-                boundary_where.append("created_at < ?")
-                boundary_params.append(start_hour + ":59:59.999999Z~")
+                start_hour_space = start_hour.replace("T", " ")
+                next_hour_utc = start_dt_utc_clean.replace(minute=0, second=0) + timedelta(hours=1)
+                next_hour_space = next_hour_utc.strftime("%Y-%m-%d %H")
+                next_hour_t = next_hour_utc.strftime("%Y-%m-%dT%H")
+
+                boundary_where.append("((created_at >= ? AND created_at < ?) OR (created_at >= ? AND created_at < ?))")
+                boundary_params.extend([start_hour_space, next_hour_space, start_hour, next_hour_t])
                 boundary_where.append("replace(created_at, ' ', 'T') >= ?")
                 boundary_params.append(start_dt_utc_clean.strftime("%Y-%m-%dT%H:%M:%S"))
                 boundary_where.append("substr(replace(created_at, ' ', 'T'), 1, 13) = ?")

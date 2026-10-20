@@ -176,6 +176,64 @@ def _get_weekly_project_costs(
     return weekly_cost_by_proj, weekly_capacity, window_start
 
 
+def _get_model_distribution(cur) -> list[tuple[str, dict[str, int]]]:
+    """Extracts step count and token distribution by model name, resolving NULL models via conversations."""
+    model_rows = cur.execute("""
+        SELECT model_name as mname,
+               COUNT(*) as step_count,
+               SUM(COALESCE(billed_input_tokens, 0) + COALESCE(billed_output_tokens, 0)) as tokens
+        FROM steps
+        GROUP BY model_name
+    """).fetchall()
+
+    model_groups: dict[str, dict[str, int]] = {}
+    null_steps = 0
+    null_tokens = 0
+    for r in model_rows:
+        mname = r["mname"] if hasattr(r, "keys") else r[0]
+        step_count = (r["step_count"] if hasattr(r, "keys") else r[1]) or 0
+        tokens = (r["tokens"] if hasattr(r, "keys") else r[2]) or 0
+        if not mname:
+            null_steps += step_count
+            null_tokens += tokens
+            continue
+        if mname not in model_groups:
+            model_groups[mname] = {"step_count": 0, "tokens": 0}
+        model_groups[mname]["step_count"] += step_count
+        model_groups[mname]["tokens"] += tokens
+
+    if null_steps > 0:
+        try:
+            conv_null_rows = cur.execute("""
+                SELECT COALESCE(c.model_name, 'Gemini Flash') as cname,
+                       COUNT(*) as step_count,
+                       SUM(COALESCE(s.billed_input_tokens, 0) + COALESCE(s.billed_output_tokens, 0)) as tokens
+                FROM steps s
+                JOIN conversations c ON s.conversation_id = c.id
+                WHERE s.model_name IS NULL OR s.model_name = ''
+                GROUP BY cname
+            """).fetchall()
+            for cr in conv_null_rows:
+                cname = (cr["cname"] if hasattr(cr, "keys") else cr[0]) or "Gemini Flash"
+                sc = (cr["step_count"] if hasattr(cr, "keys") else cr[1]) or 0
+                tok = (cr["tokens"] if hasattr(cr, "keys") else cr[2]) or 0
+                if cname not in model_groups:
+                    model_groups[cname] = {"step_count": 0, "tokens": 0}
+                model_groups[cname]["step_count"] += sc
+                model_groups[cname]["tokens"] += tok
+        except Exception:
+            if "Gemini Flash" not in model_groups:
+                model_groups["Gemini Flash"] = {"step_count": 0, "tokens": 0}
+            model_groups["Gemini Flash"]["step_count"] += null_steps
+            model_groups["Gemini Flash"]["tokens"] += null_tokens
+
+    return sorted(
+        model_groups.items(),
+        key=lambda x: (x[1]["tokens"], x[1]["step_count"]),
+        reverse=True,
+    )
+
+
 def print_summary(conn):
     print("\n" + "=" * 70)
     print(" 🚀 GOOGLE ANTIGRAVITY — GLOBAL AGGREGATE ANALYTICS")
@@ -347,29 +405,7 @@ def print_summary(conn):
     print("\n[3] Model Distribution (Step-Level Exact):")
     print(f"  {'Model Name':<30} | {'Steps':<10} | {'Tokens':<12} | {'Share':<6}")
     print("  " + "-" * 66)
-    model_rows = cur.execute("""
-        SELECT model_name as mname,
-               COUNT(*) as step_count,
-               SUM(COALESCE(billed_input_tokens, 0) + COALESCE(billed_output_tokens, 0)) as tokens
-        FROM steps
-        GROUP BY model_name
-        ORDER BY tokens DESC
-    """).fetchall()
-    model_groups = {}
-    for r in model_rows:
-        mname = (r["mname"] if hasattr(r, "keys") else r[0]) or "Gemini Flash"
-        sc = (r["step_count"] if hasattr(r, "keys") else r[1]) or 0
-        toks = (r["tokens"] if hasattr(r, "keys") else r[2]) or 0
-        if mname not in model_groups:
-            model_groups[mname] = {"step_count": 0, "tokens": 0}
-        model_groups[mname]["step_count"] += sc
-        model_groups[mname]["tokens"] += toks
-
-    sorted_models = sorted(
-        model_groups.items(),
-        key=lambda x: (x[1]["tokens"], x[1]["step_count"]),
-        reverse=True,
-    )
+    sorted_models = _get_model_distribution(cur)
     tot_model_tokens = sum(info["tokens"] for _, info in sorted_models)
     for mname, info in sorted_models:
         toks = info["tokens"]
@@ -953,40 +989,40 @@ def print_timeline(conn, days: int = 14):
         except Exception:
             rows = None
 
-    if rows:
+    if rows is not None:
         for r in rows:
             try:
-                hk_val = r["hour_key"] if hasattr(r, "keys") else r[0]
-                cid = r["conversation_id"] if hasattr(r, "keys") else r[1]
+                raw_hour_key = r["hour_key"] if hasattr(r, "keys") else r[0]
+                conv_id = r["conversation_id"] if hasattr(r, "keys") else r[1]
                 steps = (r["step_count"] if hasattr(r, "keys") else r[2]) or 0
                 tokens = (r["est_tokens"] if hasattr(r, "keys") else r[3]) or 0
                 cost = (r["billed_cost"] if hasattr(r, "keys") else r[4]) or 0.0
 
-                hk = str(hk_val).strip().replace(" ", "T")
-                if "Z" in hk or "+" in hk[10:] or "-" in hk[10:]:
-                    hk = hk.replace("Z", "+00:00")
-                elif len(hk) == 13:
-                    hk = hk + ":00:00+00:00"
-                elif len(hk) == 10:
-                    hk = hk + "T00:00:00+00:00"
+                hour_str = str(raw_hour_key).strip().replace(" ", "T")
+                if "Z" in hour_str or "+" in hour_str[10:] or "-" in hour_str[10:]:
+                    hour_str = hour_str.replace("Z", "+00:00")
+                elif len(hour_str) == 13:
+                    hour_str = hour_str + ":00:00+00:00"
+                elif len(hour_str) == 10:
+                    hour_str = hour_str + "T00:00:00+00:00"
                 else:
-                    hk = hk + "+00:00"
-                dt = datetime.fromisoformat(hk)
+                    hour_str = hour_str + "+00:00"
+                dt = datetime.fromisoformat(hour_str)
                 if dt.tzinfo is None:
                     dt = dt.replace(tzinfo=timezone.utc)
                 dt = dt.astimezone(local_tz)
-                d_str = dt.strftime("%Y-%m-%d")
-                if d_str not in daily_map:
-                    daily_map[d_str] = {"sessions": 0, "steps": 0, "tokens": 0, "cost": 0.0}
-                    day_sessions[d_str] = set()
-                daily_map[d_str]["steps"] += steps
-                daily_map[d_str]["tokens"] += tokens
-                daily_map[d_str]["cost"] += cost
-                day_sessions[d_str].add(cid)
+                date_str = dt.strftime("%Y-%m-%d")
+                if date_str not in daily_map:
+                    daily_map[date_str] = {"sessions": 0, "steps": 0, "tokens": 0, "cost": 0.0}
+                    day_sessions[date_str] = set()
+                daily_map[date_str]["steps"] += steps
+                daily_map[date_str]["tokens"] += tokens
+                daily_map[date_str]["cost"] += cost
+                day_sessions[date_str].add(conv_id)
             except Exception:
                 pass
     else:
-        # Fallback to steps table if hourly_step_rollups is missing or empty
+        # Fallback to steps table if hourly_step_rollups query failed
         try:
             step_rows = cur.execute(
                 """
@@ -998,33 +1034,33 @@ def print_timeline(conn, days: int = 14):
             ).fetchall()
             for r in step_rows:
                 try:
-                    c_at = r["created_at"] if hasattr(r, "keys") else r[0]
-                    cid = r["conversation_id"] if hasattr(r, "keys") else r[1]
-                    est_t = (r["est_tokens"] if hasattr(r, "keys") else r[2]) or 0
-                    bin_t = (r["billed_input_tokens"] if hasattr(r, "keys") else r[3]) or 0
-                    bout_t = (r["billed_output_tokens"] if hasattr(r, "keys") else r[4]) or 0
-                    b_cost = (r["billed_cost"] if hasattr(r, "keys") else r[5]) or 0.0
+                    created_at_raw = r["created_at"] if hasattr(r, "keys") else r[0]
+                    conv_id = r["conversation_id"] if hasattr(r, "keys") else r[1]
+                    step_est_tokens = (r["est_tokens"] if hasattr(r, "keys") else r[2]) or 0
+                    step_billed_in = (r["billed_input_tokens"] if hasattr(r, "keys") else r[3]) or 0
+                    step_billed_out = (r["billed_output_tokens"] if hasattr(r, "keys") else r[4]) or 0
+                    step_billed_cost = (r["billed_cost"] if hasattr(r, "keys") else r[5]) or 0.0
 
-                    cat_str = str(c_at).strip().replace(" ", "T")
-                    if "Z" in cat_str or "+" in cat_str[10:] or "-" in cat_str[10:]:
-                        cat_str = cat_str.replace("Z", "+00:00")
+                    created_str = str(created_at_raw).strip().replace(" ", "T")
+                    if "Z" in created_str or "+" in created_str[10:] or "-" in created_str[10:]:
+                        created_str = created_str.replace("Z", "+00:00")
                     else:
-                        cat_str = cat_str + "+00:00"
-                    dt = datetime.fromisoformat(cat_str)
+                        created_str = created_str + "+00:00"
+                    dt = datetime.fromisoformat(created_str)
                     if dt.tzinfo is None:
                         dt = dt.replace(tzinfo=timezone.utc)
                     dt = dt.astimezone(local_tz)
-                    d_str = dt.strftime("%Y-%m-%d")
-                    if d_str not in daily_map:
-                        daily_map[d_str] = {"sessions": 0, "steps": 0, "tokens": 0, "cost": 0.0}
-                        day_sessions[d_str] = set()
-                    daily_map[d_str]["steps"] += 1
-                    toks = bin_t + bout_t
-                    if not toks:
-                        toks = est_t
-                    daily_map[d_str]["tokens"] += toks
-                    daily_map[d_str]["cost"] += b_cost
-                    day_sessions[d_str].add(cid)
+                    date_str = dt.strftime("%Y-%m-%d")
+                    if date_str not in daily_map:
+                        daily_map[date_str] = {"sessions": 0, "steps": 0, "tokens": 0, "cost": 0.0}
+                        day_sessions[date_str] = set()
+                    daily_map[date_str]["steps"] += 1
+                    tokens = step_billed_in + step_billed_out
+                    if not tokens:
+                        tokens = step_est_tokens
+                    daily_map[date_str]["tokens"] += tokens
+                    daily_map[date_str]["cost"] += step_billed_cost
+                    day_sessions[date_str].add(conv_id)
                 except Exception:
                     pass
         except Exception:
@@ -1165,29 +1201,7 @@ def generate_global_report(
         ]
     )
 
-    model_rows = cur.execute("""
-        SELECT model_name as mname,
-               COUNT(*) as step_count,
-               SUM(COALESCE(billed_input_tokens, 0) + COALESCE(billed_output_tokens, 0)) as tokens
-        FROM steps
-        GROUP BY model_name
-        ORDER BY tokens DESC
-    """).fetchall()
-    model_groups = {}
-    for r in model_rows:
-        mname = (r["mname"] if hasattr(r, "keys") else r[0]) or "Gemini Flash"
-        sc = (r["step_count"] if hasattr(r, "keys") else r[1]) or 0
-        toks = (r["tokens"] if hasattr(r, "keys") else r[2]) or 0
-        if mname not in model_groups:
-            model_groups[mname] = {"step_count": 0, "tokens": 0}
-        model_groups[mname]["step_count"] += sc
-        model_groups[mname]["tokens"] += toks
-
-    sorted_models = sorted(
-        model_groups.items(),
-        key=lambda x: (x[1]["tokens"], x[1]["step_count"]),
-        reverse=True,
-    )
+    sorted_models = _get_model_distribution(cur)
     tot_model_tokens = sum(info["tokens"] for _, info in sorted_models)
     for mname, info in sorted_models:
         toks = info["tokens"]
