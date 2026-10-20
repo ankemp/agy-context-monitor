@@ -2359,40 +2359,71 @@ def test_query_timeline_data_uses_created_at_index(tmp_path: Path):
         bounded_res = api_routes.query_timeline_data(spy_conn, days=7, tz="UTC")
         assert len(bounded_res) == 7
 
-        # Extract the actual query executed against the steps table
-        steps_queries = [
-            (sql, params) for sql, params in executed_queries if "FROM steps" in sql
+        # Extract the actual timeline query (targeting hourly_step_rollups or fallback steps)
+        rollup_queries = [
+            (sql, params)
+            for sql, params in executed_queries
+            if "FROM hourly_step_rollups" in sql and "hour_key IS NOT NULL" in sql
         ]
-        assert len(steps_queries) == 1, (
-            f"Expected exactly 1 steps query, got: {steps_queries}"
-        )
-        sql, params = steps_queries[0]
-        assert "created_at >= ?" in sql
+        if rollup_queries:
+            assert len(rollup_queries) == 1
+            sql, params = rollup_queries[0]
+            assert "hour_key >= ?" in sql
+            cur = conn.cursor()
+            plan_bounded = cur.execute(f"EXPLAIN QUERY PLAN {sql}", params).fetchall()
+            bounded_details = [r["detail"] for r in plan_bounded]
+            assert any(
+                "SEARCH" in d and "hourly_step_rollups" in d for d in bounded_details
+            ), f"Expected index search in query plan: {bounded_details}"
+        else:
+            steps_queries = [
+                (sql, params) for sql, params in executed_queries if "FROM steps" in sql
+            ]
+            assert len(steps_queries) == 1, (
+                f"Expected exactly 1 steps query, got: {steps_queries}"
+            )
+            sql, params = steps_queries[0]
+            assert "created_at >= ?" in sql
 
-        cur = conn.cursor()
-        plan_bounded = cur.execute(f"EXPLAIN QUERY PLAN {sql}", params).fetchall()
-        bounded_details = [r["detail"] for r in plan_bounded]
-        assert any(
-            "idx_steps_created" in d and "SEARCH" in d for d in bounded_details
-        ), f"Expected index search in query plan: {bounded_details}"
+            cur = conn.cursor()
+            plan_bounded = cur.execute(f"EXPLAIN QUERY PLAN {sql}", params).fetchall()
+            bounded_details = [r["detail"] for r in plan_bounded]
+            assert any(
+                "idx_steps_created" in d and "SEARCH" in d for d in bounded_details
+            ), f"Expected index search in query plan: {bounded_details}"
 
         # Now verify unbounded query plan
         executed_queries.clear()
         unbounded_res = api_routes.query_timeline_data(spy_conn, days=None, tz="UTC")
         assert len(unbounded_res) >= 45
 
-        unbounded_steps_queries = [
-            (sql, params) for sql, params in executed_queries if "FROM steps" in sql
+        unbounded_rollup_queries = [
+            (sql, params)
+            for sql, params in executed_queries
+            if "FROM hourly_step_rollups" in sql and "hour_key IS NOT NULL" in sql
         ]
-        assert len(unbounded_steps_queries) == 1
-        u_sql, u_params = unbounded_steps_queries[0]
-        assert "created_at >= ?" not in u_sql
+        if unbounded_rollup_queries:
+            assert len(unbounded_rollup_queries) == 1
+            u_sql, u_params = unbounded_rollup_queries[0]
+            assert "hour_key >= ?" not in u_sql
+            plan_unbounded = cur.execute(f"EXPLAIN QUERY PLAN {u_sql}", u_params).fetchall()
+            unbounded_details = [r["detail"] for r in plan_unbounded]
+            assert any(
+                "SCAN hourly_step_rollups" in d for d in unbounded_details
+            ), f"Expected full scan in unbounded query plan: {unbounded_details}"
+        else:
+            unbounded_steps_queries = [
+                (sql, params) for sql, params in executed_queries if "FROM steps" in sql
+            ]
+            assert len(unbounded_steps_queries) == 1
+            u_sql, u_params = unbounded_steps_queries[0]
+            assert "created_at >= ?" not in u_sql
 
-        plan_unbounded = cur.execute(f"EXPLAIN QUERY PLAN {u_sql}", u_params).fetchall()
-        unbounded_details = [r["detail"] for r in plan_unbounded]
-        assert any("SCAN steps" in d for d in unbounded_details), (
-            f"Expected full table scan in unbounded query plan: {unbounded_details}"
-        )
+            plan_unbounded = cur.execute(f"EXPLAIN QUERY PLAN {u_sql}", u_params).fetchall()
+            unbounded_details = [r["detail"] for r in plan_unbounded]
+            assert any("SCAN steps" in d for d in unbounded_details), (
+                f"Expected full table scan in unbounded query plan: {unbounded_details}"
+            )
 
 
 def test_query_timeline_data_malformed_timestamps_graceful(tmp_path: Path):
@@ -2886,7 +2917,7 @@ def test_frontend_debouncing_and_abort_controller():
     )
     assert "clearTimeout(dbUpdateDebounceTimer)" in js_content
     assert "setTimeout(" in js_content
-    assert "300" in js_content
+    assert "2000" in js_content
 
     # 2. AbortController with signal passing
     assert "dashboardAbortController" in js_content, (
@@ -3096,17 +3127,17 @@ def test_frontend_lazy_heatmap_and_abort_execution():
         await new Promise(r => setTimeout(r, 10));
       }
 
-      // Ensure fetch has NOT fired before the 300ms trailing timer elapses
+      // Ensure fetch has NOT fired before the 2000ms trailing timer elapses
       if (fetchCount !== beforeBurstFetches) {
         throw new Error(`Debounce failed: fetch occurred early (${fetchCount - beforeBurstFetches} calls during burst)`);
       }
 
       // Advance past trailing timer
-      await new Promise(r => setTimeout(r, 350));
+      await new Promise(r => setTimeout(r, 2050));
 
-      // Exactly 9 fetches for the single collapsed Promise.all fetch (includes preloaded cycle timeline)
-      if (fetchCount !== beforeBurstFetches + 9) {
-        throw new Error(`Expected exactly 9 fetches after debounce window, got ${fetchCount - beforeBurstFetches}`);
+      // Exactly 8 fetches for the single collapsed Promise.all fetch (active timeline only)
+      if (fetchCount !== beforeBurstFetches + 8) {
+        throw new Error(`Expected exactly 8 fetches after debounce window, got ${fetchCount - beforeBurstFetches}`);
       }
 
       // 9. Test AbortError rejection handling: should not throw unhandled rejection

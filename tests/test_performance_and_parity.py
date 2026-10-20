@@ -617,3 +617,265 @@ def test_legacy_tools_blocks_cleanup(tmp_path):
 
     conn.close()
 
+
+def test_rollup_query_plans_and_calibrate_capacity(tmp_path):
+    from context_monitor.db import refresh_conversation_rollups, ensure_rollups_synced
+    from context_monitor.quota import calibrate_capacity, get_hourly_activity_profile
+    from context_monitor.dashboard import api_routes
+
+    db_file = tmp_path / "test_rollup_queries.db"
+    init_db(db_file)
+    conn = get_db_connection(db_file)
+    cur = conn.cursor()
+
+    # 1. Insert conversations and steps
+    cur.execute("""
+        INSERT INTO conversations (id, title, project, model_name, created_at, total_steps, total_tokens)
+        VALUES ('conv-1', 'Conv 1', 'project-a', 'Gemini Pro', '2026-10-18T10:00:00Z', 2, 1000)
+    """)
+    cur.execute("""
+        INSERT INTO steps (conversation_id, step_index, created_at, model_name, est_tokens, billed_cost, billed_input_tokens, billed_output_tokens)
+        VALUES 
+        ('conv-1', 1, '2026-10-18T10:15:00Z', 'Gemini Pro', 400, 0.05, 200, 100),
+        ('conv-1', 2, '2026-10-18T10:45:00Z', 'Gemini Pro', 600, 0.07, 400, 150)
+    """)
+    conn.commit()
+
+    # 2. Test calibrate_capacity with GROUP BY model_name
+    # Verify EXPLAIN QUERY PLAN uses idx_steps_created_cost
+    eqp = cur.execute(
+        "EXPLAIN QUERY PLAN SELECT model_name, SUM(billed_cost) FROM steps INDEXED BY idx_steps_created_cost WHERE created_at >= ? GROUP BY model_name",
+        ("2026-10-18T00:00:00",)
+    ).fetchall()
+    eqp_str = " ".join([str(tuple(r)) for r in eqp])
+    assert "idx_steps_created_cost" in eqp_str, f"Query plan did not use idx_steps_created_cost: {eqp_str}"
+
+    # Verify calibrate_capacity works with GROUP BY model_name
+    # (used_fraction = 1 - 0.90 = 0.10, cost = 0.12, 0.12 / 0.10 = 1.20 -> clamped to min bounds for gemini-weekly: 350.0)
+    calibrated = calibrate_capacity(
+        conn=conn,
+        bucket_id="gemini-weekly",
+        remaining_fraction=0.90,
+        reset_time="2026-10-21T02:00:00Z",
+        fallback_capacity=672.0,
+    )
+    assert calibrated >= 350.0
+
+    # 3. Test query_timeline_data and query_activity_matrix auto-sync and query hourly_step_rollups
+    executed_queries: list[tuple[str, tuple]] = []
+
+    class SpyCursor:
+        def __init__(self, r): self._r = r
+        def execute(self, s, p=()): executed_queries.append((s, p)); return self._r.execute(s, p)
+        def fetchall(self): return self._r.fetchall()
+        def fetchone(self): return self._r.fetchone()
+        def __getattr__(self, n): return getattr(self._r, n)
+
+    class SpyConn:
+        def __init__(self, r): self._r = r
+        def cursor(self): return SpyCursor(self._r.cursor())
+        def execute(self, s, p=()): executed_queries.append((s, p)); return self._r.execute(s, p)
+        def __getattr__(self, n): return getattr(self._r, n)
+
+    spy = SpyConn(conn)
+    timeline = api_routes.query_timeline_data(spy, days=7, tz="UTC")
+    assert any(d["steps"] == 2 for d in timeline)
+    assert any("FROM hourly_step_rollups" in s for s, _ in executed_queries)
+
+    # Verify query plan for bounded timeline query uses index
+    tl_sql, tl_params = next((s, p) for s, p in executed_queries if "FROM hourly_step_rollups" in s and "hour_key >= ?" in s)
+    tl_plan = cur.execute(f"EXPLAIN QUERY PLAN {tl_sql}", tl_params).fetchall()
+    assert any("SEARCH" in r["detail"] and "hourly_step_rollups" in r["detail"] for r in tl_plan)
+
+    executed_queries.clear()
+    matrix = api_routes.query_activity_matrix(spy, tz="UTC")
+    total_steps = sum(sum(r) for r in matrix["hourly_aggregate"])
+    assert total_steps == 2
+    assert any("FROM hourly_step_rollups" in s for s, _ in executed_queries)
+
+    # 4. Test get_hourly_activity_profile reads from rollups
+    executed_queries.clear()
+    profile = get_hourly_activity_profile(spy, force_refresh=True)
+    assert profile["total_steps"] == 2
+    assert any("FROM hourly_step_rollups" in s for s, _ in executed_queries)
+
+    # 5. Test fallback when hourly_step_rollups table is dropped (verifies sqlite3.OperationalError handling & no NameError)
+    conn.execute("DROP TABLE hourly_step_rollups")
+    conn.commit()
+
+    matrix_fallback = api_routes.query_activity_matrix(conn, tz="UTC")
+    total_steps_fallback = sum(sum(r) for r in matrix_fallback["hourly_aggregate"])
+    assert total_steps_fallback == 2
+
+    timeline_fallback = api_routes.query_timeline_data(conn, days=7, tz="UTC")
+    assert any(d["steps"] == 2 for d in timeline_fallback)
+
+    profile_fallback = get_hourly_activity_profile(conn, force_refresh=True)
+    assert profile_fallback["total_steps"] == 2
+
+    conn.close()
+
+
+def test_single_flight_api_cache(tmp_path):
+    import time
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    db_file = tmp_path / "test_single_flight.db"
+    init_db(db_file)
+    conn = get_db_connection(db_file)
+
+    call_count = 0
+    lock = threading.Lock()
+
+    def slow_compute():
+        nonlocal call_count
+        with lock:
+            call_count += 1
+        time.sleep(0.05)
+        return {"result": 42}
+
+    # Launch 8 concurrent threads requesting the exact same cache_key simultaneously
+    def worker(worker_id):
+        c = get_db_connection(db_file)
+        try:
+            res = get_cached_api_response(c, "/api/heavy-endpoint", slow_compute)
+            data = json.loads(res.decode("utf-8"))
+            assert data["result"] == 42
+        finally:
+            c.close()
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = [pool.submit(worker, i) for i in range(8)]
+        for f in futures:
+            f.result()
+
+    # With single-flight coalescing, slow_compute must be invoked exactly ONCE
+    assert call_count == 1, f"Expected single-flight compute_fn to be called 1 time, but called {call_count} times"
+
+    conn.close()
+
+
+def test_server_transparent_gzip(tmp_path):
+    import io
+    import gzip
+    from unittest.mock import MagicMock
+    from context_monitor.dashboard.server import DashboardHTTPHandler
+
+    db_file = tmp_path / "test_gzip.db"
+    init_db(db_file)
+
+    # Subclass handler to capture response without running a real socket server
+    class DummyHandler(DashboardHTTPHandler):
+        def __init__(self, request_headers):
+            self.headers = request_headers
+            self.wfile = io.BytesIO()
+            self._headers_sent = {}
+            self.status_code = None
+
+        def send_response(self, code, message=None):
+            self.status_code = code
+
+        def send_header(self, keyword, value):
+            self._headers_sent[keyword.lower()] = value
+
+        def end_headers(self):
+            pass
+
+    # 1. Payload >= 1024 bytes with Accept-Encoding: gzip -> must compress
+    large_payload = b'{"data": "' + (b'x' * 2000) + b'"}'
+    handler_gzip = DummyHandler({"Accept-Encoding": "gzip, deflate, br"})
+    handler_gzip._send_bytes(large_payload, "application/json")
+
+    assert handler_gzip.status_code == 200
+    assert handler_gzip._headers_sent.get("content-encoding") == "gzip"
+    compressed_bytes = handler_gzip.wfile.getvalue()
+    assert len(compressed_bytes) < len(large_payload)
+    decompressed = gzip.decompress(compressed_bytes)
+    assert decompressed == large_payload
+
+    # 2. Payload >= 1024 bytes without Accept-Encoding: gzip -> no compression
+    handler_nogzip = DummyHandler({})
+    handler_nogzip._send_bytes(large_payload, "application/json")
+    assert handler_nogzip.status_code == 200
+    assert "content-encoding" not in handler_nogzip._headers_sent
+    assert handler_nogzip.wfile.getvalue() == large_payload
+
+    # 3. Payload < 1024 bytes even with Accept-Encoding: gzip -> no compression
+    small_payload = b'{"status": "ok"}'
+    handler_small = DummyHandler({"Accept-Encoding": "gzip"})
+    handler_small._send_bytes(small_payload, "application/json")
+    assert "content-encoding" not in handler_small._headers_sent
+    assert handler_small.wfile.getvalue() == small_payload
+
+
+def test_quota_write_suppression_and_ls_cache(tmp_path):
+    from context_monitor.quota import (
+        sync_and_get_quota_state,
+        discover_language_server_credentials,
+        _CACHED_LS_CREDS,
+    )
+
+    db_file = tmp_path / "test_suppression.db"
+    init_db(db_file)
+    conn = get_db_connection(db_file)
+    observer = get_db_connection(db_file)
+
+    fake_raw = {
+        "groups": [
+            {
+                "displayName": "Gemini Models",
+                "buckets": [
+                    {
+                        "bucketId": "gemini-weekly",
+                        "window": "weekly",
+                        "remainingFraction": 0.85,
+                        "resetTime": "2026-10-25T02:00:00Z",
+                    }
+                ],
+            }
+        ]
+    }
+
+    # First fetch: empty DB -> must write into DB
+    q1 = sync_and_get_quota_state(conn=conn, force_refresh=True, ls_fetcher=lambda: fake_raw)
+    assert len(q1) >= 1
+    tc1 = conn.total_changes
+    dv1 = observer.execute("PRAGMA data_version;").fetchone()[0]
+
+    # Second fetch with identical values and force_refresh=True: must suppress write!
+    q2 = sync_and_get_quota_state(conn=conn, force_refresh=True, ls_fetcher=lambda: fake_raw)
+    assert len(q2) >= 1
+    tc2 = conn.total_changes
+    dv2 = observer.execute("PRAGMA data_version;").fetchone()[0]
+    # Data version must NOT change because write was suppressed
+    assert tc1 == tc2, "Expected conn.total_changes to remain unchanged on identical quota state"
+    assert dv1 == dv2, "Expected PRAGMA data_version to remain unchanged on identical quota state"
+
+    # Third fetch with changed remaining_fraction: must write into DB
+    fake_changed = {
+        "groups": [
+            {
+                "displayName": "Gemini Models",
+                "buckets": [
+                    {
+                        "bucketId": "gemini-weekly",
+                        "window": "weekly",
+                        "remainingFraction": 0.80,  # Changed!
+                        "resetTime": "2026-10-25T02:00:00Z",
+                    }
+                ],
+            }
+        ]
+    }
+    q3 = sync_and_get_quota_state(conn=conn, force_refresh=True, ls_fetcher=lambda: fake_changed)
+    assert len(q3) >= 1
+    tc3 = conn.total_changes
+    dv3 = observer.execute("PRAGMA data_version;").fetchone()[0]
+    assert tc3 > tc2, "Expected conn.total_changes to increase when quota state changed"
+    assert dv3 > dv2, "Expected PRAGMA data_version to change when quota state changed"
+
+    observer.close()
+    conn.close()
+
+

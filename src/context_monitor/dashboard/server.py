@@ -3,6 +3,7 @@
 # requires-python = ">=3.11"
 # dependencies = ["jinja2"]
 # ///
+import gzip
 import os
 import sys
 import json
@@ -33,6 +34,9 @@ _MONITOR_CONNS = {}
 _MONITOR_INOS = {}
 _LAST_DATA_VERSIONS = {}
 _ACTIVE_DB = None
+
+_INFLIGHT_LOCK = threading.Lock()
+_INFLIGHT_KEYS = {}
 
 
 def clear_api_cache():
@@ -78,7 +82,9 @@ def get_cached_api_response(conn, cache_key: str, compute_fn):
     global _ACTIVE_DB
     db_path = _extract_db_path(conn)
 
-    with _API_CACHE_LOCK:
+    def _resolve_target_and_check():
+        global _ACTIVE_DB
+        mon_conn = None
         if db_path:
             cur_ino = None
             try:
@@ -89,7 +95,6 @@ def get_cached_api_response(conn, cache_key: str, compute_fn):
             mon_conn = _MONITOR_CONNS.get(db_path)
             last_ino = _MONITOR_INOS.get(db_path)
 
-            # If file was replaced or recreated at the same path, reconnect monitor
             if mon_conn is not None and (cur_ino is None or cur_ino != last_ino):
                 try:
                     mon_conn.close()
@@ -148,28 +153,72 @@ def get_cached_api_response(conn, cache_key: str, compute_fn):
             _LAST_DATA_VERSIONS[target_key] = dv
 
         if cache_key in _API_CACHE:
-            return _API_CACHE[cache_key]
+            return _API_CACHE[cache_key], target_key, dv, mon_conn
+        return None, target_key, dv, mon_conn
 
-    data = compute_fn()
-    if isinstance(data, tuple) and data[0] == "error":
-        return data
-
-    serialized = json.dumps(data).encode("utf-8")
+    # 1. Fast cache hit check
     with _API_CACHE_LOCK:
-        if _ACTIVE_DB == target_key:
-            if db_path and mon_conn is not None:
-                try:
-                    current_dv = mon_conn.execute("PRAGMA data_version;").fetchone()[0]
-                except Exception:
+        cached, target_key, dv, mon_conn = _resolve_target_and_check()
+        if cached is not None:
+            return cached
+
+    # 2. Cache miss -> acquire per-key single-flight lock
+    flight_tag = f"{target_key}:{cache_key}"
+    with _INFLIGHT_LOCK:
+        flight_lock = _INFLIGHT_KEYS.setdefault(flight_tag, threading.Lock())
+
+    with flight_lock:
+        with _API_CACHE_LOCK:
+            cached, target_key, dv, mon_conn = _resolve_target_and_check()
+            if cached is not None:
+                return cached
+
+        data = compute_fn()
+        if isinstance(data, tuple) and data[0] == "error":
+            return data
+
+        serialized = json.dumps(data).encode("utf-8")
+        with _API_CACHE_LOCK:
+            if _ACTIVE_DB == target_key:
+                if db_path and mon_conn is not None:
+                    try:
+                        current_dv = mon_conn.execute("PRAGMA data_version;").fetchone()[0]
+                    except Exception:
+                        current_dv = dv
+                else:
                     current_dv = dv
-            else:
-                current_dv = dv
-            _LAST_DATA_VERSIONS[target_key] = current_dv
-            _API_CACHE[cache_key] = serialized
-    return serialized
+                _LAST_DATA_VERSIONS[target_key] = current_dv
+                _API_CACHE[cache_key] = serialized
+        return serialized
 
 
 class DashboardHTTPHandler(BaseHTTPRequestHandler):
+    def _send_bytes(
+        self,
+        data: bytes,
+        content_type: str,
+        status_code: int = 200,
+        extra_headers: dict | None = None,
+    ):
+        accept_enc = (
+            self.headers.get("Accept-Encoding", "")
+            if hasattr(self, "headers") and self.headers
+            else ""
+        )
+        use_gzip = "gzip" in accept_enc and len(data) >= 1024
+        payload = gzip.compress(data) if use_gzip else data
+
+        self.send_response(status_code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(payload)))
+        if use_gzip:
+            self.send_header("Content-Encoding", "gzip")
+        if extra_headers:
+            for k, v in extra_headers.items():
+                self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(payload)
+
     def do_GET(self):
         parsed = urlparse(self.path)
         path = parsed.path
@@ -182,26 +231,17 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
         if path == "/" or path == "/index.html":
             template = env.get_template("index.html")
             html = template.render(IS_STATIC_EXPORT=False)
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.end_headers()
-            self.wfile.write(html.encode("utf-8"))
+            self._send_bytes(html.encode("utf-8"), "text/html; charset=utf-8")
             return
 
         if path == "/static/style.css":
-            self.send_response(200)
-            self.send_header("Content-Type", "text/css")
-            self.end_headers()
             with open(DASHBOARD_DIR / "static" / "style.css", "rb") as f:
-                self.wfile.write(f.read())
+                self._send_bytes(f.read(), "text/css")
             return
 
         if path == "/static/script.js":
-            self.send_response(200)
-            self.send_header("Content-Type", "application/javascript")
-            self.end_headers()
             with open(DASHBOARD_DIR / "static" / "script.js", "rb") as f:
-                self.wfile.write(f.read())
+                self._send_bytes(f.read(), "application/javascript")
             return
 
         if path in ("/api/events", "/events", "/api/stream"):
@@ -261,11 +301,11 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                     conn, model_name=model_param, billed_cost=cost_val
                 )
                 serialized = json.dumps(data).encode("utf-8")
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Cache-Control", "no-cache")
-                self.end_headers()
-                self.wfile.write(serialized)
+                self._send_bytes(
+                    serialized,
+                    "application/json",
+                    extra_headers={"Cache-Control": "no-cache"},
+                )
             finally:
                 conn.close()
             return
@@ -364,10 +404,7 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                 self.send_error(res[1], res[2])
                 return
 
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.end_headers()
-            self.wfile.write(res)
+            self._send_bytes(res, "application/json")
         except Exception as e:
             self.send_error(500, str(e))
         finally:

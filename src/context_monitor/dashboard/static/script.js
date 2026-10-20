@@ -66,7 +66,7 @@
     }
 
     function upsertChart(existingChart, canvas, config) {
-      if (!canvas) return null;
+      if (!canvas || typeof canvas.getContext !== 'function') return null;
       trackCanvasPointer(canvas);
 
       if (existingChart && existingChart.config.type === config.type) {
@@ -398,10 +398,12 @@
         const convQueryStr = convQuery.length > 0 ? `?${convQuery.join('&')}` : '';
 
         const fetchOpts = signal ? { signal } : {};
-        const [summaryRes, timelineRes, timelineCycleRes, costProjRes, toolsRes, mcpRes, hotFilesRes, matrixRes, convsRes] = await Promise.all([
+        const isCycleActive = (typeof currentTimelineDays === 'string' && currentTimelineDays.toLowerCase().trim() === 'cycle');
+        const activeTimelineUrl = isCycleActive ? `/api/timeline${cycleQueryStr}` : `/api/timeline${queryStr}`;
+
+        const [summaryRes, timelineActiveRes, costProjRes, toolsRes, mcpRes, hotFilesRes, matrixRes, convsRes] = await Promise.all([
           fetch(`/api/summary${queryStr}`, fetchOpts).then(r => r.json()),
-          fetch(`/api/timeline${queryStr}`, fetchOpts).then(r => r.json()),
-          fetch(`/api/timeline${cycleQueryStr}`, fetchOpts).then(r => r.json()),
+          fetch(activeTimelineUrl, fetchOpts).then(r => r.json()),
           fetch(`/api/cost-by-project${queryStr}`, fetchOpts).then(r => r.json()),
           fetch(`/api/tools${queryStr}`, fetchOpts).then(r => r.json()),
           fetch(`/api/mcp${queryStr}`, fetchOpts).then(r => r.json()),
@@ -412,9 +414,12 @@
 
         if (signal && signal.aborted) return;
 
-        allTimelineData = Array.isArray(timelineRes) ? timelineRes : [];
-        cycleTimelineData = Array.isArray(timelineCycleRes) ? timelineCycleRes : [];
-        cachedCycleProject = currentProject;
+        if (isCycleActive) {
+          cycleTimelineData = Array.isArray(timelineActiveRes) ? timelineActiveRes : [];
+          cachedCycleProject = currentProject;
+        } else {
+          allTimelineData = Array.isArray(timelineActiveRes) ? timelineActiveRes : [];
+        }
         allProjectCostData = costProjRes || { total_cost: 0, projects: [] };
         allToolsData = Array.isArray(toolsRes) ? toolsRes : [];
         allMcpData = Array.isArray(mcpRes) ? mcpRes : [];
@@ -1282,6 +1287,26 @@
         return;
       }
 
+      if (!allTimelineData || allTimelineData.length === 0) {
+        const clientTz = Intl.DateTimeFormat().resolvedOptions().timeZone || '';
+        let baseQuery = [];
+        if (clientTz) baseQuery.push(`tz=${encodeURIComponent(clientTz)}`);
+        if (currentProject !== 'all') baseQuery.push(`project=${encodeURIComponent(currentProject)}`);
+        const queryStr = baseQuery.length > 0 ? `?${baseQuery.join('&')}` : '';
+        fetch(`/api/timeline${queryStr}`)
+          .then(r => r.json())
+          .then(res => {
+            allTimelineData = Array.isArray(res) ? res : [];
+            if (currentTimelineDays === days) {
+              setTimelineRange(days);
+            }
+          })
+          .catch(e => {
+            console.error('Failed to fetch timeline data', e);
+          });
+        return;
+      }
+
       let sliced = allTimelineData;
       if (days) {
         sliced = allTimelineData.slice(-days);
@@ -1655,7 +1680,7 @@
 
       // 1. Chart.js Horizontal Bar Chart
       const chartCanvas = document.getElementById('projectCostChart');
-      if (chartCanvas) {
+      if (chartCanvas && typeof chartCanvas.getContext === 'function') {
         const ctx = chartCanvas.getContext('2d');
         const labels = projects.map(p => p.project);
         const isCost = (currentProjectMetric === 'cost');
@@ -3379,6 +3404,19 @@
     }
 
     let dbUpdateDebounceTimer = null;
+    let lastDbUpdateTime = 0;
+    let pendingDashboardRefresh = false;
+
+    if (typeof document !== 'undefined') {
+      document.addEventListener('visibilitychange', () => {
+        if (!document.hidden && pendingDashboardRefresh) {
+          console.log("⚡ Tab became visible with pending SQLite update. Refreshing UI...");
+          pendingDashboardRefresh = false;
+          lastDbUpdateTime = Date.now();
+          fetchDashboardData();
+        }
+      });
+    }
 
     function initLiveSyncSSE() {
       let evtSource = null;
@@ -3407,13 +3445,22 @@
               if (d && (d.quota || d.quota_summary)) renderQuotaSection(d.quota || d.quota_summary);
             }
           } catch (e) {}
+
+          if (typeof document !== 'undefined' && document.hidden) {
+            pendingDashboardRefresh = true;
+            return;
+          }
+
           if (dbUpdateDebounceTimer) {
             clearTimeout(dbUpdateDebounceTimer);
           }
+          // 2000ms SSE debounce window (previously 300ms) to coalesce rapid sub-agent writes
+          const sseDebounceMs = 2000;
           dbUpdateDebounceTimer = setTimeout(() => {
+            lastDbUpdateTime = Date.now();
             fetchDashboardData();
             dbUpdateDebounceTimer = null;
-          }, 300);
+          }, sseDebounceMs);
         });
 
         evtSource.addEventListener('quota_update', (event) => {

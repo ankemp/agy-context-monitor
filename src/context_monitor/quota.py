@@ -53,6 +53,7 @@ __all__ = [
     "get_hourly_activity_profile",
     "invalidate_activity_profile_cache",
     "normalize_activity_profile",
+    "_CACHED_LS_CREDS",
 ]
 
 MIN_PROFILE_STEPS: int = 50
@@ -61,6 +62,12 @@ LAPLACE_ALPHA: float = 0.15
 DEFAULT_LOG_PATH = Path(
     os.path.expanduser("~/Library/Logs/Antigravity/language_server.log")
 )
+
+_CACHED_LS_CREDS: tuple[int | None, str | None, float] = (None, None, 0.0)
+_LS_CREDS_LOCK = threading.Lock()
+_QUOTA_SYNC_LOCK = threading.Lock()
+_LAST_QUOTA_SYNC_TIMES: dict[str, float] = {}
+LS_CREDS_CACHE_TTL = 60.0
 
 
 class QuotaStateList(list):
@@ -178,6 +185,7 @@ def _get_default_capacity(bucket_id: str) -> float:
 
 def discover_language_server_credentials(
     log_path: Path | str | None = None,
+    force_refresh: bool = False,
 ) -> tuple[int | None, str | None]:
     """
     Discovers the Antigravity Language Server HTTP port and CSRF token.
@@ -185,8 +193,22 @@ def discover_language_server_credentials(
     Returns:
         tuple[int | None, str | None]: (http_port, csrf_token) or (None, None) on failure.
     """
+    global _CACHED_LS_CREDS
+    now = time.monotonic()
+
+    if log_path is None and not force_refresh:
+        with _LS_CREDS_LOCK:
+            port, token, ts = _CACHED_LS_CREDS
+            if port is not None and token is not None and (now - ts) < LS_CREDS_CACHE_TTL:
+                return port, token
+
     token = _discover_csrf_token()
     port = _discover_http_port(log_path)
+
+    if log_path is None and port is not None and token is not None:
+        with _LS_CREDS_LOCK:
+            _CACHED_LS_CREDS = (port, token, time.monotonic())
+
     return port, token
 
 
@@ -446,10 +468,16 @@ def calibrate_capacity(
     total_billed_cost = 0.0
 
     try:
-        cur = conn.execute(
-            "SELECT model_name, billed_cost FROM steps WHERE created_at >= ?",
-            (window_start_prefix,),
-        )
+        try:
+            cur = conn.execute(
+                "SELECT model_name, SUM(billed_cost) FROM steps INDEXED BY idx_steps_created_cost WHERE created_at >= ? GROUP BY model_name",
+                (window_start_prefix,),
+            )
+        except sqlite3.OperationalError:
+            cur = conn.execute(
+                "SELECT model_name, SUM(billed_cost) FROM steps WHERE created_at >= ? GROUP BY model_name",
+                (window_start_prefix,),
+            )
 
         for r in cur.fetchall():
             m_name = r[0] or ""
@@ -487,8 +515,9 @@ def sync_and_get_quota_state(
     """
     Checks cached quota_state from db. If cached rows exist, are younger than TTL (60s),
     and not force_refresh, returns them.
-    Otherwise attempts discovery and RPC fetch.
-    If fetch succeeds, calibrates capacity and upserts into quota_state.
+    Otherwise attempts discovery and RPC fetch under a single-flight lock.
+    If fetch succeeds, calibrates capacity and upserts into quota_state only if
+    remaining_fraction, reset_time, or calibrated_capacity changed (write suppression).
     If fetch fails, returns cached rows (even if expired) or synthesizes fallback rows.
     """
     if conn is None:
@@ -505,96 +534,158 @@ def sync_and_get_quota_state(
     if ttl_seconds is None:
         ttl_seconds = get_quota_cache_ttl()
 
+    db_path = _extract_db_path(conn)
+    cache_key = db_path if db_path else f"conn_{id(conn)}"
+
     cached_rows = get_quota_state(conn)
 
-    cache_is_fresh = False
-    if cached_rows and not force_refresh:
+    def _check_freshness(rows):
+        if not rows:
+            return False
+        if ls_fetcher is None:
+            last_sync = _LAST_QUOTA_SYNC_TIMES.get(cache_key, 0.0)
+            if (time.monotonic() - last_sync) < ttl_seconds:
+                return True
         now = datetime.now(timezone.utc)
-        all_fresh = True
-        for r in cached_rows:
+        for r in rows:
             fetched_at_str = r.get("fetched_at") or r.get("updated_at")
             if not fetched_at_str:
-                all_fresh = False
-                break
+                return False
             fetched_dt = _to_utc_datetime(fetched_at_str)
             if fetched_dt is None or (now - fetched_dt).total_seconds() > ttl_seconds:
-                all_fresh = False
-                break
-        cache_is_fresh = all_fresh
+                return False
+        return True
 
-    if cache_is_fresh:
+    if not force_refresh and _check_freshness(cached_rows):
         return QuotaStateList(cached_rows)
 
-    raw_payload = None
-    if ls_fetcher is not None:
-        try:
-            raw_payload = ls_fetcher()
-        except Exception:
-            raw_payload = None
-    else:
-        try:
-            port, token = discover_language_server_credentials()
-            if port and token:
-                raw_payload = fetch_raw_quota_summary(port, token)
-        except Exception:
-            raw_payload = None
+    global _CACHED_LS_CREDS
+    with _QUOTA_SYNC_LOCK:
+        # Double-check freshness under lock
+        cached_rows = get_quota_state(conn)
+        if not force_refresh and _check_freshness(cached_rows):
+            return QuotaStateList(cached_rows)
 
-    if raw_payload and isinstance(raw_payload, dict):
-        response_data = (
-            raw_payload.get("response")
-            if isinstance(raw_payload.get("response"), dict)
-            else raw_payload
-        )
-        groups = response_data.get("groups", [])
-        rows_to_upsert = []
-        now_iso = datetime.now(timezone.utc).isoformat()
+        raw_payload = None
+        if ls_fetcher is not None:
+            try:
+                raw_payload = ls_fetcher()
+            except Exception:
+                raw_payload = None
+        else:
+            try:
+                port, token = discover_language_server_credentials(force_refresh=force_refresh)
+                if port and token:
+                    raw_payload = fetch_raw_quota_summary(port, token)
+                    if raw_payload is None:
+                        with _LS_CREDS_LOCK:
+                            _CACHED_LS_CREDS = (None, None, 0.0)
+            except Exception:
+                raw_payload = None
 
-        for grp in groups:
-            group_name = grp.get("displayName") or grp.get("group_name", "")
-            for b in grp.get("buckets", []):
-                bucket_id = b.get("bucketId") or b.get("bucket_id")
-                if not bucket_id:
-                    continue
-                window = b.get("window", "")
-                raw_rem = (
-                    b.get("remainingFraction")
-                    if b.get("remainingFraction") is not None
-                    else b.get("remaining_fraction", 1.0)
-                )
-                try:
-                    rem_frac = float(raw_rem) if raw_rem is not None else 1.0
-                except (ValueError, TypeError):
-                    rem_frac = 1.0
-                reset_time = b.get("resetTime") or b.get("reset_time") or ""
-                fallback_cap = _get_default_capacity(bucket_id)
+        if raw_payload and isinstance(raw_payload, dict):
+            _LAST_QUOTA_SYNC_TIMES[cache_key] = time.monotonic()
+            response_data = (
+                raw_payload.get("response")
+                if isinstance(raw_payload.get("response"), dict)
+                else raw_payload
+            )
+            groups = response_data.get("groups", [])
+            rows_to_upsert = []
+            now_iso = datetime.now(timezone.utc).isoformat()
 
-                calibrated = calibrate_capacity(
-                    conn=conn,
-                    bucket_id=bucket_id,
-                    remaining_fraction=rem_frac,
-                    reset_time=reset_time,
-                    fallback_capacity=fallback_cap,
-                )
+            for grp in groups:
+                group_name = grp.get("displayName") or grp.get("group_name", "")
+                for b in grp.get("buckets", []):
+                    bucket_id = b.get("bucketId") or b.get("bucket_id")
+                    if not bucket_id:
+                        continue
+                    window = b.get("window", "")
+                    raw_rem = (
+                        b.get("remainingFraction")
+                        if b.get("remainingFraction") is not None
+                        else b.get("remaining_fraction", 1.0)
+                    )
+                    try:
+                        rem_frac = float(raw_rem) if raw_rem is not None else 1.0
+                    except (ValueError, TypeError):
+                        rem_frac = 1.0
+                    reset_time = b.get("resetTime") or b.get("reset_time") or ""
+                    fallback_cap = _get_default_capacity(bucket_id)
 
-                rows_to_upsert.append(
-                    {
-                        "bucket_id": bucket_id,
-                        "group_name": group_name,
-                        "window": window,
-                        "remaining_fraction": rem_frac,
-                        "reset_time": reset_time,
-                        "calibrated_capacity": calibrated,
-                        "fetched_at": now_iso,
+                    calibrated = calibrate_capacity(
+                        conn=conn,
+                        bucket_id=bucket_id,
+                        remaining_fraction=rem_frac,
+                        reset_time=reset_time,
+                        fallback_capacity=fallback_cap,
+                    )
+
+                    rows_to_upsert.append(
+                        {
+                            "bucket_id": bucket_id,
+                            "group_name": group_name,
+                            "window": window,
+                            "remaining_fraction": rem_frac,
+                            "reset_time": reset_time,
+                            "calibrated_capacity": calibrated,
+                            "fetched_at": now_iso,
+                        }
+                    )
+
+            if rows_to_upsert:
+                should_write = False
+                if not cached_rows:
+                    should_write = True
+                else:
+                    cached_by_id = {
+                        (r.get("bucket_id") or r.get("bucketId") or "").strip().lower(): r
+                        for r in cached_rows
                     }
-                )
+                    if len(rows_to_upsert) != len(cached_rows):
+                        should_write = True
+                    else:
+                        for new_r in rows_to_upsert:
+                            bid = str(new_r.get("bucket_id") or "").strip().lower()
+                            old_r = cached_by_id.get(bid)
+                            if old_r is None:
+                                should_write = True
+                                break
+                            try:
+                                new_rem = float(new_r.get("remaining_fraction", 0.0))
+                                old_rem = float(old_r.get("remaining_fraction", 0.0))
+                                if abs(new_rem - old_rem) > 1e-4:
+                                    should_write = True
+                                    break
+                            except (ValueError, TypeError):
+                                should_write = True
+                                break
 
-        if rows_to_upsert:
-            upsert_quota_state(conn, rows_to_upsert)
-            fresh_rows = get_quota_state(conn)
-            return QuotaStateList(fresh_rows)
+                            new_reset = str(new_r.get("reset_time", "") or "").strip()
+                            old_reset = str(old_r.get("reset_time", "") or "").strip()
+                            if new_reset != old_reset:
+                                should_write = True
+                                break
 
-    if cached_rows:
-        return QuotaStateList(cached_rows)
+                            try:
+                                new_cap = float(new_r.get("calibrated_capacity", 0.0))
+                                old_cap = float(old_r.get("calibrated_capacity", 0.0))
+                                if abs(new_cap - old_cap) > 1e-2:
+                                    should_write = True
+                                    break
+                            except (ValueError, TypeError):
+                                should_write = True
+                                break
+
+                if should_write:
+                    upsert_quota_state(conn, rows_to_upsert)
+                    fresh_rows = get_quota_state(conn)
+                    return QuotaStateList(fresh_rows)
+                else:
+                    return QuotaStateList(cached_rows)
+
+        if cached_rows:
+            return QuotaStateList(cached_rows)
 
     # Synthesize fallback rows if no cache exists
     now_iso = datetime.now(timezone.utc).isoformat()
@@ -1358,9 +1449,17 @@ def get_hourly_activity_profile(
     query_success = False
 
     try:
+        from context_monitor.db import ensure_rollups_synced
+
+        ensure_rollups_synced(conn)
+    except Exception:
+        pass
+
+    try:
         cursor = conn.execute(
-            "SELECT substr(created_at, 1, 13) AS hour_key, COUNT(*) AS step_count "
-            "FROM steps WHERE created_at IS NOT NULL AND created_at != '' "
+            "SELECT hour_key, SUM(step_count) AS step_count "
+            "FROM hourly_step_rollups "
+            "WHERE hour_key IS NOT NULL AND hour_key != '' "
             "GROUP BY hour_key"
         )
         for row in cursor.fetchall():
@@ -1385,6 +1484,38 @@ def get_hourly_activity_profile(
                     matrix[d][h] += step_count
                     total_steps += step_count
         query_success = True
+    except sqlite3.OperationalError:
+        # Fallback to steps table if hourly_step_rollups is unavailable
+        try:
+            cursor = conn.execute(
+                "SELECT substr(created_at, 1, 13) AS hour_key, COUNT(*) AS step_count "
+                "FROM steps WHERE created_at IS NOT NULL AND created_at != '' "
+                "GROUP BY hour_key"
+            )
+            for row in cursor.fetchall():
+                hour_key = row[0]
+                step_count = int(row[1] or 0)
+                if not hour_key or step_count <= 0:
+                    continue
+
+                clean_key = str(hour_key).strip().replace(" ", "T").replace("t", "T")
+                if len(clean_key) == 13:
+                    dt_str = clean_key + ":00:00Z"
+                elif len(clean_key) == 10:
+                    dt_str = clean_key + "T00:00:00Z"
+                else:
+                    dt_str = clean_key
+
+                dt = _to_utc_datetime(dt_str)
+                if dt is not None:
+                    d = dt.weekday()
+                    h = dt.hour
+                    if 0 <= d < 7 and 0 <= h < 24:
+                        matrix[d][h] += step_count
+                        total_steps += step_count
+            query_success = True
+        except Exception:
+            pass
     except Exception:
         pass
 

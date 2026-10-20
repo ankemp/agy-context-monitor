@@ -1,4 +1,5 @@
 from pathlib import Path
+import sqlite3
 import math
 import os
 import json
@@ -7,7 +8,7 @@ from datetime import datetime, timedelta, timezone, tzinfo
 from typing import Any, NamedTuple
 from zoneinfo import ZoneInfo
 
-from context_monitor.db import get_quota_state
+from context_monitor.db import get_quota_state, ensure_rollups_synced
 from context_monitor.pricing import get_pricing_key
 from context_monitor.quota import (
     _get_default_capacity,
@@ -678,6 +679,11 @@ def query_timeline_data(conn, days=None, tz=None, project=None):
         except (ValueError, TypeError, OverflowError):
             num_days = None
 
+    try:
+        ensure_rollups_synced(conn)
+    except Exception:
+        pass
+
     cur = conn.cursor()
     target_tz = get_target_tz(tz)
     today = datetime.now(target_tz).date()
@@ -688,19 +694,6 @@ def query_timeline_data(conn, days=None, tz=None, project=None):
         ).fetchall()
     )
 
-    where_conditions = ["created_at IS NOT NULL", "created_at != ''"]
-    params = []
-    if project and project != "all":
-        if project == "(unassigned)":
-            where_conditions.append(
-                "conversation_id IN (SELECT id FROM conversations WHERE project IS NULL OR project = '')"
-            )
-        else:
-            where_conditions.append(
-                "conversation_id IN (SELECT id FROM conversations WHERE project = ?)"
-            )
-            params.append(project)
-
     has_valid_reset = False
     start_dt_utc = None
     reset_dt_utc = None
@@ -708,6 +701,19 @@ def query_timeline_data(conn, days=None, tz=None, project=None):
     reset_dt_local = None
 
     if is_cycle_mode:
+        where_conditions = ["created_at IS NOT NULL", "created_at != ''"]
+        params = []
+        if project and project != "all":
+            if project == "(unassigned)":
+                where_conditions.append(
+                    "conversation_id IN (SELECT id FROM conversations WHERE project IS NULL OR project = '')"
+                )
+            else:
+                where_conditions.append(
+                    "conversation_id IN (SELECT id FROM conversations WHERE project = ?)"
+                )
+                params.append(project)
+
         try:
             quota_rows = get_quota_state(conn)
         except Exception:
@@ -756,30 +762,75 @@ def query_timeline_data(conn, days=None, tz=None, project=None):
             cutoff_date = today - timedelta(days=8)
             where_conditions.append("created_at >= ?")
             params.append(cutoff_date.isoformat())
-    elif num_days is not None:
+
+        where_clause = "WHERE " + " AND ".join(where_conditions)
+        rows = cur.execute(
+            f"""
+            SELECT 
+                substr(created_at, 1, 13) as hour_key,
+                conversation_id,
+                COUNT(*) as step_count,
+                SUM(COALESCE(billed_input_tokens, 0) + COALESCE(billed_output_tokens, 0)) as tokens,
+                SUM(billed_cost) as cost
+            FROM steps
+            {where_clause}
+            GROUP BY hour_key, conversation_id
+        """,
+            tuple(params),
+        ).fetchall()
+    else:
+        where_conditions = ["hour_key IS NOT NULL", "hour_key != ''"]
+        params = []
+        if project and project != "all":
+            if project == "(unassigned)":
+                where_conditions.append(
+                    "conversation_id IN (SELECT id FROM conversations WHERE project IS NULL OR project = '')"
+                )
+            else:
+                where_conditions.append(
+                    "conversation_id IN (SELECT id FROM conversations WHERE project = ?)"
+                )
+                params.append(project)
+
+        if num_days is not None:
+            try:
+                cutoff_date = today - timedelta(days=num_days + 1)
+                where_conditions.append("hour_key >= ?")
+                params.append(cutoff_date.isoformat())
+            except OverflowError:
+                num_days = None
+
+        where_clause = "WHERE " + " AND ".join(where_conditions)
         try:
-            cutoff_date = today - timedelta(days=num_days + 1)
-            where_conditions.append("created_at >= ?")
-            params.append(cutoff_date.isoformat())
-        except OverflowError:
-            num_days = None
-
-    where_clause = "WHERE " + " AND ".join(where_conditions)
-
-    rows = cur.execute(
-        f"""
-        SELECT 
-            substr(created_at, 1, 13) as hour_key,
-            conversation_id,
-            COUNT(*) as step_count,
-            SUM(COALESCE(billed_input_tokens, 0) + COALESCE(billed_output_tokens, 0)) as tokens,
-            SUM(billed_cost) as cost
-        FROM steps
-        {where_clause}
-        GROUP BY hour_key, conversation_id
-    """,
-        tuple(params),
-    ).fetchall()
+            rows = cur.execute(
+                f"""
+                SELECT 
+                    hour_key,
+                    conversation_id,
+                    step_count,
+                    billed_tokens as tokens,
+                    billed_cost as cost
+                FROM hourly_step_rollups
+                {where_clause}
+            """,
+                tuple(params),
+            ).fetchall()
+        except (sqlite3.OperationalError, Exception):
+            legacy_where = where_clause.replace("hour_key", "created_at")
+            rows = cur.execute(
+                f"""
+                SELECT 
+                    substr(created_at, 1, 13) as hour_key,
+                    conversation_id,
+                    COUNT(*) as step_count,
+                    SUM(COALESCE(billed_input_tokens, 0) + COALESCE(billed_output_tokens, 0)) as tokens,
+                    SUM(billed_cost) as cost
+                FROM steps
+                {legacy_where}
+                GROUP BY hour_key, conversation_id
+            """,
+                tuple(params),
+            ).fetchall()
 
     daily_map = {}
     day_sessions = {}
@@ -1065,10 +1116,15 @@ def query_hot_files_data(conn, project=None):
 
 
 def query_activity_matrix(conn, tz=None, project=None):
+    try:
+        ensure_rollups_synced(conn)
+    except Exception:
+        pass
+
     cur = conn.cursor()
     target_tz = get_target_tz(tz)
 
-    where_clause = "WHERE created_at IS NOT NULL AND created_at != ''"
+    where_clause = "WHERE hour_key IS NOT NULL AND hour_key != ''"
     params = ()
     if project:
         if project == "(unassigned)":
@@ -1077,19 +1133,34 @@ def query_activity_matrix(conn, tz=None, project=None):
             where_clause += " AND conversation_id IN (SELECT id FROM conversations WHERE project = ?)"
             params = (project,)
 
-    rows = cur.execute(
-        f"""
-        SELECT 
-            substr(created_at, 1, 13) as hour_key,
-            conversation_id,
-            COUNT(*) as step_count,
-            SUM(est_tokens) as tokens
-        FROM steps
-        {where_clause}
-        GROUP BY hour_key, conversation_id
-    """,
-        params,
-    ).fetchall()
+    try:
+        rows = cur.execute(
+            f"""
+            SELECT 
+                hour_key,
+                conversation_id,
+                step_count,
+                est_tokens as tokens
+            FROM hourly_step_rollups
+            {where_clause}
+        """,
+            params,
+        ).fetchall()
+    except sqlite3.OperationalError:
+        legacy_where = where_clause.replace("hour_key", "created_at")
+        rows = cur.execute(
+            f"""
+            SELECT 
+                substr(created_at, 1, 13) as hour_key,
+                conversation_id,
+                COUNT(*) as step_count,
+                SUM(est_tokens) as tokens
+            FROM steps
+            {legacy_where}
+            GROUP BY hour_key, conversation_id
+        """,
+            params,
+        ).fetchall()
 
     daily_map = {}
     hourly_aggregate = [[0 for _ in range(24)] for _ in range(7)]

@@ -47,16 +47,6 @@ def broadcast_sse(event_name: str, data: dict):
         except Exception:
             pass
 
-        if isinstance(data, dict) and "quota" not in data:
-            try:
-                from context_monitor.db import get_db_connection
-                from context_monitor.dashboard import api_routes
-
-                with get_db_connection() as conn:
-                    data["quota"] = api_routes.query_quota_data(conn)
-            except Exception:
-                pass
-
         with SSE_LOCK:
             callbacks = list(_CHANGE_CALLBACKS)
         for cb in callbacks:
@@ -76,11 +66,21 @@ def broadcast_sse(event_name: str, data: dict):
 
 
 class DbChangeWatcher(threading.Thread):
-    def __init__(self, db_path: Path | str, check_interval: float = 0.5):
+    def __init__(
+        self,
+        db_path: Path | str,
+        check_interval: float = 1.0,
+        settle_window: float | None = None,
+    ):
         super().__init__(daemon=True)
         self.db_path = Path(db_path)
         self.wal_path = Path(str(db_path) + "-wal")
         self.check_interval = check_interval
+        self.settle_window = (
+            settle_window
+            if settle_window is not None
+            else (1.5 if check_interval >= 0.5 else check_interval)
+        )
         self._stop_event = threading.Event()
         self.last_state = self._get_state()
 
@@ -107,10 +107,16 @@ class DbChangeWatcher(threading.Thread):
             try:
                 cur_state = self._get_state()
                 if cur_state != self.last_state:
+                    # Coalesce rapid changes until file writes settle
+                    while not self._stop_event.is_set():
+                        if self._stop_event.wait(self.settle_window):
+                            return
+                        new_state = self._get_state()
+                        if new_state == cur_state:
+                            break
+                        cur_state = new_state
+
                     self.last_state = cur_state
-                    if self._stop_event.wait(0.3):
-                        break
-                    self.last_state = self._get_state()
                     broadcast_sse(
                         "db_update", {"timestamp": datetime.now().isoformat()}
                     )
