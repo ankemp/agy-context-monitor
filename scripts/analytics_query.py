@@ -27,13 +27,13 @@ import sys
 import json
 import argparse
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 _root = Path(__file__).resolve().parent.parent
 if str(_root / "src") not in sys.path:
     sys.path.insert(0, str(_root / "src"))
 
-from context_monitor.db import get_db_connection, DEFAULT_DB_PATH  # noqa: E402
+from context_monitor.db import get_db_connection, DEFAULT_DB_PATH, ensure_rollups_synced  # noqa: E402
 from context_monitor.pricing import (  # noqa: E402
     calculate_step_cost,
 )
@@ -73,13 +73,23 @@ def format_duration(seconds: float) -> str:
 
 def calculate_billed_cost(conn):
     cur = conn.cursor()
-    # Check if steps have populated billed_cost
+    # 1. Fast check: aggregate directly from conversations table (0.8ms vs scanning all steps)
+    try:
+        row = cur.execute(
+            "SELECT SUM(billed_cost), SUM(billed_input_tokens), SUM(billed_output_tokens) FROM conversations"
+        ).fetchone()
+        if row and row[0] is not None and row[0] > 0:
+            return float(row[0] or 0.0), int(row[1] or 0), int(row[2] or 0)
+    except Exception:
+        pass
+
+    # 2. Check if steps have populated billed_cost
     try:
         row = cur.execute(
             "SELECT SUM(billed_cost), SUM(billed_input_tokens), SUM(billed_output_tokens) FROM steps"
         ).fetchone()
         if row and row[0] is not None and row[0] > 0:
-            return row[0] or 0.0, row[1] or 0, row[2] or 0
+            return float(row[0] or 0.0), int(row[1] or 0), int(row[2] or 0)
     except Exception:
         pass
 
@@ -338,20 +348,34 @@ def print_summary(conn):
     print(f"  {'Model Name':<30} | {'Steps':<10} | {'Tokens':<12} | {'Share':<6}")
     print("  " + "-" * 66)
     model_rows = cur.execute("""
-        SELECT COALESCE(s.model_name, c.model_name, 'Gemini Flash') as mname,
+        SELECT model_name as mname,
                COUNT(*) as step_count,
-               SUM(COALESCE(s.billed_input_tokens, 0) + COALESCE(s.billed_output_tokens, 0)) as tokens
-        FROM steps s
-        JOIN conversations c ON s.conversation_id = c.id
-        GROUP BY mname
+               SUM(COALESCE(billed_input_tokens, 0) + COALESCE(billed_output_tokens, 0)) as tokens
+        FROM steps
+        GROUP BY model_name
         ORDER BY tokens DESC
     """).fetchall()
-    tot_model_tokens = sum(r["tokens"] or 0 for r in model_rows)
+    model_groups = {}
     for r in model_rows:
-        toks = r["tokens"] or 0
+        mname = (r["mname"] if hasattr(r, "keys") else r[0]) or "Gemini Flash"
+        sc = (r["step_count"] if hasattr(r, "keys") else r[1]) or 0
+        toks = (r["tokens"] if hasattr(r, "keys") else r[2]) or 0
+        if mname not in model_groups:
+            model_groups[mname] = {"step_count": 0, "tokens": 0}
+        model_groups[mname]["step_count"] += sc
+        model_groups[mname]["tokens"] += toks
+
+    sorted_models = sorted(
+        model_groups.items(),
+        key=lambda x: (x[1]["tokens"], x[1]["step_count"]),
+        reverse=True,
+    )
+    tot_model_tokens = sum(info["tokens"] for _, info in sorted_models)
+    for mname, info in sorted_models:
+        toks = info["tokens"]
         share = (toks / tot_model_tokens * 100) if tot_model_tokens else 0.0
         print(
-            f"  {(r['mname'] or 'Unknown'):<30} | {r['step_count']:<10,}| {format_tokens(toks):<12} | {share:5.1f}%"
+            f"  {mname:<30} | {info['step_count']:<10,}| {format_tokens(toks):<12} | {share:5.1f}%"
         )
 
     weekly_cost_by_proj, weekly_capacity, window_start = _get_weekly_project_costs(
@@ -880,6 +904,20 @@ def print_hot_files(conn):
 
 
 def print_timeline(conn, days: int = 14):
+    if days is None:
+        days = 14
+    try:
+        days = int(days)
+    except (TypeError, ValueError):
+        days = 14
+    if days < 1:
+        days = 1
+
+    try:
+        ensure_rollups_synced(conn)
+    except Exception:
+        pass
+
     local_tz = datetime.now().astimezone().tzinfo
     tz_abbr = datetime.now().astimezone().strftime("%Z")
     print("\n" + "=" * 75)
@@ -887,29 +925,108 @@ def print_timeline(conn, days: int = 14):
     print("=" * 75)
     cur = conn.cursor()
 
-    rows = cur.execute("""
-        SELECT created_at, conversation_id, billed_input_tokens, billed_output_tokens, billed_cost
-        FROM steps
-        WHERE created_at IS NOT NULL AND created_at != ''
-    """).fetchall()
+    cutoff_str = (datetime.now(local_tz).date() - timedelta(days=days + 1)).isoformat()
 
     daily_map = {}
     day_sessions = {}
-    for r in rows:
+
+    rows = None
+    try:
+        rows = cur.execute(
+            """
+            SELECT hour_key, conversation_id, step_count, COALESCE(NULLIF(billed_tokens, 0), est_tokens) as est_tokens, billed_cost
+            FROM hourly_step_rollups
+            WHERE hour_key >= ?
+        """,
+            (cutoff_str,),
+        ).fetchall()
+    except Exception:
         try:
-            dt = datetime.fromisoformat(
-                r["created_at"].replace("Z", "+00:00")
-            ).astimezone(local_tz)
-            d_str = dt.strftime("%Y-%m-%d")
-            if d_str not in daily_map:
-                daily_map[d_str] = {"sessions": 0, "steps": 0, "tokens": 0, "cost": 0.0}
-                day_sessions[d_str] = set()
-            daily_map[d_str]["steps"] += 1
-            daily_map[d_str]["tokens"] += (r["billed_input_tokens"] or 0) + (
-                r["billed_output_tokens"] or 0
-            )
-            daily_map[d_str]["cost"] += r["billed_cost"] or 0.0
-            day_sessions[d_str].add(r["conversation_id"])
+            rows = cur.execute(
+                """
+                SELECT hour_key, conversation_id, step_count, est_tokens, billed_cost
+                FROM hourly_step_rollups
+                WHERE hour_key >= ?
+            """,
+                (cutoff_str,),
+            ).fetchall()
+        except Exception:
+            rows = None
+
+    if rows:
+        for r in rows:
+            try:
+                hk_val = r["hour_key"] if hasattr(r, "keys") else r[0]
+                cid = r["conversation_id"] if hasattr(r, "keys") else r[1]
+                steps = (r["step_count"] if hasattr(r, "keys") else r[2]) or 0
+                tokens = (r["est_tokens"] if hasattr(r, "keys") else r[3]) or 0
+                cost = (r["billed_cost"] if hasattr(r, "keys") else r[4]) or 0.0
+
+                hk = str(hk_val).strip().replace(" ", "T")
+                if "Z" in hk or "+" in hk[10:] or "-" in hk[10:]:
+                    hk = hk.replace("Z", "+00:00")
+                elif len(hk) == 13:
+                    hk = hk + ":00:00+00:00"
+                elif len(hk) == 10:
+                    hk = hk + "T00:00:00+00:00"
+                else:
+                    hk = hk + "+00:00"
+                dt = datetime.fromisoformat(hk)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                dt = dt.astimezone(local_tz)
+                d_str = dt.strftime("%Y-%m-%d")
+                if d_str not in daily_map:
+                    daily_map[d_str] = {"sessions": 0, "steps": 0, "tokens": 0, "cost": 0.0}
+                    day_sessions[d_str] = set()
+                daily_map[d_str]["steps"] += steps
+                daily_map[d_str]["tokens"] += tokens
+                daily_map[d_str]["cost"] += cost
+                day_sessions[d_str].add(cid)
+            except Exception:
+                pass
+    else:
+        # Fallback to steps table if hourly_step_rollups is missing or empty
+        try:
+            step_rows = cur.execute(
+                """
+                SELECT created_at, conversation_id, est_tokens, billed_input_tokens, billed_output_tokens, billed_cost
+                FROM steps
+                WHERE created_at IS NOT NULL AND created_at != '' AND created_at >= ?
+            """,
+                (cutoff_str,),
+            ).fetchall()
+            for r in step_rows:
+                try:
+                    c_at = r["created_at"] if hasattr(r, "keys") else r[0]
+                    cid = r["conversation_id"] if hasattr(r, "keys") else r[1]
+                    est_t = (r["est_tokens"] if hasattr(r, "keys") else r[2]) or 0
+                    bin_t = (r["billed_input_tokens"] if hasattr(r, "keys") else r[3]) or 0
+                    bout_t = (r["billed_output_tokens"] if hasattr(r, "keys") else r[4]) or 0
+                    b_cost = (r["billed_cost"] if hasattr(r, "keys") else r[5]) or 0.0
+
+                    cat_str = str(c_at).strip().replace(" ", "T")
+                    if "Z" in cat_str or "+" in cat_str[10:] or "-" in cat_str[10:]:
+                        cat_str = cat_str.replace("Z", "+00:00")
+                    else:
+                        cat_str = cat_str + "+00:00"
+                    dt = datetime.fromisoformat(cat_str)
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    dt = dt.astimezone(local_tz)
+                    d_str = dt.strftime("%Y-%m-%d")
+                    if d_str not in daily_map:
+                        daily_map[d_str] = {"sessions": 0, "steps": 0, "tokens": 0, "cost": 0.0}
+                        day_sessions[d_str] = set()
+                    daily_map[d_str]["steps"] += 1
+                    toks = bin_t + bout_t
+                    if not toks:
+                        toks = est_t
+                    daily_map[d_str]["tokens"] += toks
+                    daily_map[d_str]["cost"] += b_cost
+                    day_sessions[d_str].add(cid)
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -1049,20 +1166,34 @@ def generate_global_report(
     )
 
     model_rows = cur.execute("""
-        SELECT COALESCE(s.model_name, c.model_name, 'Gemini Flash') as mname,
+        SELECT model_name as mname,
                COUNT(*) as step_count,
-               SUM(COALESCE(s.billed_input_tokens, 0) + COALESCE(s.billed_output_tokens, 0)) as tokens
-        FROM steps s
-        JOIN conversations c ON s.conversation_id = c.id
-        GROUP BY mname
+               SUM(COALESCE(billed_input_tokens, 0) + COALESCE(billed_output_tokens, 0)) as tokens
+        FROM steps
+        GROUP BY model_name
         ORDER BY tokens DESC
     """).fetchall()
-    tot_model_tokens = sum(r["tokens"] or 0 for r in model_rows)
+    model_groups = {}
     for r in model_rows:
-        toks = r["tokens"] or 0
+        mname = (r["mname"] if hasattr(r, "keys") else r[0]) or "Gemini Flash"
+        sc = (r["step_count"] if hasattr(r, "keys") else r[1]) or 0
+        toks = (r["tokens"] if hasattr(r, "keys") else r[2]) or 0
+        if mname not in model_groups:
+            model_groups[mname] = {"step_count": 0, "tokens": 0}
+        model_groups[mname]["step_count"] += sc
+        model_groups[mname]["tokens"] += toks
+
+    sorted_models = sorted(
+        model_groups.items(),
+        key=lambda x: (x[1]["tokens"], x[1]["step_count"]),
+        reverse=True,
+    )
+    tot_model_tokens = sum(info["tokens"] for _, info in sorted_models)
+    for mname, info in sorted_models:
+        toks = info["tokens"]
         share = (toks / tot_model_tokens * 100) if tot_model_tokens else 0.0
         lines.append(
-            f"| `{r['mname'] or 'Unknown'}` | {r['step_count']:,} | {format_tokens(toks)} | {share:.1f}% |"
+            f"| `{mname}` | {info['step_count']:,} | {format_tokens(toks)} | {share:.1f}% |"
         )
 
     quota_state = sync_and_get_quota_state(conn)

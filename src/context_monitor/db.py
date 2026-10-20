@@ -162,6 +162,9 @@ CREATE INDEX IF NOT EXISTS idx_tool_exec_name ON tool_executions(tool_name);
 CREATE INDEX IF NOT EXISTS idx_tool_exec_server ON tool_executions(mcp_server);
 CREATE INDEX IF NOT EXISTS idx_tool_exec_mcp_tool ON tool_executions(mcp_tool);
 CREATE INDEX IF NOT EXISTS idx_tool_exec_path ON tool_executions(target_path);
+CREATE INDEX IF NOT EXISTS idx_tool_exec_name_cov ON tool_executions(tool_name, conversation_id, mcp_server);
+CREATE INDEX IF NOT EXISTS idx_tool_exec_path_cov ON tool_executions(target_path, conversation_id, tool_name) WHERE target_path IS NOT NULL AND target_path != '';
+CREATE INDEX IF NOT EXISTS idx_tool_exec_mcp_cov ON tool_executions(mcp_server, mcp_tool, conversation_id, is_error) WHERE mcp_server IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_blocks_conv_hash ON transcript_blocks(conversation_id, block_hash);
 CREATE INDEX IF NOT EXISTS idx_blocks_conv_step ON transcript_blocks(conversation_id, step_index);
 CREATE INDEX IF NOT EXISTS idx_blocks_tools ON transcript_blocks(block_type) WHERE block_type = 'tools';
@@ -555,9 +558,10 @@ def refresh_conversation_rollups(
     )
     if not was_in_transaction:
         conn.commit()
+        _record_rollup_synced(conn)
 
 
-_ROLLUP_SYNC_LOCK = threading.Lock()
+_ROLLUP_SYNC_LOCK = threading.RLock()
 _LAST_SYNCED_STATE: dict[Any, tuple[int | None, int]] = {}
 
 
@@ -633,73 +637,134 @@ def _record_rollup_synced(conn: sqlite3.Connection) -> None:
 
 def ensure_rollups_synced(conn: sqlite3.Connection, force: bool = False) -> None:
     """Verifies that hourly_step_rollups matches the steps table and rebuilds if out of sync."""
-    cur = conn.cursor()
+    with _ROLLUP_SYNC_LOCK:
+        cur = conn.cursor()
+        in_tx = getattr(conn, "in_transaction", False)
 
-    # 1. Fast check: is hourly_step_rollups empty?
-    has_rollups = (
-        cur.execute("SELECT 1 FROM hourly_step_rollups LIMIT 1").fetchone() is not None
-    )
-    if not has_rollups:
-        # Check if steps table has data; if empty, nothing to build
-        has_steps = (
-            cur.execute(
-                "SELECT 1 FROM steps WHERE created_at IS NOT NULL AND created_at != '' LIMIT 1"
-            ).fetchone()
-            is not None
+        # 1. Fast check: is hourly_step_rollups empty?
+        has_rollups = (
+            cur.execute("SELECT 1 FROM hourly_step_rollups LIMIT 1").fetchone() is not None
         )
-        if not has_steps:
+        if not has_rollups:
+            # Check if steps table has data; if empty, nothing to build
+            has_steps = (
+                cur.execute(
+                    "SELECT 1 FROM steps WHERE created_at IS NOT NULL AND created_at != '' LIMIT 1"
+                ).fetchone()
+                is not None
+            )
+            if not has_steps:
+                if not in_tx:
+                    _record_rollup_synced(conn)
+                return
+            # Initial build
+            _rebuild_hourly_rollups(conn)
+            if not in_tx:
+                _record_rollup_synced(conn)
             return
-        # Initial build
-        _rebuild_hourly_rollups(conn)
-        _record_rollup_synced(conn)
-        return
 
-    # 2. If rollups exist, avoid 124ms full table scan across 672k rows if database is unchanged
-    in_tx = getattr(conn, "in_transaction", False)
-    if not force and not in_tx:
-        cache_key, state = _get_db_sync_state(conn)
-        with _ROLLUP_SYNC_LOCK:
+        # 2. Fast check 2: if not force and not in_tx, check _LAST_SYNCED_STATE
+        if not force and not in_tx:
+            cache_key, state = _get_db_sync_state(conn)
             last_state = _LAST_SYNCED_STATE.get(cache_key)
             if last_state is not None and last_state == state:
                 return
 
-    # 3. Check whether steps and hourly_step_rollups are in sync
-    step_stats = cur.execute(
-        """
-        SELECT 
-            COUNT(*), 
-            COALESCE(SUM(est_tokens), 0), 
-            COALESCE(SUM(COALESCE(billed_cost, 0.0)), 0.0)
-        FROM steps 
-        WHERE created_at IS NOT NULL AND created_at != ''
-        """
-    ).fetchone()
-    step_cnt = step_stats[0] if step_stats else 0
-    step_tokens = step_stats[1] if step_stats else 0
-    step_cost = step_stats[2] if step_stats else 0.0
+        # 3. If force, rebuild and record synced
+        if force:
+            _rebuild_hourly_rollups(conn)
+            if not in_tx:
+                _record_rollup_synced(conn)
+            return
 
-    rollup_stats = cur.execute(
-        """
-        SELECT 
-            COALESCE(SUM(step_count), 0), 
-            COALESCE(SUM(est_tokens), 0), 
-            COALESCE(SUM(billed_cost), 0.0)
-        FROM hourly_step_rollups
-        """
-    ).fetchone()
-    rollup_cnt = rollup_stats[0] if rollup_stats else 0
-    rollup_tokens = rollup_stats[1] if rollup_stats else 0
-    rollup_cost = rollup_stats[2] if rollup_stats else 0.0
+        # 4. When _LAST_SYNCED_STATE misses (e.g. cross-process sync or after cache clear):
+        max_id_row = cur.execute("SELECT MAX(id) FROM steps").fetchone()
+        max_id = (max_id_row[0] or 0) if max_id_row else 0
 
-    if (
-        step_cnt != rollup_cnt
-        or step_tokens != rollup_tokens
-        or abs(step_cost - rollup_cost) > 1e-4
-    ):
-        _rebuild_hourly_rollups(conn)
+        if max_id <= 5000:
+            # Small databases / unit tests: run full steps vs hourly_step_rollups comparison
+            step_stats = cur.execute(
+                """
+                SELECT 
+                    COUNT(*), 
+                    COALESCE(SUM(est_tokens), 0), 
+                    COALESCE(SUM(COALESCE(billed_cost, 0.0)), 0.0)
+                FROM steps 
+                WHERE created_at IS NOT NULL AND created_at != ''
+                """
+            ).fetchone()
+            step_cnt = step_stats[0] if step_stats else 0
+            step_tokens = step_stats[1] if step_stats else 0
+            step_cost = step_stats[2] if step_stats else 0.0
 
-    if not in_tx:
-        _record_rollup_synced(conn)
+            rollup_stats = cur.execute(
+                """
+                SELECT 
+                    COALESCE(SUM(step_count), 0), 
+                    COALESCE(SUM(est_tokens), 0), 
+                    COALESCE(SUM(billed_cost), 0.0)
+                FROM hourly_step_rollups
+                """
+            ).fetchone()
+            rollup_cnt = rollup_stats[0] if rollup_stats else 0
+            rollup_tokens = rollup_stats[1] if rollup_stats else 0
+            rollup_cost = rollup_stats[2] if rollup_stats else 0.0
+
+            if (
+                step_cnt != rollup_cnt
+                or step_tokens != rollup_tokens
+                or abs(step_cost - rollup_cost) > 1e-4
+            ):
+                _rebuild_hourly_rollups(conn)
+
+            if not in_tx:
+                _record_rollup_synced(conn)
+        else:
+            # Production DB with > 5000 steps (and not force): check latest conversation
+            row = cur.execute(
+                "SELECT conversation_id FROM steps WHERE id = ?", (max_id,)
+            ).fetchone()
+            if row:
+                latest_cid = row[0]
+                conv_step_stats = cur.execute(
+                    """
+                    SELECT 
+                        COUNT(*), 
+                        COALESCE(SUM(est_tokens), 0), 
+                        COALESCE(SUM(COALESCE(billed_cost, 0.0)), 0.0)
+                    FROM steps 
+                    WHERE conversation_id = ? AND created_at IS NOT NULL AND created_at != ''
+                    """,
+                    (latest_cid,),
+                ).fetchone()
+                c_step_cnt = conv_step_stats[0] if conv_step_stats else 0
+                c_step_tokens = conv_step_stats[1] if conv_step_stats else 0
+                c_step_cost = conv_step_stats[2] if conv_step_stats else 0.0
+
+                conv_rollup_stats = cur.execute(
+                    """
+                    SELECT 
+                        COALESCE(SUM(step_count), 0), 
+                        COALESCE(SUM(est_tokens), 0), 
+                        COALESCE(SUM(billed_cost), 0.0)
+                    FROM hourly_step_rollups
+                    WHERE conversation_id = ?
+                    """,
+                    (latest_cid,),
+                ).fetchone()
+                c_rollup_cnt = conv_rollup_stats[0] if conv_rollup_stats else 0
+                c_rollup_tokens = conv_rollup_stats[1] if conv_rollup_stats else 0
+                c_rollup_cost = conv_rollup_stats[2] if conv_rollup_stats else 0.0
+
+                if (
+                    c_step_cnt != c_rollup_cnt
+                    or c_step_tokens != c_rollup_tokens
+                    or abs(c_step_cost - c_rollup_cost) > 1e-4
+                ):
+                    refresh_conversation_rollups(conn, latest_cid)
+
+            if not in_tx:
+                _record_rollup_synced(conn)
 
 
 if __name__ == "__main__":

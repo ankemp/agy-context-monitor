@@ -26,6 +26,7 @@ if str(_root / "src") not in sys.path:
 
 from context_monitor.db import (  # noqa: E402
     DEFAULT_DB_PATH,
+    INDEXES_SQL,
     ensure_rollups_synced,
     get_db_connection,
     init_db,
@@ -1050,10 +1051,17 @@ def run_backfill(
 
         # Ensure all rollups are fully in sync with steps
         try:
-            ensure_rollups_synced(conn)
+            ensure_rollups_synced(conn, force=force)
             conn.commit()
         except Exception:
             pass
+
+        if force:
+            try:
+                conn.executescript(INDEXES_SQL)
+                conn.commit()
+            except Exception:
+                pass
 
         # Calibrate and initialize quota state for historical backfill
         try:

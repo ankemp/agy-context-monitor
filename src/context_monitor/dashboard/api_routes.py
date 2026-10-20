@@ -352,25 +352,35 @@ def query_summary_data(conn, tz=None, project=None):
         ((total_tools - total_fails) / max(1, total_tools)) * 100, 1
     )
 
-    # Consolidated single query for tool execution counts
-    where_tool_clause = f"WHERE 1=1 {where_tool}"
-    tool_counts = cur.execute(
+    # Fast tool execution counts using covering index
+    tool_name_filter = (
+        "('view_file', 'grep_search', 'find_by_name', 'list_dir', 'run_command', "
+        "'write_to_file', 'replace_file_content', 'multi_replace_file_content')"
+    )
+    tool_rows = cur.execute(
         f"""
-        SELECT 
-            COUNT(CASE WHEN tool_name = 'view_file' THEN 1 END) as view_cnt,
-            COUNT(CASE WHEN tool_name IN ('view_file', 'grep_search', 'find_by_name', 'list_dir') THEN 1 END) as reads_cnt,
-            COUNT(CASE WHEN tool_name = 'run_command' THEN 1 END) as cmds_cnt,
-            COUNT(CASE WHEN tool_name IN ('write_to_file', 'replace_file_content', 'multi_replace_file_content') THEN 1 END) as edits_cnt
+        SELECT tool_name, COUNT(*) as cnt
         FROM tool_executions
-        {where_tool_clause}
+        WHERE tool_name IN {tool_name_filter} {where_tool}
+        GROUP BY tool_name
     """,
         params_conv,
-    ).fetchone()
+    ).fetchall()
 
-    total_views = tool_counts["view_cnt"] or 0
-    reads_cnt = tool_counts["reads_cnt"] or 0
-    cmds_cnt = tool_counts["cmds_cnt"] or 0
-    edits_cnt = tool_counts["edits_cnt"] or 0
+    tc_map = {r["tool_name"]: r["cnt"] for r in tool_rows}
+    total_views = tc_map.get("view_file", 0)
+    reads_cnt = (
+        tc_map.get("view_file", 0)
+        + tc_map.get("grep_search", 0)
+        + tc_map.get("find_by_name", 0)
+        + tc_map.get("list_dir", 0)
+    )
+    cmds_cnt = tc_map.get("run_command", 0)
+    edits_cnt = (
+        tc_map.get("write_to_file", 0)
+        + tc_map.get("replace_file_content", 0)
+        + tc_map.get("multi_replace_file_content", 0)
+    )
 
     total_re_reads = row["total_re_reads"] or 0
     re_read_rate = round((total_re_reads / max(1, total_views)) * 100, 1)
@@ -384,7 +394,6 @@ def query_summary_data(conn, tz=None, project=None):
         FROM steps
         WHERE phase IS NOT NULL {where_step_and}
         GROUP BY phase
-        ORDER BY tokens DESC
     """,
         params_conv,
     ).fetchall()
@@ -392,6 +401,7 @@ def query_summary_data(conn, tz=None, project=None):
         {"phase": r["phase"], "steps": r["steps"], "tokens": r["tokens"] or 0}
         for r in phase_rows
     ]
+    phases.sort(key=lambda x: x["tokens"], reverse=True)
 
     # Top bloat steps
     bloat_rows = cur.execute(
@@ -420,44 +430,111 @@ def query_summary_data(conn, tz=None, project=None):
     total_billed_output_tokens = row["total_billed_output_tokens"] or 0
 
     models = []
+    model_data: dict[str, dict[str, Any]] = {}
     if project:
-        model_sql = f"""
-            SELECT COALESCE(s.model_name, c.model_name, 'Gemini Flash') as mname,
-                   COUNT(*) as steps,
-                   SUM(COALESCE(s.billed_input_tokens, 0) + COALESCE(s.billed_output_tokens, 0)) as tokens
-            FROM steps s
-            JOIN conversations c ON s.conversation_id = c.id
-            WHERE 1=1 {where_step_join}
-            GROUP BY mname
-            ORDER BY tokens DESC
-        """
-        model_params = params_conv
+        if project == "(unassigned)":
+            model_sql = """
+                SELECT s.model_name as mname,
+                       COUNT(*) as steps,
+                       SUM(COALESCE(s.billed_input_tokens, 0) + COALESCE(s.billed_output_tokens, 0)) as tokens
+                FROM steps s
+                WHERE s.conversation_id IN (SELECT id FROM conversations WHERE project IS NULL OR project = '')
+                GROUP BY s.model_name
+            """
+            model_params = ()
+        else:
+            model_sql = """
+                SELECT s.model_name as mname,
+                       COUNT(*) as steps,
+                       SUM(COALESCE(s.billed_input_tokens, 0) + COALESCE(s.billed_output_tokens, 0)) as tokens
+                FROM steps s
+                WHERE s.conversation_id IN (SELECT id FROM conversations WHERE project = ?)
+                GROUP BY s.model_name
+            """
+            model_params = (project,)
     else:
         model_sql = """
-            SELECT COALESCE(model_name, 'Gemini Flash') as mname,
+            SELECT model_name as mname,
                    COUNT(*) as steps,
                    SUM(COALESCE(billed_input_tokens, 0) + COALESCE(billed_output_tokens, 0)) as tokens
             FROM steps
-            GROUP BY mname
-            ORDER BY tokens DESC
+            GROUP BY model_name
         """
         model_params = ()
 
-    for r in cur.execute(model_sql, model_params):
-        models.append(
-            {
-                "model_name": r["mname"] or "Unknown",
-                "steps": r["steps"],
-                "tokens": r["tokens"] or 0,
-            }
-        )
+    model_rows = cur.execute(model_sql, model_params).fetchall()
+    for r in model_rows:
+        name = r["mname"]
+        if not name:
+            if project:
+                if project == "(unassigned)":
+                    null_sql = """
+                        SELECT COALESCE(c.model_name, 'Gemini Flash') as cname,
+                               COUNT(*) as steps,
+                               SUM(COALESCE(s.billed_input_tokens, 0) + COALESCE(s.billed_output_tokens, 0)) as tokens
+                        FROM steps s
+                        JOIN conversations c ON s.conversation_id = c.id
+                        WHERE (s.model_name IS NULL OR s.model_name = '')
+                          AND (c.project IS NULL OR c.project = '')
+                        GROUP BY cname
+                    """
+                    null_params = ()
+                else:
+                    null_sql = """
+                        SELECT COALESCE(c.model_name, 'Gemini Flash') as cname,
+                               COUNT(*) as steps,
+                               SUM(COALESCE(s.billed_input_tokens, 0) + COALESCE(s.billed_output_tokens, 0)) as tokens
+                        FROM steps s
+                        JOIN conversations c ON s.conversation_id = c.id
+                        WHERE (s.model_name IS NULL OR s.model_name = '')
+                          AND c.project = ?
+                        GROUP BY cname
+                    """
+                    null_params = (project,)
+                null_rows = cur.execute(null_sql, null_params).fetchall()
+                if null_rows:
+                    for nr in null_rows:
+                        cname = nr["cname"] or "Gemini Flash"
+                        st = nr["steps"] or 0
+                        tok = nr["tokens"] or 0
+                        if cname in model_data:
+                            model_data[cname]["steps"] += st
+                            model_data[cname]["tokens"] += tok
+                        else:
+                            model_data[cname] = {
+                                "model_name": cname,
+                                "steps": st,
+                                "tokens": tok,
+                            }
+                    continue
+                name = "Gemini Flash"
+            else:
+                name = "Gemini Flash"
 
-    categories = []
-    for r in cur.execute(
-        f"SELECT category, SUM(est_tokens) as tokens FROM steps WHERE category IS NOT NULL {where_step_and} GROUP BY category ORDER BY tokens DESC LIMIT 10",
+        tokens = r["tokens"] or 0
+        steps = r["steps"] or 0
+        if name in model_data:
+            model_data[name]["steps"] += steps
+            model_data[name]["tokens"] += tokens
+        else:
+            model_data[name] = {
+                "model_name": name,
+                "steps": steps,
+                "tokens": tokens,
+            }
+
+    models = sorted(model_data.values(), key=lambda x: x["tokens"], reverse=True)
+
+    category_rows = cur.execute(
+        f"SELECT category, SUM(est_tokens) as tokens FROM steps WHERE category IS NOT NULL {where_step_and} GROUP BY category",
         params_conv,
-    ):
-        categories.append({"category": r["category"], "tokens": r["tokens"] or 0})
+    ).fetchall()
+    categories = [
+        {"category": r["category"], "tokens": r["tokens"] or 0}
+        for r in category_rows
+    ]
+    categories.sort(key=lambda x: x["tokens"], reverse=True)
+    categories = categories[:10]
 
     earliest_local = parse_to_local_dt(row["earliest"], tz)
     latest_local = parse_to_local_dt(row["latest"], tz)
@@ -798,7 +875,9 @@ def query_timeline_data(conn, days=None, tz=None, project=None):
                         boundary_params.append(project)
 
                 boundary_where.append("created_at >= ?")
-                boundary_params.append(start_dt_utc_clean.strftime("%Y-%m-%d"))
+                boundary_params.append(start_hour.replace("T", " "))
+                boundary_where.append("created_at < ?")
+                boundary_params.append(start_hour + ":59:59.999999Z~")
                 boundary_where.append("replace(created_at, ' ', 'T') >= ?")
                 boundary_params.append(start_dt_utc_clean.strftime("%Y-%m-%dT%H:%M:%S"))
                 boundary_where.append("substr(replace(created_at, ' ', 'T'), 1, 13) = ?")
