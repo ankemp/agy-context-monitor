@@ -574,12 +574,16 @@ def analyze_transcript(
 
             if (
                 not project
-                and step_type in ("USER_INPUT", "CHECKPOINT")
-                and "<user_information>" in content
+                and step_type in ("USER_INPUT", "CHECKPOINT", "SYSTEM", "SYSTEM_MESSAGE")
             ):
-                m = re.search(r"(?:/Users/[^\s]+)\s*->\s*[^\s]+/([^\s]+)", content)
-                if m:
-                    project = m.group(1)
+                if "<user_information>" in content:
+                    m = re.search(r"(?:/Users/[^\s]+)\s*->\s*[^\s]+/([^\s]+)", content)
+                    if m:
+                        project = m.group(1)
+                if not project and "/Users/akemp/Workspace/" in content:
+                    m = re.search(r"/Users/akemp/Workspace/([^/\"\'\s\<\>\`]+)", content)
+                    if m:
+                        project = m.group(1)
 
             if is_error:
                 failed_tool_calls += 1
@@ -625,20 +629,25 @@ def analyze_transcript(
                     detail = f"Tools called: {', '.join(tool_names)}"
                     for tc_name, tc_args in pending_tool_calls:
                         target_p = (
-                            tc_args.get("TargetFile")
+                            tc_args.get("Path")
+                            or tc_args.get("path")
+                            or tc_args.get("TargetFile")
+                            or tc_args.get("target_file")
                             or tc_args.get("AbsolutePath")
                             or tc_args.get("SearchPath")
                             or tc_args.get("DirectoryPath")
                             or ""
                         )
-                        proj_path = target_p or tc_args.get("Cwd") or ""
+                        proj_path = target_p or tc_args.get("Cwd") or tc_args.get("cwd") or ""
+                        if not proj_path and tc_args.get("CommandLine"):
+                            proj_path = tc_args.get("CommandLine")
                         if (
                             not project
                             and proj_path
-                            and "/Users/akemp/Workspace/" in proj_path
+                            and "/Users/akemp/Workspace/" in str(proj_path)
                         ):
                             m = re.search(
-                                r"/Users/akemp/Workspace/([^/\"\'\s]+)", proj_path
+                                r"/Users/akemp/Workspace/([^/\"\'\s]+)", str(proj_path)
                             )
                             if m:
                                 project = m.group(1)
@@ -1261,33 +1270,42 @@ def sync_to_sqlite(
                     analysis["subagent_role"] = subagent_role
 
                 if parent_id:
-                    p_row = cur.execute(
-                        "SELECT id, root_id, project, depth, title FROM conversations WHERE id = ?",
-                        (parent_id,),
-                    ).fetchone()
-                    if p_row:
-                        root_id = p_row["root_id"] or p_row["id"]
-                        depth = (p_row["depth"] or 0) + 1
-                        if not analysis.get("project") and p_row["project"]:
-                            analysis["project"] = p_row["project"]
-                        if (
-                            not analysis.get("title")
-                            or analysis["title"] in ("Active Session", "")
-                            or (
-                                analysis["title"].startswith("[Autonomous Worker]")
-                                and subagent_role
-                                and subagent_role != "Autonomous Worker"
-                            )
-                        ) and p_row["title"]:
-                            role_label = subagent_role or "Worker"
-                            clean_p_title = p_row["title"]
-                            m_sub = re.match(r"^\[.+?\]\s*(.+)", clean_p_title)
-                            if m_sub:
-                                clean_p_title = m_sub.group(1)
-                            analysis["title"] = f"[{role_label}] {clean_p_title[:90]}"
+                    if parent_id == cid:
+                        parent_id = None
+                        root_id = cid
+                        depth = 0
                     else:
-                        root_id = parent_id
-                        depth = 1
+                        p_row = cur.execute(
+                            "SELECT id, root_id, parent_id, project, depth, title FROM conversations WHERE id = ?",
+                            (parent_id,),
+                        ).fetchone()
+                        if p_row and (p_row["root_id"] == cid or p_row["id"] == cid or p_row["parent_id"] == cid):
+                            parent_id = None
+                            root_id = cid
+                            depth = 0
+                        elif p_row:
+                            root_id = p_row["root_id"] or p_row["id"]
+                            depth = (p_row["depth"] or 0) + 1
+                            if not analysis.get("project") and p_row["project"]:
+                                analysis["project"] = p_row["project"]
+                            if (
+                                not analysis.get("title")
+                                or analysis["title"] in ("Active Session", "")
+                                or (
+                                    analysis["title"].startswith("[Autonomous Worker]")
+                                    and subagent_role
+                                    and subagent_role != "Autonomous Worker"
+                                )
+                            ) and p_row["title"]:
+                                role_label = subagent_role or "Worker"
+                                clean_p_title = p_row["title"]
+                                m_sub = re.match(r"^\[.+?\]\s*(.+)", clean_p_title)
+                                if m_sub:
+                                    clean_p_title = m_sub.group(1)
+                                analysis["title"] = f"[{role_label}] {clean_p_title[:90]}"
+                        else:
+                            root_id = parent_id
+                            depth = 1
 
                 models_used_list = analysis.get("models_used", [])
                 model_transitions = analysis.get("model_transitions", [])
@@ -1345,9 +1363,9 @@ def sync_to_sqlite(
                         billed_cost = excluded.billed_cost,
                         billed_input_tokens = excluded.billed_input_tokens,
                         billed_output_tokens = excluded.billed_output_tokens,
-                        parent_id = COALESCE(excluded.parent_id, conversations.parent_id),
-                        root_id = COALESCE(excluded.root_id, conversations.root_id),
-                        depth = CASE WHEN excluded.parent_id IS NOT NULL THEN excluded.depth ELSE conversations.depth END,
+                        parent_id = excluded.parent_id,
+                        root_id = excluded.root_id,
+                        depth = excluded.depth,
                         subagent_role = COALESCE(excluded.subagent_role, conversations.subagent_role),
                         subagent_type = COALESCE(excluded.subagent_type, conversations.subagent_type),
                         invoking_step_index = COALESCE(excluded.invoking_step_index, conversations.invoking_step_index),

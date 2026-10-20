@@ -2253,13 +2253,19 @@
       if (!tbody) return;
       tbody.innerHTML = '';
 
-      const filtered = allConversations.filter(c => c.title.toLowerCase().includes(q) || c.id.toLowerCase().includes(q) || (c.created_at && c.created_at.includes(q)));
+      const filtered = allConversations.filter(c => 
+        (c.title || '').toLowerCase().includes(q) || 
+        (c.id || '').toLowerCase().includes(q) || 
+        (c.created_at && c.created_at.includes(q)) ||
+        (c.updated_at && c.updated_at.includes(q))
+      );
 
       for (const c of filtered.slice(0, 50)) {
         const tr = document.createElement('tr');
         tr.className = 'hover:bg-dark-800/60 transition';
         
-        const dateStr = c.created_at || '--';
+        const lastActiveStr = c.updated_at || c.created_at || '--';
+        const startedStr = c.created_at || '--';
         const activeSec = c.active_agent_seconds || c.active_pairing_seconds || c.duration_seconds || 0;
         const wallSec = c.duration_seconds || 0;
         const timeTitle = `Agent Work: ${formatDuration(c.active_agent_seconds || 0)} | Active Pairing: ${formatDuration(c.active_pairing_seconds || 0)} | Total Span: ${formatDuration(wallSec)}`;
@@ -2314,7 +2320,10 @@
         }
 
         tr.innerHTML = `
-          <td class="py-2.5 px-3 text-gray-400 whitespace-nowrap font-mono text-[11px]">${dateStr}</td>
+          <td class="py-2.5 px-3 text-gray-300 whitespace-nowrap font-mono text-[11px]" title="Started: ${startedStr}">
+            <span class="font-medium text-emerald-400">${lastActiveStr}</span>
+            <span class="text-[10px] text-gray-500 block font-mono">Started ${startedStr}</span>
+          </td>
           <td class="py-2.5 px-3">${titleHtml}</td>
           <td class="py-2.5 px-3 max-w-[220px] align-middle">${formatModelBadgeHtml(c.model_name)}</td>
           <td class="py-2.5 px-3 text-right">${stepsHtml}</td>
@@ -2346,9 +2355,14 @@
 
             const depth = sub.depth || 1;
             const padClass = depth === 1 ? 'pl-8' : depth === 2 ? 'pl-12' : 'pl-16';
+            const childLastActiveStr = sub.updated_at || sub.created_at || '--';
+            const childStartedStr = sub.created_at || '--';
 
             childTr.innerHTML = `
-              <td class="py-2 px-3 text-gray-500 whitespace-nowrap font-mono text-[10px] pl-6">${sub.created_at || '--'}</td>
+              <td class="py-2 px-3 text-gray-400 whitespace-nowrap font-mono text-[10px] pl-6" title="Started: ${childStartedStr}">
+                <span class="text-emerald-400/80">${childLastActiveStr}</span>
+                <span class="text-[9px] text-gray-500 block font-mono">Started ${childStartedStr}</span>
+              </td>
               <td class="py-2 px-3 ${padClass}">
                 <div class="flex items-center space-x-2 max-w-sm flex-wrap gap-y-1">
                   <span class="text-pink-400 font-mono text-xs">↳</span>

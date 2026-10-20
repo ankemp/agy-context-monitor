@@ -3359,3 +3359,33 @@ def test_frontend_swarm_view_and_campaign_cost_elements():
     assert data["status"] == "ok"
     assert len(data["tested"]) == 4
 
+
+def test_query_conversations_list_sorting_and_updated_at(tmp_path: Path):
+    """Verifies query_conversations_list sorts by COALESCE(updated_at, created_at) DESC and returns updated_at."""
+    db_file = tmp_path / "test_sort.db"
+    init_db(db_file)
+    with get_db_connection(db_file) as conn:
+        # Conv 1: older created_at, but updated recently (active session)
+        conn.execute(
+            """
+            INSERT INTO conversations (id, title, created_at, updated_at, total_steps, total_tokens)
+            VALUES ('c_older_active', 'Older Active', '2026-10-19T10:00:00Z', '2026-10-20T12:00:00Z', 10, 100)
+            """
+        )
+        # Conv 2: newer created_at, but updated earlier
+        conn.execute(
+            """
+            INSERT INTO conversations (id, title, created_at, updated_at, total_steps, total_tokens)
+            VALUES ('c_newer_idle', 'Newer Idle', '2026-10-20T09:00:00Z', '2026-10-20T09:30:00Z', 5, 50)
+            """
+        )
+        conn.commit()
+
+        convs = api_routes.query_conversations_list(conn, view_mode="hierarchy")
+        assert len(convs) == 2
+        assert convs[0]["id"] == "c_older_active", f"Expected active conversation at index 0, got {convs[0]['id']}"
+        assert convs[1]["id"] == "c_newer_idle"
+        assert "updated_at" in convs[0]
+        assert "created_at" in convs[0]
+
+

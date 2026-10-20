@@ -456,12 +456,16 @@ def parse_conversation(
 
             if (
                 not project
-                and step_type in ("USER_INPUT", "CHECKPOINT")
-                and "<user_information>" in content
+                and step_type in ("USER_INPUT", "CHECKPOINT", "SYSTEM", "SYSTEM_MESSAGE")
             ):
-                m = re.search(r"(?:/Users/[^\s]+)\s*->\s*[^\s]+/([^\s]+)", content)
-                if m:
-                    project = m.group(1)
+                if "<user_information>" in content:
+                    m = re.search(r"(?:/Users/[^\s]+)\s*->\s*[^\s]+/([^\s]+)", content)
+                    if m:
+                        project = m.group(1)
+                if not project and "/Users/akemp/Workspace/" in content:
+                    m = re.search(r"/Users/akemp/Workspace/([^/\"\'\s\<\>\`]+)", content)
+                    if m:
+                        project = m.group(1)
 
             if is_error:
                 failed_tool_calls += 1
@@ -509,21 +513,26 @@ def parse_conversation(
                     # Record tool executions and volume metrics
                     for tc_name, tc_args in pending_tool_calls:
                         target_p = (
-                            tc_args.get("TargetFile")
+                            tc_args.get("Path")
+                            or tc_args.get("path")
+                            or tc_args.get("TargetFile")
+                            or tc_args.get("target_file")
                             or tc_args.get("AbsolutePath")
                             or tc_args.get("SearchPath")
                             or tc_args.get("DirectoryPath")
                             or ""
                         )
 
-                        proj_path = target_p or tc_args.get("Cwd") or ""
+                        proj_path = target_p or tc_args.get("Cwd") or tc_args.get("cwd") or ""
+                        if not proj_path and tc_args.get("CommandLine"):
+                            proj_path = tc_args.get("CommandLine")
                         if (
                             not project
                             and proj_path
-                            and "/Users/akemp/Workspace/" in proj_path
+                            and "/Users/akemp/Workspace/" in str(proj_path)
                         ):
                             m = re.search(
-                                r"/Users/akemp/Workspace/([^/\"\'\s]+)", proj_path
+                                r"/Users/akemp/Workspace/([^/\"\'\s]+)", str(proj_path)
                             )
                             if m:
                                 project = m.group(1)

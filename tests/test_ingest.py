@@ -1138,3 +1138,70 @@ def test_sync_to_sqlite_incremental_append_with_ephemeral_steps(tmp_path: Path):
         ), f"Expected 0 DELETE statements on append, got {executed_deletes}"
 
 
+def test_analyze_transcript_project_detection_from_path_and_cmdline(tmp_path: Path):
+    """Verifies that analyze_transcript extracts project from modern tool calls with Path or CommandLine."""
+    # 1. Antigravity 2.0 read_file with Path
+    t1 = tmp_path / "t_path.jsonl"
+    t1.write_text(
+        '{"step_index": 1, "type": "USER_INPUT", "content": "Inspect file"}\n'
+        '{"step_index": 2, "type": "PLANNER_RESPONSE", "tool_calls": [{"name": "read_file", "args": {"Path": "/Users/akemp/Workspace/agy-context-monitor/src/db.py"}}]}\n',
+        encoding="utf-8",
+    )
+    res1 = analyze_transcript(t1)
+    assert res1["project"] == "agy-context-monitor"
+
+    # 2. run_command with CommandLine in workspace
+    t2 = tmp_path / "t_cmd.jsonl"
+    t2.write_text(
+        '{"step_index": 1, "type": "USER_INPUT", "content": "Run tests"}\n'
+        '{"step_index": 2, "type": "PLANNER_RESPONSE", "tool_calls": [{"name": "run_command", "args": {"CommandLine": "cd /Users/akemp/Workspace/ledger && pytest"}}]}\n',
+        encoding="utf-8",
+    )
+    res2 = analyze_transcript(t2)
+    assert res2["project"] == "ledger"
+
+
+def test_sync_to_sqlite_lineage_cycle_prevention(tmp_path: Path):
+    """Verifies that cyclic parent linkages are prevented and broken into root conversations."""
+    db_file = tmp_path / "test_cycle.db"
+    init_db(db_file)
+    cid_a = "conv-cycle-a"
+    cid_b = "conv-cycle-b"
+
+    # Step 1: Insert B as initial root, then A with parent B
+    conn = get_db_connection(db_file)
+    conn.execute(
+        "INSERT INTO conversations (id, title, parent_id, root_id, depth) VALUES (?, ?, ?, ?, ?)",
+        (cid_b, "Conv B", None, cid_b, 0),
+    )
+    conn.execute(
+        "INSERT INTO conversations (id, title, parent_id, root_id, depth) VALUES (?, ?, ?, ?, ?)",
+        (cid_a, "Conv A", cid_b, cid_b, 1),
+    )
+    conn.commit()
+    conn.close()
+
+    # Step 2: Try to sync B with parent A -> cycle would form (B -> A -> B)
+    analysis_b = {
+        "title": "Conv B",
+        "parent_id": cid_a,
+        "steps": [],
+        "total_chars": 100,
+        "total_tokens": 50,
+        "duration_seconds": 10,
+        "start_time": "2026-10-20T10:00:00Z",
+        "end_time": "2026-10-20T10:00:10Z",
+    }
+    with patch("scripts.ingest.DEFAULT_DB_PATH", db_file):
+        sync_to_sqlite(cid_b, "Gemini Flash", analysis_b)
+
+    conn = get_db_connection(db_file)
+    row_b = conn.execute("SELECT parent_id, root_id, depth FROM conversations WHERE id = ?", (cid_b,)).fetchone()
+    conn.close()
+
+    assert row_b["parent_id"] is None, f"Expected parent_id to be None to break cycle, got {row_b['parent_id']}"
+    assert row_b["root_id"] == cid_b
+    assert row_b["depth"] == 0
+
+
+

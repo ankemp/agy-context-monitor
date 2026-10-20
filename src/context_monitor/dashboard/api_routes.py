@@ -1529,14 +1529,14 @@ def query_conversations_list(
     try:
         rows = cur.execute(
             f"""
-            SELECT id, title, project, model_name, models_used, created_at, total_steps, total_tokens,
+            SELECT id, title, project, model_name, models_used, created_at, updated_at, total_steps, total_tokens,
                    duration_seconds, active_agent_seconds, active_pairing_seconds,
                    billed_cost, billed_input_tokens, billed_output_tokens,
                    parent_id, root_id, depth, subagent_role, subagent_type, invoking_step_index,
                    compaction_count, pruned_tokens
             FROM conversations
             {where_clause}
-            ORDER BY created_at DESC
+            ORDER BY COALESCE(updated_at, created_at) DESC
             LIMIT {limit}
         """,
             tuple(params),
@@ -1544,14 +1544,14 @@ def query_conversations_list(
     except Exception:
         rows = cur.execute(
             f"""
-            SELECT id, title, project, model_name, created_at, total_steps, total_tokens,
+            SELECT id, title, project, model_name, created_at, updated_at, total_steps, total_tokens,
                    duration_seconds, active_agent_seconds, active_pairing_seconds,
                    billed_cost, billed_input_tokens, billed_output_tokens,
                    parent_id, root_id, depth, subagent_role, subagent_type, invoking_step_index,
                    compaction_count, pruned_tokens
             FROM conversations
             {where_clause}
-            ORDER BY created_at DESC
+            ORDER BY COALESCE(updated_at, created_at) DESC
             LIMIT {limit}
         """,
             tuple(params),
@@ -1569,7 +1569,7 @@ def query_conversations_list(
         try:
             desc_rows = cur.execute(
                 f"""
-                SELECT id, title, project, model_name, models_used, created_at, total_steps, total_tokens,
+                SELECT id, title, project, model_name, models_used, created_at, updated_at, total_steps, total_tokens,
                        duration_seconds, active_agent_seconds, active_pairing_seconds,
                        billed_cost, billed_input_tokens, billed_output_tokens,
                        parent_id, root_id, depth, subagent_role, subagent_type, invoking_step_index,
@@ -1583,7 +1583,7 @@ def query_conversations_list(
         except Exception:
             desc_rows = cur.execute(
                 f"""
-                SELECT id, title, project, model_name, created_at, total_steps, total_tokens,
+                SELECT id, title, project, model_name, created_at, updated_at, total_steps, total_tokens,
                        duration_seconds, active_agent_seconds, active_pairing_seconds,
                        billed_cost, billed_input_tokens, billed_output_tokens,
                        parent_id, root_id, depth, subagent_role, subagent_type, invoking_step_index,
@@ -1600,6 +1600,11 @@ def query_conversations_list(
             if rid not in descendants_by_root:
                 descendants_by_root[rid] = []
             d_dt = parse_to_local_dt(dr["created_at"], target_tz)
+            d_udt = (
+                parse_to_local_dt(dr["updated_at"], target_tz)
+                if ("updated_at" in dr.keys() and dr["updated_at"])
+                else None
+            )
             d_act = (dr["billed_input_tokens"] or 0) + (dr["billed_output_tokens"] or 0)
             dr_m_used = dr["model_name"] or "Gemini"
             try:
@@ -1619,6 +1624,9 @@ def query_conversations_list(
                     "created_at": d_dt.strftime("%Y-%m-%d %H:%M")
                     if d_dt
                     else dr["created_at"],
+                    "updated_at": d_udt.strftime("%Y-%m-%d %H:%M")
+                    if d_udt
+                    else (dr["updated_at"] if "updated_at" in dr.keys() and dr["updated_at"] else dr["created_at"]),
                     "total_steps": dr["total_steps"] or 0,
                     "tokens": d_act,
                     "total_tokens": d_act,
@@ -1642,6 +1650,11 @@ def query_conversations_list(
 
     for r in rows:
         dt = parse_to_local_dt(r["created_at"], target_tz)
+        udt = (
+            parse_to_local_dt(r["updated_at"], target_tz)
+            if ("updated_at" in r.keys() and r["updated_at"])
+            else None
+        )
         act_tok = (r["billed_input_tokens"] or 0) + (r["billed_output_tokens"] or 0)
         c_cost = round(r["billed_cost"] or 0.0, 2)
         c_steps = r["total_steps"] or 0
@@ -1677,6 +1690,9 @@ def query_conversations_list(
                 "model_name": r["model_name"] or "Gemini",
                 "models_used": r_m_used,
                 "created_at": dt.strftime("%Y-%m-%d %H:%M") if dt else r["created_at"],
+                "updated_at": udt.strftime("%Y-%m-%d %H:%M")
+                if udt
+                else (r["updated_at"] if "updated_at" in r.keys() and r["updated_at"] else r["created_at"]),
                 "total_steps": c_steps,
                 "tokens": act_tok,
                 "total_tokens": act_tok,
