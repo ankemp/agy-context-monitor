@@ -36,6 +36,12 @@ from context_monitor.quota import (
     normalize_activity_profile,
     sync_and_get_quota_state,
 )
+from context_monitor.project import (
+    backfill_db_projects,
+    extract_project_from_text,
+    extract_project_from_tool_args,
+    normalize_project_name,
+)
 
 __all__ = [
     "DEFAULT_DB_PATH",
@@ -70,4 +76,8 @@ __all__ = [
     "get_hourly_activity_profile",
     "invalidate_activity_profile_cache",
     "normalize_activity_profile",
+    "normalize_project_name",
+    "extract_project_from_text",
+    "extract_project_from_tool_args",
+    "backfill_db_projects",
 ]
