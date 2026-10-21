@@ -1303,8 +1303,16 @@ def sync_to_sqlite(
 
                 if not analysis.get("project") and root_id:
                     swarm_row = cur.execute(
-                        "SELECT project FROM conversations WHERE (id = ? OR root_id = ?) AND project IS NOT NULL AND project != '' LIMIT 1",
-                        (root_id, root_id),
+                        """
+                        SELECT project FROM conversations
+                        WHERE (id = ? OR root_id = ?)
+                          AND project IS NOT NULL
+                          AND project != ''
+                          AND lower(project) NOT IN ('(unassigned)', 'unassigned')
+                        ORDER BY CASE WHEN id = ? THEN 0 ELSE 1 END, depth ASC
+                        LIMIT 1
+                        """,
+                        (root_id, root_id, root_id),
                     ).fetchone()
                     if swarm_row:
                         try:
@@ -1468,7 +1476,7 @@ def sync_to_sqlite(
                 # Propagate project to unassigned swarm members
                 if analysis.get("project"):
                     conn.execute(
-                        "UPDATE conversations SET project = ? WHERE (id = ? OR root_id = ?) AND (project IS NULL OR project = '')",
+                        "UPDATE conversations SET project = ? WHERE (id = ? OR root_id = ?) AND (project IS NULL OR project = '' OR lower(project) IN ('(unassigned)', 'unassigned'))",
                         (analysis["project"], root_id, root_id),
                     )
 

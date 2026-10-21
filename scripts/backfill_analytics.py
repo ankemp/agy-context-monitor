@@ -1096,8 +1096,11 @@ def run_backfill(
                     c_depth += 1
                 c_root = c_curr
                 c_proj = c_conv.get("project")
-                if c_proj and c_root not in swarm_project_map:
-                    swarm_project_map[c_root] = c_proj
+                if c_proj:
+                    if c_root == c_id:
+                        swarm_project_map[c_root] = c_proj
+                    elif c_root not in swarm_project_map:
+                        swarm_project_map[c_root] = c_proj
 
             # Fallback to existing DB projects for roots or swarms
             try:
@@ -1106,13 +1109,18 @@ def run_backfill(
                 ).fetchall()
                 for r in db_swarms:
                     try:
-                        r_id = r["root_id"] or r["id"]
+                        r_row_id = r["id"]
+                        r_id = r["root_id"] or r_row_id
                         p_val = r["project"]
                     except (IndexError, TypeError):
+                        r_row_id = r[0]
                         r_id = r[1] or r[0]
                         p_val = r[2]
-                    if r_id and r_id not in swarm_project_map and p_val:
-                        swarm_project_map[r_id] = p_val
+                    if r_id and p_val:
+                        if r_id == r_row_id and (r_id not in swarm_project_map or swarm_project_map.get(r_id) is None):
+                            swarm_project_map[r_id] = p_val
+                        elif r_id not in swarm_project_map:
+                            swarm_project_map[r_id] = p_val
             except Exception:
                 pass
 

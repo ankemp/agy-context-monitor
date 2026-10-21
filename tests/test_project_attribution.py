@@ -289,3 +289,155 @@ def test_run_backfill_preserves_historical_and_propagates_swarms(tmp_path):
     assert rows["hist-isolated"] == "saved-proj"
     assert rows["child-subagent"] == "vinny-companion"
     assert rows["hist-root"] == "vinny-companion"
+
+
+def test_extract_project_from_text_modern_user_info_and_containers():
+    # 1. Modern Active Workspaces with non-Workspace parent dir
+    user_info = """<user_information>
+Active Workspaces:
+- /Users/akemp/Projects/web-frontend
+Command Working Directory: /Users/akemp/Projects/web-frontend
+</user_information>"""
+    assert extract_project_from_text(user_info) == "web-frontend"
+
+    # 2. Command Working Directory fallback
+    cwd_info = """<user_information>
+The USER's OS version is mac.
+Command Working Directory: /home/ubuntu/repos/backend-service
+</user_information>"""
+    assert extract_project_from_text(cwd_info) == "backend-service"
+
+    # 3. Generic home directory does not produce user's name as project
+    home_info = """<user_information>
+Command Working Directory: /Users/akemp
+</user_information>"""
+    assert extract_project_from_text(home_info) is None
+
+    # 4. Containers and Codespaces (/workspace and /workspaces)
+    assert extract_project_from_text("/workspaces/my-cool-app/src/index.ts") == "my-cool-app"
+    assert extract_project_from_text("/workspace/cloud-api/main.go") == "cloud-api"
+    assert extract_project_from_text("file:///workspaces/my-cool-app") == "my-cool-app"
+
+
+def test_extract_project_from_tool_args_search_directory():
+    assert (
+        extract_project_from_tool_args({"SearchDirectory": "/workspaces/my-cool-app"})
+        == "my-cool-app"
+    )
+    assert (
+        extract_project_from_tool_args({"search_directory": "/Users/akemp/Workspace/ledger"})
+        == "ledger"
+    )
+
+
+def test_backfill_db_projects_row_factory_safety_and_unassigned_cleanup():
+    conn = sqlite3.connect(":memory:")
+    # Ensure default row_factory is None
+    assert conn.row_factory is None
+    conn.execute(
+        "CREATE TABLE conversations (id TEXT PRIMARY KEY, title TEXT, project TEXT, parent_id TEXT, root_id TEXT, depth INTEGER)"
+    )
+    conn.execute(
+        "CREATE TABLE tool_executions (id INTEGER PRIMARY KEY, conversation_id TEXT, target_path TEXT, command_line TEXT)"
+    )
+    # c-recoverable has literal '(unassigned)' and tool execution
+    conn.execute(
+        "INSERT INTO conversations VALUES ('c-recoverable', 'Conv 1', '(unassigned)', NULL, 'c-recoverable', 0)"
+    )
+    conn.execute(
+        "INSERT INTO tool_executions (conversation_id, target_path) VALUES ('c-recoverable', '/Users/akemp/Workspace/ledger/main.py')"
+    )
+    # c-unrecoverable has literal '(unassigned)' and no paths
+    conn.execute(
+        "INSERT INTO conversations VALUES ('c-unrecoverable', 'Conv 2', '(unassigned)', NULL, 'c-unrecoverable', 0)"
+    )
+    conn.commit()
+
+    updated = backfill_db_projects(conn)
+    assert updated == 2
+    # Ensure conn.row_factory was restored to None
+    assert conn.row_factory is None
+
+    rows = dict(conn.execute("SELECT id, project FROM conversations").fetchall())
+    assert rows["c-recoverable"] == "ledger"
+    assert rows["c-unrecoverable"] is None
+
+
+def test_init_db_sets_user_version_3_when_conversations_exist(tmp_path):
+    db_file = tmp_path / "conv_test.db"
+    init_db(db_file)
+    conn = get_db_connection(db_file)
+    conn.execute(
+        "INSERT INTO conversations (id, title, project, root_id, depth) VALUES ('c1', 'Title', 'ledger.', 'c1', 0)"
+    )
+    conn.commit()
+
+    # Re-running init_db triggers _init_db_conn migration to v3
+    init_db(conn)
+    ver = conn.execute("PRAGMA user_version;").fetchone()[0]
+    proj = conn.execute("SELECT project FROM conversations WHERE id = 'c1'").fetchone()["project"]
+    conn.close()
+    assert ver == 3
+    assert proj == "ledger"
+
+
+def test_swarm_root_priority_over_child_project(tmp_path):
+    from scripts.backfill_analytics import run_backfill
+    import json
+
+    brain_dir = tmp_path / "brain"
+    brain_dir.mkdir()
+    db_file = tmp_path / "test_swarm_priority.db"
+    init_db(db_file)
+
+    # Root has project 'root-app'
+    root_dir = brain_dir / "root-conv"
+    root_dir.mkdir()
+    (root_dir / "transcript.jsonl").write_text(
+        json.dumps({
+            "step_index": 1,
+            "type": "USER_INPUT",
+            "content": "Working in /Users/akemp/Workspace/root-app",
+        }) + "\n",
+        encoding="utf-8",
+    )
+
+    # Child 1 has project 'child-app'
+    child1_dir = brain_dir / "child-1"
+    child1_dir.mkdir()
+    (child1_dir / "transcript.jsonl").write_text(
+        json.dumps({
+            "step_index": 1,
+            "type": "SYSTEM_MESSAGE",
+            "content": "[Message] timestamp=2026-10-21T01:00:00Z sender=root-conv\nSubtask",
+        }) + "\n" +
+        json.dumps({
+            "step_index": 2,
+            "type": "USER_INPUT",
+            "content": "Working in /Users/akemp/Workspace/child-app",
+        }) + "\n",
+        encoding="utf-8",
+    )
+
+    # Child 2 has NO project, should inherit root's 'root-app'
+    child2_dir = brain_dir / "child-2"
+    child2_dir.mkdir()
+    (child2_dir / "transcript.jsonl").write_text(
+        json.dumps({
+            "step_index": 1,
+            "type": "SYSTEM_MESSAGE",
+            "content": "[Message] timestamp=2026-10-21T01:00:00Z sender=root-conv\nGeneric subtask",
+        }) + "\n",
+        encoding="utf-8",
+    )
+
+    run_backfill(brain_dir=brain_dir, db_path=db_file)
+
+    conn = get_db_connection(db_file)
+    rows = dict(conn.execute("SELECT id, project FROM conversations").fetchall())
+    conn.close()
+
+    assert rows["root-conv"] == "root-app"
+    assert rows["child-1"] == "child-app"
+    # Child 2 inherits root's canonical project 'root-app'
+    assert rows["child-2"] == "root-app"

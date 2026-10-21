@@ -25,12 +25,20 @@ _USER_INFO_ARROW_RE = re.compile(
     r"(?:/Users/[^\s]+)\s*->\s*[^\s]+/([^\s/\"\'<>`(),;:]+)"
 )
 
+_USER_INFO_WORKSPACE_RE = re.compile(
+    r"(?:Active Workspaces:\s*(?:\n|\r\n)\s*-\s*|Command Working Directory:\s*)([^\r\n]+)"
+)
+
 _WORKTREE_PATH_RE = re.compile(
     r"[/\\]+\.gemini[/\\]+antigravity[/\\]+worktrees[/\\]+([^/\\\"'\s<>`(),;:]+)"
 )
 
 _WORKSPACE_PATH_RE = re.compile(
-    r"(?:/Users/[^/\\\"'\s<>`]+|~|[A-Za-z]:[/\\]Users[/\\][^/\\\"'\s<>`]+|/home/[^/\\\"'\s<>`]+)[/\\]+[Ww]orkspace[/\\]+([^/\\\"'\s<>`(),;:]+)"
+    r"(?:(?:file://)?(?:/Users/[^/\\\"'\s<>`]+|~|[A-Za-z]:[/\\]Users[/\\][^/\\\"'\s<>`]+|/home/[^/\\\"'\s<>`]+|/[a-zA-Z0-9_.-]+)?[/\\]+|\b)[Ww]orkspaces?[/\\]+([^/\\\"'\s<>`(),;:]+)"
+)
+
+_GENERIC_ROOT_PATHS = re.compile(
+    r"^(?:/Users/[^/]+|/home/[^/]+|~|[A-Za-z]:[/\\]Users[/\\][^/\\]+|/tmp|/var/tmp|/)$"
 )
 
 _PUNCT_STRIP_CHARS = " \"'`.,;:()[]{}<>\\/"
@@ -72,22 +80,34 @@ def extract_project_from_text(text: str | None) -> str | None:
     """Extracts and normalizes a project name from text content.
 
     Matches:
-    1. Legacy <user_information> arrow syntax: /Users/... -> /Users/.../<project>
+    1. <user_information> blocks:
+       - Legacy arrow syntax: /Users/... -> /Users/.../<project>
+       - Modern Active Workspaces / Command Working Directory: .../<project>
     2. Antigravity worktrees: .../.gemini/antigravity/worktrees/<project>/...
-    3. Workspace paths (case-insensitive): .../[Ww]orkspace/<project>/...
+    3. Workspace paths (case-insensitive): .../[Ww]orkspaces?/<project>/...
     """
     if not text:
         return None
 
     s = str(text)
 
-    # 1. <user_information> legacy arrow syntax
+    # 1. <user_information> blocks
     if "<user_information>" in s:
         m = _USER_INFO_ARROW_RE.search(s)
         if m:
             proj = normalize_project_name(m.group(1))
             if proj:
                 return proj
+
+        m_ws = _USER_INFO_WORKSPACE_RE.search(s)
+        if m_ws:
+            raw_path = m_ws.group(1).strip().strip("\"'`")
+            clean_path = raw_path.rstrip("/\\")
+            if clean_path and not _GENERIC_ROOT_PATHS.match(clean_path):
+                base = clean_path.split("/")[-1].split("\\")[-1]
+                proj = normalize_project_name(base)
+                if proj:
+                    return proj
 
     # 2. Antigravity worktrees
     m = _WORKTREE_PATH_RE.search(s)
@@ -121,6 +141,10 @@ def extract_project_from_tool_args(tc_args: Any) -> str | None:
             "AbsolutePath",
             "SearchPath",
             "DirectoryPath",
+            "SearchDirectory",
+            "search_directory",
+            "TargetDirectory",
+            "target_directory",
             "Cwd",
             "cwd",
             "CommandLine",
@@ -183,183 +207,190 @@ def backfill_db_projects(conn: sqlite3.Connection) -> int:
     if not _table_exists(conn, "conversations"):
         return 0
 
-    cur = conn.cursor()
-    # Ensure rows are dict-accessible or use column indexes
-    conn.row_factory = sqlite3.Row
+    orig_factory = conn.row_factory
+    try:
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
 
-    conv_rows = cur.execute(
-        "SELECT id, title, project, parent_id, root_id, depth FROM conversations"
-    ).fetchall()
-
-    if not conv_rows:
-        return 0
-
-    total_updates = 0
-    updates_to_apply: dict[str, str] = {}
-    current_projects: dict[str, str] = {}
-
-    # 1. Normalize existing non-empty project names
-    for row in conv_rows:
-        cid = row["id"]
-        proj = row["project"]
-        if proj:
-            norm = normalize_project_name(proj)
-            if norm != proj and norm is not None:
-                updates_to_apply[cid] = norm
-                current_projects[cid] = norm
-            elif norm:
-                current_projects[cid] = norm
-
-    # 2. Identify unassigned conversations
-    unassigned_cids = {
-        row["id"] for row in conv_rows if row["id"] not in current_projects
-    }
-
-    if unassigned_cids:
-        # 3a. Extract from tool_executions (target_path, command_line)
-        if _table_exists(conn, "tool_executions"):
-            tool_rows = cur.execute(
-                """
-                SELECT conversation_id, target_path, command_line
-                FROM tool_executions
-                WHERE conversation_id IN (
-                    SELECT id FROM conversations WHERE project IS NULL OR project = ''
-                )
-                AND (target_path IS NOT NULL OR command_line IS NOT NULL)
-                """
-            ).fetchall()
-            for r in tool_rows:
-                cid = r["conversation_id"]
-                if cid in unassigned_cids and cid not in current_projects:
-                    proj = None
-                    if r["target_path"]:
-                        proj = extract_project_from_text(r["target_path"])
-                    if not proj and r["command_line"]:
-                        proj = extract_project_from_text(r["command_line"])
-                    if proj:
-                        current_projects[cid] = proj
-                        updates_to_apply[cid] = proj
-
-        # 3b. Extract from transcript_blocks (content)
-        if _table_exists(conn, "transcript_blocks"):
-            tb_rows = cur.execute(
-                """
-                SELECT conversation_id, content
-                FROM transcript_blocks
-                WHERE conversation_id IN (
-                    SELECT id FROM conversations WHERE project IS NULL OR project = ''
-                )
-                AND (
-                    content LIKE '%Workspace%'
-                    OR content LIKE '%workspace%'
-                    OR content LIKE '%worktrees%'
-                    OR content LIKE '%<user_information>%'
-                )
-                """
-            ).fetchall()
-            for r in tb_rows:
-                cid = r["conversation_id"]
-                if cid in unassigned_cids and cid not in current_projects:
-                    proj = extract_project_from_text(r["content"])
-                    if proj:
-                        current_projects[cid] = proj
-                        updates_to_apply[cid] = proj
-
-        # 3c. Extract from steps (detail)
-        if _table_exists(conn, "steps"):
-            step_rows = cur.execute(
-                """
-                SELECT conversation_id, detail
-                FROM steps
-                WHERE conversation_id IN (
-                    SELECT id FROM conversations WHERE project IS NULL OR project = ''
-                )
-                AND detail IS NOT NULL
-                AND (
-                    detail LIKE '%Workspace%'
-                    OR detail LIKE '%workspace%'
-                    OR detail LIKE '%worktrees%'
-                )
-                """
-            ).fetchall()
-            for r in step_rows:
-                cid = r["conversation_id"]
-                if cid in unassigned_cids and cid not in current_projects:
-                    proj = extract_project_from_text(r["detail"])
-                    if proj:
-                        current_projects[cid] = proj
-                        updates_to_apply[cid] = proj
-
-        # 3d. Extract from conversations (title)
-        title_rows = cur.execute(
-            """
-            SELECT id, title
-            FROM conversations
-            WHERE (project IS NULL OR project = '')
-            AND title IS NOT NULL
-            AND (
-                title LIKE '%Workspace%'
-                OR title LIKE '%workspace%'
-                OR title LIKE '%worktrees%'
-            )
-            """
+        conv_rows = cur.execute(
+            "SELECT id, title, project, parent_id, root_id, depth FROM conversations"
         ).fetchall()
-        for r in title_rows:
-            cid = r["id"]
-            if cid in unassigned_cids and cid not in current_projects:
-                proj = extract_project_from_text(r["title"])
-                if proj:
-                    current_projects[cid] = proj
-                    updates_to_apply[cid] = proj
 
-    # 4. Bidirectional swarm propagation
-    dsu = _DisjointSet()
-    for row in conv_rows:
-        cid = row["id"]
-        dsu.find(cid)
-        p_id = row["parent_id"]
-        r_id = row["root_id"]
-        if p_id:
-            dsu.union(cid, p_id)
-        if r_id:
-            dsu.union(cid, r_id)
+        if not conv_rows:
+            return 0
 
-    components: dict[str, list[sqlite3.Row]] = collections.defaultdict(list)
-    for row in conv_rows:
-        root_key = dsu.find(row["id"])
-        components[root_key].append(row)
+        total_updates = 0
+        updates_to_apply: dict[str, str | None] = {}
+        current_projects: dict[str, str] = {}
 
-    for root_key, members in components.items():
-        # Check if any member has a known project
-        swarm_project = None
-        # First preference: Root conversation's project
-        for m in members:
-            m_cid = m["id"]
-            if (m["depth"] == 0 or not m["parent_id"]) and m_cid in current_projects:
-                swarm_project = current_projects[m_cid]
-                break
+        # 1. Normalize existing non-empty project names
+        for row in conv_rows:
+            cid = row["id"]
+            proj = row["project"]
+            if proj:
+                norm = normalize_project_name(proj)
+                if norm != proj:
+                    # If norm is None (e.g. '(unassigned)'), schedule setting to NULL
+                    # If norm is a cleaned project name (e.g. 'ledger.' -> 'ledger'), schedule update
+                    updates_to_apply[cid] = norm
+                if norm:
+                    current_projects[cid] = norm
 
-        # Second preference: Any member's project
-        if not swarm_project:
+        # 2. Identify unassigned conversations
+        unassigned_cids = {
+            row["id"] for row in conv_rows if row["id"] not in current_projects
+        }
+
+        if unassigned_cids:
+            # 3a. Extract from tool_executions (target_path, command_line)
+            if _table_exists(conn, "tool_executions"):
+                tool_rows = cur.execute(
+                    """
+                    SELECT conversation_id, target_path, command_line
+                    FROM tool_executions
+                    WHERE conversation_id IN (
+                        SELECT id FROM conversations
+                        WHERE project IS NULL OR project = '' OR lower(project) IN ('(unassigned)', 'unassigned')
+                    )
+                    AND (target_path IS NOT NULL OR command_line IS NOT NULL)
+                    """
+                ).fetchall()
+                for r in tool_rows:
+                    cid = r["conversation_id"]
+                    if cid in unassigned_cids and cid not in current_projects:
+                        proj = None
+                        if r["target_path"]:
+                            proj = extract_project_from_text(r["target_path"])
+                        if not proj and r["command_line"]:
+                            proj = extract_project_from_text(r["command_line"])
+                        if proj:
+                            current_projects[cid] = proj
+                            updates_to_apply[cid] = proj
+
+            # 3b. Extract from transcript_blocks (content)
+            if _table_exists(conn, "transcript_blocks"):
+                tb_rows = cur.execute(
+                    """
+                    SELECT conversation_id, content
+                    FROM transcript_blocks
+                    WHERE conversation_id IN (
+                        SELECT id FROM conversations
+                        WHERE project IS NULL OR project = '' OR lower(project) IN ('(unassigned)', 'unassigned')
+                    )
+                    AND (
+                        content LIKE '%Workspace%'
+                        OR content LIKE '%workspace%'
+                        OR content LIKE '%worktree%'
+                        OR content LIKE '%<user_information>%'
+                    )
+                    """
+                ).fetchall()
+                for r in tb_rows:
+                    cid = r["conversation_id"]
+                    if cid in unassigned_cids and cid not in current_projects:
+                        proj = extract_project_from_text(r["content"])
+                        if proj:
+                            current_projects[cid] = proj
+                            updates_to_apply[cid] = proj
+
+            # 3c. Extract from steps (detail)
+            if _table_exists(conn, "steps"):
+                step_rows = cur.execute(
+                    """
+                    SELECT conversation_id, detail
+                    FROM steps
+                    WHERE conversation_id IN (
+                        SELECT id FROM conversations
+                        WHERE project IS NULL OR project = '' OR lower(project) IN ('(unassigned)', 'unassigned')
+                    )
+                    AND detail IS NOT NULL
+                    AND (
+                        detail LIKE '%Workspace%'
+                        OR detail LIKE '%workspace%'
+                        OR detail LIKE '%worktree%'
+                    )
+                    """
+                ).fetchall()
+                for r in step_rows:
+                    cid = r["conversation_id"]
+                    if cid in unassigned_cids and cid not in current_projects:
+                        proj = extract_project_from_text(r["detail"])
+                        if proj:
+                            current_projects[cid] = proj
+                            updates_to_apply[cid] = proj
+
+            # 3d. Extract from conversations (title)
+            title_rows = cur.execute(
+                """
+                SELECT id, title
+                FROM conversations
+                WHERE (project IS NULL OR project = '' OR lower(project) IN ('(unassigned)', 'unassigned'))
+                AND title IS NOT NULL
+                AND (
+                    title LIKE '%Workspace%'
+                    OR title LIKE '%workspace%'
+                    OR title LIKE '%worktree%'
+                )
+                """
+            ).fetchall()
+            for r in title_rows:
+                cid = r["id"]
+                if cid in unassigned_cids and cid not in current_projects:
+                    proj = extract_project_from_text(r["title"])
+                    if proj:
+                        current_projects[cid] = proj
+                        updates_to_apply[cid] = proj
+
+        # 4. Bidirectional swarm propagation
+        dsu = _DisjointSet()
+        for row in conv_rows:
+            cid = row["id"]
+            dsu.find(cid)
+            p_id = row["parent_id"]
+            r_id = row["root_id"]
+            if p_id:
+                dsu.union(cid, p_id)
+            if r_id:
+                dsu.union(cid, r_id)
+
+        components: dict[str, list[sqlite3.Row]] = collections.defaultdict(list)
+        for row in conv_rows:
+            root_key = dsu.find(row["id"])
+            components[root_key].append(row)
+
+        for root_key, members in components.items():
+            # Check if any member has a known project
+            swarm_project = None
+            # First preference: Root conversation's project
             for m in members:
                 m_cid = m["id"]
-                if m_cid in current_projects:
+                if (m["depth"] == 0 or not m["parent_id"]) and m_cid in current_projects:
                     swarm_project = current_projects[m_cid]
                     break
 
-        # If swarm project was found, propagate to unassigned members
-        if swarm_project:
-            for m in members:
-                m_cid = m["id"]
-                if m_cid not in current_projects:
-                    current_projects[m_cid] = swarm_project
-                    updates_to_apply[m_cid] = swarm_project
+            # Second preference: Any member's project
+            if not swarm_project:
+                for m in members:
+                    m_cid = m["id"]
+                    if m_cid in current_projects:
+                        swarm_project = current_projects[m_cid]
+                        break
 
-    # 5. Apply batch updates
-    if updates_to_apply:
-        params = [(proj, cid) for cid, proj in updates_to_apply.items()]
-        cur.executemany("UPDATE conversations SET project = ? WHERE id = ?", params)
-        conn.commit()
-        total_updates = len(params)
+            # If swarm project was found, propagate to unassigned members
+            if swarm_project:
+                for m in members:
+                    m_cid = m["id"]
+                    if m_cid not in current_projects:
+                        current_projects[m_cid] = swarm_project
+                        updates_to_apply[m_cid] = swarm_project
 
-    return total_updates
+        # 5. Apply batch updates
+        if updates_to_apply:
+            params = [(proj, cid) for cid, proj in updates_to_apply.items()]
+            cur.executemany("UPDATE conversations SET project = ? WHERE id = ?", params)
+            conn.commit()
+            total_updates = len(params)
+
+        return total_updates
+    finally:
+        conn.row_factory = orig_factory
