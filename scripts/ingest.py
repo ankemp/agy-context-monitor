@@ -1274,7 +1274,7 @@ def sync_to_sqlite(
                             root_id = p_row["root_id"] or p_row["id"]
                             depth = (p_row["depth"] or 0) + 1
                             if not analysis.get("project") and p_row["project"]:
-                                analysis["project"] = p_row["project"]
+                                analysis["project"] = normalize_project_name(p_row["project"])
                             if (
                                 not analysis.get("title")
                                 or analysis["title"] in ("Active Session", "")
@@ -1297,7 +1297,7 @@ def sync_to_sqlite(
                 if not analysis.get("project") and existing:
                     try:
                         if existing["project"]:
-                            analysis["project"] = existing["project"]
+                            analysis["project"] = normalize_project_name(existing["project"])
                     except (IndexError, KeyError):
                         pass
 

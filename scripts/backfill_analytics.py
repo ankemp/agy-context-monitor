@@ -1105,17 +1105,22 @@ def run_backfill(
             # Fallback to existing DB projects for roots or swarms
             try:
                 db_swarms = conn.execute(
-                    "SELECT id, root_id, project FROM conversations WHERE project IS NOT NULL AND project != ''"
+                    """
+                    SELECT id, root_id, project
+                    FROM conversations
+                    WHERE project IS NOT NULL AND project != ''
+                      AND lower(project) NOT IN ('(unassigned)', 'unassigned')
+                    """
                 ).fetchall()
                 for r in db_swarms:
                     try:
                         r_row_id = r["id"]
                         r_id = r["root_id"] or r_row_id
-                        p_val = r["project"]
+                        p_val = normalize_project_name(r["project"])
                     except (IndexError, TypeError):
                         r_row_id = r[0]
                         r_id = r[1] or r[0]
-                        p_val = r[2]
+                        p_val = normalize_project_name(r[2])
                     if r_id and p_val:
                         if r_id == r_row_id and (r_id not in swarm_project_map or swarm_project_map.get(r_id) is None):
                             swarm_project_map[r_id] = p_val

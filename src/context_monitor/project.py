@@ -34,7 +34,7 @@ _WORKTREE_PATH_RE = re.compile(
 )
 
 _WORKSPACE_PATH_RE = re.compile(
-    r"(?:(?:file://)?(?:/Users/[^/\\\"'\s<>`]+|~|[A-Za-z]:[/\\]Users[/\\][^/\\\"'\s<>`]+|/home/[^/\\\"'\s<>`]+|/[a-zA-Z0-9_.-]+)?[/\\]+|\b)[Ww]orkspaces?[/\\]+([^/\\\"'\s<>`(),;:]+)"
+    r"(?:(?:file://)?(?:/Users/[^/\\\"'\s<>`]+|~|[A-Za-z]:[/\\]Users[/\\][^/\\\"'\s<>`]+|/home/[^/\\\"'\s<>`]+|/[a-zA-Z0-9_.-]+)?[/\\]+|^|[\"'\s])[Ww]orkspaces?[/\\]+([^/\\\"'\s<>`(),;:]+)"
 )
 
 _GENERIC_ROOT_PATHS = re.compile(
@@ -43,6 +43,15 @@ _GENERIC_ROOT_PATHS = re.compile(
 
 _PUNCT_STRIP_CHARS = " \"'`.,;:()[]{}<>\\/"
 
+_INVALID_PROJECT_EXTENSIONS = (
+    ".md", ".json", ".ts", ".js", ".py", ".txt", ".yaml", ".yml",
+    ".html", ".toml", ".lock", ".sh", ".rs", ".go"
+)
+_INVALID_PROJECT_NAMES = {
+    "tmp", "temp", "project", "workspace", "workspaces", "worktree", "worktrees",
+    "n", "src", "dist", "build", "node_modules", "vendor"
+}
+
 
 def normalize_project_name(raw: str | None) -> str | None:
     """Normalizes a raw project name string.
@@ -50,7 +59,7 @@ def normalize_project_name(raw: str | None) -> str | None:
     Strips surrounding whitespace, quotes, backticks, escaped quotes, and trailing
     punctuation (periods, commas, parens, brackets, colons).
     Returns None if the resulting string is empty, consists only of punctuation,
-    or matches '(unassigned)'.
+    matches '(unassigned)', is a single character, or has a file extension.
     """
     if raw is None:
         return None
@@ -71,6 +80,15 @@ def normalize_project_name(raw: str | None) -> str | None:
 
     # Must contain at least one alphanumeric character
     if not re.search(r"[A-Za-z0-9]", val):
+        return None
+
+    # Reject single-character names or generic invalid tokens
+    lower_val = val.lower()
+    if len(val) <= 1 or lower_val in _INVALID_PROJECT_NAMES:
+        return None
+
+    # Reject file paths or file names with extensions
+    if any(lower_val.endswith(ext) for ext in _INVALID_PROJECT_EXTENSIONS):
         return None
 
     return val
@@ -104,6 +122,12 @@ def extract_project_from_text(text: str | None) -> str | None:
             raw_path = m_ws.group(1).strip().strip("\"'`")
             clean_path = raw_path.rstrip("/\\")
             if clean_path and not _GENERIC_ROOT_PATHS.match(clean_path):
+                # If clean_path contains an explicit worktree or workspace segment, extract from it first
+                m_sub = _WORKTREE_PATH_RE.search(clean_path) or _WORKSPACE_PATH_RE.search(clean_path)
+                if m_sub:
+                    proj = normalize_project_name(m_sub.group(1))
+                    if proj:
+                        return proj
                 base = clean_path.split("/")[-1].split("\\")[-1]
                 proj = normalize_project_name(base)
                 if proj:
@@ -242,85 +266,84 @@ def backfill_db_projects(conn: sqlite3.Connection) -> int:
         }
 
         if unassigned_cids:
-            # 3a. Extract from tool_executions (target_path, command_line)
-            if _table_exists(conn, "tool_executions"):
-                tool_rows = cur.execute(
-                    """
-                    SELECT conversation_id, target_path, command_line
-                    FROM tool_executions
-                    WHERE conversation_id IN (
-                        SELECT id FROM conversations
-                        WHERE project IS NULL OR project = '' OR lower(project) IN ('(unassigned)', 'unassigned')
-                    )
-                    AND (target_path IS NOT NULL OR command_line IS NOT NULL)
-                    """
-                ).fetchall()
-                for r in tool_rows:
-                    cid = r["conversation_id"]
+            def _scan_and_extract(
+                table_name: str,
+                query: str,
+                col_names: tuple[str, ...],
+                id_col: str = "conversation_id",
+            ) -> None:
+                if not _table_exists(conn, table_name):
+                    return
+                for r in cur.execute(query).fetchall():
+                    cid = r[id_col]
                     if cid in unassigned_cids and cid not in current_projects:
-                        proj = None
-                        if r["target_path"]:
-                            proj = extract_project_from_text(r["target_path"])
-                        if not proj and r["command_line"]:
-                            proj = extract_project_from_text(r["command_line"])
-                        if proj:
-                            current_projects[cid] = proj
-                            updates_to_apply[cid] = proj
+                        for col in col_names:
+                            val = r[col]
+                            if val:
+                                proj = extract_project_from_text(val)
+                                if proj:
+                                    current_projects[cid] = proj
+                                    updates_to_apply[cid] = proj
+                                    break
+
+            # 3a. Extract from tool_executions (target_path, command_line)
+            _scan_and_extract(
+                "tool_executions",
+                """
+                SELECT conversation_id, target_path, command_line
+                FROM tool_executions
+                WHERE conversation_id IN (
+                    SELECT id FROM conversations
+                    WHERE project IS NULL OR project = '' OR lower(project) IN ('(unassigned)', 'unassigned')
+                )
+                AND (target_path IS NOT NULL OR command_line IS NOT NULL)
+                """,
+                ("target_path", "command_line"),
+            )
 
             # 3b. Extract from transcript_blocks (content)
-            if _table_exists(conn, "transcript_blocks"):
-                tb_rows = cur.execute(
-                    """
-                    SELECT conversation_id, content
-                    FROM transcript_blocks
-                    WHERE conversation_id IN (
-                        SELECT id FROM conversations
-                        WHERE project IS NULL OR project = '' OR lower(project) IN ('(unassigned)', 'unassigned')
-                    )
-                    AND (
-                        content LIKE '%Workspace%'
-                        OR content LIKE '%workspace%'
-                        OR content LIKE '%worktree%'
-                        OR content LIKE '%<user_information>%'
-                    )
-                    """
-                ).fetchall()
-                for r in tb_rows:
-                    cid = r["conversation_id"]
-                    if cid in unassigned_cids and cid not in current_projects:
-                        proj = extract_project_from_text(r["content"])
-                        if proj:
-                            current_projects[cid] = proj
-                            updates_to_apply[cid] = proj
+            _scan_and_extract(
+                "transcript_blocks",
+                """
+                SELECT conversation_id, content
+                FROM transcript_blocks
+                WHERE conversation_id IN (
+                    SELECT id FROM conversations
+                    WHERE project IS NULL OR project = '' OR lower(project) IN ('(unassigned)', 'unassigned')
+                )
+                AND (
+                    content LIKE '%Workspace%'
+                    OR content LIKE '%workspace%'
+                    OR content LIKE '%worktree%'
+                    OR content LIKE '%<user_information>%'
+                )
+                """,
+                ("content",),
+            )
 
             # 3c. Extract from steps (detail)
-            if _table_exists(conn, "steps"):
-                step_rows = cur.execute(
-                    """
-                    SELECT conversation_id, detail
-                    FROM steps
-                    WHERE conversation_id IN (
-                        SELECT id FROM conversations
-                        WHERE project IS NULL OR project = '' OR lower(project) IN ('(unassigned)', 'unassigned')
-                    )
-                    AND detail IS NOT NULL
-                    AND (
-                        detail LIKE '%Workspace%'
-                        OR detail LIKE '%workspace%'
-                        OR detail LIKE '%worktree%'
-                    )
-                    """
-                ).fetchall()
-                for r in step_rows:
-                    cid = r["conversation_id"]
-                    if cid in unassigned_cids and cid not in current_projects:
-                        proj = extract_project_from_text(r["detail"])
-                        if proj:
-                            current_projects[cid] = proj
-                            updates_to_apply[cid] = proj
+            _scan_and_extract(
+                "steps",
+                """
+                SELECT conversation_id, detail
+                FROM steps
+                WHERE conversation_id IN (
+                    SELECT id FROM conversations
+                    WHERE project IS NULL OR project = '' OR lower(project) IN ('(unassigned)', 'unassigned')
+                )
+                AND detail IS NOT NULL
+                AND (
+                    detail LIKE '%Workspace%'
+                    OR detail LIKE '%workspace%'
+                    OR detail LIKE '%worktree%'
+                )
+                """,
+                ("detail",),
+            )
 
             # 3d. Extract from conversations (title)
-            title_rows = cur.execute(
+            _scan_and_extract(
+                "conversations",
                 """
                 SELECT id, title
                 FROM conversations
@@ -331,15 +354,10 @@ def backfill_db_projects(conn: sqlite3.Connection) -> int:
                     OR title LIKE '%workspace%'
                     OR title LIKE '%worktree%'
                 )
-                """
-            ).fetchall()
-            for r in title_rows:
-                cid = r["id"]
-                if cid in unassigned_cids and cid not in current_projects:
-                    proj = extract_project_from_text(r["title"])
-                    if proj:
-                        current_projects[cid] = proj
-                        updates_to_apply[cid] = proj
+                """,
+                ("title",),
+                id_col="id",
+            )
 
         # 4. Bidirectional swarm propagation
         dsu = _DisjointSet()

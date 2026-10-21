@@ -21,6 +21,14 @@ def test_normalize_project_name_strips_trailing_punctuation():
     assert normalize_project_name("`vinny-companion`") == "vinny-companion"
     assert normalize_project_name("'poc-hosting':") == "poc-hosting"
     assert normalize_project_name("(unassigned)") is None
+    # Reject files with extensions
+    assert normalize_project_name("SKILL.md") is None
+    assert normalize_project_name("package.json") is None
+    assert normalize_project_name("main.py") is None
+    # Reject single-char or invalid tokens
+    assert normalize_project_name("n") is None
+    assert normalize_project_name("tmp") is None
+    assert normalize_project_name("workspace") is None
 
 
 def test_extract_project_from_text_variants():
@@ -441,3 +449,12 @@ def test_swarm_root_priority_over_child_project(tmp_path):
     assert rows["child-1"] == "child-app"
     # Child 2 inherits root's canonical project 'root-app'
     assert rows["child-2"] == "root-app"
+
+
+def test_user_info_subfolder_extracts_project_root():
+    user_info = """<user_information>
+Active Workspaces:
+- /Users/akemp/Workspace/my-project/src/components
+</user_information>"""
+    assert extract_project_from_text(user_info) == "my-project"
+
