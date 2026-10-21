@@ -1374,8 +1374,11 @@
         const PROJECT_COLORS = ['#6366f1', '#38bdf8', '#a855f7', '#10b981', '#f59e0b'];
         const OTHER_COLOR = '#64748b';
 
-        barDatasets = topProjects.map((proj, idx) => {
-          const color = PROJECT_COLORS[idx % PROJECT_COLORS.length];
+        let colorIdx = 0;
+        barDatasets = topProjects.map((proj) => {
+          const color = proj === '(unassigned)'
+            ? OTHER_COLOR
+            : PROJECT_COLORS[colorIdx++ % PROJECT_COLORS.length];
           return {
             label: proj,
             type: 'bar',
