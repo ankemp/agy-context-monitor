@@ -38,6 +38,12 @@ from context_monitor.pricing import (  # noqa: E402
     extract_model_switch,
     get_model_context_limit,
 )
+from context_monitor.project import (  # noqa: E402
+    backfill_db_projects,
+    extract_project_from_text,
+    extract_project_from_tool_args,
+    normalize_project_name,
+)
 from context_monitor.quota import sync_and_get_quota_state  # noqa: E402
 
 CHARS_PER_TOKEN = 3.8
@@ -454,18 +460,8 @@ def parse_conversation(
                         if cur_model not in models_used:
                             models_used.append(cur_model)
 
-            if (
-                not project
-                and step_type in ("USER_INPUT", "CHECKPOINT", "SYSTEM", "SYSTEM_MESSAGE")
-            ):
-                if "<user_information>" in content:
-                    m = re.search(r"(?:/Users/[^\s]+)\s*->\s*[^\s]+/([^\s]+)", content)
-                    if m:
-                        project = m.group(1)
-                if not project and "/Users/akemp/Workspace/" in content:
-                    m = re.search(r"/Users/akemp/Workspace/([^/\"\'\s\<\>\`]+)", content)
-                    if m:
-                        project = m.group(1)
+            if not project and content:
+                project = extract_project_from_text(content)
 
             if is_error:
                 failed_tool_calls += 1
@@ -526,16 +522,8 @@ def parse_conversation(
                         proj_path = target_p or tc_args.get("Cwd") or tc_args.get("cwd") or ""
                         if not proj_path and tc_args.get("CommandLine"):
                             proj_path = tc_args.get("CommandLine")
-                        if (
-                            not project
-                            and proj_path
-                            and "/Users/akemp/Workspace/" in str(proj_path)
-                        ):
-                            m = re.search(
-                                r"/Users/akemp/Workspace/([^/\"\'\s]+)", str(proj_path)
-                            )
-                            if m:
-                                project = m.group(1)
+                        if not project:
+                            project = extract_project_from_tool_args(tc_args)
 
                         cmd_line = tc_args.get("CommandLine", "")
                         clean_path = str(target_p).strip("\"'") if target_p else None
@@ -1094,6 +1082,40 @@ def run_backfill(
 
     try:
         with conn:
+            # Pre-resolve swarm root_id and map swarm projects
+            swarm_project_map = {}
+            for data in data_list:
+                c_conv = data["conversation"]
+                c_id = c_conv["id"]
+                c_curr = c_id
+                c_depth = 0
+                c_visited = set()
+                while c_curr in parent_map and c_curr not in c_visited and c_depth < 25:
+                    c_visited.add(c_curr)
+                    c_curr = parent_map[c_curr]
+                    c_depth += 1
+                c_root = c_curr
+                c_proj = c_conv.get("project")
+                if c_proj and c_root not in swarm_project_map:
+                    swarm_project_map[c_root] = c_proj
+
+            # Fallback to existing DB projects for roots or swarms
+            try:
+                db_swarms = conn.execute(
+                    "SELECT id, root_id, project FROM conversations WHERE project IS NOT NULL AND project != ''"
+                ).fetchall()
+                for r in db_swarms:
+                    try:
+                        r_id = r["root_id"] or r["id"]
+                        p_val = r["project"]
+                    except (IndexError, TypeError):
+                        r_id = r[1] or r[0]
+                        p_val = r[2]
+                    if r_id and r_id not in swarm_project_map and p_val:
+                        swarm_project_map[r_id] = p_val
+            except Exception:
+                pass
+
             for i, data in enumerate(data_list, 1):
                 conv = data["conversation"]
                 cid = conv["id"]
@@ -1120,7 +1142,10 @@ def run_backfill(
                 conv["subagent_type"] = meta.get("type")
                 conv["invoking_step_index"] = meta.get("step_index")
 
-                # Inherit project from ancestors if missing
+                # Inherit project from swarm or ancestors if missing
+                if not conv.get("project"):
+                    conv["project"] = swarm_project_map.get(root_id)
+
                 if not conv.get("project") and depth > 0:
                     curr_ancestor = parent_id
                     while curr_ancestor:
@@ -1129,6 +1154,9 @@ def run_backfill(
                             conv["project"] = anc_data["conversation"]["project"]
                             break
                         curr_ancestor = parent_map.get(curr_ancestor)
+
+                if conv.get("project"):
+                    conv["project"] = normalize_project_name(conv["project"])
 
                 # Generate clean semantic title if generic
                 role = conv.get("subagent_role") or "Autonomous Worker"
@@ -1165,7 +1193,7 @@ def run_backfill(
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(id) DO UPDATE SET
                         title = excluded.title,
-                        project = excluded.project,
+                        project = COALESCE(excluded.project, conversations.project),
                         model_name = excluded.model_name,
                         models_used = excluded.models_used,
                         created_at = excluded.created_at,
@@ -1326,6 +1354,13 @@ def run_backfill(
                         f"  [{pct:5.1f}%] Processed {i}/{total_parsed} conversations ({total_steps_inserted:,} steps)...",
                         flush=True,
                     )
+
+        # Backfill projects for historical DB conversations and propagate swarm lineages
+        try:
+            backfill_db_projects(conn)
+            conn.commit()
+        except Exception:
+            pass
 
         # Ensure all rollups are fully in sync with steps
         try:

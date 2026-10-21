@@ -35,6 +35,11 @@ from context_monitor.pricing import (  # noqa: E402
     extract_model_switch,
     get_model_context_limit,
 )
+from context_monitor.project import (  # noqa: E402
+    extract_project_from_text,
+    extract_project_from_tool_args,
+    normalize_project_name,
+)
 from context_monitor.quota import (  # noqa: E402
     calculate_quota_metrics,
     format_quota_pct,
@@ -572,18 +577,8 @@ def analyze_transcript(
                         if cur_model not in models_used:
                             models_used.append(cur_model)
 
-            if (
-                not project
-                and step_type in ("USER_INPUT", "CHECKPOINT", "SYSTEM", "SYSTEM_MESSAGE")
-            ):
-                if "<user_information>" in content:
-                    m = re.search(r"(?:/Users/[^\s]+)\s*->\s*[^\s]+/([^\s]+)", content)
-                    if m:
-                        project = m.group(1)
-                if not project and "/Users/akemp/Workspace/" in content:
-                    m = re.search(r"/Users/akemp/Workspace/([^/\"\'\s\<\>\`]+)", content)
-                    if m:
-                        project = m.group(1)
+            if not project and content:
+                project = extract_project_from_text(content)
 
             if is_error:
                 failed_tool_calls += 1
@@ -641,16 +636,8 @@ def analyze_transcript(
                         proj_path = target_p or tc_args.get("Cwd") or tc_args.get("cwd") or ""
                         if not proj_path and tc_args.get("CommandLine"):
                             proj_path = tc_args.get("CommandLine")
-                        if (
-                            not project
-                            and proj_path
-                            and "/Users/akemp/Workspace/" in str(proj_path)
-                        ):
-                            m = re.search(
-                                r"/Users/akemp/Workspace/([^/\"\'\s]+)", str(proj_path)
-                            )
-                            if m:
-                                project = m.group(1)
+                        if not project:
+                            project = extract_project_from_tool_args(tc_args)
                         clean_path = str(target_p).strip("\"'") if target_p else None
 
                         if tc_name == "invoke_subagent":
@@ -1307,6 +1294,29 @@ def sync_to_sqlite(
                             root_id = parent_id
                             depth = 1
 
+                if not analysis.get("project") and existing:
+                    try:
+                        if existing["project"]:
+                            analysis["project"] = existing["project"]
+                    except (IndexError, KeyError):
+                        pass
+
+                if not analysis.get("project") and root_id:
+                    swarm_row = cur.execute(
+                        "SELECT project FROM conversations WHERE (id = ? OR root_id = ?) AND project IS NOT NULL AND project != '' LIMIT 1",
+                        (root_id, root_id),
+                    ).fetchone()
+                    if swarm_row:
+                        try:
+                            if swarm_row["project"]:
+                                analysis["project"] = swarm_row["project"]
+                        except (IndexError, KeyError):
+                            if swarm_row[0]:
+                                analysis["project"] = swarm_row[0]
+
+                if analysis.get("project"):
+                    analysis["project"] = normalize_project_name(analysis["project"])
+
                 models_used_list = analysis.get("models_used", [])
                 model_transitions = analysis.get("model_transitions", [])
                 if not models_used_list and active_model:
@@ -1453,6 +1463,13 @@ def sync_to_sqlite(
                             ch_type,
                             ch_step,
                         ),
+                    )
+
+                # Propagate project to unassigned swarm members
+                if analysis.get("project"):
+                    conn.execute(
+                        "UPDATE conversations SET project = ? WHERE (id = ? OR root_id = ?) AND (project IS NULL OR project = '')",
+                        (analysis["project"], root_id, root_id),
                     )
 
                 if is_append_only:

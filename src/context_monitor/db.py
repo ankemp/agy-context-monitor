@@ -360,6 +360,17 @@ def _init_db_conn(conn: sqlite3.Connection) -> None:
                         pass
                 conn.execute("PRAGMA user_version = 2;")
                 conn.commit()
+        if user_ver < 3:
+            has_convs = (
+                cur.execute("SELECT 1 FROM conversations LIMIT 1").fetchone()
+                is not None
+            )
+            if has_convs:
+                from context_monitor.project import backfill_db_projects
+
+                backfill_db_projects(conn)
+                conn.execute("PRAGMA user_version = 3;")
+                conn.commit()
     except Exception:
         pass
 
