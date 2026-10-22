@@ -62,7 +62,7 @@ def format_tokens(n: int) -> str:
 
 
 def format_duration(seconds: float) -> str:
-    if not seconds:
+    if not seconds or seconds <= 0:
         return "0m"
     hours = int(seconds // 3600)
     mins = int((seconds % 3600) // 60)
@@ -814,7 +814,8 @@ def print_velocity(conn):
             SUM(lines_written) as total_written,
             SUM(lines_edited) as total_edited,
             SUM(failed_tool_calls) as total_fails,
-            SUM(active_agent_seconds) as total_agent_sec
+            SUM(active_agent_seconds) as total_agent_sec,
+            SUM(active_pairing_seconds) as total_pairing_sec
         FROM conversations
     """).fetchone()
 
@@ -824,7 +825,8 @@ def print_velocity(conn):
     total_written = row["total_written"] or 0
     total_edited = row["total_edited"] or 0
     total_fails = row["total_fails"] or 0
-    total_agent_sec = row["total_agent_sec"] or 0
+    total_agent_sec = max(0.0, float(row["total_agent_sec"] or 0))
+    total_pairing_sec = max(0.0, float(row["total_pairing_sec"] or 0))
 
     autonomy = total_tools / max(1, total_prompts)
     success_rate = ((total_tools - total_fails) / max(1, total_tools)) * 100
@@ -841,6 +843,15 @@ def print_velocity(conn):
 
     saved_seconds = (reads_cnt * 30) + (cmds_cnt * 45) + (edits_cnt * 120)
     saved_hours = saved_seconds / 3600
+    baseline_sec = total_pairing_sec if total_pairing_sec > 0 else total_agent_sec
+    baseline_sec = max(0.0, float(baseline_sec))
+    force_multiplier = (
+        round(1.0 + (saved_seconds / baseline_sec), 1)
+        if baseline_sec > 0
+        else 1.0
+    )
+    effective_hours = (baseline_sec + saved_seconds) / 3600
+    pairing_dur = format_duration(baseline_sec)
 
     print(
         f" Autonomy Multiplier       : {autonomy:.1f}x ({total_tools:,} tool actions across {total_prompts:,} user prompts)"
@@ -859,6 +870,9 @@ def print_velocity(conn):
     )
     print(
         f" Estimated Dev Time Saved  : ~{saved_hours:,.0f} engineering hours saved to date"
+    )
+    print(
+        f" Force Multiplier          : {force_multiplier:.1f}x ({effective_hours:.1f}h effective output / {pairing_dur} active pairing)"
     )
     print("=" * 75 + "\n")
 
@@ -1101,6 +1115,7 @@ def generate_global_report(
             SUM(total_tokens) as total_tokens,
             SUM(duration_seconds) as total_duration,
             SUM(active_agent_seconds) as total_agent_sec,
+            SUM(active_pairing_seconds) as total_pairing_sec,
             SUM(thinking_tokens) as total_thinking,
             SUM(user_prompts) as total_prompts,
             SUM(tool_calls_count) as total_tools,
@@ -1119,6 +1134,27 @@ def generate_global_report(
     total_tokens = totals["total_tokens"] or 0
     autonomy = (totals["total_tools"] or 0) / max(1, totals["total_prompts"] or 1)
 
+    reads_cnt = cur.execute(
+        "SELECT COUNT(*) FROM tool_executions WHERE tool_name IN ('view_file', 'grep_search', 'find_by_name', 'list_dir')"
+    ).fetchone()[0]
+    cmds_cnt = cur.execute(
+        "SELECT COUNT(*) FROM tool_executions WHERE tool_name = 'run_command'"
+    ).fetchone()[0]
+    edits_cnt = cur.execute(
+        "SELECT COUNT(*) FROM tool_executions WHERE tool_name IN ('write_to_file', 'replace_file_content', 'multi_replace_file_content')"
+    ).fetchone()[0]
+
+    saved_seconds = (reads_cnt * 30) + (cmds_cnt * 45) + (edits_cnt * 120)
+    total_pairing_sec = max(0.0, float(totals["total_pairing_sec"] or 0))
+    total_agent_sec = max(0.0, float(totals["total_agent_sec"] or 0))
+    baseline_sec = total_pairing_sec if total_pairing_sec > 0 else total_agent_sec
+    baseline_sec = max(0.0, float(baseline_sec))
+    force_multiplier = (
+        round(1.0 + (saved_seconds / baseline_sec), 1)
+        if baseline_sec > 0
+        else 1.0
+    )
+
     mcp_row = cur.execute(
         "SELECT COUNT(*) as mcp_calls, COUNT(DISTINCT mcp_server) as servers FROM tool_executions WHERE mcp_server IS NOT NULL"
     ).fetchone()
@@ -1131,6 +1167,7 @@ def generate_global_report(
         f"> **Total Sessions**: {total_convs:,} conversations  ",
         f"> **Total Operations**: {total_steps:,} logged steps  ",
         f"> **Autonomy Multiplier**: **{autonomy:.1f}x actions per prompt**  ",
+        f"> **Force Multiplier**: **{force_multiplier:.1f}x effective output**  ",
         f"> **Deep Reasoning Tokens**: **{format_tokens(totals['total_thinking'] or 0)}**  ",
         f"> **Code Authored & Refactored**: **{(totals['total_written'] or 0) + (totals['total_edited'] or 0):,} lines**  ",
         f"> **MCP Invocations**: **{total_mcp_calls:,} calls** across {total_mcp_servers} servers  ",

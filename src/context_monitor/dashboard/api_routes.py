@@ -324,18 +324,15 @@ def query_summary_data(conn, tz=None, project=None):
     params_conv = ()
     where_tool = ""
     where_step_and = ""
-    where_step_join = ""
     if project:
         if project == "(unassigned)":
             where_conv = "WHERE (project IS NULL OR project = '')"
             where_tool = "AND conversation_id IN (SELECT id FROM conversations WHERE project IS NULL OR project = '')"
             where_step_and = "AND conversation_id IN (SELECT id FROM conversations WHERE project IS NULL OR project = '')"
-            where_step_join = "AND (c.project IS NULL OR c.project = '')"
         else:
             where_conv = "WHERE project = ?"
             where_tool = "AND conversation_id IN (SELECT id FROM conversations WHERE project = ?)"
             where_step_and = "AND conversation_id IN (SELECT id FROM conversations WHERE project = ?)"
-            where_step_join = "AND c.project = ?"
             params_conv = (project,)
 
     row = cur.execute(
@@ -412,7 +409,19 @@ def query_summary_data(conn, tz=None, project=None):
     total_re_reads = row["total_re_reads"] or 0
     re_read_rate = round((total_re_reads / max(1, total_views)) * 100, 1)
     re_read_waste_tokens = total_re_reads * 750
-    saved_hours = round(((reads_cnt * 30) + (cmds_cnt * 45) + (edits_cnt * 120)) / 3600)
+    saved_seconds = (reads_cnt * 30) + (cmds_cnt * 45) + (edits_cnt * 120)
+    saved_hours = round(saved_seconds / 3600)
+    total_pairing_work = max(0, row["total_pairing_work"] or 0)
+    total_agent_work = max(0, row["total_agent_work"] or 0)
+    baseline_work_sec = (
+        total_pairing_work if total_pairing_work > 0 else total_agent_work
+    )
+    baseline_work_sec = max(0, baseline_work_sec)
+    force_multiplier = (
+        round(1.0 + (saved_seconds / baseline_work_sec), 1)
+        if baseline_work_sec > 0
+        else 1.0
+    )
 
     # Phase breakdown
     phase_rows = cur.execute(
@@ -580,8 +589,8 @@ def query_summary_data(conn, tz=None, project=None):
         "total_tokens": row["total_tokens"] or 0,
         "total_chars": row["total_chars"] or 0,
         "total_duration": row["total_duration"] or 0,
-        "total_agent_work": row["total_agent_work"] or 0,
-        "total_pairing_work": row["total_pairing_work"] or 0,
+        "total_agent_work": total_agent_work,
+        "total_pairing_work": total_pairing_work,
         "total_thinking": row["total_thinking"] or 0,
         "total_prompts": total_prompts,
         "total_tools": total_tools,
@@ -594,7 +603,9 @@ def query_summary_data(conn, tz=None, project=None):
         "re_read_waste_tokens": re_read_waste_tokens,
         "resilience_rate": resilience_rate,
         "failed_tool_calls": total_fails,
+        "saved_seconds": saved_seconds,
         "saved_hours": saved_hours,
+        "force_multiplier": force_multiplier,
         "saved_reads": reads_cnt,
         "saved_cmds": cmds_cnt,
         "saved_edits": edits_cnt,

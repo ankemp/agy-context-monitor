@@ -414,3 +414,184 @@ def test_project_weekly_quota_summary_and_report(
             assert "| `agy-monitor` | $10.50 | 1.50% |" in content
             assert "| `legacy-proj` | $53.50 | 0.50% |" in content
             assert not EMOJI_PATTERN.search(content)
+
+
+def test_print_velocity_force_multiplier(tmp_path: Path, capsys: pytest.CaptureFixture):
+    """Verifies print_velocity includes Force Multiplier, effective hours, and zero division guards."""
+    db_file = tmp_path / "test_velocity.db"
+    init_db(db_file)
+    with get_db_connection(db_file) as conn:
+        # Standard case:
+        # pairing_sec = 3600 (1h), agent_sec = 1800 (30m)
+        # 20 view_file (600s), 40 run_command (1800s), 40 write_to_file (4800s) => saved_sec = 7200s (2h)
+        # baseline = 3600s => force_multiplier = 1.0 + (7200 / 3600) = 3.0x
+        # effective_hours = (3600 + 7200) / 3600 = 3.0h
+        # pairing_dur = 1h 0m
+        conn.execute(
+            """
+            INSERT INTO conversations (
+                id, title, active_pairing_seconds, active_agent_seconds, total_steps, total_tokens,
+                user_prompts, tool_calls_count, lines_written, lines_edited, failed_tool_calls
+            ) VALUES (
+                'conv_vel', 'Velocity Test', 3600.0, 1800.0, 100, 10000,
+                10, 100, 500, 200, 5
+            )
+            """
+        )
+        for i in range(20):
+            conn.execute(
+                "INSERT INTO tool_executions (conversation_id, step_index, tool_name) VALUES ('conv_vel', ?, 'view_file')",
+                (i,),
+            )
+        for i in range(40):
+            conn.execute(
+                "INSERT INTO tool_executions (conversation_id, step_index, tool_name) VALUES ('conv_vel', ?, 'run_command')",
+                (20 + i,),
+            )
+        for i in range(40):
+            conn.execute(
+                "INSERT INTO tool_executions (conversation_id, step_index, tool_name) VALUES ('conv_vel', ?, 'write_to_file')",
+                (60 + i,),
+            )
+        conn.commit()
+
+        analytics_query.print_velocity(conn)
+        captured = capsys.readouterr().out
+        assert "Force Multiplier" in captured
+        assert "3.0x" in captured
+        assert "(3.0h effective output / 1h 0m active pairing)" in captured
+
+    # Edge case: zero pairing and zero agent seconds (no division by zero)
+    db_zero = tmp_path / "test_velocity_zero.db"
+    init_db(db_zero)
+    with get_db_connection(db_zero) as conn:
+        conn.execute(
+            """
+            INSERT INTO conversations (
+                id, title, active_pairing_seconds, active_agent_seconds, total_steps, total_tokens,
+                user_prompts, tool_calls_count
+            ) VALUES (
+                'conv_zero', 'Zero Test', 0.0, 0.0, 10, 1000, 2, 5
+            )
+            """
+        )
+        conn.commit()
+        analytics_query.print_velocity(conn)
+        out_zero = capsys.readouterr().out
+        assert "Force Multiplier" in out_zero
+        assert "1.0x (0.0h effective output / 0m active pairing)" in out_zero
+
+    # Fallback: active_pairing_seconds = 0 but active_agent_seconds = 3600
+    db_agent = tmp_path / "test_velocity_agent.db"
+    init_db(db_agent)
+    with get_db_connection(db_agent) as conn:
+        conn.execute(
+            """
+            INSERT INTO conversations (
+                id, title, active_pairing_seconds, active_agent_seconds, total_steps, total_tokens,
+                user_prompts, tool_calls_count
+            ) VALUES (
+                'conv_agent', 'Agent Fallback', 0.0, 3600.0, 10, 1000, 2, 30
+            )
+            """
+        )
+        for i in range(30):
+            conn.execute(
+                "INSERT INTO tool_executions (conversation_id, step_index, tool_name) VALUES ('conv_agent', ?, 'write_to_file')",
+                (i,),
+            )
+        conn.commit()
+        analytics_query.print_velocity(conn)
+        out_agent = capsys.readouterr().out
+        # saved_sec = 30 * 120 = 3600. baseline = 3600. multiplier = 1.0 + (3600/3600) = 2.0x
+        # effective_hours = (3600 + 3600) / 3600 = 2.0h. pairing_dur = format_duration(3600) = 1h 0m
+        assert "Force Multiplier" in out_agent
+        assert "2.0x (2.0h effective output / 1h 0m active pairing)" in out_agent
+
+    # Edge case: negative pairing and agent seconds (sanitized to 0m, no negative hours)
+    db_neg = tmp_path / "test_velocity_neg.db"
+    init_db(db_neg)
+    with get_db_connection(db_neg) as conn:
+        conn.execute(
+            """
+            INSERT INTO conversations (
+                id, title, active_pairing_seconds, active_agent_seconds, total_steps, total_tokens,
+                user_prompts, tool_calls_count
+            ) VALUES (
+                'conv_neg', 'Neg Test', -100.0, -50.0, 10, 1000, 2, 5
+            )
+            """
+        )
+        conn.commit()
+        analytics_query.print_velocity(conn)
+        out_neg = capsys.readouterr().out
+        assert "Force Multiplier" in out_neg
+        assert "1.0x (0.0h effective output / 0m active pairing)" in out_neg
+        assert "Active Agent Work Time    : 0m of pure LLM execution" in out_neg
+
+    # Case: positive pairing time but zero saved seconds (multiplier = 1.0x)
+    db_no_tools = tmp_path / "test_velocity_no_tools.db"
+    init_db(db_no_tools)
+    with get_db_connection(db_no_tools) as conn:
+        conn.execute(
+            """
+            INSERT INTO conversations (
+                id, title, active_pairing_seconds, active_agent_seconds, total_steps, total_tokens,
+                user_prompts, tool_calls_count
+            ) VALUES (
+                'conv_notools', 'No Tools', 3600.0, 1800.0, 10, 1000, 2, 0
+            )
+            """
+        )
+        conn.commit()
+        analytics_query.print_velocity(conn)
+        out_no_tools = capsys.readouterr().out
+        assert "1.0x (1.0h effective output / 1h 0m active pairing)" in out_no_tools
+
+
+def test_format_duration_edge_cases():
+    """Verifies format_duration handles negative, zero, and standard durations properly."""
+    assert analytics_query.format_duration(0) == "0m"
+    assert analytics_query.format_duration(-10) == "0m"
+    assert analytics_query.format_duration(-50.0) == "0m"
+    assert analytics_query.format_duration(-3600.0) == "0m"
+    assert analytics_query.format_duration(1800) == "30m"
+    assert analytics_query.format_duration(3600) == "1h 0m"
+    assert analytics_query.format_duration(3665) == "1h 1m"
+
+
+def test_generate_global_report_force_multiplier(tmp_path: Path):
+    """Verifies generate_global_report includes Force Multiplier in header block without decorative emojis."""
+    db_file = tmp_path / "test_report_fm.db"
+    init_db(db_file)
+    with get_db_connection(db_file) as conn:
+        conn.execute(
+            """
+            INSERT INTO conversations (
+                id, title, active_pairing_seconds, active_agent_seconds, total_steps, total_tokens
+            ) VALUES (
+                'conv_fm', 'FM Report Test', 1800.0, 900.0, 20, 2000
+            )
+            """
+        )
+        for i in range(30):
+            conn.execute(
+                "INSERT INTO tool_executions (conversation_id, step_index, tool_name) VALUES ('conv_fm', ?, 'replace_file_content')",
+                (i,),
+            )
+        conn.commit()
+
+        report_file = tmp_path / "global_analytics_fm.md"
+        with patch(
+            "context_monitor.quota.discover_language_server_credentials",
+            return_value=(None, None),
+        ):
+            analytics_query.generate_global_report(conn, output_path=report_file)
+
+        assert report_file.exists()
+        content = report_file.read_text(encoding="utf-8")
+        assert "> **Force Multiplier**: **3.0x effective output**" in content
+        # Clean markdown invariant across the entire report
+        assert not EMOJI_PATTERN.search(content), (
+            "Markdown report must not contain decorative emojis"
+        )

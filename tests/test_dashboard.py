@@ -3389,3 +3389,121 @@ def test_query_conversations_list_sorting_and_updated_at(tmp_path: Path):
         assert "created_at" in convs[0]
 
 
+def test_query_summary_force_multiplier(tmp_path: Path):
+    """Verifies Force Multiplier calculation, fallbacks, and project scoping in query_summary_data."""
+    db_file = tmp_path / "test_force_multiplier.db"
+    init_db(db_file)
+    with get_db_connection(db_file) as conn:
+        # Case 1: Standard calculation
+        # active_pairing_seconds = 1800 (0.5h)
+        # tools: 20 view_file (20*30=600s), 40 run_command (40*45=1800s), 10 write_to_file (10*120=1200s) -> saved_seconds = 3600 (1.0h)
+        # force_multiplier = round(1.0 + (3600 / 1800), 1) = 3.0
+        conn.execute(
+            """
+            INSERT INTO conversations (id, title, project, active_pairing_seconds, active_agent_seconds, total_steps, total_tokens)
+            VALUES ('conv_proj1', 'Task 1', 'project-a', 1800.0, 900.0, 70, 5000)
+            """
+        )
+        for i in range(20):
+            conn.execute(
+                "INSERT INTO tool_executions (conversation_id, step_index, tool_name) VALUES ('conv_proj1', ?, 'view_file')",
+                (i,),
+            )
+        for i in range(40):
+            conn.execute(
+                "INSERT INTO tool_executions (conversation_id, step_index, tool_name) VALUES ('conv_proj1', ?, 'run_command')",
+                (20 + i,),
+            )
+        for i in range(10):
+            conn.execute(
+                "INSERT INTO tool_executions (conversation_id, step_index, tool_name) VALUES ('conv_proj1', ?, 'write_to_file')",
+                (60 + i,),
+            )
+        conn.commit()
+
+        # Query summary without project filter
+        summary = api_routes.query_summary_data(conn)
+        assert summary["saved_seconds"] == 3600
+        assert summary["saved_hours"] == 1
+        assert summary["force_multiplier"] == 3.0
+
+        # Query summary for project-a
+        summary_a = api_routes.query_summary_data(conn, project="project-a")
+        assert summary_a["saved_seconds"] == 3600
+        assert summary_a["force_multiplier"] == 3.0
+
+        # Query summary for an empty project
+        summary_empty = api_routes.query_summary_data(conn, project="empty-project")
+        assert summary_empty["saved_seconds"] == 0
+        assert summary_empty["saved_hours"] == 0
+        assert summary_empty["force_multiplier"] == 1.0
+
+        # Case 2: Zero pairing and zero agent seconds guard
+        conn.execute(
+            """
+            INSERT INTO conversations (id, title, project, active_pairing_seconds, active_agent_seconds, total_steps, total_tokens)
+            VALUES ('conv_zero', 'Zero Seconds', 'project-zero', 0.0, 0.0, 10, 500)
+            """
+        )
+        conn.execute(
+            "INSERT INTO tool_executions (conversation_id, step_index, tool_name) VALUES ('conv_zero', 1, 'write_to_file')"
+        )
+        conn.commit()
+
+        summary_zero = api_routes.query_summary_data(conn, project="project-zero")
+        assert summary_zero["saved_seconds"] == 120
+        # baseline is 0, so fallback must be 1.0 (no division by zero)
+        assert summary_zero["force_multiplier"] == 1.0
+
+        # Case 3: Fallback when active_pairing_seconds == 0 but active_agent_seconds > 0
+        # active_agent_seconds = 1800, saved_seconds = 3600 (30 edits * 120)
+        conn.execute(
+            """
+            INSERT INTO conversations (id, title, project, active_pairing_seconds, active_agent_seconds, total_steps, total_tokens)
+            VALUES ('conv_agent_only', 'Agent Work Only', 'project-agent', 0.0, 1800.0, 30, 2000)
+            """
+        )
+        for i in range(30):
+            conn.execute(
+                "INSERT INTO tool_executions (conversation_id, step_index, tool_name) VALUES ('conv_agent_only', ?, 'replace_file_content')",
+                (i,),
+            )
+        conn.commit()
+
+        summary_agent = api_routes.query_summary_data(conn, project="project-agent")
+        assert summary_agent["saved_seconds"] == 3600
+        # 1.0 + (3600 / 1800) = 3.0
+        assert summary_agent["force_multiplier"] == 3.0
+
+        # Case 4: Unassigned project scoping
+        conn.execute(
+            """
+            INSERT INTO conversations (id, title, project, active_pairing_seconds, active_agent_seconds, total_steps, total_tokens)
+            VALUES ('conv_unassigned', 'Unassigned Conv', NULL, 1200.0, 600.0, 15, 1000)
+            """
+        )
+        for i in range(10):
+            conn.execute(
+                "INSERT INTO tool_executions (conversation_id, step_index, tool_name) VALUES ('conv_unassigned', ?, 'run_command')",
+                (i,),
+            )
+        conn.commit()
+
+        summary_unassigned = api_routes.query_summary_data(conn, project="(unassigned)")
+        # 10 run_command * 45s = 450s
+        assert summary_unassigned["saved_seconds"] == 450
+        # 1.0 + (450 / 1200) = 1.375 -> round to 1.4
+        assert summary_unassigned["force_multiplier"] == 1.4
+
+        # Case 5: Negative duration values sanitized to 0
+        conn.execute(
+            """
+            INSERT INTO conversations (id, title, project, active_pairing_seconds, active_agent_seconds, total_steps, total_tokens)
+            VALUES ('conv_neg_test', 'Neg Conv', 'project-neg', -100.0, -50.0, 5, 200)
+            """
+        )
+        conn.commit()
+        summary_neg = api_routes.query_summary_data(conn, project="project-neg")
+        assert summary_neg["total_pairing_work"] == 0
+        assert summary_neg["total_agent_work"] == 0
+        assert summary_neg["force_multiplier"] == 1.0
