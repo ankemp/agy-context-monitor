@@ -744,6 +744,37 @@
         }
       }
 
+      const elForceMultiplier = document.getElementById('kpiForceMultiplier');
+      if (elForceMultiplier) elForceMultiplier.textContent = `${data.force_multiplier || 1}x`;
+
+      const activeCollabWork = pairingWork > 0 ? pairingWork : agentWork;
+      const pairingHours = activeCollabWork / 3600;
+      const savedSec = data.saved_seconds != null ? data.saved_seconds : ((data.saved_hours || 0) * 3600);
+      const savedHours = data.saved_hours != null ? data.saved_hours : Math.round(savedSec / 3600);
+      const effectiveHours = (activeCollabWork + savedSec) / 3600;
+
+      const elForceMultiplierSub = document.getElementById('kpiForceMultiplierSub');
+      if (elForceMultiplierSub) {
+        if (effectiveHours > 0 && pairingWork > 0) {
+          elForceMultiplierSub.textContent = `~${effectiveHours.toFixed(1)}h output / ${formatDuration(pairingWork)}`;
+        } else if (effectiveHours > 0 && agentWork > 0) {
+          elForceMultiplierSub.textContent = `~${effectiveHours.toFixed(1)}h output / ${formatDuration(agentWork)}`;
+        } else {
+          elForceMultiplierSub.textContent = 'Effective output';
+        }
+      }
+
+      const cardForceMultiplier = document.getElementById('cardForceMultiplier');
+      if (cardForceMultiplier) {
+        const collabDur = pairingWork > 0 ? formatDuration(pairingWork) : formatDuration(agentWork);
+        cardForceMultiplier.title = `Pairing Force Multiplier: ${data.force_multiplier || 1}x\n` +
+          `Formula: (Active Pairing Time + Dev Time Saved) / Active Pairing Time\n` +
+          `• Effective Engineering Output: ~${effectiveHours.toFixed(1)}h\n` +
+          `• Active Pairing Collaboration: ${collabDur}\n` +
+          `• Equivalent Dev Time Saved: ~${savedHours}h\n` +
+          `• Direct speed-up ratio: +${(savedHours / Math.max(0.1, pairingHours)).toFixed(1)}x speed-up vs manual`;
+      }
+
       // Context Hygiene Diagnostics
       const elReReadRate = document.getElementById('diagReReadRate');
       if (elReReadRate) elReReadRate.textContent = `${data.re_read_rate || 0}%`;

@@ -403,6 +403,33 @@ def test_dashboard_frontend_invariants():
     assert "geminiWeeklyBucket" in js_content
     assert "weeklyCalibratedCapacity" in js_content
 
+    # Force Multiplier UI and rendering invariants
+    assert "cardForceMultiplier" in html_content
+    assert "kpiForceMultiplier" in html_content
+    assert "kpiForceMultiplierSub" in html_content
+    assert "Force Multiplier" in html_content
+    assert "grid-cols-2 md:grid-cols-3 lg:grid-cols-5" in html_content
+    assert "border-l-4 border-l-cyan-500" in html_content
+    assert "bg-cyan-500/10 text-cyan-400" in html_content
+    assert 'data-lucide="rocket"' in html_content
+    assert (
+        "Pairing Force Multiplier: (Active Pairing Time + Dev Time Saved) / Active Pairing Time"
+        in html_content
+    )
+    assert "cardForceMultiplier" in js_content
+    assert "kpiForceMultiplier" in js_content
+    assert "kpiForceMultiplierSub" in js_content
+    assert "force_multiplier" in js_content
+    assert (
+        "(Active Pairing Time + Dev Time Saved) / Active Pairing Time"
+        in js_content
+    )
+    assert "• Effective Engineering Output: ~" in js_content
+    assert "• Active Pairing Collaboration:" in js_content
+    assert "• Equivalent Dev Time Saved: ~" in js_content
+    assert "• Direct speed-up ratio: +" in js_content
+    assert "speed-up vs manual" in js_content
+
 
 def test_standalone_html_export_quota(test_db: Path, tmp_path: Path):
     """Verifies standalone HTML export embeds quota in STATIC_DATA and includes quota UI."""
@@ -429,6 +456,9 @@ def test_standalone_html_export_quota(test_db: Path, tmp_path: Path):
     assert "Subscription Quotas" in html
     assert "24x7 Activity Matrix Weighted" in html
     assert "Linear Wall-Clock" in html
+    assert "cardForceMultiplier" in html
+    assert "kpiForceMultiplier" in html
+    assert "Force Multiplier" in html
 
 
 def test_build_static_bundle(test_db: Path):
@@ -3507,3 +3537,152 @@ def test_query_summary_force_multiplier(tmp_path: Path):
         assert summary_neg["total_pairing_work"] == 0
         assert summary_neg["total_agent_work"] == 0
         assert summary_neg["force_multiplier"] == 1.0
+
+
+def test_dashboard_force_multiplier_frontend_rendering():
+    """Verifies Force Multiplier widget DOM rendering in script.js via Node.js:
+    - Standard case: updates value (e.g. 3.5x), subtext (~3.5h output / 1h 0m), and title tooltip
+    - Empty/zero case: falls back to 1x, 'Effective output', and +0.0x speed-up
+    - Agent-only case: falls back to agent work when pairingWork is 0
+    """
+    node_script = """
+    const fs = require('fs');
+    const code = fs.readFileSync('src/context_monitor/dashboard/static/script.js', 'utf8');
+
+    function createMockElement() {
+      return {
+        className: '',
+        textContent: '',
+        title: '',
+        style: {},
+        children: [],
+        classList: { add() {}, remove() {} }
+      };
+    }
+
+    const mockElements = {
+      kpiTokens: createMockElement(),
+      kpiChars: createMockElement(),
+      kpiConvs: createMockElement(),
+      kpiDateRange: createMockElement(),
+      kpiSteps: createMockElement(),
+      kpiAvgSteps: createMockElement(),
+      kpiTools: createMockElement(),
+      kpiDuration: createMockElement(),
+      kpiPairingSub: createMockElement(),
+      cardActiveTime: createMockElement(),
+      kpiCost: createMockElement(),
+      kpiBilledTokens: createMockElement(),
+      kpiAutonomy: createMockElement(),
+      kpiAutonomySub: createMockElement(),
+      cardAutonomy: createMockElement(),
+      kpiThinking: createMockElement(),
+      cardThinking: createMockElement(),
+      kpiCodeLines: createMockElement(),
+      kpiCodeSub: createMockElement(),
+      cardCodeLines: createMockElement(),
+      kpiTimeSaved: createMockElement(),
+      cardTimeSaved: createMockElement(),
+      kpiForceMultiplier: createMockElement(),
+      kpiForceMultiplierSub: createMockElement(),
+      cardForceMultiplier: createMockElement(),
+      diagReReadRate: createMockElement(),
+      diagReReadBar: createMockElement(),
+      diagReReadCount: createMockElement(),
+      diagReReadWaste: createMockElement(),
+      cardDiagReRead: createMockElement(),
+      diagResilienceRate: createMockElement(),
+      diagResilienceBar: createMockElement(),
+      diagFailedCalls: createMockElement(),
+      cardDiagResilience: createMockElement(),
+    };
+
+    const mockDocument = {
+      getElementById: (id) => mockElements[id] || createMockElement(),
+      createElement: () => createMockElement(),
+      querySelectorAll: () => [],
+      addEventListener: () => {}
+    };
+
+    const mockWindow = {
+      location: { search: '' },
+      addEventListener: () => {},
+      history: { pushState: () => {} }
+    };
+
+    const fn = new Function('window', 'document', 'Chart', 'lucide', `
+      ${code}
+      return { renderKPIs };
+    `);
+
+    const api = fn(
+      mockWindow,
+      mockDocument,
+      { defaults: { font: {}, elements: {}, plugins: {} }, register: () => {} },
+      { createIcons: () => {} }
+    );
+
+    // Case 1: Standard case
+    api.renderKPIs({
+      force_multiplier: 3.5,
+      total_pairing_work: 3600,
+      total_agent_work: 1800,
+      saved_seconds: 9000,
+      saved_hours: 3
+    });
+    if (mockElements.kpiForceMultiplier.textContent !== '3.5x') {
+      throw new Error(`Expected 3.5x, got ${mockElements.kpiForceMultiplier.textContent}`);
+    }
+    if (mockElements.kpiForceMultiplierSub.textContent !== '~3.5h output / 1h 0m') {
+      throw new Error(`Expected ~3.5h output / 1h 0m, got ${mockElements.kpiForceMultiplierSub.textContent}`);
+    }
+    if (!mockElements.cardForceMultiplier.title.includes('Pairing Force Multiplier: 3.5x')) {
+      throw new Error(`Missing multiplier in title: ${mockElements.cardForceMultiplier.title}`);
+    }
+    if (!mockElements.cardForceMultiplier.title.includes('Formula: (Active Pairing Time + Dev Time Saved) / Active Pairing Time')) {
+      throw new Error(`Missing formula in title: ${mockElements.cardForceMultiplier.title}`);
+    }
+    if (!mockElements.cardForceMultiplier.title.includes('+3.0x speed-up vs manual')) {
+      throw new Error(`Missing speed-up ratio in title: ${mockElements.cardForceMultiplier.title}`);
+    }
+
+    // Case 2: Empty/zero case
+    api.renderKPIs({});
+    if (mockElements.kpiForceMultiplier.textContent !== '1x') {
+      throw new Error(`Expected 1x for empty data, got ${mockElements.kpiForceMultiplier.textContent}`);
+    }
+    if (mockElements.kpiForceMultiplierSub.textContent !== 'Effective output') {
+      throw new Error(`Expected fallback to 'Effective output', got ${mockElements.kpiForceMultiplierSub.textContent}`);
+    }
+    if (!mockElements.cardForceMultiplier.title.includes('+0.0x speed-up vs manual')) {
+      throw new Error(`Expected +0.0x speed-up for zero work, got ${mockElements.cardForceMultiplier.title}`);
+    }
+
+    // Case 3: Agent work fallback when pairing is 0
+    api.renderKPIs({
+      force_multiplier: 2.0,
+      total_pairing_work: 0,
+      total_agent_work: 3600,
+      saved_seconds: 3600,
+      saved_hours: 1
+    });
+    if (mockElements.kpiForceMultiplier.textContent !== '2x') {
+      throw new Error(`Expected 2x for agent fallback, got ${mockElements.kpiForceMultiplier.textContent}`);
+    }
+    if (mockElements.kpiForceMultiplierSub.textContent !== '~2.0h output / 1h 0m') {
+      throw new Error(`Expected agent fallback in subtext, got ${mockElements.kpiForceMultiplierSub.textContent}`);
+    }
+    if (!mockElements.cardForceMultiplier.title.includes('Active Pairing Collaboration: 1h 0m')) {
+      throw new Error(`Expected agent work duration in title, got ${mockElements.cardForceMultiplier.title}`);
+    }
+
+    console.log(JSON.stringify({ status: 'ok', cases: 3 }));
+    """
+
+    res = subprocess.run(
+        ["node", "-e", node_script], capture_output=True, text=True, cwd=Path.cwd()
+    )
+    assert res.returncode == 0, f"Node script failed: {res.stderr}"
+    data = json.loads(res.stdout.strip().splitlines()[-1])
+    assert data["status"] == "ok"
+    assert data["cases"] == 3

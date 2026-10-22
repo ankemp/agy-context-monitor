@@ -270,6 +270,8 @@ def test_export_standalone_html_includes_cost_by_project(tmp_path, monkeypatch):
     assert "/api/cost-by-project" in content
     assert 'id="cardTimeSaved"' in content
     assert "Calculated from automated developer actions" in content
+    assert 'id="cardForceMultiplier"' in content
+    assert "Pairing Force Multiplier" in content
     assert 'id="cardAutonomy"' in content
     assert "Autonomous leverage ratio" in content
     assert 'id="cardThinking"' in content

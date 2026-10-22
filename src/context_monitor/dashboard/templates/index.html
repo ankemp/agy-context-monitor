@@ -220,7 +220,7 @@
     </div>
 
     <!-- 1b. Developer Velocity & Autonomy ROI Banner -->
-    <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+    <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4">
       <div id="cardAutonomy" class="card p-3.5 flex items-center space-x-3.5 border-l-4 border-l-indigo-500 cursor-help" title="Autonomous leverage ratio: Average automated tool operations executed per human prompt (total_tools / user_prompts). Higher ratios represent deeper autonomous execution per instruction.">
         <div class="p-2.5 rounded-lg bg-indigo-500/10 text-indigo-400">
           <i data-lucide="zap" class="w-5 h-5"></i>
@@ -262,6 +262,17 @@
           <div class="text-[10px] font-medium text-gray-400 uppercase tracking-wider">Dev Time Saved</div>
           <div id="kpiTimeSaved" class="text-xl font-bold text-white tracking-tight">--</div>
           <div class="text-[10px] text-gray-400">Engineering hours</div>
+        </div>
+      </div>
+
+      <div id="cardForceMultiplier" class="card p-3.5 flex items-center space-x-3.5 border-l-4 border-l-cyan-500 cursor-help" title="Pairing Force Multiplier: (Active Pairing Time + Dev Time Saved) / Active Pairing Time. Measures total equivalent engineering output produced per hour of active human-agent collaboration.">
+        <div class="p-2.5 rounded-lg bg-cyan-500/10 text-cyan-400">
+          <i data-lucide="rocket" class="w-5 h-5"></i>
+        </div>
+        <div>
+          <div class="text-[10px] font-medium text-gray-400 uppercase tracking-wider">Force Multiplier</div>
+          <div id="kpiForceMultiplier" class="text-xl font-bold text-white tracking-tight">--</div>
+          <div class="text-[10px] text-gray-400" id="kpiForceMultiplierSub">Effective output</div>
         </div>
       </div>
     </div>
