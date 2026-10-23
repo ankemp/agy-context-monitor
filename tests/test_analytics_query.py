@@ -424,8 +424,8 @@ def test_print_velocity_force_multiplier(tmp_path: Path, capsys: pytest.CaptureF
         # Standard case:
         # pairing_sec = 3600 (1h), agent_sec = 1800 (30m)
         # 20 view_file (600s), 40 run_command (1800s), 40 write_to_file (4800s) => saved_sec = 7200s (2h)
-        # baseline = 3600s => force_multiplier = 1.0 + (7200 / 3600) = 3.0x
-        # effective_hours = (3600 + 7200) / 3600 = 3.0h
+        # effective_output = 3600 + 1800 + 7200 = 12600s = 3.5h
+        # denominator = 3600s => force_multiplier = 12600 / 3600 = 3.5x
         # pairing_dur = 1h 0m
         conn.execute(
             """
@@ -458,8 +458,15 @@ def test_print_velocity_force_multiplier(tmp_path: Path, capsys: pytest.CaptureF
         analytics_query.print_velocity(conn)
         captured = capsys.readouterr().out
         assert "Force Multiplier" in captured
-        assert "3.0x" in captured
-        assert "(3.0h effective output / 1h 0m active pairing)" in captured
+        assert "3.5x" in captured
+        assert "(3.5h effective output / 1h 0m active pairing)" in captured
+        assert "Human Pairing Time (Inter-Turn)      : 1h 0m" in captured
+        assert "Agent Work Time (Root + Subagent Fleet): 30m" in captured
+        assert (
+            "Est. Dev Time Saved (Tool Execution) : ~2 engineering hours saved to date"
+            in captured
+        )
+        assert "Effective Output Hours               : 3.5h" in captured
 
     # Edge case: zero pairing and zero agent seconds (no division by zero)
     db_zero = tmp_path / "test_velocity_zero.db"
@@ -527,9 +534,12 @@ def test_print_velocity_force_multiplier(tmp_path: Path, capsys: pytest.CaptureF
         out_neg = capsys.readouterr().out
         assert "Force Multiplier" in out_neg
         assert "1.0x (0.0h effective output / 0m active pairing)" in out_neg
-        assert "Active Agent Work Time    : 0m of pure LLM execution" in out_neg
+        assert (
+            "Agent Work Time (Root + Subagent Fleet): 0m of pure LLM execution"
+            in out_neg
+        )
 
-    # Case: positive pairing time but zero saved seconds (multiplier = 1.0x)
+    # Case: positive pairing time but zero saved seconds (multiplier = (3600 + 1800) / 3600 = 1.5x)
     db_no_tools = tmp_path / "test_velocity_no_tools.db"
     init_db(db_no_tools)
     with get_db_connection(db_no_tools) as conn:
@@ -546,7 +556,7 @@ def test_print_velocity_force_multiplier(tmp_path: Path, capsys: pytest.CaptureF
         conn.commit()
         analytics_query.print_velocity(conn)
         out_no_tools = capsys.readouterr().out
-        assert "1.0x (1.0h effective output / 1h 0m active pairing)" in out_no_tools
+        assert "1.5x (1.5h effective output / 1h 0m active pairing)" in out_no_tools
 
 
 def test_format_duration_edge_cases():
@@ -590,8 +600,312 @@ def test_generate_global_report_force_multiplier(tmp_path: Path):
 
         assert report_file.exists()
         content = report_file.read_text(encoding="utf-8")
-        assert "> **Force Multiplier**: **3.0x effective output**" in content
+        assert "> **Force Multiplier**: **3.5x effective output**" in content
+        assert "> **Human Pairing Time (Inter-Turn)**: 30m" in content
+        assert "> **Agent Work Time (Root + Subagent Fleet)**: 15m" in content
+        assert "> **Est. Dev Time Saved (Tool Execution)**: ~1 hours (1h 0m)" in content
+        assert "> **Effective Output Hours**: **1.8h**" in content
         # Clean markdown invariant across the entire report
         assert not EMOJI_PATTERN.search(content), (
             "Markdown report must not contain decorative emojis"
         )
+
+
+def test_print_summary_force_multiplier_and_labels(
+    tmp_path: Path, capsys: pytest.CaptureFixture
+):
+    """Verifies print_summary outputs updated Force Multiplier and timing labels."""
+    db_file = tmp_path / "test_summary_fm.db"
+    init_db(db_file)
+    with patch(
+        "context_monitor.quota.discover_language_server_credentials",
+        return_value=(None, None),
+    ):
+        with get_db_connection(db_file) as conn:
+            conn.execute(
+                """
+                INSERT INTO conversations (
+                    id, title, active_pairing_seconds, active_agent_seconds, total_steps, total_tokens,
+                    user_prompts, tool_calls_count
+                ) VALUES (
+                    'conv_sum', 'Summary Test', 3600.0, 1800.0, 10, 1000, 2, 40
+                )
+                """
+            )
+            for i in range(40):
+                conn.execute(
+                    "INSERT INTO tool_executions (conversation_id, step_index, tool_name) VALUES ('conv_sum', ?, 'write_to_file')",
+                    (i,),
+                )
+            conn.commit()
+
+            analytics_query.print_summary(conn)
+            captured = capsys.readouterr().out
+            # 3600s pairing + 1800s agent + 4800s saved (40 * 120) = 10200s (2.833h -> 2.8h)
+            # Force Multiplier = 10200 / 3600 = 2.8333 -> 2.8x
+            assert "Human Pairing Time (Inter-Turn): 1h 0m" in captured
+            assert "Agent Work Time (Root + Fleet): 30m" in captured
+            assert (
+                "Force Multiplier            : 2.8x (2.8h effective output / 1h 0m active pairing)"
+                in captured
+            )
+
+
+def test_ingest_and_backfill_subagent_zero_pairing(tmp_path: Path):
+    """Verifies that both ingest.py and backfill_analytics.py enforce active_pairing_seconds = 0.0 for subagents."""
+    import json
+    import ingest
+    import backfill_analytics as backfill
+
+    db_file = tmp_path / "test_subagent_zero.db"
+    init_db(db_file)
+    with get_db_connection(db_file) as conn:
+        conn.execute(
+            "INSERT INTO conversations (id, title) VALUES ('root-123', 'Root Task')"
+        )
+        conn.commit()
+
+    # 1. ingest.sync_to_sqlite: even if analysis had pairing seconds, subagent resolution forces 0.0
+    analysis = {
+        "title": "Subagent Worker",
+        "start_time": "2026-10-23T10:00:00Z",
+        "end_time": "2026-10-23T10:10:00Z",
+        "duration_seconds": 600.0,
+        "active_agent_seconds": 300.0,
+        "active_pairing_seconds": 250.0,  # Erroneous pairing time
+        "total_chars": 1000,
+        "total_tokens": 250,
+        "steps": [],
+        "parent_id": "root-123",
+        "subagent_role": "DeepCoder",
+    }
+    ingest.sync_to_sqlite("sub-456", "Gemini Pro", analysis, db_path=db_file)
+    with get_db_connection(db_file) as conn:
+        row = conn.execute(
+            "SELECT active_pairing_seconds, active_agent_seconds FROM conversations WHERE id = 'sub-456'"
+        ).fetchone()
+        assert row["active_pairing_seconds"] == 0.0
+        assert row["active_agent_seconds"] == 300.0
+
+    # 2. backfill_analytics parse_conversation & Pass 2
+    root_conv_dir = tmp_path / "brain" / "root-conv"
+    (root_conv_dir / ".system_generated" / "logs").mkdir(parents=True)
+    with open(
+        root_conv_dir / ".system_generated" / "logs" / "transcript.jsonl", "w"
+    ) as f:
+        f.write(
+            json.dumps(
+                {
+                    "step_index": 1,
+                    "type": "USER_INPUT",
+                    "created_at": "2026-10-23T10:00:00Z",
+                    "content": "Hello",
+                    "characters": 5,
+                }
+            )
+            + "\n"
+        )
+        f.write(
+            json.dumps(
+                {
+                    "step_index": 2,
+                    "type": "PLANNER_RESPONSE",
+                    "created_at": "2026-10-23T10:00:10Z",
+                    "content": "Hi",
+                    "est_tokens": 10,
+                }
+            )
+            + "\n"
+        )
+
+    sub_conv_dir = tmp_path / "brain" / "sub-conv"
+    (sub_conv_dir / ".system_generated" / "logs").mkdir(parents=True)
+    with open(
+        sub_conv_dir / ".system_generated" / "logs" / "transcript.jsonl", "w"
+    ) as f:
+        f.write(
+            json.dumps(
+                {
+                    "step_index": 1,
+                    "type": "SYSTEM_MESSAGE",
+                    "created_at": "2026-10-23T10:00:10Z",
+                    "content": "[Message] timestamp=2026-10-23T10:00:10Z sender=root-conv recipient=sub-conv\nDo work",
+                }
+            )
+            + "\n"
+        )
+        f.write(
+            json.dumps(
+                {
+                    "step_index": 2,
+                    "type": "USER_INPUT",
+                    "created_at": "2026-10-23T10:00:15Z",
+                    "content": "Sub-prompt",
+                    "characters": 10,
+                }
+            )
+            + "\n"
+        )
+        f.write(
+            json.dumps(
+                {
+                    "step_index": 3,
+                    "type": "PLANNER_RESPONSE",
+                    "created_at": "2026-10-23T10:00:25Z",
+                    "content": "Done",
+                    "est_tokens": 20,
+                }
+            )
+            + "\n"
+        )
+
+    # Ingest transcript analysis
+    parsed_root = ingest.analyze_transcript(root_conv_dir)
+    assert parsed_root["active_pairing_seconds"] > 0.0
+    parsed_sub = ingest.analyze_transcript(sub_conv_dir)
+    assert parsed_sub["active_pairing_seconds"] == 0.0
+    assert parsed_sub["parent_id"] == "root-conv"
+
+    # Backfill
+    backfill_db = tmp_path / "backfill.db"
+    backfill.run_backfill(brain_dir=tmp_path / "brain", db_path=backfill_db)
+    with get_db_connection(backfill_db) as conn:
+        r_row = conn.execute(
+            "SELECT active_pairing_seconds FROM conversations WHERE id = 'root-conv'"
+        ).fetchone()
+        assert r_row["active_pairing_seconds"] > 0.0
+        s_row = conn.execute(
+            "SELECT active_pairing_seconds FROM conversations WHERE id = 'sub-conv'"
+        ).fetchone()
+        assert s_row["active_pairing_seconds"] == 0.0
+
+
+def test_ingest_dispatched_subagent_prior_pairing_reset(tmp_path: Path):
+    """Verifies that when a child subagent is ingested BEFORE its parent, parent sync resets child's pairing seconds."""
+    import ingest
+
+    db_file = tmp_path / "test_out_of_order_sub.db"
+    init_db(db_file)
+
+    # 1. Child ingests first standalone (no parent known yet)
+    child_analysis = {
+        "title": "Subagent Standalone",
+        "start_time": "2026-10-23T10:00:00Z",
+        "end_time": "2026-10-23T10:10:00Z",
+        "duration_seconds": 600.0,
+        "active_agent_seconds": 300.0,
+        "active_pairing_seconds": 200.0,
+        "total_chars": 1000,
+        "total_tokens": 250,
+        "steps": [],
+        "parent_id": None,
+        "subagent_role": None,
+    }
+    ingest.sync_to_sqlite("child-sub", "Gemini Pro", child_analysis, db_path=db_file)
+
+    with get_db_connection(db_file) as conn:
+        row = conn.execute(
+            "SELECT active_pairing_seconds, parent_id, depth FROM conversations WHERE id = 'child-sub'"
+        ).fetchone()
+        assert row["active_pairing_seconds"] == 200.0
+        assert row["parent_id"] is None
+        assert row["depth"] == 0
+
+    # 2. Parent ingests and declares child in dispatched_subagents
+    parent_analysis = {
+        "title": "Root Coordinator Task",
+        "start_time": "2026-10-23T10:00:00Z",
+        "end_time": "2026-10-23T10:15:00Z",
+        "duration_seconds": 900.0,
+        "active_agent_seconds": 400.0,
+        "active_pairing_seconds": 120.0,
+        "total_chars": 2000,
+        "total_tokens": 500,
+        "steps": [],
+        "dispatched_subagents": [
+            {
+                "id": "child-sub",
+                "role": "DeepCoder",
+                "type": "DeepCoder",
+                "step_index": 2,
+            }
+        ],
+    }
+    ingest.sync_to_sqlite("parent-root", "Gemini Pro", parent_analysis, db_path=db_file)
+
+    with get_db_connection(db_file) as conn:
+        child_row = conn.execute(
+            "SELECT active_pairing_seconds, parent_id, depth, subagent_role FROM conversations WHERE id = 'child-sub'"
+        ).fetchone()
+        assert child_row["parent_id"] == "parent-root"
+        assert child_row["depth"] == 1
+        assert child_row["subagent_role"] == "DeepCoder"
+        # Invariant: subagents must have active_pairing_seconds reset to 0.0
+        assert child_row["active_pairing_seconds"] == 0.0
+
+
+def test_backfill_subagent_from_existing_db_lineage(tmp_path: Path):
+    """Verifies backfill preloads DB lineage and enforces active_pairing_seconds = 0.0 even without transcript sender header."""
+    import json
+    import backfill_analytics as backfill
+
+    db_file = tmp_path / "test_backfill_db_lineage.db"
+    init_db(db_file)
+
+    # Seed parent and subagent with existing lineage in DB, but subagent having non-zero pairing time
+    with get_db_connection(db_file) as conn:
+        conn.execute(
+            """
+            INSERT INTO conversations (id, title, active_pairing_seconds, active_agent_seconds, total_steps, total_tokens)
+            VALUES ('root-db', 'Root Task', 300.0, 150.0, 5, 500)
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO conversations (id, title, parent_id, root_id, depth, subagent_role, active_pairing_seconds, active_agent_seconds, total_steps, total_tokens)
+            VALUES ('sub-db', 'Subagent Worker', 'root-db', 'root-db', 1, 'DeepCoder', 180.0, 120.0, 5, 400)
+            """
+        )
+        conn.commit()
+
+    # Subagent transcript has NO [Message] sender header
+    sub_dir = tmp_path / "brain" / "sub-db"
+    (sub_dir / ".system_generated" / "logs").mkdir(parents=True)
+    with open(sub_dir / ".system_generated" / "logs" / "transcript.jsonl", "w") as f:
+        f.write(
+            json.dumps(
+                {
+                    "step_index": 1,
+                    "type": "USER_INPUT",
+                    "created_at": "2026-10-23T10:00:00Z",
+                    "content": "Execute task",
+                    "characters": 12,
+                }
+            )
+            + "\n"
+        )
+        f.write(
+            json.dumps(
+                {
+                    "step_index": 2,
+                    "type": "PLANNER_RESPONSE",
+                    "created_at": "2026-10-23T10:00:30Z",
+                    "content": "Working",
+                    "est_tokens": 50,
+                }
+            )
+            + "\n"
+        )
+
+    backfill.run_backfill(
+        brain_dir=tmp_path / "brain", conversation_id="sub-db", db_path=db_file
+    )
+
+    with get_db_connection(db_file) as conn:
+        row = conn.execute(
+            "SELECT parent_id, depth, subagent_role, active_pairing_seconds FROM conversations WHERE id = 'sub-db'"
+        ).fetchone()
+        assert row["parent_id"] == "root-db"
+        assert row["depth"] == 1
+        assert row["subagent_role"] == "DeepCoder"
+        assert row["active_pairing_seconds"] == 0.0

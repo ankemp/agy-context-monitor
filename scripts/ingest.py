@@ -25,7 +25,11 @@ _root = Path(__file__).resolve().parent.parent
 if str(_root / "src") not in sys.path:
     sys.path.insert(0, str(_root / "src"))
 
-from context_monitor.db import DEFAULT_DB_PATH, get_db_connection, refresh_conversation_rollups  # noqa: E402
+from context_monitor.db import (
+    DEFAULT_DB_PATH,
+    get_db_connection,
+    refresh_conversation_rollups,
+)  # noqa: E402
 from context_monitor.diff import DiffResult, diff_block_lists  # noqa: E402
 from context_monitor.formats import BlockParser  # noqa: E402
 from context_monitor.html_report import generate_html_report  # noqa: E402
@@ -48,6 +52,7 @@ from context_monitor.quota import (  # noqa: E402
     sync_and_get_quota_state,
 )
 from context_monitor.settings import should_generate_artifacts  # noqa: E402
+from context_monitor.timings import compute_session_timings  # noqa: E402
 
 CHARS_PER_TOKEN = 3.8
 
@@ -76,7 +81,7 @@ def _clean_arg_str(val: Any) -> str:
                 pass
             inner = s[1:-1].strip()
             if not re.search(r'(?<!\\)"', inner):
-                s = inner.replace(r'\"', '"').strip()
+                s = inner.replace(r"\"", '"').strip()
                 continue
         if s.startswith("'") and s.endswith("'") and len(s) >= 2:
             inner = s[1:-1].strip()
@@ -120,18 +125,14 @@ def extract_subagent_specs(tc_args: dict[str, Any]) -> list[dict[str, str]]:
             results = []
             for item in specs_list:
                 if isinstance(item, dict):
-                    role = _clean_arg_str(
-                        item.get("Role") or item.get("role") or ""
-                    )
+                    role = _clean_arg_str(item.get("Role") or item.get("role") or "")
                     sub_type = _clean_arg_str(
                         item.get("TypeName")
                         or item.get("type")
                         or item.get("subagent_type")
                         or ""
                     )
-                    model = _clean_arg_str(
-                        item.get("Model") or item.get("model") or ""
-                    )
+                    model = _clean_arg_str(item.get("Model") or item.get("model") or "")
                     results.append(
                         {
                             "role": role or "Autonomous Worker",
@@ -246,7 +247,7 @@ def parse_manage_subagents_output(content: str) -> list[dict[str, str]]:
         )
         if not cid_m:
             cid_m = re.search(
-                r'\b([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})\b',
+                r"\b([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})\b",
                 line,
                 re.IGNORECASE,
             )
@@ -335,7 +336,9 @@ def format_ephemeral_status(
 
     if not has_valid_quota:
         if fleet_agent_count > 1 and fleet_cost is not None:
-            return f"{ctx_prefix} · Fleet ({fleet_agent_count}) Value: ${fleet_cost:,.2f}"
+            return (
+                f"{ctx_prefix} · Fleet ({fleet_agent_count}) Value: ${fleet_cost:,.2f}"
+            )
         return f"{ctx_prefix} · Session Value: ${effective_cost:,.2f}"
 
     sess_wk_pct = quota_metrics.get("session_weekly_pct")
@@ -633,7 +636,9 @@ def analyze_transcript(
                             or tc_args.get("DirectoryPath")
                             or ""
                         )
-                        proj_path = target_p or tc_args.get("Cwd") or tc_args.get("cwd") or ""
+                        proj_path = (
+                            target_p or tc_args.get("Cwd") or tc_args.get("cwd") or ""
+                        )
                         if not proj_path and tc_args.get("CommandLine"):
                             proj_path = tc_args.get("CommandLine")
                         if not project:
@@ -966,53 +971,9 @@ def analyze_transcript(
             )
 
     total_tokens = int(total_chars / CHARS_PER_TOKEN)
-    duration_seconds = 0.0
-    active_agent_seconds = 0.0
-    active_pairing_seconds = 0.0
-
-    start_dt = None
-    end_dt = None
-    prev_dt = None
-    cur_turn_start = None
-
-    for s in steps:
-        c_at = s.get("created_at")
-        s_type = s.get("step_type")
-        if not c_at:
-            continue
-        try:
-            dt = datetime.fromisoformat(c_at.replace("Z", "+00:00"))
-        except Exception:
-            continue
-
-        if start_dt is None:
-            start_dt = dt
-        end_dt = dt
-
-        if prev_dt is not None:
-            delta = (dt - prev_dt).total_seconds()
-            if 0 < delta <= 300:
-                active_pairing_seconds += delta
-
-        if s_type == "USER_INPUT":
-            if cur_turn_start is not None and prev_dt is not None:
-                turn_dur = (prev_dt - cur_turn_start).total_seconds()
-                if 0 < turn_dur <= 1800:
-                    active_agent_seconds += turn_dur
-            cur_turn_start = dt
-        elif s_type in ("PLANNER_RESPONSE", "GENERIC", "SYSTEM_MESSAGE"):
-            if cur_turn_start is None:
-                cur_turn_start = dt
-
-        prev_dt = dt
-
-    if cur_turn_start is not None and end_dt is not None:
-        turn_dur = (end_dt - cur_turn_start).total_seconds()
-        if 0 < turn_dur <= 1800:
-            active_agent_seconds += turn_dur
-
-    if start_dt and end_dt:
-        duration_seconds = max((end_dt - start_dt).total_seconds(), 0.0)
+    duration_seconds, active_agent_seconds, active_pairing_seconds = (
+        compute_session_timings(steps, is_subagent=bool(detected_parent_id))
+    )
 
     if first_model is None:
         first_model = cur_model
@@ -1135,12 +1096,19 @@ def sync_to_sqlite(
                 curr_steps = analysis.get("steps", [])
 
                 # Check if append-only candidate
-                curr_steps_le = [s for s in curr_steps if s["step_index"] <= prev_max_step]
-                curr_blocks_le = [b for b in curr_blocks if b.step_index <= prev_max_step]
+                curr_steps_le = [
+                    s for s in curr_steps if s["step_index"] <= prev_max_step
+                ]
+                curr_blocks_le = [
+                    b for b in curr_blocks if b.step_index <= prev_max_step
+                ]
 
                 is_append_only = False
                 if prev_step_count > 0 and prev_max_step > 0:
-                    if len(curr_steps_le) == prev_step_count and len(curr_blocks_le) == prev_block_count:
+                    if (
+                        len(curr_steps_le) == prev_step_count
+                        and len(curr_blocks_le) == prev_block_count
+                    ):
                         last_block_row = cur.execute(
                             "SELECT block_hash FROM transcript_blocks WHERE conversation_id = ? ORDER BY step_index DESC, id DESC LIMIT 1",
                             (cid,),
@@ -1188,7 +1156,9 @@ def sync_to_sqlite(
                             is_append_only = True
 
                 if is_append_only:
-                    new_blocks = [b for b in curr_blocks if b.step_index > prev_max_step]
+                    new_blocks = [
+                        b for b in curr_blocks if b.step_index > prev_max_step
+                    ]
                     if new_blocks:
                         diff_res = diff_block_lists([], new_blocks)
                     else:
@@ -1266,7 +1236,11 @@ def sync_to_sqlite(
                             "SELECT id, root_id, parent_id, project, depth, title FROM conversations WHERE id = ?",
                             (parent_id,),
                         ).fetchone()
-                        if p_row and (p_row["root_id"] == cid or p_row["id"] == cid or p_row["parent_id"] == cid):
+                        if p_row and (
+                            p_row["root_id"] == cid
+                            or p_row["id"] == cid
+                            or p_row["parent_id"] == cid
+                        ):
                             parent_id = None
                             root_id = cid
                             depth = 0
@@ -1274,7 +1248,9 @@ def sync_to_sqlite(
                             root_id = p_row["root_id"] or p_row["id"]
                             depth = (p_row["depth"] or 0) + 1
                             if not analysis.get("project") and p_row["project"]:
-                                analysis["project"] = normalize_project_name(p_row["project"])
+                                analysis["project"] = normalize_project_name(
+                                    p_row["project"]
+                                )
                             if (
                                 not analysis.get("title")
                                 or analysis["title"] in ("Active Session", "")
@@ -1289,15 +1265,22 @@ def sync_to_sqlite(
                                 m_sub = re.match(r"^\[.+?\]\s*(.+)", clean_p_title)
                                 if m_sub:
                                     clean_p_title = m_sub.group(1)
-                                analysis["title"] = f"[{role_label}] {clean_p_title[:90]}"
+                                analysis["title"] = (
+                                    f"[{role_label}] {clean_p_title[:90]}"
+                                )
                         else:
                             root_id = parent_id
                             depth = 1
 
+                if parent_id is not None or subagent_role is not None or depth > 0:
+                    analysis["active_pairing_seconds"] = 0.0
+
                 if not analysis.get("project") and existing:
                     try:
                         if existing["project"]:
-                            analysis["project"] = normalize_project_name(existing["project"])
+                            analysis["project"] = normalize_project_name(
+                                existing["project"]
+                            )
                     except (IndexError, KeyError):
                         pass
 
@@ -1440,13 +1423,14 @@ def sync_to_sqlite(
                     conn.execute(
                         """
                         INSERT INTO conversations (
-                            id, title, project, parent_id, root_id, depth, subagent_role, subagent_type, invoking_step_index
+                            id, title, project, parent_id, root_id, depth, subagent_role, subagent_type, invoking_step_index, active_pairing_seconds
                         )
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0.0)
                         ON CONFLICT(id) DO UPDATE SET
                             parent_id = excluded.parent_id,
                             root_id = excluded.root_id,
                             depth = excluded.depth,
+                            active_pairing_seconds = 0.0,
                             subagent_role = CASE
                                 WHEN excluded.subagent_role IS NOT NULL AND excluded.subagent_role != 'Autonomous Worker' THEN excluded.subagent_role
                                 ELSE COALESCE(conversations.subagent_role, excluded.subagent_role)

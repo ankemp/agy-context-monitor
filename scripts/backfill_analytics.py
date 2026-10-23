@@ -18,6 +18,7 @@ import re
 import time
 from pathlib import Path
 from datetime import datetime
+from typing import Any
 
 # Import db layer
 _root = Path(__file__).resolve().parent.parent
@@ -45,6 +46,7 @@ from context_monitor.project import (  # noqa: E402
     normalize_project_name,
 )
 from context_monitor.quota import sync_and_get_quota_state  # noqa: E402
+from context_monitor.timings import compute_session_timings  # noqa: E402
 
 CHARS_PER_TOKEN = 3.8
 
@@ -117,7 +119,7 @@ def _clean_arg_str(val: Any) -> str:
                 pass
             inner = s[1:-1].strip()
             if not re.search(r'(?<!\\)"', inner):
-                s = inner.replace(r'\"', '"').strip()
+                s = inner.replace(r"\"", '"').strip()
                 continue
         if s.startswith("'") and s.endswith("'") and len(s) >= 2:
             inner = s[1:-1].strip()
@@ -161,18 +163,14 @@ def extract_subagent_specs(tc_args: dict[str, Any]) -> list[dict[str, str]]:
             results = []
             for item in specs_list:
                 if isinstance(item, dict):
-                    role = _clean_arg_str(
-                        item.get("Role") or item.get("role") or ""
-                    )
+                    role = _clean_arg_str(item.get("Role") or item.get("role") or "")
                     sub_type = _clean_arg_str(
                         item.get("TypeName")
                         or item.get("type")
                         or item.get("subagent_type")
                         or ""
                     )
-                    model = _clean_arg_str(
-                        item.get("Model") or item.get("model") or ""
-                    )
+                    model = _clean_arg_str(item.get("Model") or item.get("model") or "")
                     results.append(
                         {
                             "role": role or "Autonomous Worker",
@@ -287,7 +285,7 @@ def parse_manage_subagents_output(content: str) -> list[dict[str, str]]:
         )
         if not cid_m:
             cid_m = re.search(
-                r'\b([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})\b',
+                r"\b([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})\b",
                 line,
                 re.IGNORECASE,
             )
@@ -519,7 +517,9 @@ def parse_conversation(
                             or ""
                         )
 
-                        proj_path = target_p or tc_args.get("Cwd") or tc_args.get("cwd") or ""
+                        proj_path = (
+                            target_p or tc_args.get("Cwd") or tc_args.get("cwd") or ""
+                        )
                         if not proj_path and tc_args.get("CommandLine"):
                             proj_path = tc_args.get("CommandLine")
                         if not project:
@@ -850,53 +850,9 @@ def parse_conversation(
                 }
             )
 
-    duration_seconds = 0.0
-    active_agent_seconds = 0.0
-    active_pairing_seconds = 0.0
-
-    start_dt = None
-    end_dt = None
-    prev_dt = None
-    cur_turn_start = None
-
-    for s in steps:
-        c_at = s.get("created_at")
-        s_type = s.get("step_type")
-        if not c_at:
-            continue
-        try:
-            dt = datetime.fromisoformat(c_at.replace("Z", "+00:00"))
-        except Exception:
-            continue
-
-        if start_dt is None:
-            start_dt = dt
-        end_dt = dt
-
-        if prev_dt is not None:
-            delta = (dt - prev_dt).total_seconds()
-            if 0 < delta <= 300:
-                active_pairing_seconds += delta
-
-        if s_type == "USER_INPUT":
-            if cur_turn_start is not None and prev_dt is not None:
-                turn_dur = (prev_dt - cur_turn_start).total_seconds()
-                if 0 < turn_dur <= 1800:
-                    active_agent_seconds += turn_dur
-            cur_turn_start = dt
-        elif s_type in ("PLANNER_RESPONSE", "GENERIC", "SYSTEM_MESSAGE"):
-            if cur_turn_start is None:
-                cur_turn_start = dt
-
-        prev_dt = dt
-
-    if cur_turn_start is not None and end_dt is not None:
-        turn_dur = (end_dt - cur_turn_start).total_seconds()
-        if 0 < turn_dur <= 1800:
-            active_agent_seconds += turn_dur
-
-    if start_dt and end_dt:
-        duration_seconds = max((end_dt - start_dt).total_seconds(), 0.0)
+    duration_seconds, active_agent_seconds, active_pairing_seconds = (
+        compute_session_timings(steps, is_subagent=bool(detected_parent_id))
+    )
 
     total_tokens = int(total_chars / CHARS_PER_TOKEN)
 
@@ -1102,7 +1058,7 @@ def run_backfill(
                     elif c_root not in swarm_project_map:
                         swarm_project_map[c_root] = c_proj
 
-            # Fallback to existing DB projects for roots or swarms
+            # Fallback to existing DB projects and lineages for roots, swarms, and parent maps
             try:
                 db_swarms = conn.execute(
                     """
@@ -1122,10 +1078,42 @@ def run_backfill(
                         r_id = r[1] or r[0]
                         p_val = normalize_project_name(r[2])
                     if r_id and p_val:
-                        if r_id == r_row_id and (r_id not in swarm_project_map or swarm_project_map.get(r_id) is None):
+                        if r_id == r_row_id and (
+                            r_id not in swarm_project_map
+                            or swarm_project_map.get(r_id) is None
+                        ):
                             swarm_project_map[r_id] = p_val
                         elif r_id not in swarm_project_map:
                             swarm_project_map[r_id] = p_val
+
+                db_lineages = conn.execute(
+                    """
+                    SELECT id, parent_id, root_id, depth, subagent_role, subagent_type, invoking_step_index
+                    FROM conversations
+                    WHERE parent_id IS NOT NULL OR subagent_role IS NOT NULL
+                    """
+                ).fetchall()
+                for el in db_lineages:
+                    try:
+                        e_id = el["id"]
+                        e_pid = el["parent_id"]
+                        e_role = el["subagent_role"]
+                        e_type = el["subagent_type"]
+                        e_step = el["invoking_step_index"]
+                    except (IndexError, TypeError):
+                        e_id = el[0]
+                        e_pid = el[1]
+                        e_role = el[4]
+                        e_type = el[5]
+                        e_step = el[6]
+                    if e_pid and e_id not in parent_map:
+                        parent_map[e_id] = e_pid
+                    if e_role and e_id not in subagent_meta:
+                        subagent_meta[e_id] = {
+                            "role": e_role,
+                            "type": e_type,
+                            "step_index": e_step,
+                        }
             except Exception:
                 pass
 
@@ -1151,9 +1139,19 @@ def run_backfill(
                 conv["depth"] = depth
 
                 meta = subagent_meta.get(cid, {})
-                conv["subagent_role"] = meta.get("role")
-                conv["subagent_type"] = meta.get("type")
-                conv["invoking_step_index"] = meta.get("step_index")
+                conv["subagent_role"] = meta.get("role") or conv.get("subagent_role")
+                conv["subagent_type"] = meta.get("type") or conv.get("subagent_type")
+                conv["invoking_step_index"] = meta.get("step_index") or conv.get(
+                    "invoking_step_index"
+                )
+
+                if (
+                    parent_id is not None
+                    or depth > 0
+                    or conv.get("subagent_role") is not None
+                ):
+                    conv["active_pairing_seconds"] = 0.0
+                    data["active_pairing_seconds"] = 0.0
 
                 # Inherit project from swarm or ancestors if missing
                 if not conv.get("project"):
@@ -1371,6 +1369,20 @@ def run_backfill(
         # Backfill projects for historical DB conversations and propagate swarm lineages
         try:
             backfill_db_projects(conn)
+            conn.commit()
+        except Exception:
+            pass
+
+        # Ensure all subagent records have active_pairing_seconds zeroed
+        try:
+            conn.execute(
+                """
+                UPDATE conversations
+                SET active_pairing_seconds = 0.0
+                WHERE (parent_id IS NOT NULL OR depth > 0 OR subagent_role IS NOT NULL)
+                  AND active_pairing_seconds != 0.0
+                """
+            )
             conn.commit()
         except Exception:
             pass

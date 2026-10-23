@@ -690,7 +690,7 @@
       
       const cardEl = document.getElementById('cardActiveTime');
       if (cardEl) {
-        cardEl.title = `Pure Agent Execution Time: ${formatDuration(agentWork)} (active LLM reasoning, code generation, tool runs).\\nActive Pairing Time: ${formatDuration(pairingWork)} (continuous interactions <= 5m gaps).\\nTotal Wall-Clock Span: ${formatDuration(wallSpan)} (across all open sessions).`;
+        cardEl.title = `Agent Execution Time: ${formatDuration(agentWork)} (pure active LLM reasoning & tool runs across root + fleet).\nInter-Turn Human Pairing Time: ${formatDuration(pairingWork)} (reading/thinking/writing, capped at 15m AFK).\nTotal Wall-Clock Span: ${formatDuration(wallSpan)} (across all open sessions).`;
       }
       
       document.getElementById('kpiCost').textContent = '$' + (data.total_billed_cost || 0).toLocaleString(undefined, {minimumFractionDigits: 2, maximumFractionDigits: 2});
@@ -747,18 +747,25 @@
       const elForceMultiplier = document.getElementById('kpiForceMultiplier');
       if (elForceMultiplier) elForceMultiplier.textContent = `${data.force_multiplier || 1}x`;
 
-      const activeCollabWork = pairingWork > 0 ? pairingWork : agentWork;
-      const pairingHours = activeCollabWork / 3600;
       const savedSec = data.saved_seconds != null ? data.saved_seconds : ((data.saved_hours || 0) * 3600);
       const savedHours = data.saved_hours != null ? data.saved_hours : Math.round(savedSec / 3600);
-      const effectiveHours = (activeCollabWork + savedSec) / 3600;
+      const effectiveSec = pairingWork > 0
+        ? (pairingWork + agentWork + savedSec)
+        : (agentWork > 0 ? (agentWork + savedSec) : 0);
+      const effectiveHours = data.effective_output_hours != null
+        ? data.effective_output_hours
+        : (effectiveSec / 3600);
+      const denomWork = pairingWork > 0 ? pairingWork : agentWork;
+      const denomHours = denomWork / 3600;
 
       const elForceMultiplierSub = document.getElementById('kpiForceMultiplierSub');
       if (elForceMultiplierSub) {
-        if (effectiveHours > 0 && pairingWork > 0) {
-          elForceMultiplierSub.textContent = `~${effectiveHours.toFixed(1)}h output / ${formatDuration(pairingWork)}`;
-        } else if (effectiveHours > 0 && agentWork > 0) {
-          elForceMultiplierSub.textContent = `~${effectiveHours.toFixed(1)}h output / ${formatDuration(agentWork)}`;
+        if ((effectiveHours > 0 || effectiveSec > 0) && pairingWork > 0) {
+          const displayHours = effectiveHours > 0 ? effectiveHours : (effectiveSec / 3600);
+          elForceMultiplierSub.textContent = `~${displayHours.toFixed(1)}h output / ${formatDuration(pairingWork)}`;
+        } else if ((effectiveHours > 0 || effectiveSec > 0) && agentWork > 0) {
+          const displayHours = effectiveHours > 0 ? effectiveHours : (effectiveSec / 3600);
+          elForceMultiplierSub.textContent = `~${displayHours.toFixed(1)}h output / ${formatDuration(agentWork)}`;
         } else {
           elForceMultiplierSub.textContent = 'Effective output';
         }
@@ -766,13 +773,16 @@
 
       const cardForceMultiplier = document.getElementById('cardForceMultiplier');
       if (cardForceMultiplier) {
-        const collabDur = pairingWork > 0 ? formatDuration(pairingWork) : formatDuration(agentWork);
+        const agentDur = formatDuration(agentWork);
+        const pairingDur = formatDuration(pairingWork);
+        const speedUpRatio = denomWork > 0 ? Math.max(0, (effectiveSec - denomWork) / denomWork).toFixed(1) : '0.0';
         cardForceMultiplier.title = `Pairing Force Multiplier: ${data.force_multiplier || 1}x\n` +
-          `Formula: (Active Pairing Time + Dev Time Saved) / Active Pairing Time\n` +
+          `Formula: (Human Pairing + Agent Work + Dev Time Saved) / Human Pairing (capped at 15m AFK)\n` +
           `• Effective Engineering Output: ~${effectiveHours.toFixed(1)}h\n` +
-          `• Active Pairing Collaboration: ${collabDur}\n` +
-          `• Equivalent Dev Time Saved: ~${savedHours}h\n` +
-          `• Direct speed-up ratio: +${(savedHours / Math.max(0.1, pairingHours)).toFixed(1)}x speed-up vs manual`;
+          `• Human Pairing Time: ${pairingDur} (reading/thinking/writing)\n` +
+          `• Agent Work Time: ${agentDur} (fleet execution)\n` +
+          `• Equivalent Dev Time Saved: ~${savedHours}h (automated actions)\n` +
+          `• Direct speed-up ratio: +${speedUpRatio}x speed-up vs manual`;
       }
 
       // Context Hygiene Diagnostics
@@ -2300,9 +2310,12 @@
         
         const lastActiveStr = c.updated_at || c.created_at || '--';
         const startedStr = c.created_at || '--';
-        const activeSec = c.active_agent_seconds || c.active_pairing_seconds || c.duration_seconds || 0;
+        const agentSec = c.active_agent_seconds || 0;
+        const pairingSec = c.active_pairing_seconds || 0;
+        const fleetAgentSec = c.fleet_agent_seconds || agentSec;
         const wallSec = c.duration_seconds || 0;
-        const timeTitle = `Agent Work: ${formatDuration(c.active_agent_seconds || 0)} | Active Pairing: ${formatDuration(c.active_pairing_seconds || 0)} | Total Span: ${formatDuration(wallSec)}`;
+        const hasFleetDiff = fleetAgentSec > agentSec;
+        const timeTitle = `Agent Work: ${formatDuration(agentSec)}${hasFleetDiff ? ` (Fleet: ${formatDuration(fleetAgentSec)})` : ''} | Human Pairing: ${formatDuration(pairingSec)} | Total Span: ${formatDuration(wallSec)}`;
         const isExpanded = expandedConvs.has(c.id);
 
         let titleHtml = '';
@@ -2364,7 +2377,8 @@
           <td class="py-2.5 px-3 text-right">${costHtml}</td>
           <td class="py-2.5 px-3 text-right">${tokensHtml}</td>
           <td class="py-2.5 px-3 text-right text-gray-300 whitespace-nowrap" title="${timeTitle}">
-            <span class="font-medium text-emerald-400 text-xs">${formatDuration(activeSec)}</span>
+            <span class="font-medium text-emerald-400 text-xs">${formatDuration(agentSec || (pairingSec || wallSec))}</span>
+            ${hasFleetDiff ? `<span class="text-[10px] text-pink-300 font-mono font-medium block">Fleet: ${formatDuration(fleetAgentSec)}</span>` : ''}
             <span class="text-[10px] text-gray-500 block font-mono">(${formatDuration(wallSec)})</span>
           </td>
           <td class="py-2.5 px-3 text-center">
@@ -2378,9 +2392,13 @@
           for (const sub of c.subagents) {
             const childTr = document.createElement('tr');
             childTr.className = 'bg-dark-900/40 hover:bg-dark-800/40 transition border-l-2 border-pink-500/50';
-            const childActiveSec = sub.active_agent_seconds || sub.duration_seconds || 0;
+            const childAgentSec = sub.active_agent_seconds || 0;
+            const childPairingSec = sub.active_pairing_seconds || 0;
+            const childFleetSec = sub.fleet_agent_seconds || childAgentSec;
+            const hasChildFleetDiff = childFleetSec > childAgentSec;
+            const childActiveSec = childAgentSec || sub.duration_seconds || 0;
             const childWallSec = sub.duration_seconds || 0;
-            const childTimeTitle = `Agent Work: ${formatDuration(sub.active_agent_seconds || 0)} | Total Span: ${formatDuration(childWallSec)}`;
+            const childTimeTitle = `Agent Work: ${formatDuration(childAgentSec)}${hasChildFleetDiff ? ` (Fleet: ${formatDuration(childFleetSec)})` : ''} | Human Pairing: ${formatDuration(childPairingSec)} | Total Span: ${formatDuration(childWallSec)}`;
 
             let subCompactionBadge = '';
             if (sub.compaction_count > 0) {
@@ -2411,6 +2429,7 @@
               <td class="py-2 px-3 text-right font-mono font-medium text-indigo-400/80 text-xs">${formatTokens(sub.tokens || sub.total_tokens)}</td>
               <td class="py-2 px-3 text-right text-gray-400 whitespace-nowrap text-xs" title="${childTimeTitle}">
                 <span class="text-emerald-400/80">${formatDuration(childActiveSec)}</span>
+                ${hasChildFleetDiff ? `<span class="text-[10px] text-pink-300 font-mono font-medium block">Fleet: ${formatDuration(childFleetSec)}</span>` : ''}
               </td>
               <td class="py-2 px-3 text-center">
                 ${(typeof IS_STATIC_EXPORT !== "undefined" && IS_STATIC_EXPORT) ? "" : `<button onclick="inspectSession('${sub.id}')" class="px-2 py-0.5 rounded bg-pink-600/70 hover:bg-pink-600 text-[10px] font-medium text-white transition">Inspect</button>`}
@@ -2440,11 +2459,23 @@
         const modelLabel = distinctModels.length > 1 ? distinctModels.join(' ➔ ') : (conv.model_name || 'Gemini');
         document.getElementById('modalModel').innerHTML = formatModelBadgeHtml(modelLabel);
         
-        const activeSec = conv.active_agent_seconds || conv.active_pairing_seconds || conv.duration_seconds || 0;
-        document.getElementById('modalDuration').textContent = formatDuration(activeSec);
+        const convAgentSec = conv.active_agent_seconds || 0;
+        const convPairingSec = conv.active_pairing_seconds || 0;
+        const fleetSummaryAgent = (data.fleet_summary && data.fleet_summary.total_agent_seconds != null) ? data.fleet_summary.total_agent_seconds : convAgentSec;
+        const hasFleetAgent = fleetSummaryAgent > convAgentSec;
+
+        const durationEl = document.getElementById('modalDuration');
+        if (durationEl) {
+          if (hasFleetAgent) {
+            durationEl.innerHTML = `${formatDuration(convAgentSec)} <span class="text-xs text-pink-300 font-normal">/ Fleet: ${formatDuration(fleetSummaryAgent)}</span>`;
+          } else {
+            durationEl.textContent = formatDuration(convAgentSec || conv.duration_seconds || 0);
+          }
+          durationEl.title = `Agent Work: ${formatDuration(convAgentSec)}${hasFleetAgent ? ` (Fleet: ${formatDuration(fleetSummaryAgent)})` : ''} | Human Pairing: ${formatDuration(convPairingSec)} | Total Span: ${formatDuration(conv.duration_seconds || 0)}`;
+        }
         const modalWallSpanEl = document.getElementById('modalWallSpan');
         if (modalWallSpanEl) {
-          modalWallSpanEl.textContent = `Span: ${formatDuration(conv.duration_seconds || 0)}`;
+          modalWallSpanEl.textContent = `Span: ${formatDuration(conv.duration_seconds || 0)}${convPairingSec > 0 ? ` • Pairing: ${formatDuration(convPairingSec)}` : ''}`;
         }
 
         // Fix MIA Total Tokens & Total Steps

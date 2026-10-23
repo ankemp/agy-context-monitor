@@ -78,12 +78,14 @@ def test_db(tmp_path: Path):
             INSERT INTO conversations (
                 id, title, project, model_name, created_at, updated_at,
                 total_steps, total_tokens, billed_cost, billed_input_tokens, billed_output_tokens,
-                parent_id, root_id, depth, subagent_role, subagent_type
+                parent_id, root_id, depth, subagent_role, subagent_type,
+                active_agent_seconds, active_pairing_seconds
             ) VALUES (
                 'root-conv-1', 'Root Task Conversation', 'test-proj', 'Gemini 3.8 Flash (High)',
                 '2026-10-14T10:00:00Z', '2026-10-14T10:30:00Z',
                 10, 50000, 7.00, 40000, 10000,
-                NULL, 'root-conv-1', 0, NULL, NULL
+                NULL, 'root-conv-1', 0, NULL, NULL,
+                300.0, 120.0
             )
             """
         )
@@ -92,12 +94,14 @@ def test_db(tmp_path: Path):
             INSERT INTO conversations (
                 id, title, project, model_name, created_at, updated_at,
                 total_steps, total_tokens, billed_cost, billed_input_tokens, billed_output_tokens,
-                parent_id, root_id, depth, subagent_role, subagent_type
+                parent_id, root_id, depth, subagent_role, subagent_type,
+                active_agent_seconds, active_pairing_seconds
             ) VALUES (
                 'sub-conv-1', 'Subagent Worker 1', 'test-proj', 'Gemini 3.8 Flash (High)',
                 '2026-10-14T10:05:00Z', '2026-10-14T10:25:00Z',
                 5, 20000, 3.50, 15000, 5000,
-                'root-conv-1', 'root-conv-1', 1, 'code-reviewer', 'subagent'
+                'root-conv-1', 'root-conv-1', 1, 'code-reviewer', 'subagent',
+                150.0, 0.0
             )
             """
         )
@@ -177,6 +181,12 @@ def test_query_summary_data_quota_enrichment(test_db: Path):
     assert qs["3p-weekly"]["quota_remaining_pct"] == 95.0
     assert qs["3p-5h"]["quota_remaining_pct"] == 98.0
 
+    # Timing and force multiplier metrics
+    assert summary["total_pairing_work"] == 120.0
+    assert summary["total_agent_work"] == 450.0
+    assert summary["force_multiplier"] == 4.8
+    assert summary["effective_output_hours"] == 0.2
+
 
 def test_query_conversations_list_quota_enrichment(test_db: Path):
     """Verifies query_conversations_list includes session and fleet quota percentages."""
@@ -193,6 +203,9 @@ def test_query_conversations_list_quota_enrichment(test_db: Path):
     # Root session billed_cost = 7.0, capacity = 700.0 -> weekly_quota_pct = 1.0%
     assert root["weekly_quota_pct"] == 1.0
     assert root["five_hour_quota_pct"] == 2.8  # 7.0 / 250.0 * 100
+    assert root["active_agent_seconds"] == 300.0
+    assert root["fleet_agent_seconds"] == 450.0
+    assert root["active_pairing_seconds"] == 120.0
 
     # Fleet includes subagent (7.0 + 3.5 = 10.5) -> fleet_weekly_quota_pct = 1.5%
     assert root["fleet_cost"] == 10.50
@@ -204,6 +217,68 @@ def test_query_conversations_list_quota_enrichment(test_db: Path):
     sub = root["subagents"][0]
     assert sub["id"] == "sub-conv-1"
     assert sub["weekly_quota_pct"] == 0.5  # 3.5 / 700.0 * 100
+    assert sub["active_agent_seconds"] == 150.0
+    assert sub["fleet_agent_seconds"] == 150.0
+    assert sub["active_pairing_seconds"] == 0.0
+
+
+def test_query_conversations_list_nested_subagent_fleet_timing(tmp_path: Path):
+    """Verifies that multi-tier subagents (depth > 1) roll up descendant agent seconds."""
+    db_file = tmp_path / "test_nested_fleet.db"
+    init_db(db_file)
+    with get_db_connection(db_file) as conn:
+        # Root Coordinator (depth 0)
+        conn.execute(
+            """
+            INSERT INTO conversations (
+                id, title, project, parent_id, root_id, depth,
+                active_agent_seconds, active_pairing_seconds, duration_seconds
+            ) VALUES ('root-n1', 'Root Coordinator', 'test-p', NULL, 'root-n1', 0, 200.0, 100.0, 500.0)
+            """
+        )
+        # Subagent 1 (depth 1, child of root-n1)
+        conn.execute(
+            """
+            INSERT INTO conversations (
+                id, title, project, parent_id, root_id, depth,
+                active_agent_seconds, active_pairing_seconds, duration_seconds
+            ) VALUES ('sub-n1', 'Subagent Worker', 'test-p', 'root-n1', 'root-n1', 1, 150.0, 0.0, 300.0)
+            """
+        )
+        # Subagent 2 (depth 2, child of sub-n1)
+        conn.execute(
+            """
+            INSERT INTO conversations (
+                id, title, project, parent_id, root_id, depth,
+                active_agent_seconds, active_pairing_seconds, duration_seconds
+            ) VALUES ('sub-n2', 'Nested Subagent Worker', 'test-p', 'sub-n1', 'root-n1', 2, 50.0, 0.0, 100.0)
+            """
+        )
+        conn.commit()
+
+        convs = api_routes.query_conversations_list(conn, view_mode="hierarchy")
+        assert len(convs) == 1
+        root = convs[0]
+        assert root["id"] == "root-n1"
+        assert root["active_agent_seconds"] == 200.0
+        # Root fleet: 200 + 150 + 50 = 400.0
+        assert root["fleet_agent_seconds"] == 400.0
+        assert root["active_pairing_seconds"] == 100.0
+
+        subagents = root["subagents"]
+        assert len(subagents) == 2
+        s1 = next(s for s in subagents if s["id"] == "sub-n1")
+        s2 = next(s for s in subagents if s["id"] == "sub-n2")
+
+        # Subagent 1 has depth 1 and child sub-n2: fleet = 150 + 50 = 200.0
+        assert s1["active_agent_seconds"] == 150.0
+        assert s1["fleet_agent_seconds"] == 200.0
+        assert s1["active_pairing_seconds"] == 0.0
+
+        # Subagent 2 has depth 2 and no children: fleet = 50.0
+        assert s2["active_agent_seconds"] == 50.0
+        assert s2["fleet_agent_seconds"] == 50.0
+        assert s2["active_pairing_seconds"] == 0.0
 
 
 def test_query_session_details_quota_enrichment(test_db: Path):
@@ -235,6 +310,8 @@ def test_query_session_details_quota_enrichment(test_db: Path):
     fleet = details["fleet_summary"]
     assert fleet["total_cost"] == 10.50
     assert fleet["weekly_quota_pct"] == 1.5
+    assert fleet["total_agent_seconds"] == 450.0
+    assert fleet["total_pairing_seconds"] == 120.0
 
 
 def test_server_http_and_sse_endpoints(test_db: Path):
@@ -413,7 +490,7 @@ def test_dashboard_frontend_invariants():
     assert "bg-cyan-500/10 text-cyan-400" in html_content
     assert 'data-lucide="rocket"' in html_content
     assert (
-        "Pairing Force Multiplier: (Active Pairing Time + Dev Time Saved) / Active Pairing Time"
+        "Pairing Force Multiplier: (Human Pairing + Agent Work + Dev Time Saved) / Human Pairing (capped at 15m AFK)"
         in html_content
     )
     assert "cardForceMultiplier" in js_content
@@ -421,14 +498,28 @@ def test_dashboard_frontend_invariants():
     assert "kpiForceMultiplierSub" in js_content
     assert "force_multiplier" in js_content
     assert (
-        "(Active Pairing Time + Dev Time Saved) / Active Pairing Time"
+        "(Human Pairing + Agent Work + Dev Time Saved) / Human Pairing (capped at 15m AFK)"
         in js_content
     )
     assert "• Effective Engineering Output: ~" in js_content
-    assert "• Active Pairing Collaboration:" in js_content
+    assert "• Human Pairing Time:" in js_content
+    assert "• Agent Work Time:" in js_content
     assert "• Equivalent Dev Time Saved: ~" in js_content
     assert "• Direct speed-up ratio: +" in js_content
     assert "speed-up vs manual" in js_content
+
+    # Agent Work Time and Pairing Time KPI card invariants
+    assert "cardActiveTime" in html_content
+    assert "Agent Work Time" in html_content
+    assert "kpiPairingSub" in html_content
+    assert (
+        "Agent Execution Time: Pure active LLM reasoning & tool runs across root + fleet. Inter-Turn Human Pairing Time: Reading/thinking/writing time (capped at 15m AFK). Total Wall-Clock Span: Open session lifecycle."
+        in html_content
+    )
+    assert "cardActiveTime" in js_content
+    assert "kpiPairingSub" in js_content
+    assert "Agent Execution Time:" in js_content
+    assert "Inter-Turn Human Pairing Time:" in js_content
 
 
 def test_standalone_html_export_quota(test_db: Path, tmp_path: Path):
@@ -530,7 +621,9 @@ def test_standalone_html_export_cycle_offline_execution(test_db: Path, tmp_path:
     embedded_match = re.search(
         r"<script>(\s*const IS_STATIC_EXPORT = true;[\s\S]*?)</script>", html
     )
-    assert embedded_match is not None, "Embedded static JS block was not found in exported HTML"
+    assert embedded_match is not None, (
+        "Embedded static JS block was not found in exported HTML"
+    )
     embedded_js = embedded_match.group(1)
 
     node_script = f"""
@@ -2436,11 +2529,13 @@ def test_query_timeline_data_uses_created_at_index(tmp_path: Path):
             assert len(unbounded_rollup_queries) == 1
             u_sql, u_params = unbounded_rollup_queries[0]
             assert "hour_key >= ?" not in u_sql
-            plan_unbounded = cur.execute(f"EXPLAIN QUERY PLAN {u_sql}", u_params).fetchall()
+            plan_unbounded = cur.execute(
+                f"EXPLAIN QUERY PLAN {u_sql}", u_params
+            ).fetchall()
             unbounded_details = [r["detail"] for r in plan_unbounded]
-            assert any(
-                "SCAN hourly_step_rollups" in d for d in unbounded_details
-            ), f"Expected full scan in unbounded query plan: {unbounded_details}"
+            assert any("SCAN hourly_step_rollups" in d for d in unbounded_details), (
+                f"Expected full scan in unbounded query plan: {unbounded_details}"
+            )
         else:
             unbounded_steps_queries = [
                 (sql, params) for sql, params in executed_queries if "FROM steps" in sql
@@ -2449,7 +2544,9 @@ def test_query_timeline_data_uses_created_at_index(tmp_path: Path):
             u_sql, u_params = unbounded_steps_queries[0]
             assert "created_at >= ?" not in u_sql
 
-            plan_unbounded = cur.execute(f"EXPLAIN QUERY PLAN {u_sql}", u_params).fetchall()
+            plan_unbounded = cur.execute(
+                f"EXPLAIN QUERY PLAN {u_sql}", u_params
+            ).fetchall()
             unbounded_details = [r["detail"] for r in plan_unbounded]
             assert any("SCAN steps" in d for d in unbounded_details), (
                 f"Expected full table scan in unbounded query plan: {unbounded_details}"
@@ -2608,11 +2705,81 @@ def test_query_timeline_data_cycle_mode_with_quota_reset(tmp_path: Path):
         )
 
         steps_to_insert = [
-            ("c1", 1, "exec", "cat", "act", "t", "m", 100, "", ts_before, 1.50, 800, 200),
-            ("c1", 2, "exec", "cat", "act", "t", "m", 100, "", ts_after, 3.00, 2000, 500),
-            ("c1", 3, "exec", "cat", "act", "t", "m", 100, "", ts_today, 5.00, 4000, 1000),
-            ("c1", 4, "exec", "cat", "act", "t", "m", 100, "", ts_past, 2.00, 1000, 500),
-            ("c1", 5, "exec", "cat", "act", "t", "m", 100, "", ts_post_reset, 4.00, 3000, 1000),
+            (
+                "c1",
+                1,
+                "exec",
+                "cat",
+                "act",
+                "t",
+                "m",
+                100,
+                "",
+                ts_before,
+                1.50,
+                800,
+                200,
+            ),
+            (
+                "c1",
+                2,
+                "exec",
+                "cat",
+                "act",
+                "t",
+                "m",
+                100,
+                "",
+                ts_after,
+                3.00,
+                2000,
+                500,
+            ),
+            (
+                "c1",
+                3,
+                "exec",
+                "cat",
+                "act",
+                "t",
+                "m",
+                100,
+                "",
+                ts_today,
+                5.00,
+                4000,
+                1000,
+            ),
+            (
+                "c1",
+                4,
+                "exec",
+                "cat",
+                "act",
+                "t",
+                "m",
+                100,
+                "",
+                ts_past,
+                2.00,
+                1000,
+                500,
+            ),
+            (
+                "c1",
+                5,
+                "exec",
+                "cat",
+                "act",
+                "t",
+                "m",
+                100,
+                "",
+                ts_post_reset,
+                4.00,
+                3000,
+                1000,
+            ),
         ]
         conn.executemany(
             """
@@ -2758,7 +2925,7 @@ def test_query_timeline_data_cycle_project_filtering(tmp_path: Path):
             """,
             [
                 ("c_alpha", 1, now_iso, 2.00, 3000, 1000),  # 4000 tokens
-                ("c_beta", 1, now_iso, 3.50, 5000, 2000),   # 7000 tokens
+                ("c_beta", 1, now_iso, 3.50, 5000, 2000),  # 7000 tokens
             ],
         )
         conn.commit()
@@ -2855,7 +3022,9 @@ def test_query_timeline_data_cycle_edge_cases(tmp_path: Path):
         # c) Step 10 seconds before start_dt_utc -> must be EXCLUDED
         ts_exact_subsecond = start_dt_utc.strftime("%Y-%m-%dT%H:%M:%S.500Z")
         ts_space = (start_dt_utc + timedelta(minutes=5)).strftime("%Y-%m-%d %H:%M:%S")
-        ts_before = (start_dt_utc - timedelta(seconds=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        ts_before = (start_dt_utc - timedelta(seconds=10)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
 
         conn.executemany(
             """
@@ -3234,12 +3403,21 @@ def test_frontend_swarm_view_and_campaign_cost_elements():
     assert "let currentSwarmLayoutMode = 'list';" in js_content
     assert "window.setSwarmLayoutMode = setSwarmLayoutMode;" in js_content
     assert "function setSwarmLayoutMode(mode)" in js_content
-    assert "const padClass = depth === 1 ? 'pl-8' : depth === 2 ? 'pl-12' : 'pl-16';" in js_content
+    assert (
+        "const padClass = depth === 1 ? 'pl-8' : depth === 2 ? 'pl-12' : 'pl-16';"
+        in js_content
+    )
     assert "+${s.subagent_count}" in js_content
     assert "Local: $" in js_content
     assert "Fleet: $" in js_content
-    assert "${formatTokens(tokVal)} / ${formatTokens(data.fleet_summary.total_tokens)} fleet" in js_content
-    assert "${stepVal.toLocaleString()} / ${data.fleet_summary.total_steps.toLocaleString()} fleet" in js_content
+    assert (
+        "${formatTokens(tokVal)} / ${formatTokens(data.fleet_summary.total_tokens)} fleet"
+        in js_content
+    )
+    assert (
+        "${stepVal.toLocaleString()} / ${data.fleet_summary.total_steps.toLocaleString()} fleet"
+        in js_content
+    )
     assert "fleet_nodes" in js_content
     assert "context_pct" in js_content
     assert "weekly_quota_pct" in js_content
@@ -3413,7 +3591,9 @@ def test_query_conversations_list_sorting_and_updated_at(tmp_path: Path):
 
         convs = api_routes.query_conversations_list(conn, view_mode="hierarchy")
         assert len(convs) == 2
-        assert convs[0]["id"] == "c_older_active", f"Expected active conversation at index 0, got {convs[0]['id']}"
+        assert convs[0]["id"] == "c_older_active", (
+            f"Expected active conversation at index 0, got {convs[0]['id']}"
+        )
         assert convs[1]["id"] == "c_newer_idle"
         assert "updated_at" in convs[0]
         assert "created_at" in convs[0]
@@ -3426,8 +3606,9 @@ def test_query_summary_force_multiplier(tmp_path: Path):
     with get_db_connection(db_file) as conn:
         # Case 1: Standard calculation
         # active_pairing_seconds = 1800 (0.5h)
+        # active_agent_seconds = 900.0 (0.25h)
         # tools: 20 view_file (20*30=600s), 40 run_command (40*45=1800s), 10 write_to_file (10*120=1200s) -> saved_seconds = 3600 (1.0h)
-        # force_multiplier = round(1.0 + (3600 / 1800), 1) = 3.0
+        # force_multiplier = (1800 + 900 + 3600) / 1800 = 6300 / 1800 = 3.5
         conn.execute(
             """
             INSERT INTO conversations (id, title, project, active_pairing_seconds, active_agent_seconds, total_steps, total_tokens)
@@ -3455,18 +3636,21 @@ def test_query_summary_force_multiplier(tmp_path: Path):
         summary = api_routes.query_summary_data(conn)
         assert summary["saved_seconds"] == 3600
         assert summary["saved_hours"] == 1
-        assert summary["force_multiplier"] == 3.0
+        assert summary["force_multiplier"] == 3.5
+        assert summary["effective_output_hours"] == 1.8
 
         # Query summary for project-a
         summary_a = api_routes.query_summary_data(conn, project="project-a")
         assert summary_a["saved_seconds"] == 3600
-        assert summary_a["force_multiplier"] == 3.0
+        assert summary_a["force_multiplier"] == 3.5
+        assert summary_a["effective_output_hours"] == 1.8
 
         # Query summary for an empty project
         summary_empty = api_routes.query_summary_data(conn, project="empty-project")
         assert summary_empty["saved_seconds"] == 0
         assert summary_empty["saved_hours"] == 0
         assert summary_empty["force_multiplier"] == 1.0
+        assert summary_empty["effective_output_hours"] == 0.0
 
         # Case 2: Zero pairing and zero agent seconds guard
         conn.execute(
@@ -3484,6 +3668,7 @@ def test_query_summary_force_multiplier(tmp_path: Path):
         assert summary_zero["saved_seconds"] == 120
         # baseline is 0, so fallback must be 1.0 (no division by zero)
         assert summary_zero["force_multiplier"] == 1.0
+        assert summary_zero["effective_output_hours"] == 0.0
 
         # Case 3: Fallback when active_pairing_seconds == 0 but active_agent_seconds > 0
         # active_agent_seconds = 1800, saved_seconds = 3600 (30 edits * 120)
@@ -3502,8 +3687,9 @@ def test_query_summary_force_multiplier(tmp_path: Path):
 
         summary_agent = api_routes.query_summary_data(conn, project="project-agent")
         assert summary_agent["saved_seconds"] == 3600
-        # 1.0 + (3600 / 1800) = 3.0
+        # (1800 + 3600) / 1800 = 3.0
         assert summary_agent["force_multiplier"] == 3.0
+        assert summary_agent["effective_output_hours"] == 1.5
 
         # Case 4: Unassigned project scoping
         conn.execute(
@@ -3522,8 +3708,9 @@ def test_query_summary_force_multiplier(tmp_path: Path):
         summary_unassigned = api_routes.query_summary_data(conn, project="(unassigned)")
         # 10 run_command * 45s = 450s
         assert summary_unassigned["saved_seconds"] == 450
-        # 1.0 + (450 / 1200) = 1.375 -> round to 1.4
-        assert summary_unassigned["force_multiplier"] == 1.4
+        # (1200 + 600 + 450) / 1200 = 2250 / 1200 = 1.875 -> round to 1.9
+        assert summary_unassigned["force_multiplier"] == 1.9
+        assert summary_unassigned["effective_output_hours"] == 0.6
 
         # Case 5: Negative duration values sanitized to 0
         conn.execute(
@@ -3537,6 +3724,7 @@ def test_query_summary_force_multiplier(tmp_path: Path):
         assert summary_neg["total_pairing_work"] == 0
         assert summary_neg["total_agent_work"] == 0
         assert summary_neg["force_multiplier"] == 1.0
+        assert summary_neg["effective_output_hours"] == 0.0
 
 
 def test_dashboard_force_multiplier_frontend_rendering():
@@ -3550,12 +3738,19 @@ def test_dashboard_force_multiplier_frontend_rendering():
     const code = fs.readFileSync('src/context_monitor/dashboard/static/script.js', 'utf8');
 
     function createMockElement() {
+      let _html = '';
       return {
         className: '',
         textContent: '',
         title: '',
         style: {},
         children: [],
+        appendChild(child) { this.children.push(child); },
+        get innerHTML() { return _html; },
+        set innerHTML(val) {
+          _html = val;
+          if (val === '') this.children = [];
+        },
         classList: { add() {}, remove() {} }
       };
     }
@@ -3595,7 +3790,17 @@ def test_dashboard_force_multiplier_frontend_rendering():
       diagResilienceBar: createMockElement(),
       diagFailedCalls: createMockElement(),
       cardDiagResilience: createMockElement(),
+      convSearch: createMockElement(),
+      convTableBody: createMockElement(),
+      modalDuration: createMockElement(),
+      modalWallSpan: createMockElement(),
+      modalTitle: createMockElement(),
+      modalSub: createMockElement(),
+      modalModel: createMockElement(),
+      modalTokens: createMockElement(),
+      modalSteps: createMockElement(),
     };
+    mockElements.convSearch.value = '';
 
     const mockDocument = {
       getElementById: (id) => mockElements[id] || createMockElement(),
@@ -3604,15 +3809,31 @@ def test_dashboard_force_multiplier_frontend_rendering():
       addEventListener: () => {}
     };
 
+    const mockFetch = async () => ({
+      json: async () => ({
+        conversation: { id: 'root-c', title: 'Root Session', active_agent_seconds: 300, active_pairing_seconds: 120, duration_seconds: 600 },
+        steps: [{ model_name: 'Gemini 3.8 Flash' }],
+        fleet_summary: { total_agent_seconds: 450, total_pairing_seconds: 120 }
+      })
+    });
+    global.fetch = mockFetch;
+
     const mockWindow = {
       location: { search: '' },
       addEventListener: () => {},
-      history: { pushState: () => {} }
+      history: { pushState: () => {} },
+      fetch: mockFetch
     };
 
     const fn = new Function('window', 'document', 'Chart', 'lucide', `
       ${code}
-      return { renderKPIs };
+      return {
+        renderKPIs,
+        renderConversations,
+        inspectSession,
+        setExpandedConvs: (s) => { expandedConvs = s; },
+        setConvViewMode: (m) => { currentConvViewMode = m; }
+      };
     `);
 
     const api = fn(
@@ -3622,61 +3843,137 @@ def test_dashboard_force_multiplier_frontend_rendering():
       { createIcons: () => {} }
     );
 
-    // Case 1: Standard case
-    api.renderKPIs({
-      force_multiplier: 3.5,
-      total_pairing_work: 3600,
-      total_agent_work: 1800,
-      saved_seconds: 9000,
-      saved_hours: 3
+    (async () => {
+      // Case 1: Standard case
+      api.renderKPIs({
+        force_multiplier: 3.5,
+        total_pairing_work: 3600,
+        total_agent_work: 1800,
+        saved_seconds: 9000,
+        saved_hours: 3
+      });
+      if (mockElements.kpiForceMultiplier.textContent !== '3.5x') {
+        throw new Error(`Expected 3.5x, got ${mockElements.kpiForceMultiplier.textContent}`);
+      }
+      if (mockElements.kpiForceMultiplierSub.textContent !== '~4.0h output / 1h 0m') {
+        throw new Error(`Expected ~4.0h output / 1h 0m, got ${mockElements.kpiForceMultiplierSub.textContent}`);
+      }
+      if (!mockElements.cardForceMultiplier.title.includes('Pairing Force Multiplier: 3.5x')) {
+        throw new Error(`Missing multiplier in title: ${mockElements.cardForceMultiplier.title}`);
+      }
+      if (!mockElements.cardForceMultiplier.title.includes('Formula: (Human Pairing + Agent Work + Dev Time Saved) / Human Pairing')) {
+        throw new Error(`Missing formula in title: ${mockElements.cardForceMultiplier.title}`);
+      }
+      if (!mockElements.cardForceMultiplier.title.includes('+3.0x speed-up vs manual')) {
+        throw new Error(`Missing speed-up ratio in title: ${mockElements.cardForceMultiplier.title}`);
+      }
+      if (!mockElements.cardActiveTime.title.includes('Agent Execution Time: 30m')) {
+        throw new Error(`Missing agent execution time in cardActiveTime: ${mockElements.cardActiveTime.title}`);
+      }
+      if (!mockElements.cardActiveTime.title.includes('Inter-Turn Human Pairing Time: 1h 0m')) {
+        throw new Error(`Missing pairing time in cardActiveTime: ${mockElements.cardActiveTime.title}`);
+      }
+
+      // Case 2: Empty/zero case
+      api.renderKPIs({});
+      if (mockElements.kpiForceMultiplier.textContent !== '1x') {
+        throw new Error(`Expected 1x for empty data, got ${mockElements.kpiForceMultiplier.textContent}`);
+      }
+      if (mockElements.kpiForceMultiplierSub.textContent !== 'Effective output') {
+        throw new Error(`Expected fallback to 'Effective output', got ${mockElements.kpiForceMultiplierSub.textContent}`);
+      }
+      if (!mockElements.cardForceMultiplier.title.includes('+0.0x speed-up vs manual')) {
+        throw new Error(`Expected +0.0x speed-up for zero work, got ${mockElements.cardForceMultiplier.title}`);
+      }
+
+      // Case 3: Agent work fallback when pairing is 0
+      api.renderKPIs({
+        force_multiplier: 2.0,
+        total_pairing_work: 0,
+        total_agent_work: 3600,
+        saved_seconds: 3600,
+        saved_hours: 1
+      });
+      if (mockElements.kpiForceMultiplier.textContent !== '2x') {
+        throw new Error(`Expected 2x for agent fallback, got ${mockElements.kpiForceMultiplier.textContent}`);
+      }
+      if (mockElements.kpiForceMultiplierSub.textContent !== '~2.0h output / 1h 0m') {
+        throw new Error(`Expected agent fallback in subtext, got ${mockElements.kpiForceMultiplierSub.textContent}`);
+      }
+      if (!mockElements.cardForceMultiplier.title.includes('Agent Work Time: 1h 0m')) {
+        throw new Error(`Expected agent work duration in title, got ${mockElements.cardForceMultiplier.title}`);
+      }
+
+      // Case 4: Short session where effective_output_hours rounds to 0.0 (speed-up ratio must not be negative)
+      api.renderKPIs({
+        force_multiplier: 1.0,
+        total_pairing_work: 120,
+        total_agent_work: 0,
+        saved_seconds: 0,
+        saved_hours: 0,
+        effective_output_hours: 0.0
+      });
+      if (!mockElements.cardForceMultiplier.title.includes('+0.0x speed-up vs manual')) {
+        throw new Error(`Expected non-negative +0.0x speed-up ratio, got: ${mockElements.cardForceMultiplier.title}`);
+      }
+      if (!mockElements.kpiForceMultiplierSub.textContent.includes('~0.0h output / 2m')) {
+        throw new Error(`Expected subtext with pairing duration for short session, got: ${mockElements.kpiForceMultiplierSub.textContent}`);
+      }
+
+      // Case 5: Conversation table rendering with Fleet duration badge
+      api.setConvViewMode('hierarchy');
+      api.setExpandedConvs(new Set(['root-1']));
+      api.renderConversations([
+        {
+          id: 'root-1',
+          title: 'Root Session',
+          project: 'test',
+          active_agent_seconds: 300,
+          fleet_agent_seconds: 450,
+          active_pairing_seconds: 120,
+          duration_seconds: 600,
+          subagent_count: 1,
+          subagents: [
+            {
+              id: 'sub-1',
+              title: 'Child Subagent',
+              subagent_role: 'Worker',
+              depth: 1,
+              active_agent_seconds: 100,
+              fleet_agent_seconds: 150,
+              active_pairing_seconds: 0,
+              duration_seconds: 200,
+              total_steps: 5
+            }
+          ]
+        }
+      ]);
+      const rootRowHtml = mockElements.convTableBody.children[0].innerHTML;
+      if (!rootRowHtml.includes('Fleet: 7m')) {
+        throw new Error(`Expected Fleet: 7m in root row HTML: ${rootRowHtml}`);
+      }
+      const childRowHtml = mockElements.convTableBody.children[1].innerHTML;
+      if (!childRowHtml.includes('Fleet: 2m')) {
+        throw new Error(`Expected Fleet: 2m in child row HTML: ${childRowHtml}`);
+      }
+
+      // Case 6: Session modal inspection with fleet agent duration
+      await api.inspectSession('root-c');
+      if (!mockElements.modalDuration.innerHTML.includes('/ Fleet: 7m')) {
+        throw new Error(`Expected / Fleet: 7m in modal duration: ${mockElements.modalDuration.innerHTML}`);
+      }
+      if (!mockElements.modalDuration.title.includes('Fleet: 7m')) {
+        throw new Error(`Expected Fleet: 7m in modal duration title: ${mockElements.modalDuration.title}`);
+      }
+      if (!mockElements.modalWallSpan.textContent.includes('Pairing: 2m')) {
+        throw new Error(`Expected Pairing: 2m in modal wall span: ${mockElements.modalWallSpan.textContent}`);
+      }
+
+      console.log(JSON.stringify({ status: 'ok', cases: 6 }));
+    })().catch(err => {
+      console.error(err);
+      process.exit(1);
     });
-    if (mockElements.kpiForceMultiplier.textContent !== '3.5x') {
-      throw new Error(`Expected 3.5x, got ${mockElements.kpiForceMultiplier.textContent}`);
-    }
-    if (mockElements.kpiForceMultiplierSub.textContent !== '~3.5h output / 1h 0m') {
-      throw new Error(`Expected ~3.5h output / 1h 0m, got ${mockElements.kpiForceMultiplierSub.textContent}`);
-    }
-    if (!mockElements.cardForceMultiplier.title.includes('Pairing Force Multiplier: 3.5x')) {
-      throw new Error(`Missing multiplier in title: ${mockElements.cardForceMultiplier.title}`);
-    }
-    if (!mockElements.cardForceMultiplier.title.includes('Formula: (Active Pairing Time + Dev Time Saved) / Active Pairing Time')) {
-      throw new Error(`Missing formula in title: ${mockElements.cardForceMultiplier.title}`);
-    }
-    if (!mockElements.cardForceMultiplier.title.includes('+3.0x speed-up vs manual')) {
-      throw new Error(`Missing speed-up ratio in title: ${mockElements.cardForceMultiplier.title}`);
-    }
-
-    // Case 2: Empty/zero case
-    api.renderKPIs({});
-    if (mockElements.kpiForceMultiplier.textContent !== '1x') {
-      throw new Error(`Expected 1x for empty data, got ${mockElements.kpiForceMultiplier.textContent}`);
-    }
-    if (mockElements.kpiForceMultiplierSub.textContent !== 'Effective output') {
-      throw new Error(`Expected fallback to 'Effective output', got ${mockElements.kpiForceMultiplierSub.textContent}`);
-    }
-    if (!mockElements.cardForceMultiplier.title.includes('+0.0x speed-up vs manual')) {
-      throw new Error(`Expected +0.0x speed-up for zero work, got ${mockElements.cardForceMultiplier.title}`);
-    }
-
-    // Case 3: Agent work fallback when pairing is 0
-    api.renderKPIs({
-      force_multiplier: 2.0,
-      total_pairing_work: 0,
-      total_agent_work: 3600,
-      saved_seconds: 3600,
-      saved_hours: 1
-    });
-    if (mockElements.kpiForceMultiplier.textContent !== '2x') {
-      throw new Error(`Expected 2x for agent fallback, got ${mockElements.kpiForceMultiplier.textContent}`);
-    }
-    if (mockElements.kpiForceMultiplierSub.textContent !== '~2.0h output / 1h 0m') {
-      throw new Error(`Expected agent fallback in subtext, got ${mockElements.kpiForceMultiplierSub.textContent}`);
-    }
-    if (!mockElements.cardForceMultiplier.title.includes('Active Pairing Collaboration: 1h 0m')) {
-      throw new Error(`Expected agent work duration in title, got ${mockElements.cardForceMultiplier.title}`);
-    }
-
-    console.log(JSON.stringify({ status: 'ok', cases: 3 }));
     """
 
     res = subprocess.run(
@@ -3685,4 +3982,4 @@ def test_dashboard_force_multiplier_frontend_rendering():
     assert res.returncode == 0, f"Node script failed: {res.stderr}"
     data = json.loads(res.stdout.strip().splitlines()[-1])
     assert data["status"] == "ok"
-    assert data["cases"] == 3
+    assert data["cases"] == 6

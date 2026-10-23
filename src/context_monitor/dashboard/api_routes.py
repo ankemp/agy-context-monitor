@@ -17,6 +17,7 @@ from context_monitor.quota import (
     get_hourly_activity_profile,
     sync_and_get_quota_state,
 )
+from context_monitor.timings import calculate_force_multiplier
 
 CHARS_PER_TOKEN = 3.8
 
@@ -37,7 +38,7 @@ def _clean_arg_str(val: Any) -> str:
                 pass
             inner = s[1:-1].strip()
             if not re.search(r'(?<!\\)"', inner):
-                s = inner.replace(r'\"', '"').strip()
+                s = inner.replace(r"\"", '"').strip()
                 continue
         if s.startswith("'") and s.endswith("'") and len(s) >= 2:
             inner = s[1:-1].strip()
@@ -413,15 +414,11 @@ def query_summary_data(conn, tz=None, project=None):
     saved_hours = round(saved_seconds / 3600)
     total_pairing_work = max(0, row["total_pairing_work"] or 0)
     total_agent_work = max(0, row["total_agent_work"] or 0)
-    baseline_work_sec = (
-        total_pairing_work if total_pairing_work > 0 else total_agent_work
+    fm, eff_sec, _ = calculate_force_multiplier(
+        total_pairing_work, total_agent_work, saved_seconds
     )
-    baseline_work_sec = max(0, baseline_work_sec)
-    force_multiplier = (
-        round(1.0 + (saved_seconds / baseline_work_sec), 1)
-        if baseline_work_sec > 0
-        else 1.0
-    )
+    force_multiplier = round(fm, 1)
+    effective_output_hours = round(eff_sec / 3600.0, 1)
 
     # Phase breakdown
     phase_rows = cur.execute(
@@ -567,8 +564,7 @@ def query_summary_data(conn, tz=None, project=None):
         params_conv,
     ).fetchall()
     categories = [
-        {"category": r["category"], "tokens": r["tokens"] or 0}
-        for r in category_rows
+        {"category": r["category"], "tokens": r["tokens"] or 0} for r in category_rows
     ]
     categories.sort(key=lambda x: x["tokens"], reverse=True)
     categories = categories[:10]
@@ -606,6 +602,7 @@ def query_summary_data(conn, tz=None, project=None):
         "saved_seconds": saved_seconds,
         "saved_hours": saved_hours,
         "force_multiplier": force_multiplier,
+        "effective_output_hours": effective_output_hours,
         "saved_reads": reads_cnt,
         "saved_cmds": cmds_cnt,
         "saved_edits": edits_cnt,
@@ -1003,15 +1000,23 @@ def query_timeline_data(conn, days=None, tz=None, project=None):
                         boundary_params.append(project)
 
                 start_hour_space = start_hour.replace("T", " ")
-                next_hour_utc = start_dt_utc_clean.replace(minute=0, second=0) + timedelta(hours=1)
+                next_hour_utc = start_dt_utc_clean.replace(
+                    minute=0, second=0
+                ) + timedelta(hours=1)
                 next_hour_space = next_hour_utc.strftime("%Y-%m-%d %H")
                 next_hour_t = next_hour_utc.strftime("%Y-%m-%dT%H")
 
-                boundary_where.append("((created_at >= ? AND created_at < ?) OR (created_at >= ? AND created_at < ?))")
-                boundary_params.extend([start_hour_space, next_hour_space, start_hour, next_hour_t])
+                boundary_where.append(
+                    "((created_at >= ? AND created_at < ?) OR (created_at >= ? AND created_at < ?))"
+                )
+                boundary_params.extend(
+                    [start_hour_space, next_hour_space, start_hour, next_hour_t]
+                )
                 boundary_where.append("replace(created_at, ' ', 'T') >= ?")
                 boundary_params.append(start_dt_utc_clean.strftime("%Y-%m-%dT%H:%M:%S"))
-                boundary_where.append("substr(replace(created_at, ' ', 'T'), 1, 13) = ?")
+                boundary_where.append(
+                    "substr(replace(created_at, ' ', 'T'), 1, 13) = ?"
+                )
                 boundary_params.append(start_hour)
 
                 b_clause = "WHERE " + " AND ".join(boundary_where)
@@ -1189,22 +1194,55 @@ def query_timeline_data(conn, days=None, tz=None, project=None):
 
             is_future = curr > today
             if is_future:
-                timeline.append(_make_timeline_item(d_str, label=label, is_start=is_start, is_reset=is_reset, is_future=True))
+                timeline.append(
+                    _make_timeline_item(
+                        d_str,
+                        label=label,
+                        is_start=is_start,
+                        is_reset=is_reset,
+                        is_future=True,
+                    )
+                )
             else:
                 if d_str in daily_map:
                     item = daily_map[d_str]
-                    timeline.append(_make_timeline_item(
-                        d_str, label=label, is_start=is_start, is_reset=is_reset, is_future=False,
-                        sessions=item["sessions"], steps=item["steps"], tokens=item["tokens"], cost=item["cost"], projects=item["projects"]
-                    ))
+                    timeline.append(
+                        _make_timeline_item(
+                            d_str,
+                            label=label,
+                            is_start=is_start,
+                            is_reset=is_reset,
+                            is_future=False,
+                            sessions=item["sessions"],
+                            steps=item["steps"],
+                            tokens=item["tokens"],
+                            cost=item["cost"],
+                            projects=item["projects"],
+                        )
+                    )
                 else:
-                    timeline.append(_make_timeline_item(d_str, label=label, is_start=is_start, is_reset=is_reset, is_future=False))
+                    timeline.append(
+                        _make_timeline_item(
+                            d_str,
+                            label=label,
+                            is_start=is_start,
+                            is_reset=is_reset,
+                            is_future=False,
+                        )
+                    )
         else:
             if d_str in daily_map:
                 item = daily_map[d_str]
-                timeline.append(_make_timeline_item(
-                    d_str, sessions=item["sessions"], steps=item["steps"], tokens=item["tokens"], cost=item["cost"], projects=item["projects"]
-                ))
+                timeline.append(
+                    _make_timeline_item(
+                        d_str,
+                        sessions=item["sessions"],
+                        steps=item["steps"],
+                        tokens=item["tokens"],
+                        cost=item["cost"],
+                        projects=item["projects"],
+                    )
+                )
             else:
                 timeline.append(_make_timeline_item(d_str))
         curr += timedelta(days=1)
@@ -1637,13 +1675,20 @@ def query_conversations_list(
                     else dr["created_at"],
                     "updated_at": d_udt.strftime("%Y-%m-%d %H:%M")
                     if d_udt
-                    else (dr["updated_at"] if "updated_at" in dr.keys() and dr["updated_at"] else dr["created_at"]),
+                    else (
+                        dr["updated_at"]
+                        if "updated_at" in dr.keys() and dr["updated_at"]
+                        else dr["created_at"]
+                    ),
                     "total_steps": dr["total_steps"] or 0,
                     "tokens": d_act,
                     "total_tokens": d_act,
                     "disk_tokens": dr["total_tokens"] or 0,
                     "duration_seconds": dr["duration_seconds"] or 0,
                     "active_agent_seconds": dr["active_agent_seconds"] or 0,
+                    "fleet_agent_seconds": round(
+                        float(dr["active_agent_seconds"] or 0.0), 1
+                    ),
                     "active_pairing_seconds": dr["active_pairing_seconds"] or 0,
                     "billed_cost": d_cost,
                     "weekly_quota_pct": d_w_pct,
@@ -1658,6 +1703,28 @@ def query_conversations_list(
                     "pruned_tokens": dr["pruned_tokens"] or 0,
                 }
             )
+
+        # Compute nested descendant agent rollups for subagents with children
+        for rid, descs in descendants_by_root.items():
+            children_by_parent: dict[str, list[dict]] = {}
+            for d in descs:
+                p_id = d.get("parent_id")
+                if p_id:
+                    children_by_parent.setdefault(p_id, []).append(d)
+
+            def _get_sub_descendant_agent_sec(node_id: str) -> float:
+                tot = 0.0
+                for child in children_by_parent.get(node_id, []):
+                    tot += float(
+                        child.get("active_agent_seconds") or 0.0
+                    ) + _get_sub_descendant_agent_sec(child["id"])
+                return tot
+
+            for d in descs:
+                sub_desc_sec = _get_sub_descendant_agent_sec(d["id"])
+                d["fleet_agent_seconds"] = round(
+                    float(d.get("active_agent_seconds") or 0.0) + sub_desc_sec, 1
+                )
 
     for r in rows:
         dt = parse_to_local_dt(r["created_at"], target_tz)
@@ -1682,6 +1749,12 @@ def query_conversations_list(
         )
         fleet_pruned = c_pruned + sum(d.get("pruned_tokens", 0) for d in all_desc)
         subagent_count = len(all_desc)
+        descendant_agent_seconds = sum(
+            float(d.get("active_agent_seconds") or 0.0) for d in all_desc
+        )
+        fleet_agent_seconds = round(
+            float(r["active_agent_seconds"] or 0.0) + descendant_agent_seconds, 1
+        )
 
         r_m_used = r["model_name"] or "Gemini"
         try:
@@ -1703,13 +1776,18 @@ def query_conversations_list(
                 "created_at": dt.strftime("%Y-%m-%d %H:%M") if dt else r["created_at"],
                 "updated_at": udt.strftime("%Y-%m-%d %H:%M")
                 if udt
-                else (r["updated_at"] if "updated_at" in r.keys() and r["updated_at"] else r["created_at"]),
+                else (
+                    r["updated_at"]
+                    if "updated_at" in r.keys() and r["updated_at"]
+                    else r["created_at"]
+                ),
                 "total_steps": c_steps,
                 "tokens": act_tok,
                 "total_tokens": act_tok,
                 "disk_tokens": r["total_tokens"] or 0,
                 "duration_seconds": r["duration_seconds"] or 0,
                 "active_agent_seconds": r["active_agent_seconds"] or 0,
+                "fleet_agent_seconds": fleet_agent_seconds,
                 "active_pairing_seconds": r["active_pairing_seconds"] or 0,
                 "billed_cost": c_cost,
                 "weekly_quota_pct": c_w_pct,
@@ -1857,7 +1935,9 @@ def query_session_details(conn, cid, tz=None):
                         parsed_args = {}
 
                     subagents_list = []
-                    subagents_raw = parsed_args.get("Subagents") or parsed_args.get("subagents")
+                    subagents_raw = parsed_args.get("Subagents") or parsed_args.get(
+                        "subagents"
+                    )
                     if subagents_raw:
                         if isinstance(subagents_raw, str):
                             s = _clean_arg_str(subagents_raw)
@@ -1874,12 +1954,21 @@ def query_session_details(conn, cid, tz=None):
 
                     if not subagents_list:
                         flat_keys = (
-                            "Role", "role", "TypeName", "type",
-                            "subagent_type", "subagentType",
-                            "Prompt", "prompt", "Model", "model"
+                            "Role",
+                            "role",
+                            "TypeName",
+                            "type",
+                            "subagent_type",
+                            "subagentType",
+                            "Prompt",
+                            "prompt",
+                            "Model",
+                            "model",
                         )
                         if any(k in parsed_args for k in flat_keys):
-                            role = _clean_arg_str(parsed_args.get("Role") or parsed_args.get("role") or "")
+                            role = _clean_arg_str(
+                                parsed_args.get("Role") or parsed_args.get("role") or ""
+                            )
                             sub_type = _clean_arg_str(
                                 parsed_args.get("TypeName")
                                 or parsed_args.get("type")
@@ -1887,8 +1976,16 @@ def query_session_details(conn, cid, tz=None):
                                 or parsed_args.get("subagentType")
                                 or ""
                             )
-                            model = _clean_arg_str(parsed_args.get("Model") or parsed_args.get("model") or "")
-                            prompt = _clean_arg_str(parsed_args.get("Prompt") or parsed_args.get("prompt") or "")
+                            model = _clean_arg_str(
+                                parsed_args.get("Model")
+                                or parsed_args.get("model")
+                                or ""
+                            )
+                            prompt = _clean_arg_str(
+                                parsed_args.get("Prompt")
+                                or parsed_args.get("prompt")
+                                or ""
+                            )
                             subagents_list = [
                                 {
                                     "role": role or "Autonomous Worker",
@@ -2107,7 +2204,7 @@ def query_session_details(conn, cid, tz=None):
             """
             SELECT id, title, parent_id, root_id, depth, subagent_role, subagent_type,
                    total_steps, total_tokens, billed_cost, billed_input_tokens, billed_output_tokens,
-                   duration_seconds, active_agent_seconds, model_name, compaction_count, pruned_tokens
+                   duration_seconds, active_agent_seconds, active_pairing_seconds, model_name, compaction_count, pruned_tokens
             FROM conversations
             WHERE root_id = ? OR id = ?
             ORDER BY depth ASC, created_at ASC
@@ -2119,7 +2216,7 @@ def query_session_details(conn, cid, tz=None):
             """
             SELECT id, title, parent_id, root_id, depth, subagent_role, subagent_type,
                    total_steps, total_tokens, billed_cost, billed_input_tokens, billed_output_tokens,
-                   duration_seconds, model_name
+                   duration_seconds, active_agent_seconds, active_pairing_seconds, model_name
             FROM conversations
             WHERE root_id = ? OR id = ?
             ORDER BY depth ASC, created_at ASC
@@ -2128,6 +2225,7 @@ def query_session_details(conn, cid, tz=None):
         ).fetchall()
 
     swarm_nodes = [dict(sr) for sr in swarm_rows]
+    subagents_list = [n for n in swarm_nodes if n.get("id") != conv_dict.get("id")]
     total_swarm_cost = sum(n["billed_cost"] or 0.0 for n in swarm_nodes)
     total_swarm_tokens = sum(
         (n["billed_input_tokens"] or 0) + (n["billed_output_tokens"] or 0)
@@ -2148,6 +2246,16 @@ def query_session_details(conn, cid, tz=None):
         "total_cost": round(total_swarm_cost, 2),
         "total_tokens": total_swarm_tokens,
         "total_steps": total_swarm_steps,
+        "total_agent_seconds": round(
+            float(conv_dict.get("active_agent_seconds") or 0)
+            + sum(float(s.get("active_agent_seconds") or 0) for s in subagents_list),
+            1,
+        ),
+        "total_pairing_seconds": round(
+            float(conv_dict.get("active_pairing_seconds") or 0)
+            + sum(float(s.get("active_pairing_seconds") or 0) for s in subagents_list),
+            1,
+        ),
         "weekly_quota_pct": fleet_q["weekly_pct"],
         "five_hour_quota_pct": fleet_q["five_hour_pct"],
     }
@@ -2156,10 +2264,14 @@ def query_session_details(conn, cid, tz=None):
     nodes_by_id = {}
     for n in swarm_nodes:
         node_id = n["id"]
-        node_active_tokens = (n["billed_input_tokens"] or 0) + (n["billed_output_tokens"] or 0)
+        node_active_tokens = (n["billed_input_tokens"] or 0) + (
+            n["billed_output_tokens"] or 0
+        )
         node_cost = round(n["billed_cost"] or 0.0, 2)
         node_model = n.get("model_name") or conv_model
-        node_weekly_quota_pct, node_5h_quota_pct = _compute_quota_pcts(node_cost, node_model, bucket_caps)
+        node_weekly_quota_pct, node_5h_quota_pct = _compute_quota_pcts(
+            node_cost, node_model, bucket_caps
+        )
 
         max_tokens = get_model_context_limit(node_model)
         active_tokens = n.get("total_tokens") or 0
@@ -2167,10 +2279,14 @@ def query_session_details(conn, cid, tz=None):
             round((active_tokens / max_tokens) * 100, 1) if max_tokens else 0.0
         )
         cost_share_pct = (
-            round((node_cost / total_swarm_cost * 100), 1) if total_swarm_cost > 0 else 0.0
+            round((node_cost / total_swarm_cost * 100), 1)
+            if total_swarm_cost > 0
+            else 0.0
         )
         token_share_pct = (
-            round((node_active_tokens / total_swarm_tokens * 100), 1) if total_swarm_tokens > 0 else 0.0
+            round((node_active_tokens / total_swarm_tokens * 100), 1)
+            if total_swarm_tokens > 0
+            else 0.0
         )
 
         nodes_by_id[node_id] = {
@@ -2188,6 +2304,7 @@ def query_session_details(conn, cid, tz=None):
             "compaction_count": n.get("compaction_count") or 0,
             "pruned_tokens": n.get("pruned_tokens") or 0,
             "active_agent_seconds": round(n.get("active_agent_seconds") or 0.0, 1),
+            "active_pairing_seconds": round(n.get("active_pairing_seconds") or 0.0, 1),
             "max_tokens": max_tokens,
             "active_tokens": active_tokens,
             "context_pct": context_pct,

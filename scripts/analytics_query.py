@@ -47,6 +47,7 @@ from context_monitor.settings import (  # noqa: E402
     DEFAULT_GEMINI_5H_CAPACITY,
     DEFAULT_GEMINI_WEEKLY_CAPACITY,
 )
+from context_monitor.timings import calculate_force_multiplier  # noqa: E402
 
 
 def format_tokens(n: int) -> str:
@@ -214,7 +215,9 @@ def _get_model_distribution(cur) -> list[tuple[str, dict[str, int]]]:
                 GROUP BY cname
             """).fetchall()
             for cr in conv_null_rows:
-                cname = (cr["cname"] if hasattr(cr, "keys") else cr[0]) or "Gemini Flash"
+                cname = (
+                    cr["cname"] if hasattr(cr, "keys") else cr[0]
+                ) or "Gemini Flash"
                 sc = (cr["step_count"] if hasattr(cr, "keys") else cr[1]) or 0
                 tok = (cr["tokens"] if hasattr(cr, "keys") else cr[2]) or 0
                 if cname not in model_groups:
@@ -293,6 +296,25 @@ def print_summary(conn):
 
     autonomy_ratio = total_tools / max(1, total_prompts)
 
+    total_pairing_sec = max(0.0, float(total_pairing_work))
+    total_agent_sec = max(0.0, float(total_agent_work))
+
+    reads_cnt = cur.execute(
+        "SELECT COUNT(*) FROM tool_executions WHERE tool_name IN ('view_file', 'grep_search', 'find_by_name', 'list_dir')"
+    ).fetchone()[0]
+    cmds_cnt = cur.execute(
+        "SELECT COUNT(*) FROM tool_executions WHERE tool_name = 'run_command'"
+    ).fetchone()[0]
+    edits_cnt = cur.execute(
+        "SELECT COUNT(*) FROM tool_executions WHERE tool_name IN ('write_to_file', 'replace_file_content', 'multi_replace_file_content')"
+    ).fetchone()[0]
+    saved_seconds = (reads_cnt * 30) + (cmds_cnt * 45) + (edits_cnt * 120)
+
+    force_multiplier, effective_output_sec, denom_sec = calculate_force_multiplier(
+        total_pairing_sec, total_agent_sec, saved_seconds
+    )
+    effective_output_hours = effective_output_sec / 3600
+
     print(
         f" Total Conversations Tracked : {total_convs:,} ({multi_convs:,} multi-model)"
     )
@@ -308,13 +330,16 @@ def print_summary(conn):
     print(f" Cumulative Output / Thinking: {format_tokens(total_out)} tokens")
     print(f" True Equivalent API Value   : ${total_cost:,.2f}")
     print(
-        f" Pure Agent Execution Time   : {format_duration(total_agent_work)} (active LLM reasoning & tool calls)"
+        f" Human Pairing Time (Inter-Turn): {format_duration(total_pairing_sec)} (active human reading/writing/thinking)"
     )
     print(
-        f" Active Collaborative Time   : {format_duration(total_pairing_work)} (continuous interaction <= 5m gaps)"
+        f" Agent Work Time (Root + Fleet): {format_duration(total_agent_sec)} (active LLM reasoning & tool calls)"
     )
     print(
         f" Total Wall-Clock Span       : {format_duration(total_duration)} (across all open sessions)"
+    )
+    print(
+        f" Force Multiplier            : {force_multiplier:.1f}x ({effective_output_hours:.1f}h effective output / {format_duration(denom_sec)} active pairing)"
     )
     print(
         f" Autonomy Leverage Ratio     : {autonomy_ratio:.1f}x automated actions per prompt ({total_tools:,} tools / {total_prompts:,} prompts)"
@@ -843,36 +868,39 @@ def print_velocity(conn):
 
     saved_seconds = (reads_cnt * 30) + (cmds_cnt * 45) + (edits_cnt * 120)
     saved_hours = saved_seconds / 3600
-    baseline_sec = total_pairing_sec if total_pairing_sec > 0 else total_agent_sec
-    baseline_sec = max(0.0, float(baseline_sec))
-    force_multiplier = (
-        round(1.0 + (saved_seconds / baseline_sec), 1)
-        if baseline_sec > 0
-        else 1.0
+
+    force_multiplier, effective_output_sec, denom_sec = calculate_force_multiplier(
+        total_pairing_sec, total_agent_sec, saved_seconds
     )
-    effective_hours = (baseline_sec + saved_seconds) / 3600
-    pairing_dur = format_duration(baseline_sec)
+    effective_output_hours = effective_output_sec / 3600
+    pairing_dur = format_duration(denom_sec)
 
     print(
-        f" Autonomy Multiplier       : {autonomy:.1f}x ({total_tools:,} tool actions across {total_prompts:,} user prompts)"
+        f" Autonomy Multiplier                  : {autonomy:.1f}x ({total_tools:,} tool actions across {total_prompts:,} user prompts)"
     )
     print(
-        f" Deep Reasoning Volume     : {format_tokens(total_thinking)} thinking tokens (internal chain-of-thought)"
+        f" Deep Reasoning Volume                : {format_tokens(total_thinking)} thinking tokens (internal chain-of-thought)"
     )
     print(
-        f" Codebase Production Lines : {total_written + total_edited:,} lines (+{total_written:,} written / ~{total_edited:,} modified)"
+        f" Codebase Production Lines            : {total_written + total_edited:,} lines (+{total_written:,} written / ~{total_edited:,} modified)"
     )
     print(
-        f" Tool Success & Resilience : {success_rate:.1f}% first-attempt execution success ({total_fails:,} errors)"
+        f" Tool Success & Resilience            : {success_rate:.1f}% first-attempt execution success ({total_fails:,} errors)"
     )
     print(
-        f" Active Agent Work Time    : {format_duration(total_agent_sec)} of pure LLM execution & tool inference"
+        f" Human Pairing Time (Inter-Turn)      : {format_duration(total_pairing_sec)} (active human reading/writing/thinking)"
     )
     print(
-        f" Estimated Dev Time Saved  : ~{saved_hours:,.0f} engineering hours saved to date"
+        f" Agent Work Time (Root + Subagent Fleet): {format_duration(total_agent_sec)} of pure LLM execution & tool inference"
     )
     print(
-        f" Force Multiplier          : {force_multiplier:.1f}x ({effective_hours:.1f}h effective output / {pairing_dur} active pairing)"
+        f" Est. Dev Time Saved (Tool Execution) : ~{saved_hours:,.0f} engineering hours saved to date"
+    )
+    print(
+        f" Effective Output Hours               : {effective_output_hours:.1f}h (Human Pairing + Agent Work + Dev Time Saved)"
+    )
+    print(
+        f" Force Multiplier                     : {force_multiplier:.1f}x ({effective_output_hours:.1f}h effective output / {pairing_dur} active pairing)"
     )
     print("=" * 75 + "\n")
 
@@ -1027,7 +1055,12 @@ def print_timeline(conn, days: int = 14):
                 dt = dt.astimezone(local_tz)
                 date_str = dt.strftime("%Y-%m-%d")
                 if date_str not in daily_map:
-                    daily_map[date_str] = {"sessions": 0, "steps": 0, "tokens": 0, "cost": 0.0}
+                    daily_map[date_str] = {
+                        "sessions": 0,
+                        "steps": 0,
+                        "tokens": 0,
+                        "cost": 0.0,
+                    }
                     day_sessions[date_str] = set()
                 daily_map[date_str]["steps"] += steps
                 daily_map[date_str]["tokens"] += tokens
@@ -1050,13 +1083,25 @@ def print_timeline(conn, days: int = 14):
                 try:
                     created_at_raw = r["created_at"] if hasattr(r, "keys") else r[0]
                     conv_id = r["conversation_id"] if hasattr(r, "keys") else r[1]
-                    step_est_tokens = (r["est_tokens"] if hasattr(r, "keys") else r[2]) or 0
-                    step_billed_in = (r["billed_input_tokens"] if hasattr(r, "keys") else r[3]) or 0
-                    step_billed_out = (r["billed_output_tokens"] if hasattr(r, "keys") else r[4]) or 0
-                    step_billed_cost = (r["billed_cost"] if hasattr(r, "keys") else r[5]) or 0.0
+                    step_est_tokens = (
+                        r["est_tokens"] if hasattr(r, "keys") else r[2]
+                    ) or 0
+                    step_billed_in = (
+                        r["billed_input_tokens"] if hasattr(r, "keys") else r[3]
+                    ) or 0
+                    step_billed_out = (
+                        r["billed_output_tokens"] if hasattr(r, "keys") else r[4]
+                    ) or 0
+                    step_billed_cost = (
+                        r["billed_cost"] if hasattr(r, "keys") else r[5]
+                    ) or 0.0
 
                     created_str = str(created_at_raw).strip().replace(" ", "T")
-                    if "Z" in created_str or "+" in created_str[10:] or "-" in created_str[10:]:
+                    if (
+                        "Z" in created_str
+                        or "+" in created_str[10:]
+                        or "-" in created_str[10:]
+                    ):
                         created_str = created_str.replace("Z", "+00:00")
                     else:
                         created_str = created_str + "+00:00"
@@ -1066,7 +1111,12 @@ def print_timeline(conn, days: int = 14):
                     dt = dt.astimezone(local_tz)
                     date_str = dt.strftime("%Y-%m-%d")
                     if date_str not in daily_map:
-                        daily_map[date_str] = {"sessions": 0, "steps": 0, "tokens": 0, "cost": 0.0}
+                        daily_map[date_str] = {
+                            "sessions": 0,
+                            "steps": 0,
+                            "tokens": 0,
+                            "cost": 0.0,
+                        }
                         day_sessions[date_str] = set()
                     daily_map[date_str]["steps"] += 1
                     tokens = step_billed_in + step_billed_out
@@ -1145,15 +1195,14 @@ def generate_global_report(
     ).fetchone()[0]
 
     saved_seconds = (reads_cnt * 30) + (cmds_cnt * 45) + (edits_cnt * 120)
+    saved_hours = saved_seconds / 3600
     total_pairing_sec = max(0.0, float(totals["total_pairing_sec"] or 0))
     total_agent_sec = max(0.0, float(totals["total_agent_sec"] or 0))
-    baseline_sec = total_pairing_sec if total_pairing_sec > 0 else total_agent_sec
-    baseline_sec = max(0.0, float(baseline_sec))
-    force_multiplier = (
-        round(1.0 + (saved_seconds / baseline_sec), 1)
-        if baseline_sec > 0
-        else 1.0
+
+    force_multiplier, effective_output_sec, _ = calculate_force_multiplier(
+        total_pairing_sec, total_agent_sec, saved_seconds
     )
+    effective_output_hours = effective_output_sec / 3600
 
     mcp_row = cur.execute(
         "SELECT COUNT(*) as mcp_calls, COUNT(DISTINCT mcp_server) as servers FROM tool_executions WHERE mcp_server IS NOT NULL"
@@ -1168,13 +1217,16 @@ def generate_global_report(
         f"> **Total Operations**: {total_steps:,} logged steps  ",
         f"> **Autonomy Multiplier**: **{autonomy:.1f}x actions per prompt**  ",
         f"> **Force Multiplier**: **{force_multiplier:.1f}x effective output**  ",
+        f"> **Human Pairing Time (Inter-Turn)**: {format_duration(total_pairing_sec)}  ",
+        f"> **Agent Work Time (Root + Subagent Fleet)**: {format_duration(total_agent_sec)}  ",
+        f"> **Est. Dev Time Saved (Tool Execution)**: ~{saved_hours:,.0f} hours ({format_duration(saved_seconds)})  ",
+        f"> **Effective Output Hours**: **{effective_output_hours:.1f}h**  ",
         f"> **Deep Reasoning Tokens**: **{format_tokens(totals['total_thinking'] or 0)}**  ",
         f"> **Code Authored & Refactored**: **{(totals['total_written'] or 0) + (totals['total_edited'] or 0):,} lines**  ",
         f"> **MCP Invocations**: **{total_mcp_calls:,} calls** across {total_mcp_servers} servers  ",
         f"> **Redundant File Reads**: {total_re_reads:,}  ",
         f"> **Cumulative Multi-Turn Billed Input**: **{format_tokens(total_in)} tokens**  ",
-        f"> **True Equivalent API Billing Value**: **${total_cost:,.2f}**  ",
-        f"> **Agent Working Time**: {format_duration(totals['total_agent_sec'] or 0)}\n",
+        f"> **True Equivalent API Billing Value**: **${total_cost:,.2f}**\n",
         "## 1. Context Consumption by Activity Phase\n",
         "| Development Phase | Estimated Tokens | Share |",
         "| :--- | :--- | :--- |",
