@@ -142,6 +142,7 @@
     let currentHotFilesFilter = 'files';
     let cachedActivityMatrix = null;
     let currentHeatmapMode = 'year';
+    let currentHourlyNormMode = 'avg';
     let localTimezoneAbbr = Intl.DateTimeFormat().resolvedOptions().timeZone || 'Local';
     function getProjectFromUrl() {
       try {
@@ -1017,11 +1018,107 @@
       return COLOR_PALETTE.lvl8;
     }
 
+    function getActiveHourlyMatrix(data) {
+      const d = data || cachedActivityMatrix || {};
+      if (currentHourlyNormMode === 'avg') {
+        return (d.hourly_aggregate_avg && d.hourly_aggregate_avg.length > 0)
+          ? d.hourly_aggregate_avg
+          : (d.hourly_aggregate || []);
+      }
+      if (currentHourlyNormMode === 'rolling30d') {
+        return (d.hourly_aggregate_30d && d.hourly_aggregate_30d.length > 0)
+          ? d.hourly_aggregate_30d
+          : (d.hourly_aggregate || []);
+      }
+      return d.hourly_aggregate || [];
+    }
+
+    function formatHourlyAggTooltip(dayIdx, hour, dayName, timeFormatted, fallbackVal) {
+      const d = cachedActivityMatrix;
+      const hasGranularData = Boolean(
+        d && (
+          (d.hourly_aggregate_avg && d.hourly_aggregate_avg.length > 0) ||
+          (d.hourly_aggregate_30d && d.hourly_aggregate_30d.length > 0) ||
+          (d.weekday_active_counts && d.weekday_active_counts.length > 0)
+        )
+      );
+
+      if (!d || !hasGranularData) {
+        let val = fallbackVal !== undefined ? fallbackVal : 0;
+        if (d && d.hourly_aggregate && d.hourly_aggregate[dayIdx] && d.hourly_aggregate[dayIdx][hour] !== undefined) {
+          val = d.hourly_aggregate[dayIdx][hour];
+        }
+        return `${dayName} at ${timeFormatted} (${localTimezoneAbbr}) — ${val.toLocaleString()} operations across all history`;
+      }
+
+      const total = (d.hourly_aggregate && d.hourly_aggregate[dayIdx] && d.hourly_aggregate[dayIdx][hour]) || 0;
+      let avg = (d.hourly_aggregate_avg && d.hourly_aggregate_avg[dayIdx] && d.hourly_aggregate_avg[dayIdx][hour]) !== undefined
+        ? d.hourly_aggregate_avg[dayIdx][hour]
+        : null;
+      const r30d = (d.hourly_aggregate_30d && d.hourly_aggregate_30d[dayIdx] && d.hourly_aggregate_30d[dayIdx][hour]) || 0;
+      let activeCount = (d.weekday_active_counts && d.weekday_active_counts[dayIdx]) || 0;
+
+      if (activeCount === 0 && avg !== null && avg > 0 && total > 0) {
+        activeCount = Math.max(1, Math.round(total / avg));
+      }
+      if (avg === null) {
+        avg = (total > 0 && activeCount > 0) ? Math.round((total / activeCount) * 10) / 10 : total;
+      }
+
+      const totalFmt = total.toLocaleString();
+      const avgFmt = typeof avg === 'number' ? (avg % 1 === 0 ? avg.toLocaleString() : avg.toFixed(1)) : String(avg);
+      const r30dFmt = r30d.toLocaleString();
+
+      let details = '';
+      if (currentHourlyNormMode === 'avg') {
+        details = `${avgFmt} avg ops/active ${dayName} (${totalFmt} total across ${activeCount} ${dayName} · ${r30dFmt} in 30d)`;
+      } else if (currentHourlyNormMode === 'rolling30d') {
+        details = `${r30dFmt} ops in 30d (${totalFmt} total across ${activeCount} ${dayName} · ${avgFmt} avg/active ${dayName})`;
+      } else {
+        details = `${totalFmt} total ops across ${activeCount} ${dayName} (${avgFmt} avg/active ${dayName} · ${r30dFmt} in 30d)`;
+      }
+      return `${dayName} at ${timeFormatted} (${localTimezoneAbbr}) — ${details}`;
+    }
+
+    function setHourlyAggNormMode(normMode) {
+      if (normMode !== 'avg' && normMode !== 'rolling30d' && normMode !== 'total') {
+        normMode = 'avg';
+      }
+      currentHourlyNormMode = normMode;
+      window.currentHourlyNormMode = normMode;
+
+      const btnClasses = {
+        active: 'px-2.5 py-1 rounded-md bg-brand-600 text-white font-medium shadow transition whitespace-nowrap',
+        inactive: 'px-2.5 py-1 rounded-md text-gray-400 hover:text-white transition whitespace-nowrap'
+      };
+
+      const btnAvg = document.getElementById('hmNormAvg');
+      const btn30d = document.getElementById('hmNorm30d');
+      const btnTotal = document.getElementById('hmNormTotal');
+
+      if (btnAvg) btnAvg.className = normMode === 'avg' ? btnClasses.active : btnClasses.inactive;
+      if (btn30d) btn30d.className = normMode === 'rolling30d' ? btnClasses.active : btnClasses.inactive;
+      if (btnTotal) btnTotal.className = normMode === 'total' ? btnClasses.active : btnClasses.inactive;
+
+      if (cachedActivityMatrix) {
+        renderActiveHeatmapGrid(cachedActivityMatrix);
+      }
+
+      if (activeHeatmapHover && activeHeatmapHover.type === 'hourly_agg' && document.getElementById('ghTooltipText')) {
+        const tooltipMsg = formatHourlyAggTooltip(activeHeatmapHover.dayIdx, activeHeatmapHover.hour, activeHeatmapHover.dayName, activeHeatmapHover.timeFormatted);
+        document.getElementById('ghTooltipText').innerHTML = `<strong>${tooltipMsg}</strong>`;
+      }
+    }
+
     window.COLOR_PALETTE = COLOR_PALETTE;
     window.formatLocalDateKey = formatLocalDateKey;
     window.computeQuantileThresholds = computeQuantileThresholds;
     window.getCommitColor = getCommitColor;
     window.updateHeatmapLegend = updateHeatmapLegend;
+    window.setHourlyAggNormMode = setHourlyAggNormMode;
+    window.getActiveHourlyMatrix = getActiveHourlyMatrix;
+    window.formatHourlyAggTooltip = formatHourlyAggTooltip;
+    window.currentHourlyNormMode = currentHourlyNormMode;
 
     function renderActiveHeatmapGrid(data) {
       const d = data || cachedActivityMatrix;
@@ -1037,7 +1134,8 @@
       } else if (currentHeatmapMode === 'past7hourly') {
         renderPast7HourlyGrid(d.past_7_days_hourly || {});
       } else if (currentHeatmapMode === 'hourly') {
-        renderHourlyAggregateGrid(d.hourly_aggregate || []);
+        const mat = getActiveHourlyMatrix(d);
+        renderHourlyAggregateGrid(mat);
       }
     }
 
@@ -1078,10 +1176,7 @@
           const tooltipMsg = `${activeHeatmapHover.dateStr} @ ${activeHeatmapHover.timeFormatted} — ${val.toLocaleString()} operations`;
           document.getElementById('ghTooltipText').innerHTML = `<strong>${tooltipMsg}</strong>`;
         } else if (activeHeatmapHover.type === 'hourly_agg') {
-          const agg = data.hourly_aggregate || [];
-          const row = agg[activeHeatmapHover.dayIdx] || [];
-          const val = row[activeHeatmapHover.hour] || 0;
-          const tooltipMsg = `${activeHeatmapHover.dayName} at ${activeHeatmapHover.timeFormatted} (${localTimezoneAbbr}) — ${val.toLocaleString()} operations across all history`;
+          const tooltipMsg = formatHourlyAggTooltip(activeHeatmapHover.dayIdx, activeHeatmapHover.hour, activeHeatmapHover.dayName, activeHeatmapHover.timeFormatted);
           document.getElementById('ghTooltipText').innerHTML = `<strong>${tooltipMsg}</strong>`;
         }
       }
@@ -1442,18 +1537,20 @@
       if (!container) return;
       container.innerHTML = '';
 
+      const mat = matrix || getActiveHourlyMatrix(cachedActivityMatrix);
       const viewValues = [];
-      if (Array.isArray(matrix)) {
-        for (let d = 0; d < matrix.length; d++) {
-          if (Array.isArray(matrix[d])) {
-            for (let h = 0; h < matrix[d].length; h++) {
-              viewValues.push(matrix[d][h] || 0);
+      if (Array.isArray(mat)) {
+        for (let d = 0; d < mat.length; d++) {
+          if (Array.isArray(mat[d])) {
+            for (let h = 0; h < mat[d].length; h++) {
+              viewValues.push(mat[d][h] || 0);
             }
           }
         }
       }
       const thresholds = computeQuantileThresholds(viewValues);
-      updateHeatmapLegend(thresholds, 'ops');
+      const unitLabel = currentHourlyNormMode === 'avg' ? 'avg ops' : 'ops';
+      updateHeatmapLegend(thresholds, unitLabel);
 
       for (let d = 0; d < 7; d++) {
         const row = document.createElement('div');
@@ -1468,17 +1565,16 @@
         squaresContainer.className = 'flex space-x-[3px]';
 
         for (let h = 0; h < 24; h++) {
-          const val = (matrix && matrix[d] && matrix[d][h]) || 0;
+          const val = (mat && mat[d] && mat[d][h]) || 0;
           const cell = document.createElement('div');
           cell.className = 'commit-square';
           cell.style.backgroundColor = getCommitColor(val, thresholds);
 
           const timeFormatted = `${h < 10 ? '0' + h : h}:00`;
-          const tooltipMsg = `${days[d]} at ${timeFormatted} (${localTimezoneAbbr}) — ${val.toLocaleString()} operations across all history`;
 
           cell.addEventListener('mouseenter', () => {
             activeHeatmapHover = { type: 'hourly_agg', dayName: days[d], timeFormatted, dayIdx: d, hour: h };
-            document.getElementById('ghTooltipText').innerHTML = `<strong>${tooltipMsg}</strong>`;
+            document.getElementById('ghTooltipText').innerHTML = `<strong>${formatHourlyAggTooltip(d, h, days[d], timeFormatted, val)}</strong>`;
           });
           cell.addEventListener('mouseleave', () => {
             activeHeatmapHover = null;
@@ -1508,6 +1604,33 @@
       document.getElementById('ghMonthView').className = mode === 'month' ? 'flex flex-col w-fit' : 'hidden';
       document.getElementById('ghPast7View').className = mode === 'past7hourly' ? 'flex flex-col w-fit' : 'hidden';
       document.getElementById('ghHourlyView').className = mode === 'hourly' ? 'flex flex-col w-fit' : 'hidden';
+
+      const normGroup = document.getElementById('hmAggNormGroup');
+      if (normGroup) {
+        if (mode === 'hourly') {
+          if (normGroup.classList) {
+            normGroup.classList.remove('hidden');
+            normGroup.classList.add('flex');
+          }
+          if (typeof normGroup.className === 'string') {
+            normGroup.className = normGroup.className.replace(/\bhidden\b/g, '').trim();
+            if (!normGroup.className.includes('flex')) {
+              normGroup.className = (normGroup.className + ' flex').trim();
+            }
+          }
+        } else {
+          if (normGroup.classList) {
+            normGroup.classList.remove('flex');
+            normGroup.classList.add('hidden');
+          }
+          if (typeof normGroup.className === 'string') {
+            normGroup.className = normGroup.className.replace(/\bflex\b/g, '').trim();
+            if (!normGroup.className.includes('hidden')) {
+              normGroup.className = (normGroup.className + ' hidden').trim();
+            }
+          }
+        }
+      }
 
       const btnClasses = {
         active: 'px-3 py-1 rounded-md bg-brand-600 text-white font-medium shadow transition whitespace-nowrap',

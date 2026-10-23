@@ -3505,6 +3505,381 @@ def test_heatmap_quantile_scaling_and_8_level_palette():
     assert data["levels"] == 9
 
 
+def test_heatmap_24x7_normalization_toggle():
+    """Verifies Task 3 Activity Matrix 24x7 Normalization Toggle:
+    - index.html contains #hmAggNormGroup with #hmNormTotal, #hmNormAvg, and #hmNorm30d buttons calling setHourlyAggNormMode(...).
+    - script.js defines setHourlyAggNormMode and exposes window.setHourlyAggNormMode.
+    - Switching modes in setHeatmapMode('hourly') toggles #hmAggNormGroup visibility.
+    - getActiveHourlyMatrix returns correct dataset for 'avg', 'rolling30d', and 'total', with fallback.
+    - renderHourlyAggregateGrid and rich hover tooltip display active metric, all-time total, active weekday count, and 30-day volume.
+    - Rich hover tooltip restoration on live SSE updates.
+    """
+    dashboard_dir = (
+        Path(__file__).resolve().parent.parent / "src" / "context_monitor" / "dashboard"
+    )
+    js_file = dashboard_dir / "static" / "script.js"
+    html_file = dashboard_dir / "templates" / "index.html"
+    js_content = js_file.read_text(encoding="utf-8")
+    html_content = html_file.read_text(encoding="utf-8")
+
+    # 1. Static Invariants in index.html and script.js
+    assert 'id="hmAggNormGroup"' in html_content
+    assert 'id="hmNormTotal"' in html_content
+    assert 'id="hmNormAvg"' in html_content
+    assert 'id="hmNorm30d"' in html_content
+    assert "setHourlyAggNormMode('avg')" in html_content
+    assert "setHourlyAggNormMode('rolling30d')" in html_content
+    assert "setHourlyAggNormMode('total')" in html_content
+
+    assert "currentHourlyNormMode" in js_content
+    assert "setHourlyAggNormMode" in js_content
+    assert "window.setHourlyAggNormMode" in js_content
+    assert "getActiveHourlyMatrix" in js_content
+    assert "formatHourlyAggTooltip" in js_content
+
+    # 2. Node execution for dynamic state, toggle visibility, and rich tooltip tests
+    node_script = r"""
+    const fs = require('fs');
+    const path = require('path');
+    const code = fs.readFileSync(path.resolve('src/context_monitor/dashboard/static/script.js'), 'utf8');
+
+    function createMockElement(id) {
+      let _html = '';
+      const classes = new Set();
+      const attrs = {};
+      const listeners = {};
+      return {
+        id: id || '',
+        textContent: '',
+        value: '',
+        title: '',
+        style: {},
+        className: '',
+        children: [],
+        appendChild(child) { this.children.push(child); },
+        querySelector: () => null,
+        querySelectorAll: function(sel) {
+          if (sel === '[data-level]') {
+            return this.children.filter(c => c.dataset && c.dataset.level);
+          }
+          return this.children;
+        },
+        dataset: {},
+        setAttribute(k, v) { attrs[k] = String(v); },
+        getAttribute(k) { return attrs[k]; },
+        addEventListener(evt, fn) {
+          if (!listeners[evt]) listeners[evt] = [];
+          listeners[evt].push(fn);
+        },
+        removeEventListener(evt, fn) {
+          if (listeners[evt]) listeners[evt] = listeners[evt].filter(f => f !== fn);
+        },
+        trigger(evt) {
+          if (listeners[evt]) listeners[evt].forEach(fn => fn());
+        },
+        get innerHTML() { return _html; },
+        set innerHTML(val) {
+          _html = val;
+          if (val === '') this.children = [];
+        },
+        classList: {
+          add(...c) { c.forEach(x => classes.add(x)); },
+          remove(...c) { c.forEach(x => classes.delete(x)); },
+          contains(c) { return classes.has(c); }
+        }
+      };
+    }
+
+    const mockElements = {
+      hmAggNormGroup: createMockElement('hmAggNormGroup'),
+      hmNormAvg: createMockElement('hmNormAvg'),
+      hmNorm30d: createMockElement('hmNorm30d'),
+      hmNormTotal: createMockElement('hmNormTotal'),
+      hmBtnYear: createMockElement('hmBtnYear'),
+      hmBtnQuarter: createMockElement('hmBtnQuarter'),
+      hmBtnMonth: createMockElement('hmBtnMonth'),
+      hmBtnPast7: createMockElement('hmBtnPast7'),
+      hmBtnHourly: createMockElement('hmBtnHourly'),
+      ghYearView: createMockElement('ghYearView'),
+      ghQuarterView: createMockElement('ghQuarterView'),
+      ghMonthView: createMockElement('ghMonthView'),
+      ghPast7View: createMockElement('ghPast7View'),
+      ghHourlyView: createMockElement('ghHourlyView'),
+      ghGrid: createMockElement('ghGrid'),
+      ghMonthLabels: createMockElement('ghMonthLabels'),
+      ghQuarterGrid: createMockElement('ghQuarterGrid'),
+      ghQuarterMonthLabels: createMockElement('ghQuarterMonthLabels'),
+      monthHourHeader: createMockElement('monthHourHeader'),
+      ghMonthGrid: createMockElement('ghMonthGrid'),
+      past7HourHeader: createMockElement('past7HourHeader'),
+      ghPast7Grid: createMockElement('ghPast7Grid'),
+      hourlyHourHeader: createMockElement('hourlyHourHeader'),
+      ghHourlyGrid: createMockElement('ghHourlyGrid'),
+      streakCurrent: createMockElement('streakCurrent'),
+      streakLongest: createMockElement('streakLongest'),
+      activeDaysCount: createMockElement('activeDaysCount'),
+      heatmapOpsCount: createMockElement('heatmapOpsCount'),
+      ghTooltipText: createMockElement('ghTooltipText'),
+      ghScaleSummary: createMockElement('ghScaleSummary'),
+      ghColorLegend: createMockElement('ghColorLegend')
+    };
+
+    // Pre-populate legend swatches
+    for (let i = 0; i <= 8; i++) {
+      const sw = createMockElement();
+      sw.dataset = { level: `lvl${i}` };
+      mockElements.ghColorLegend.appendChild(sw);
+    }
+
+    const mockDocument = {
+      getElementById: (id) => mockElements[id] || createMockElement(id),
+      createElement: (tag) => createMockElement(tag),
+      querySelectorAll: () => [],
+      addEventListener: () => {}
+    };
+
+    const mockWindow = {
+      location: { search: '' },
+      addEventListener: () => {},
+      history: { pushState: () => {} }
+    };
+
+    const fn = new Function('window', 'document', 'Chart', 'lucide', `
+      ${code}
+      return {
+        setHourlyAggNormMode,
+        getActiveHourlyMatrix,
+        formatHourlyAggTooltip,
+        setHeatmapMode,
+        renderHourlyAggregateGrid,
+        renderActiveHeatmapGrid,
+        renderHeatmapAllViews,
+        getHourlyNormMode: () => currentHourlyNormMode,
+        setCachedMatrix: (m) => { cachedActivityMatrix = m; },
+        getCachedMatrix: () => cachedActivityMatrix
+      };
+    `);
+
+    const api = fn(
+      mockWindow,
+      mockDocument,
+      { defaults: { font: {}, elements: {}, plugins: {} }, register: () => {} },
+      { createIcons: () => {} }
+    );
+
+    // Test A: Default normalization mode is 'avg'
+    if (api.getHourlyNormMode() !== 'avg') {
+      throw new Error(`Expected default hourly norm mode to be 'avg', got ${api.getHourlyNormMode()}`);
+    }
+
+    // Test B: setHeatmapMode toggles #hmAggNormGroup visibility
+    api.setHeatmapMode('year');
+    if (!mockElements.hmAggNormGroup.classList.contains('hidden') || mockElements.hmAggNormGroup.classList.contains('flex')) {
+      throw new Error('Expected hmAggNormGroup to be hidden in year mode');
+    }
+    api.setHeatmapMode('hourly');
+    if (!mockElements.hmAggNormGroup.classList.contains('flex') || mockElements.hmAggNormGroup.classList.contains('hidden')) {
+      throw new Error('Expected hmAggNormGroup to be visible (flex) in hourly mode');
+    }
+    api.setHeatmapMode('quarter');
+    if (!mockElements.hmAggNormGroup.classList.contains('hidden') || mockElements.hmAggNormGroup.classList.contains('flex')) {
+      throw new Error('Expected hmAggNormGroup to be hidden in quarter mode');
+    }
+
+    // Set up mock activity matrix with distinctive numbers for testing
+    // Monday (d=0), 14:00 (h=14): total=4950, avg=412.5, 30d=1280, active_days=12
+    const mockHourlyTotal = Array.from({ length: 7 }, () => Array(24).fill(0));
+    const mockHourlyAvg = Array.from({ length: 7 }, () => Array(24).fill(0));
+    const mockHourly30d = Array.from({ length: 7 }, () => Array(24).fill(0));
+    const mockActiveCounts = [12, 8, 10, 11, 9, 2, 1];
+
+    mockHourlyTotal[0][14] = 4950;
+    mockHourlyAvg[0][14] = 412.5;
+    mockHourly30d[0][14] = 1280;
+
+    const mockMatrixData = {
+      daily: {},
+      streak: { current: 3, longest: 5, total_active_days: 20 },
+      hourly_aggregate: mockHourlyTotal,
+      hourly_aggregate_avg: mockHourlyAvg,
+      hourly_aggregate_30d: mockHourly30d,
+      weekday_active_counts: mockActiveCounts
+    };
+    api.setCachedMatrix(mockMatrixData);
+
+    // Test C: getActiveHourlyMatrix returns corresponding dataset
+    api.setHourlyAggNormMode('avg');
+    const matAvg = api.getActiveHourlyMatrix(mockMatrixData);
+    if (matAvg[0][14] !== 412.5) {
+      throw new Error(`Expected avg matrix value 412.5, got ${matAvg[0][14]}`);
+    }
+
+    api.setHourlyAggNormMode('rolling30d');
+    const mat30d = api.getActiveHourlyMatrix(mockMatrixData);
+    if (mat30d[0][14] !== 1280) {
+      throw new Error(`Expected rolling30d matrix value 1280, got ${mat30d[0][14]}`);
+    }
+
+    api.setHourlyAggNormMode('total');
+    const matTotal = api.getActiveHourlyMatrix(mockMatrixData);
+    if (matTotal[0][14] !== 4950) {
+      throw new Error(`Expected total matrix value 4950, got ${matTotal[0][14]}`);
+    }
+
+    // Fallback: if hourly_aggregate_avg is missing, 'avg' mode falls back to hourly_aggregate
+    const sparseData = {
+      hourly_aggregate: mockHourlyTotal
+    };
+    api.setHourlyAggNormMode('avg');
+    const matFallback = api.getActiveHourlyMatrix(sparseData);
+    if (matFallback[0][14] !== 4950) {
+      throw new Error(`Expected fallback to hourly_aggregate 4950, got ${matFallback[0][14]}`);
+    }
+
+    // Test D: setHourlyAggNormMode updates button styles & handles invalid inputs
+    api.setHourlyAggNormMode('rolling30d');
+    if (!mockElements.hmNorm30d.className.includes('bg-brand-600') || !mockElements.hmNormAvg.className.includes('text-gray-400')) {
+      throw new Error(`Button styles incorrect for rolling30d: 30d="${mockElements.hmNorm30d.className}", avg="${mockElements.hmNormAvg.className}"`);
+    }
+
+    api.setHourlyAggNormMode('invalid-mode');
+    if (api.getHourlyNormMode() !== 'avg' || !mockElements.hmNormAvg.className.includes('bg-brand-600')) {
+      throw new Error('Invalid norm mode should fall back to avg');
+    }
+
+    // Test E: renderHourlyAggregateGrid updates legend unit label
+    api.setHourlyAggNormMode('avg');
+    api.renderHourlyAggregateGrid(mockHourlyAvg);
+    if (!mockElements.ghScaleSummary.textContent.includes('avg ops')) {
+      throw new Error(`Expected legend to show 'avg ops' in avg mode, got: ${mockElements.ghScaleSummary.textContent}`);
+    }
+
+    api.setHourlyAggNormMode('total');
+    api.renderHourlyAggregateGrid(mockHourlyTotal);
+    if (mockElements.ghScaleSummary.textContent.includes('avg ops') || !mockElements.ghScaleSummary.textContent.includes('ops')) {
+      throw new Error(`Expected legend to show 'ops' in total mode, got: ${mockElements.ghScaleSummary.textContent}`);
+    }
+
+    // Test F: Rich hover tooltip verification across all 3 modes
+    // Mode 1: avg
+    api.setHourlyAggNormMode('avg');
+    const tipAvg = api.formatHourlyAggTooltip(0, 14, 'Mon', '14:00');
+    if (!tipAvg.includes('412.5 avg ops/active Mon') || !tipAvg.includes('4,950 total across 12 Mon') || !tipAvg.includes('1,280 in 30d')) {
+      throw new Error(`Avg tooltip format incorrect: ${tipAvg}`);
+    }
+
+    // Mode 2: rolling30d
+    api.setHourlyAggNormMode('rolling30d');
+    const tip30d = api.formatHourlyAggTooltip(0, 14, 'Mon', '14:00');
+    if (!tip30d.includes('1,280 ops in 30d') || !tip30d.includes('4,950 total across 12 Mon') || !tip30d.includes('412.5 avg/active Mon')) {
+      throw new Error(`30d tooltip format incorrect: ${tip30d}`);
+    }
+
+    // Mode 3: total
+    api.setHourlyAggNormMode('total');
+    const tipTotal = api.formatHourlyAggTooltip(0, 14, 'Mon', '14:00');
+    if (!tipTotal.includes('4,950 total ops across 12 Mon') || !tipTotal.includes('412.5 avg/active Mon') || !tipTotal.includes('1,280 in 30d')) {
+      throw new Error(`Total tooltip format incorrect: ${tipTotal}`);
+    }
+
+    // Test G: Hover cell event triggering & renderHeatmapAllViews tooltip restoration
+    api.setHeatmapMode('hourly');
+    api.setHourlyAggNormMode('avg');
+    api.renderHourlyAggregateGrid(mockHourlyAvg);
+
+    // Cell at Mon 14:00 is in row 0 (children[1] because row label is children[0]), cell 14 is children[1].children[14]
+    const monRow = mockElements.ghHourlyGrid.children[0];
+    const monCellContainer = monRow.children[1];
+    const cell14 = monCellContainer.children[14];
+    if (!cell14) {
+      throw new Error('Failed to find cell at Mon 14:00 in ghHourlyGrid');
+    }
+
+    // Hover over cell
+    cell14.trigger('mouseenter');
+    if (!mockElements.ghTooltipText.innerHTML.includes('412.5 avg ops/active Mon')) {
+      throw new Error(`Hover tooltip not populated: ${mockElements.ghTooltipText.innerHTML}`);
+    }
+
+    // Trigger renderHeatmapAllViews (simulating live SSE push while hovering)
+    api.renderHeatmapAllViews(mockMatrixData);
+    if (!mockElements.ghTooltipText.innerHTML.includes('412.5 avg ops/active Mon')) {
+      throw new Error(`Hover restoration failed on SSE update: ${mockElements.ghTooltipText.innerHTML}`);
+    }
+
+    // Mouse leave resets tooltip
+    cell14.trigger('mouseleave');
+    if (!mockElements.ghTooltipText.textContent.includes('Hover over any commit square')) {
+      throw new Error(`Mouse leave did not reset tooltip text: ${mockElements.ghTooltipText.textContent}`);
+    }
+
+    // Test H: Sparse dataset fallback (when only hourly_aggregate is present)
+    api.setCachedMatrix(sparseData);
+    api.setHourlyAggNormMode('avg');
+    const tipSparse = api.formatHourlyAggTooltip(0, 14, 'Mon', '14:00');
+    if (!tipSparse.includes('4,950 operations across all history') || tipSparse.includes('across 0 Mon')) {
+      throw new Error(`Sparse dataset tooltip should fall back to all history operations, got: ${tipSparse}`);
+    }
+
+    // Test I: Empty array fallback in getActiveHourlyMatrix
+    const emptyArrayData = {
+      hourly_aggregate: mockHourlyTotal,
+      hourly_aggregate_avg: [],
+      hourly_aggregate_30d: []
+    };
+    api.setHourlyAggNormMode('avg');
+    const matEmptyAvg = api.getActiveHourlyMatrix(emptyArrayData);
+    if (matEmptyAvg[0][14] !== 4950) {
+      throw new Error(`Expected empty array to fall back to hourly_aggregate, got ${matEmptyAvg[0][14]}`);
+    }
+    api.setHourlyAggNormMode('rolling30d');
+    const matEmpty30d = api.getActiveHourlyMatrix(emptyArrayData);
+    if (matEmpty30d[0][14] !== 4950) {
+      throw new Error(`Expected empty array to fall back to hourly_aggregate, got ${matEmpty30d[0][14]}`);
+    }
+
+    // Test J: Inferred activeCount when weekday_active_counts is missing
+    const dataWithoutActiveCounts = {
+      hourly_aggregate: mockHourlyTotal,
+      hourly_aggregate_avg: mockHourlyAvg,
+      hourly_aggregate_30d: mockHourly30d
+    };
+    api.setCachedMatrix(dataWithoutActiveCounts);
+    api.setHourlyAggNormMode('avg');
+    const tipInferred = api.formatHourlyAggTooltip(0, 14, 'Mon', '14:00');
+    if (!tipInferred.includes('across 12 Mon') || tipInferred.includes('across 0 Mon')) {
+      throw new Error(`Expected active count to be inferred as 12 (4950 / 412.5), got: ${tipInferred}`);
+    }
+    api.setCachedMatrix(mockMatrixData);
+
+    // Test K: Live mode switch updates hover tooltip immediately
+    api.setHourlyAggNormMode('avg');
+    cell14.trigger('mouseenter');
+    if (!mockElements.ghTooltipText.innerHTML.includes('412.5 avg ops/active Mon')) {
+      throw new Error(`Hover tooltip not populated: ${mockElements.ghTooltipText.innerHTML}`);
+    }
+    api.setHourlyAggNormMode('rolling30d');
+    if (!mockElements.ghTooltipText.innerHTML.includes('1,280 ops in 30d')) {
+      throw new Error(`Live norm mode change did not update active tooltip: ${mockElements.ghTooltipText.innerHTML}`);
+    }
+    api.setHourlyAggNormMode('total');
+    if (!mockElements.ghTooltipText.innerHTML.includes('4,950 total ops across 12 Mon')) {
+      throw new Error(`Live norm mode change did not update active tooltip: ${mockElements.ghTooltipText.innerHTML}`);
+    }
+    cell14.trigger('mouseleave');
+
+    console.log(JSON.stringify({ status: 'ok', cases: 11 }));
+    """
+
+    res = subprocess.run(
+        ["node", "-e", node_script], capture_output=True, text=True, cwd=Path.cwd()
+    )
+    assert res.returncode == 0, f"Node script failed: {res.stderr}\n{res.stdout}"
+    data = json.loads(res.stdout.strip().splitlines()[-1])
+    assert data["status"] == "ok"
+    assert data["cases"] == 11
+
+
 def test_frontend_debouncing_and_abort_controller():
     """Verifies Task 4 frontend optimizations in script.js:
     - Trailing debounce timer for db_update SSE events

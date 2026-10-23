@@ -724,23 +724,38 @@
           </div>
         </div>
 
-        <!-- Zoom Tabs -->
-        <div class="flex items-center space-x-1 bg-dark-900 border border-dark-700 rounded-lg p-1 text-xs">
-          <button onclick="setHeatmapMode('year')" id="hmBtnYear" class="px-3 py-1 rounded-md bg-brand-600 text-white font-medium shadow transition whitespace-nowrap">
-            1 Year (52W)
-          </button>
-          <button onclick="setHeatmapMode('quarter')" id="hmBtnQuarter" class="px-3 py-1 rounded-md text-gray-400 hover:text-white transition whitespace-nowrap">
-            3 Months
-          </button>
-          <button onclick="setHeatmapMode('month')" id="hmBtnMonth" class="px-3 py-1 rounded-md text-gray-400 hover:text-white transition whitespace-nowrap">
-            Past 30 Days (Hourly)
-          </button>
-          <button onclick="setHeatmapMode('past7hourly')" id="hmBtnPast7" class="px-3 py-1 rounded-md text-gray-400 hover:text-white transition whitespace-nowrap">
-            Past 7 Days (Hourly)
-          </button>
-          <button onclick="setHeatmapMode('hourly')" id="hmBtnHourly" class="px-3 py-1 rounded-md text-gray-400 hover:text-white transition whitespace-nowrap">
-            24x7 Aggregate
-          </button>
+        <div class="flex flex-wrap items-center gap-2">
+          <!-- 24x7 Aggregate Normalization Toggle (visible in hourly mode) -->
+          <div id="hmAggNormGroup" class="hidden items-center space-x-1 bg-dark-900 border border-dark-700 rounded-lg p-1 text-[11px]">
+            <button onclick="setHourlyAggNormMode('avg')" id="hmNormAvg" class="px-2.5 py-1 rounded-md bg-brand-600 text-white font-medium shadow transition whitespace-nowrap" title="Average operations per active weekday">
+              Avg / Active Day
+            </button>
+            <button onclick="setHourlyAggNormMode('rolling30d')" id="hmNorm30d" class="px-2.5 py-1 rounded-md text-gray-400 hover:text-white transition whitespace-nowrap" title="Operations in the rolling past 30 days">
+              Rolling 30d
+            </button>
+            <button onclick="setHourlyAggNormMode('total')" id="hmNormTotal" class="px-2.5 py-1 rounded-md text-gray-400 hover:text-white transition whitespace-nowrap" title="Cumulative operations across all history">
+              All-Time Total
+            </button>
+          </div>
+
+          <!-- Zoom Tabs -->
+          <div class="flex items-center space-x-1 bg-dark-900 border border-dark-700 rounded-lg p-1 text-xs">
+            <button onclick="setHeatmapMode('year')" id="hmBtnYear" class="px-3 py-1 rounded-md bg-brand-600 text-white font-medium shadow transition whitespace-nowrap">
+              1 Year (52W)
+            </button>
+            <button onclick="setHeatmapMode('quarter')" id="hmBtnQuarter" class="px-3 py-1 rounded-md text-gray-400 hover:text-white transition whitespace-nowrap">
+              3 Months
+            </button>
+            <button onclick="setHeatmapMode('month')" id="hmBtnMonth" class="px-3 py-1 rounded-md text-gray-400 hover:text-white transition whitespace-nowrap">
+              Past 30 Days (Hourly)
+            </button>
+            <button onclick="setHeatmapMode('past7hourly')" id="hmBtnPast7" class="px-3 py-1 rounded-md text-gray-400 hover:text-white transition whitespace-nowrap">
+              Past 7 Days (Hourly)
+            </button>
+            <button onclick="setHeatmapMode('hourly')" id="hmBtnHourly" class="px-3 py-1 rounded-md text-gray-400 hover:text-white transition whitespace-nowrap">
+              24x7 Aggregate
+            </button>
+          </div>
         </div>
       </div>
 
