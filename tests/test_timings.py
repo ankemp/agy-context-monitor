@@ -243,7 +243,7 @@ def test_compute_session_timings_edge_cases():
     assert agent == 3.0
     assert pairing == 35.0
 
-    # Delta == 0 fallback for PLANNER_RESPONSE with 0 tokens (must still credit 1.0s floor!)
+    # Delta == 0 fallback for PLANNER_RESPONSE with 0 tokens (must be 0.0s when out_tok == 0)
     zero_delta_zero_tokens = [
         {"timestamp": "2026-10-20T10:00:00Z", "type": "USER_INPUT", "characters": 100},
         {
@@ -254,7 +254,7 @@ def test_compute_session_timings_edge_cases():
         },
     ]
     dur, agent, pairing = compute_session_timings(zero_delta_zero_tokens)
-    assert agent == 1.0
+    assert agent == 0.0
     assert pairing == 35.0
 
     # First step is PLANNER_RESPONSE with tokens
@@ -269,7 +269,7 @@ def test_compute_session_timings_edge_cases():
     assert agent == 1.0
     assert pairing == 0.0
 
-    # First step is PLANNER_RESPONSE with 0 tokens (must still credit 1.0s floor!)
+    # First step is PLANNER_RESPONSE with 0 tokens (0.0s when out_tok == 0)
     first_step_zero_tokens = [
         {
             "timestamp": "2026-10-20T10:00:00Z",
@@ -278,7 +278,7 @@ def test_compute_session_timings_edge_cases():
         },
     ]
     dur, agent, pairing = compute_session_timings(first_step_zero_tokens)
-    assert agent == 1.0
+    assert agent == 0.0
     assert pairing == 0.0
 
     # Mixed offset-naive and offset-aware ISO timestamps

@@ -58,6 +58,17 @@ def estimate_prompt_pairing_seconds(char_count: Any) -> float:
     return min(AFK_THRESHOLD_SECONDS, max(15.0, 15.0 + (safe_chars / 5.0)))
 
 
+def _estimate_planner_generation_seconds(step: dict[str, Any]) -> float:
+    """Estimate minimal LLM execution time from output and thinking tokens.
+
+    Returns 0.0 if out_tok <= 0, otherwise min(60.0, max(1.0, out_tok / 80.0)).
+    """
+    out_tok = _safe_int(step.get("est_tokens")) + _safe_int(step.get("thinking_tokens"))
+    if out_tok > 0:
+        return min(60.0, max(1.0, out_tok / 80.0))
+    return 0.0
+
+
 def _parse_iso_timestamp(ts: Any) -> datetime | None:
     """Parse an ISO 8601 string, Unix epoch number, or datetime into a UTC datetime."""
     if ts is None:
@@ -164,15 +175,9 @@ def compute_session_timings(
                 if 0.0 < delta <= max_delta:
                     active_agent_seconds += delta
                 elif delta == 0.0 and s_type == "PLANNER_RESPONSE":
-                    out_tok = _safe_int(step.get("est_tokens")) + _safe_int(
-                        step.get("thinking_tokens")
-                    )
-                    active_agent_seconds += min(60.0, max(1.0, out_tok / 80.0))
+                    active_agent_seconds += _estimate_planner_generation_seconds(step)
             elif s_type == "PLANNER_RESPONSE":
-                out_tok = _safe_int(step.get("est_tokens")) + _safe_int(
-                    step.get("thinking_tokens")
-                )
-                active_agent_seconds += min(60.0, max(1.0, out_tok / 80.0))
+                active_agent_seconds += _estimate_planner_generation_seconds(step)
 
         prev_dt = dt
         prev_step_type = s_type

@@ -1220,7 +1220,7 @@ def generate_global_report(
         f"> **Human Pairing Time (Inter-Turn)**: {format_duration(total_pairing_sec)}  ",
         f"> **Agent Work Time (Root + Subagent Fleet)**: {format_duration(total_agent_sec)}  ",
         f"> **Est. Dev Time Saved (Tool Execution)**: ~{saved_hours:,.0f} hours ({format_duration(saved_seconds)})  ",
-        f"> **Effective Output Hours**: **{effective_output_hours:.1f}h**  ",
+        f"> **Effective Output Hours**: **{effective_output_hours:.1f}h** _(Human Pairing + Agent Work + Dev Time Saved)_  ",
         f"> **Deep Reasoning Tokens**: **{format_tokens(totals['total_thinking'] or 0)}**  ",
         f"> **Code Authored & Refactored**: **{(totals['total_written'] or 0) + (totals['total_edited'] or 0):,} lines**  ",
         f"> **MCP Invocations**: **{total_mcp_calls:,} calls** across {total_mcp_servers} servers  ",

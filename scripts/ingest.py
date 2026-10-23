@@ -25,11 +25,11 @@ _root = Path(__file__).resolve().parent.parent
 if str(_root / "src") not in sys.path:
     sys.path.insert(0, str(_root / "src"))
 
-from context_monitor.db import (
+from context_monitor.db import (  # noqa: E402
     DEFAULT_DB_PATH,
     get_db_connection,
     refresh_conversation_rollups,
-)  # noqa: E402
+)
 from context_monitor.diff import DiffResult, diff_block_lists  # noqa: E402
 from context_monitor.formats import BlockParser  # noqa: E402
 from context_monitor.html_report import generate_html_report  # noqa: E402

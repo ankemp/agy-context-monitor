@@ -756,15 +756,13 @@
         ? data.effective_output_hours
         : (effectiveSec / 3600);
       const denomWork = pairingWork > 0 ? pairingWork : agentWork;
-      const denomHours = denomWork / 3600;
+      const displayHours = effectiveHours > 0 ? effectiveHours : (effectiveSec / 3600);
 
       const elForceMultiplierSub = document.getElementById('kpiForceMultiplierSub');
       if (elForceMultiplierSub) {
         if ((effectiveHours > 0 || effectiveSec > 0) && pairingWork > 0) {
-          const displayHours = effectiveHours > 0 ? effectiveHours : (effectiveSec / 3600);
           elForceMultiplierSub.textContent = `~${displayHours.toFixed(1)}h output / ${formatDuration(pairingWork)}`;
         } else if ((effectiveHours > 0 || effectiveSec > 0) && agentWork > 0) {
-          const displayHours = effectiveHours > 0 ? effectiveHours : (effectiveSec / 3600);
           elForceMultiplierSub.textContent = `~${displayHours.toFixed(1)}h output / ${formatDuration(agentWork)}`;
         } else {
           elForceMultiplierSub.textContent = 'Effective output';
@@ -2377,7 +2375,8 @@
           <td class="py-2.5 px-3 text-right">${costHtml}</td>
           <td class="py-2.5 px-3 text-right">${tokensHtml}</td>
           <td class="py-2.5 px-3 text-right text-gray-300 whitespace-nowrap" title="${timeTitle}">
-            <span class="font-medium text-emerald-400 text-xs">${formatDuration(agentSec || (pairingSec || wallSec))}</span>
+            <span class="font-medium text-emerald-400 text-xs">${formatDuration(agentSec)}</span>
+            ${pairingSec > 0 ? `<span class="text-[10px] text-amber-300/90 font-mono block">Pair: ${formatDuration(pairingSec)}</span>` : ''}
             ${hasFleetDiff ? `<span class="text-[10px] text-pink-300 font-mono font-medium block">Fleet: ${formatDuration(fleetAgentSec)}</span>` : ''}
             <span class="text-[10px] text-gray-500 block font-mono">(${formatDuration(wallSec)})</span>
           </td>
@@ -2396,7 +2395,7 @@
             const childPairingSec = sub.active_pairing_seconds || 0;
             const childFleetSec = sub.fleet_agent_seconds || childAgentSec;
             const hasChildFleetDiff = childFleetSec > childAgentSec;
-            const childActiveSec = childAgentSec || sub.duration_seconds || 0;
+            const childActiveSec = childAgentSec;
             const childWallSec = sub.duration_seconds || 0;
             const childTimeTitle = `Agent Work: ${formatDuration(childAgentSec)}${hasChildFleetDiff ? ` (Fleet: ${formatDuration(childFleetSec)})` : ''} | Human Pairing: ${formatDuration(childPairingSec)} | Total Span: ${formatDuration(childWallSec)}`;
 
@@ -2469,7 +2468,7 @@
           if (hasFleetAgent) {
             durationEl.innerHTML = `${formatDuration(convAgentSec)} <span class="text-xs text-pink-300 font-normal">/ Fleet: ${formatDuration(fleetSummaryAgent)}</span>`;
           } else {
-            durationEl.textContent = formatDuration(convAgentSec || conv.duration_seconds || 0);
+            durationEl.textContent = formatDuration(convAgentSec);
           }
           durationEl.title = `Agent Work: ${formatDuration(convAgentSec)}${hasFleetAgent ? ` (Fleet: ${formatDuration(fleetSummaryAgent)})` : ''} | Human Pairing: ${formatDuration(convPairingSec)} | Total Span: ${formatDuration(conv.duration_seconds || 0)}`;
         }

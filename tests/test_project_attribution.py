@@ -1,5 +1,4 @@
 import sqlite3
-import pytest
 from context_monitor.db import get_db_connection, init_db
 from context_monitor.project import (
     backfill_db_projects,
@@ -13,7 +12,7 @@ def test_normalize_project_name_strips_trailing_punctuation():
     assert normalize_project_name("ledger.") == "ledger"
     assert normalize_project_name("ledger,") == "ledger"
     assert normalize_project_name("agy-context-monitor)") == "agy-context-monitor"
-    assert normalize_project_name("  \"healer-roguelite\".. ") == "healer-roguelite"
+    assert normalize_project_name('  "healer-roguelite".. ') == "healer-roguelite"
     assert normalize_project_name("") is None
     assert normalize_project_name("...") is None
     assert normalize_project_name(None) is None
@@ -62,12 +61,16 @@ Active Workspaces:
     assert extract_project_from_text(legacy_info) == "vinny-companion"
     # Non-workspace global path returns None
     assert (
-        extract_project_from_text("/Users/akemp/.gemini/antigravity/builtin/skills/SKILL.md")
+        extract_project_from_text(
+            "/Users/akemp/.gemini/antigravity/builtin/skills/SKILL.md"
+        )
         is None
     )
     # Windows style workspace path
     assert (
-        extract_project_from_text(r"C:\Users\akemp\Workspace\healer-roguelite\package.json")
+        extract_project_from_text(
+            r"C:\Users\akemp\Workspace\healer-roguelite\package.json"
+        )
         == "healer-roguelite"
     )
     # Markdown link with trailing parenthesis
@@ -83,7 +86,9 @@ Active Workspaces:
 def test_extract_project_from_tool_args():
     assert (
         extract_project_from_tool_args(
-            {"Path": '"/Users/akemp/.gemini/antigravity/worktrees/ledger/branch/foo.py"'}
+            {
+                "Path": '"/Users/akemp/.gemini/antigravity/worktrees/ledger/branch/foo.py"'
+            }
         )
         == "ledger"
     )
@@ -149,7 +154,6 @@ def test_backfill_db_projects_recovers_historical_and_swarm(tmp_path):
 
 def test_analyze_transcript_and_parse_conversation_worktree_and_generic(tmp_path):
     import json
-    from pathlib import Path
     from scripts.ingest import analyze_transcript
     from scripts.backfill_analytics import parse_conversation
 
@@ -158,7 +162,14 @@ def test_analyze_transcript_and_parse_conversation_worktree_and_generic(tmp_path
     t1_dir.mkdir()
     t1_file = t1_dir / "transcript.jsonl"
     t1_file.write_text(
-        json.dumps({"step_index": 1, "type": "GENERIC", "content": "Checked /Users/akemp/workspace/ledger."}) + "\n",
+        json.dumps(
+            {
+                "step_index": 1,
+                "type": "GENERIC",
+                "content": "Checked /Users/akemp/workspace/ledger.",
+            }
+        )
+        + "\n",
         encoding="utf-8",
     )
     res_ingest1 = analyze_transcript(t1_file)
@@ -171,16 +182,21 @@ def test_analyze_transcript_and_parse_conversation_worktree_and_generic(tmp_path
     t2_dir.mkdir()
     t2_file = t2_dir / "transcript.jsonl"
     t2_file.write_text(
-        json.dumps({
-            "step_index": 1,
-            "type": "PLANNER_RESPONSE",
-            "tool_calls": [
-                {
-                    "name": "read_file",
-                    "args": {"Path": "/Users/akemp/.gemini/antigravity/worktrees/ledger/feature/test.py"},
-                }
-            ],
-        }) + "\n",
+        json.dumps(
+            {
+                "step_index": 1,
+                "type": "PLANNER_RESPONSE",
+                "tool_calls": [
+                    {
+                        "name": "read_file",
+                        "args": {
+                            "Path": "/Users/akemp/.gemini/antigravity/worktrees/ledger/feature/test.py"
+                        },
+                    }
+                ],
+            }
+        )
+        + "\n",
         encoding="utf-8",
     )
     res_ingest2 = analyze_transcript(t2_file)
@@ -190,7 +206,6 @@ def test_analyze_transcript_and_parse_conversation_worktree_and_generic(tmp_path
 
 
 def test_sync_to_sqlite_swarm_bidirectional_propagation(tmp_path):
-    from pathlib import Path
     from scripts.ingest import sync_to_sqlite
 
     db_file = tmp_path / "test_sync_swarm.db"
@@ -220,7 +235,9 @@ def test_sync_to_sqlite_swarm_bidirectional_propagation(tmp_path):
     sync_to_sqlite("child-1", "model-a", child_analysis, db_path=db_file)
 
     conn = get_db_connection(db_file)
-    root_proj = conn.execute("SELECT project FROM conversations WHERE id = 'root-1'").fetchone()[0]
+    root_proj = conn.execute(
+        "SELECT project FROM conversations WHERE id = 'root-1'"
+    ).fetchone()[0]
     assert root_proj == "ledger"
 
     # Grandchild with no project inherits from root_id
@@ -240,13 +257,14 @@ def test_sync_to_sqlite_swarm_bidirectional_propagation(tmp_path):
     sync_to_sqlite("grandchild-1", "model-a", grandchild_analysis, db_path=db_file)
 
     conn = get_db_connection(db_file)
-    gc_proj = conn.execute("SELECT project FROM conversations WHERE id = 'grandchild-1'").fetchone()[0]
+    gc_proj = conn.execute(
+        "SELECT project FROM conversations WHERE id = 'grandchild-1'"
+    ).fetchone()[0]
     assert gc_proj == "ledger"
     conn.close()
 
 
 def test_run_backfill_preserves_historical_and_propagates_swarms(tmp_path):
-    from pathlib import Path
     import json
     from scripts.backfill_analytics import run_backfill
 
@@ -270,21 +288,37 @@ def test_run_backfill_preserves_historical_and_propagates_swarms(tmp_path):
     child_dir = brain_dir / "child-subagent"
     child_dir.mkdir()
     (child_dir / "transcript.jsonl").write_text(
-        json.dumps({
-            "step_index": 1,
-            "type": "SYSTEM_MESSAGE",
-            "content": "[Message] timestamp=2026-10-21T01:00:00Z sender=hist-root\nCoordinate task",
-        }) + "\n" +
-        json.dumps({
-            "step_index": 2,
-            "type": "USER_INPUT",
-            "content": "Working on /Users/akemp/Workspace/vinny-companion/src",
-        }) + "\n" +
-        json.dumps({
-            "step_index": 3,
-            "type": "PLANNER_RESPONSE",
-            "tool_calls": [{"name": "read_file", "args": {"Path": "/Users/akemp/Workspace/vinny-companion/README.md"}}],
-        }) + "\n",
+        json.dumps(
+            {
+                "step_index": 1,
+                "type": "SYSTEM_MESSAGE",
+                "content": "[Message] timestamp=2026-10-21T01:00:00Z sender=hist-root\nCoordinate task",
+            }
+        )
+        + "\n"
+        + json.dumps(
+            {
+                "step_index": 2,
+                "type": "USER_INPUT",
+                "content": "Working on /Users/akemp/Workspace/vinny-companion/src",
+            }
+        )
+        + "\n"
+        + json.dumps(
+            {
+                "step_index": 3,
+                "type": "PLANNER_RESPONSE",
+                "tool_calls": [
+                    {
+                        "name": "read_file",
+                        "args": {
+                            "Path": "/Users/akemp/Workspace/vinny-companion/README.md"
+                        },
+                    }
+                ],
+            }
+        )
+        + "\n",
         encoding="utf-8",
     )
 
@@ -322,7 +356,10 @@ Command Working Directory: /Users/akemp
     assert extract_project_from_text(home_info) is None
 
     # 4. Containers and Codespaces (/workspace and /workspaces)
-    assert extract_project_from_text("/workspaces/my-cool-app/src/index.ts") == "my-cool-app"
+    assert (
+        extract_project_from_text("/workspaces/my-cool-app/src/index.ts")
+        == "my-cool-app"
+    )
     assert extract_project_from_text("/workspace/cloud-api/main.go") == "cloud-api"
     assert extract_project_from_text("file:///workspaces/my-cool-app") == "my-cool-app"
 
@@ -333,7 +370,9 @@ def test_extract_project_from_tool_args_search_directory():
         == "my-cool-app"
     )
     assert (
-        extract_project_from_tool_args({"search_directory": "/Users/akemp/Workspace/ledger"})
+        extract_project_from_tool_args(
+            {"search_directory": "/Users/akemp/Workspace/ledger"}
+        )
         == "ledger"
     )
 
@@ -383,7 +422,9 @@ def test_init_db_sets_user_version_3_when_conversations_exist(tmp_path):
     # Re-running init_db triggers _init_db_conn migration to v3
     init_db(conn)
     ver = conn.execute("PRAGMA user_version;").fetchone()[0]
-    proj = conn.execute("SELECT project FROM conversations WHERE id = 'c1'").fetchone()["project"]
+    proj = conn.execute("SELECT project FROM conversations WHERE id = 'c1'").fetchone()[
+        "project"
+    ]
     conn.close()
     assert ver == 3
     assert proj == "ledger"
@@ -402,11 +443,14 @@ def test_swarm_root_priority_over_child_project(tmp_path):
     root_dir = brain_dir / "root-conv"
     root_dir.mkdir()
     (root_dir / "transcript.jsonl").write_text(
-        json.dumps({
-            "step_index": 1,
-            "type": "USER_INPUT",
-            "content": "Working in /Users/akemp/Workspace/root-app",
-        }) + "\n",
+        json.dumps(
+            {
+                "step_index": 1,
+                "type": "USER_INPUT",
+                "content": "Working in /Users/akemp/Workspace/root-app",
+            }
+        )
+        + "\n",
         encoding="utf-8",
     )
 
@@ -414,16 +458,22 @@ def test_swarm_root_priority_over_child_project(tmp_path):
     child1_dir = brain_dir / "child-1"
     child1_dir.mkdir()
     (child1_dir / "transcript.jsonl").write_text(
-        json.dumps({
-            "step_index": 1,
-            "type": "SYSTEM_MESSAGE",
-            "content": "[Message] timestamp=2026-10-21T01:00:00Z sender=root-conv\nSubtask",
-        }) + "\n" +
-        json.dumps({
-            "step_index": 2,
-            "type": "USER_INPUT",
-            "content": "Working in /Users/akemp/Workspace/child-app",
-        }) + "\n",
+        json.dumps(
+            {
+                "step_index": 1,
+                "type": "SYSTEM_MESSAGE",
+                "content": "[Message] timestamp=2026-10-21T01:00:00Z sender=root-conv\nSubtask",
+            }
+        )
+        + "\n"
+        + json.dumps(
+            {
+                "step_index": 2,
+                "type": "USER_INPUT",
+                "content": "Working in /Users/akemp/Workspace/child-app",
+            }
+        )
+        + "\n",
         encoding="utf-8",
     )
 
@@ -431,11 +481,14 @@ def test_swarm_root_priority_over_child_project(tmp_path):
     child2_dir = brain_dir / "child-2"
     child2_dir.mkdir()
     (child2_dir / "transcript.jsonl").write_text(
-        json.dumps({
-            "step_index": 1,
-            "type": "SYSTEM_MESSAGE",
-            "content": "[Message] timestamp=2026-10-21T01:00:00Z sender=root-conv\nGeneric subtask",
-        }) + "\n",
+        json.dumps(
+            {
+                "step_index": 1,
+                "type": "SYSTEM_MESSAGE",
+                "content": "[Message] timestamp=2026-10-21T01:00:00Z sender=root-conv\nGeneric subtask",
+            }
+        )
+        + "\n",
         encoding="utf-8",
     )
 
@@ -457,4 +510,3 @@ Active Workspaces:
 - /Users/akemp/Workspace/my-project/src/components
 </user_information>"""
     assert extract_project_from_text(user_info) == "my-project"
-

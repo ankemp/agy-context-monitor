@@ -1934,7 +1934,7 @@ def query_session_details(conn, cid, tz=None):
                     if not isinstance(parsed_args, dict):
                         parsed_args = {}
 
-                    subagents_list = []
+                    extracted_subagents = []
                     subagents_raw = parsed_args.get("Subagents") or parsed_args.get(
                         "subagents"
                     )
@@ -1946,13 +1946,13 @@ def query_session_details(conn, cid, tz=None):
                                 if isinstance(parsed, str):
                                     parsed = json.loads(parsed)
                                 if isinstance(parsed, list):
-                                    subagents_list = parsed
+                                    extracted_subagents = parsed
                             except Exception:
                                 pass
                         elif isinstance(subagents_raw, list):
-                            subagents_list = subagents_raw
+                            extracted_subagents = subagents_raw
 
-                    if not subagents_list:
+                    if not extracted_subagents:
                         flat_keys = (
                             "Role",
                             "role",
@@ -1986,7 +1986,7 @@ def query_session_details(conn, cid, tz=None):
                                 or parsed_args.get("prompt")
                                 or ""
                             )
-                            subagents_list = [
+                            extracted_subagents = [
                                 {
                                     "role": role or "Autonomous Worker",
                                     "type": sub_type or "self",
@@ -1998,7 +1998,7 @@ def query_session_details(conn, cid, tz=None):
                                     "Prompt": prompt,
                                 }
                             ]
-                    b_dict["subagents"] = subagents_list
+                    b_dict["subagents"] = extracted_subagents
                     b_dict["tool_action"] = parsed_args.get("toolAction")
                     b_dict["tool_summary"] = parsed_args.get("toolSummary")
                 except Exception:
