@@ -301,10 +301,14 @@
 
     const COLOR_PALETTE = {
       lvl0: '#151d2f',
-      lvl1: '#312e81',
-      lvl2: '#4338ca',
-      lvl3: '#6366f1',
-      lvl4: '#a5b4fc'
+      lvl1: '#1e1b4b',
+      lvl2: '#312e81',
+      lvl3: '#3730a3',
+      lvl4: '#4338ca',
+      lvl5: '#4f46e5',
+      lvl6: '#6366f1',
+      lvl7: '#818cf8',
+      lvl8: '#c7d2fe'
     };
 
     function formatTokens(n) {
@@ -848,13 +852,176 @@
       }
     }
 
-    function getCommitColor(steps) {
-      if (!steps || steps <= 0) return COLOR_PALETTE.lvl0;
-      if (steps <= 50) return COLOR_PALETTE.lvl1;
-      if (steps <= 250) return COLOR_PALETTE.lvl2;
-      if (steps <= 1000) return COLOR_PALETTE.lvl3;
-      return COLOR_PALETTE.lvl4;
+    function formatLocalDateKey(dateObj) {
+      if (!dateObj) return '';
+      if (typeof dateObj === 'number') {
+        dateObj = new Date(dateObj);
+      } else if (typeof dateObj === 'string') {
+        if (/^\d{4}-\d{2}-\d{2}$/.test(dateObj)) return dateObj;
+        const parsed = new Date(dateObj);
+        if (isNaN(parsed.getTime())) return dateObj.substring(0, 10);
+        dateObj = parsed;
+      }
+      if (!dateObj || typeof dateObj.getFullYear !== 'function' || isNaN(dateObj.getTime())) {
+        return '';
+      }
+      const y = dateObj.getFullYear();
+      const m = String(dateObj.getMonth() + 1).padStart(2, '0');
+      const d = String(dateObj.getDate()).padStart(2, '0');
+      return `${y}-${m}-${d}`;
     }
+
+    function computeQuantileThresholds(values) {
+      if (!values || !Array.isArray(values)) {
+        return {
+          cutoffs: [0, 0, 0, 0, 0, 0, 0],
+          min: 0,
+          max: 0,
+          p50: 0,
+          count: 0
+        };
+      }
+
+      const valid = [];
+      for (let i = 0; i < values.length; i++) {
+        const v = Number(values[i]);
+        if (Number.isFinite(v) && v > 0) {
+          valid.push(v);
+        }
+      }
+
+      if (valid.length === 0) {
+        return {
+          cutoffs: [0, 0, 0, 0, 0, 0, 0],
+          min: 0,
+          max: 0,
+          p50: 0,
+          count: 0
+        };
+      }
+
+      valid.sort((a, b) => a - b);
+      const n = valid.length;
+      const minVal = valid[0];
+      const maxVal = valid[n - 1];
+
+      function getPercentile(p) {
+        if (n === 1) return valid[0];
+        const index = (n - 1) * p;
+        const lower = Math.floor(index);
+        const upper = Math.ceil(index);
+        const fraction = index - lower;
+        if (lower === upper) {
+          return valid[lower];
+        }
+        return valid[lower] + fraction * (valid[upper] - valid[lower]);
+      }
+
+      const QUANTILE_STOPS = [0.2, 0.4, 0.6, 0.75, 0.85, 0.93, 0.98];
+      const cutoffs = QUANTILE_STOPS.map(p => getPercentile(p));
+      const p50 = getPercentile(0.5);
+
+      return {
+        cutoffs,
+        min: minVal,
+        max: maxVal,
+        p50,
+        count: n
+      };
+    }
+
+    function formatLegendVal(v) {
+      if (v === undefined || v === null || isNaN(v)) return '0';
+      if (v >= 1000000) return (v / 1000000).toFixed(1) + 'M';
+      if (v >= 10000) return (v / 1000).toFixed(1) + 'k';
+      if (v % 1 !== 0) return Number(v.toFixed(1)).toString();
+      return Math.round(v).toLocaleString();
+    }
+
+    function updateHeatmapLegend(thresholds, unitLabel) {
+      const unit = unitLabel || 'ops';
+      const summaryEl = document.getElementById('ghScaleSummary');
+      const legendEl = document.getElementById('ghColorLegend');
+
+      const hasActivity = thresholds && thresholds.count > 0;
+      const hasDynamicScale = hasActivity && thresholds.min < thresholds.max;
+
+      if (summaryEl) {
+        if (hasActivity) {
+          const fmtP50 = formatLegendVal(thresholds.p50);
+          const fmtMax = formatLegendVal(thresholds.max);
+          summaryEl.textContent = `P50: ${fmtP50} · Max: ${fmtMax} ${unit}`;
+        } else {
+          summaryEl.textContent = 'No activity';
+        }
+      }
+
+      if (legendEl) {
+        const swatches = (typeof legendEl.querySelectorAll === 'function')
+          ? legendEl.querySelectorAll('[data-level]')
+          : (legendEl.children || []);
+
+        const c = (thresholds && thresholds.cutoffs) || [0, 0, 0, 0, 0, 0, 0];
+        const titles = {
+          lvl0: `0 ${unit}`,
+          lvl1: hasDynamicScale ? `≤ ${formatLegendVal(c[0])} ${unit} (P20)` : `≤ 25 ${unit}`,
+          lvl2: hasDynamicScale ? `${formatLegendVal(c[0])} – ${formatLegendVal(c[1])} ${unit} (P40)` : `26 – 100 ${unit}`,
+          lvl3: hasDynamicScale ? `${formatLegendVal(c[1])} – ${formatLegendVal(c[2])} ${unit} (P60)` : `101 – 300 ${unit}`,
+          lvl4: hasDynamicScale ? `${formatLegendVal(c[2])} – ${formatLegendVal(c[3])} ${unit} (P75)` : `301 – 750 ${unit}`,
+          lvl5: hasDynamicScale ? `${formatLegendVal(c[3])} – ${formatLegendVal(c[4])} ${unit} (P85)` : `751 – 1,500 ${unit}`,
+          lvl6: hasDynamicScale ? `${formatLegendVal(c[4])} – ${formatLegendVal(c[5])} ${unit} (P93)` : `1,501 – 3,500 ${unit}`,
+          lvl7: hasDynamicScale ? `${formatLegendVal(c[5])} – ${formatLegendVal(c[6])} ${unit} (P98)` : `3,501 – 7,500 ${unit}`,
+          lvl8: hasDynamicScale ? `> ${formatLegendVal(c[6])} ${unit} (Top 2%)` : `> 7,500 ${unit}`
+        };
+
+        if (swatches && swatches.length) {
+          for (let i = 0; i < swatches.length; i++) {
+            const swatch = swatches[i];
+            const lvl = (swatch.getAttribute && swatch.getAttribute('data-level')) || (swatch.dataset && swatch.dataset.level);
+            if (lvl && titles[lvl] !== undefined) {
+              swatch.title = titles[lvl];
+            }
+          }
+        }
+      }
+    }
+
+    function getCommitColor(steps, thresholds) {
+      if (!steps || steps <= 0) return COLOR_PALETTE.lvl0;
+
+      if (
+        thresholds &&
+        thresholds.count > 0 &&
+        thresholds.min < thresholds.max &&
+        Array.isArray(thresholds.cutoffs) &&
+        thresholds.cutoffs.length === 7
+      ) {
+        const c = thresholds.cutoffs;
+        if (steps <= c[0]) return COLOR_PALETTE.lvl1;
+        if (steps <= c[1]) return COLOR_PALETTE.lvl2;
+        if (steps <= c[2]) return COLOR_PALETTE.lvl3;
+        if (steps <= c[3]) return COLOR_PALETTE.lvl4;
+        if (steps <= c[4]) return COLOR_PALETTE.lvl5;
+        if (steps <= c[5]) return COLOR_PALETTE.lvl6;
+        if (steps <= c[6]) return COLOR_PALETTE.lvl7;
+        return COLOR_PALETTE.lvl8;
+      }
+
+      if (steps <= 25) return COLOR_PALETTE.lvl1;
+      if (steps <= 100) return COLOR_PALETTE.lvl2;
+      if (steps <= 300) return COLOR_PALETTE.lvl3;
+      if (steps <= 750) return COLOR_PALETTE.lvl4;
+      if (steps <= 1500) return COLOR_PALETTE.lvl5;
+      if (steps <= 3500) return COLOR_PALETTE.lvl6;
+      if (steps <= 7500) return COLOR_PALETTE.lvl7;
+      return COLOR_PALETTE.lvl8;
+    }
+
+    window.COLOR_PALETTE = COLOR_PALETTE;
+    window.formatLocalDateKey = formatLocalDateKey;
+    window.computeQuantileThresholds = computeQuantileThresholds;
+    window.getCommitColor = getCommitColor;
+    window.updateHeatmapLegend = updateHeatmapLegend;
 
     function renderActiveHeatmapGrid(data) {
       const d = data || cachedActivityMatrix;
@@ -934,6 +1101,18 @@
       const startDate = new Date(today);
       startDate.setDate(today.getDate() - totalDays + 1);
 
+      const endOfToday = new Date(today.getFullYear(), today.getMonth(), today.getDate(), 23, 59, 59, 999);
+      const viewValues = [];
+      let iterDate = new Date(startDate);
+      while (iterDate <= endOfToday) {
+        const ds = formatLocalDateKey(iterDate);
+        const st = (daily && daily[ds] && daily[ds].steps) || 0;
+        viewValues.push(st);
+        iterDate.setDate(iterDate.getDate() + 1);
+      }
+      const thresholds = computeQuantileThresholds(viewValues);
+      updateHeatmapLegend(thresholds, 'ops');
+
       let currentDate = new Date(startDate);
       let monthCols = {};
       let colIdx = 0;
@@ -950,7 +1129,7 @@
             continue;
           }
 
-          const dateStr = currentDate.toISOString().substring(0, 10);
+          const dateStr = formatLocalDateKey(currentDate);
           const monthName = currentDate.toLocaleString('default', { month: 'short' });
           const dayNum = currentDate.getDate();
 
@@ -958,10 +1137,10 @@
             monthCols[monthName] = colIdx;
           }
 
-          const dayData = daily[dateStr] || { steps: 0, tokens: 0, sessions: 0 };
+          const dayData = (daily && daily[dateStr]) || { steps: 0, tokens: 0, sessions: 0 };
           const cell = document.createElement('div');
           cell.className = 'commit-square-sm';
-          cell.style.backgroundColor = getCommitColor(dayData.steps);
+          cell.style.backgroundColor = getCommitColor(dayData.steps, thresholds);
 
           const formattedDate = currentDate.toLocaleDateString('default', { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' });
           const tooltipMsg = dayData.steps > 0 
@@ -1016,6 +1195,18 @@
       const startDate = new Date(today);
       startDate.setDate(today.getDate() - totalDays + (6 - today.getDay()));
 
+      const endOfToday = new Date(today.getFullYear(), today.getMonth(), today.getDate(), 23, 59, 59, 999);
+      const viewValues = [];
+      let iterDate = new Date(startDate);
+      while (iterDate <= endOfToday) {
+        const ds = formatLocalDateKey(iterDate);
+        const st = (daily && daily[ds] && daily[ds].steps) || 0;
+        viewValues.push(st);
+        iterDate.setDate(iterDate.getDate() + 1);
+      }
+      const thresholds = computeQuantileThresholds(viewValues);
+      updateHeatmapLegend(thresholds, 'ops');
+
       let currentDate = new Date(startDate);
       let colIdx = 0;
       let monthCols = {};
@@ -1032,16 +1223,16 @@
             continue;
           }
 
-          const dateStr = currentDate.toISOString().substring(0, 10);
+          const dateStr = formatLocalDateKey(currentDate);
           const monthName = currentDate.toLocaleString('default', { month: 'short' });
           if (row === 0 && !monthCols[monthName]) {
             monthCols[monthName] = colIdx;
           }
 
-          const dayData = daily[dateStr] || { steps: 0, tokens: 0, sessions: 0 };
+          const dayData = (daily && daily[dateStr]) || { steps: 0, tokens: 0, sessions: 0 };
           const cell = document.createElement('div');
           cell.className = 'commit-square';
-          cell.style.backgroundColor = getCommitColor(dayData.steps);
+          cell.style.backgroundColor = getCommitColor(dayData.steps, thresholds);
 
           const formattedDate = currentDate.toLocaleDateString('default', { weekday: 'short', month: 'short', day: 'numeric' });
           const tooltipMsg = `${dayData.steps.toLocaleString()} ops (${formatTokens(dayData.tokens)} tokens) on ${formattedDate}`;
@@ -1097,10 +1288,23 @@
       if (!container) return;
       container.innerHTML = '';
 
-      const sortedDates = Object.keys(data).sort().reverse();
+      const viewValues = [];
+      if (data) {
+        for (const dateStr in data) {
+          if (Array.isArray(data[dateStr])) {
+            for (let h = 0; h < data[dateStr].length; h++) {
+              viewValues.push(data[dateStr][h] || 0);
+            }
+          }
+        }
+      }
+      const thresholds = computeQuantileThresholds(viewValues);
+      updateHeatmapLegend(thresholds, 'ops');
+
+      const sortedDates = Object.keys(data || {}).sort().reverse();
 
       for (const dateStr of sortedDates) {
-        const hours = data[dateStr];
+        const hours = (data && data[dateStr]) || [];
         const row = document.createElement('div');
         row.className = 'flex items-center space-x-[3px]';
 
@@ -1116,7 +1320,7 @@
         hours.forEach((val, h) => {
           const cell = document.createElement('div');
           cell.className = 'commit-square';
-          cell.style.backgroundColor = getCommitColor(val);
+          cell.style.backgroundColor = getCommitColor(val, thresholds);
 
           const timeFormatted = `${h < 10 ? '0' + h : h}:00`;
           const tooltipMsg = `${dateStr} @ ${timeFormatted} — ${val.toLocaleString()} operations`;
@@ -1162,7 +1366,20 @@
       if (!container) return;
       container.innerHTML = '';
 
-      for (const [dateStr, hours] of Object.entries(data)) {
+      const viewValues = [];
+      if (data) {
+        for (const dateStr in data) {
+          if (Array.isArray(data[dateStr])) {
+            for (let h = 0; h < data[dateStr].length; h++) {
+              viewValues.push(data[dateStr][h] || 0);
+            }
+          }
+        }
+      }
+      const thresholds = computeQuantileThresholds(viewValues);
+      updateHeatmapLegend(thresholds, 'ops');
+
+      for (const [dateStr, hours] of Object.entries(data || {})) {
         const row = document.createElement('div');
         row.className = 'flex items-center space-x-[3px]';
 
@@ -1178,7 +1395,7 @@
         hours.forEach((val, h) => {
           const cell = document.createElement('div');
           cell.className = 'commit-square';
-          cell.style.backgroundColor = getCommitColor(val);
+          cell.style.backgroundColor = getCommitColor(val, thresholds);
 
           const timeFormatted = `${h < 10 ? '0' + h : h}:00`;
           const tooltipMsg = `${dateStr} @ ${timeFormatted} — ${val.toLocaleString()} operations`;
@@ -1225,6 +1442,19 @@
       if (!container) return;
       container.innerHTML = '';
 
+      const viewValues = [];
+      if (Array.isArray(matrix)) {
+        for (let d = 0; d < matrix.length; d++) {
+          if (Array.isArray(matrix[d])) {
+            for (let h = 0; h < matrix[d].length; h++) {
+              viewValues.push(matrix[d][h] || 0);
+            }
+          }
+        }
+      }
+      const thresholds = computeQuantileThresholds(viewValues);
+      updateHeatmapLegend(thresholds, 'ops');
+
       for (let d = 0; d < 7; d++) {
         const row = document.createElement('div');
         row.className = 'flex items-center space-x-[3px]';
@@ -1238,10 +1468,10 @@
         squaresContainer.className = 'flex space-x-[3px]';
 
         for (let h = 0; h < 24; h++) {
-          const val = (matrix[d] && matrix[d][h]) || 0;
+          const val = (matrix && matrix[d] && matrix[d][h]) || 0;
           const cell = document.createElement('div');
           cell.className = 'commit-square';
-          cell.style.backgroundColor = getCommitColor(val);
+          cell.style.backgroundColor = getCommitColor(val, thresholds);
 
           const timeFormatted = `${h < 10 ? '0' + h : h}:00`;
           const tooltipMsg = `${days[d]} at ${timeFormatted} (${localTimezoneAbbr}) — ${val.toLocaleString()} operations across all history`;

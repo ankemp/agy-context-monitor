@@ -3290,6 +3290,221 @@ def test_query_activity_matrix_granular_normalizations_edge_cases(temp_db):
     conn.close()
 
 
+def test_heatmap_quantile_scaling_and_8_level_palette():
+    """Verifies Task 2 Activity Matrix Granularity Improvements:
+    - COLOR_PALETTE defines lvl0 through lvl8 (9 stops).
+    - computeQuantileThresholds computes P20, P40, P60, P75, P85, P93, P98 over non-zero values.
+    - getCommitColor accepts dynamic thresholds and avoids saturation at > 1000.
+    - renderYearGrid and renderQuarterGrid use formatLocalDateKey instead of toISOString.
+    - #ghColorLegend and #ghScaleSummary are defined in index.html.
+    - Deep verification via Node execution of script.js functions.
+    """
+    dashboard_dir = (
+        Path(__file__).resolve().parent.parent / "src" / "context_monitor" / "dashboard"
+    )
+    js_file = dashboard_dir / "static" / "script.js"
+    html_file = dashboard_dir / "templates" / "index.html"
+    js_content = js_file.read_text(encoding="utf-8")
+    html_content = html_file.read_text(encoding="utf-8")
+
+    # 1. Static Invariants in script.js and index.html
+    assert "lvl0" in js_content and "lvl8" in js_content, "COLOR_PALETTE must define lvl0 through lvl8"
+    assert "computeQuantileThresholds" in js_content
+    assert "formatLocalDateKey" in js_content
+    assert "updateHeatmapLegend" in js_content
+    assert "ghScaleSummary" in html_content
+    assert "ghColorLegend" in html_content
+
+    # In renderYearGrid and renderQuarterGrid, ensure toISOString().substring(0, 10) was replaced by formatLocalDateKey
+    year_grid_body = js_content.split("function renderYearGrid(")[1].split("function renderQuarterGrid(")[0]
+    quarter_grid_body = js_content.split("function renderQuarterGrid(")[1].split("function renderMonthHourlyGrid(")[0]
+    assert "currentDate.toISOString().substring(0, 10)" not in year_grid_body
+    assert "currentDate.toISOString().substring(0, 10)" not in quarter_grid_body
+    assert "formatLocalDateKey(currentDate)" in year_grid_body
+    assert "formatLocalDateKey(currentDate)" in quarter_grid_body
+
+    # 2. Node Execution for deep mathematical and behavioral verification
+    node_script = r"""
+    const fs = require('fs');
+    const code = fs.readFileSync('src/context_monitor/dashboard/static/script.js', 'utf8');
+
+    const mockElements = {
+      ghScaleSummary: { textContent: '' },
+      ghColorLegend: {
+        children: [
+          { dataset: { level: 'lvl0' }, title: '' },
+          { dataset: { level: 'lvl1' }, title: '' },
+          { dataset: { level: 'lvl2' }, title: '' },
+          { dataset: { level: 'lvl3' }, title: '' },
+          { dataset: { level: 'lvl4' }, title: '' },
+          { dataset: { level: 'lvl5' }, title: '' },
+          { dataset: { level: 'lvl6' }, title: '' },
+          { dataset: { level: 'lvl7' }, title: '' },
+          { dataset: { level: 'lvl8' }, title: '' }
+        ],
+        querySelectorAll: function(selector) {
+          return this.children;
+        }
+      },
+      ghTooltipText: { innerHTML: '', textContent: '' }
+    };
+
+    const mockDocument = {
+      getElementById: (id) => mockElements[id] || { textContent: '', className: '', style: {}, addEventListener: () => {}, classList: { add: () => {}, remove: () => {} } },
+      querySelectorAll: () => [],
+      addEventListener: () => {}
+    };
+
+    const mockWindow = {
+      location: { search: '' },
+      addEventListener: () => {},
+      history: { pushState: () => {} }
+    };
+
+    const fn = new Function('window', 'document', 'Chart', 'lucide', `
+      ${code}
+      return {
+        COLOR_PALETTE,
+        computeQuantileThresholds,
+        getCommitColor,
+        updateHeatmapLegend,
+        formatLocalDateKey
+      };
+    `);
+
+    const api = fn(
+      mockWindow,
+      mockDocument,
+      { defaults: { font: {}, elements: {}, plugins: {} }, register: () => {} },
+      { createIcons: () => {} }
+    );
+
+    // Test A: COLOR_PALETTE 9 stops
+    const pal = api.COLOR_PALETTE;
+    const expectedKeys = ['lvl0', 'lvl1', 'lvl2', 'lvl3', 'lvl4', 'lvl5', 'lvl6', 'lvl7', 'lvl8'];
+    for (const k of expectedKeys) {
+      if (!pal[k]) throw new Error(`Missing ${k} in COLOR_PALETTE`);
+    }
+    if (Object.keys(pal).length !== 9) {
+      throw new Error(`Expected exactly 9 palette stops, got ${Object.keys(pal).length}`);
+    }
+
+    // Test B: computeQuantileThresholds empty or zero
+    const emptyRes = api.computeQuantileThresholds([]);
+    if (emptyRes.count !== 0 || emptyRes.cutoffs.length !== 7) {
+      throw new Error(`Invalid empty response: ${JSON.stringify(emptyRes)}`);
+    }
+    const zeroRes = api.computeQuantileThresholds([0, 0, 0]);
+    if (zeroRes.count !== 0) {
+      throw new Error(`Zero values should be filtered out, got count=${zeroRes.count}`);
+    }
+    // Edge case: Non-finite and invalid values filtered out
+    const nonFiniteRes = api.computeQuantileThresholds([Infinity, -Infinity, NaN, null, 'text', -10, 100]);
+    if (nonFiniteRes.count !== 1 || nonFiniteRes.min !== 100 || nonFiniteRes.max !== 100) {
+      throw new Error(`Non-finite values not properly filtered: ${JSON.stringify(nonFiniteRes)}`);
+    }
+
+    // Test C: computeQuantileThresholds with distribution [10, 20, 30, ..., 100]
+    const testVals = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100];
+    const quant = api.computeQuantileThresholds(testVals);
+    if (quant.count !== 10) throw new Error(`Expected 10 non-zero values, got ${quant.count}`);
+    if (quant.min !== 10 || quant.max !== 100) throw new Error(`Expected min=10, max=100, got min=${quant.min}, max=${quant.max}`);
+    if (quant.p50 !== 55) throw new Error(`Expected p50=55, got ${quant.p50}`);
+    if (quant.cutoffs.length !== 7) throw new Error(`Expected 7 cutoffs, got ${quant.cutoffs.length}`);
+    if (Math.abs(quant.cutoffs[0] - 28) > 0.1) throw new Error(`P20 expected ~28, got ${quant.cutoffs[0]}`);
+    if (Math.abs(quant.cutoffs[6] - 98.2) > 0.1) throw new Error(`P98 expected ~98.2, got ${quant.cutoffs[6]}`);
+
+    // Test D: getCommitColor with thresholds - eliminates saturation
+    const highVolumeVals = [5, 15, 30, 75, 150, 300, 600, 1200, 2500, 5000, 10000, 15000];
+    const hvThresholds = api.computeQuantileThresholds(highVolumeVals);
+
+    // 0 ops -> lvl0
+    if (api.getCommitColor(0, hvThresholds) !== pal.lvl0) throw new Error('0 steps must return lvl0');
+    if (api.getCommitColor(null, hvThresholds) !== pal.lvl0) throw new Error('null steps must return lvl0');
+
+    // Values that previously saturated at > 1000 (lvl4) now map to distinct levels:
+    const color500 = api.getCommitColor(500, hvThresholds);
+    const color1500 = api.getCommitColor(1500, hvThresholds);
+    const color6000 = api.getCommitColor(6000, hvThresholds);
+    const color14000 = api.getCommitColor(14000, hvThresholds);
+
+    if (color1500 === color6000 || color6000 === color14000) {
+      throw new Error(`Saturation bug: 1500, 6000, 14000 must map to distinct color stops, got ${color1500}, ${color6000}, ${color14000}`);
+    }
+
+    // Top volume (> P98) gets lvl8
+    if (api.getCommitColor(16000, hvThresholds) !== pal.lvl8) {
+      throw new Error(`Expected lvl8 for max volume, got ${api.getCommitColor(16000, hvThresholds)}`);
+    }
+
+    // Edge case: Empty thresholds (count 0) must fallback to static thresholds (1 step must NOT be lvl8)
+    if (api.getCommitColor(1, emptyRes) !== pal.lvl1) {
+      throw new Error(`Empty thresholds bug: 1 step should be lvl1, got ${api.getCommitColor(1, emptyRes)}`);
+    }
+
+    // Edge case: Uniform non-zero activity (min === max) must fallback to static thresholds (not collapse to lvl1)
+    const uniformRes = api.computeQuantileThresholds([10000, 10000]);
+    if (api.getCommitColor(10000, uniformRes) !== pal.lvl8) {
+      throw new Error(`Uniform threshold bug: 10000 steps should be lvl8, got ${api.getCommitColor(10000, uniformRes)}`);
+    }
+    if (api.getCommitColor(20, uniformRes) !== pal.lvl1) {
+      throw new Error(`Uniform threshold bug: 20 steps should be lvl1, got ${api.getCommitColor(20, uniformRes)}`);
+    }
+
+    // Test E: getCommitColor fallback static 8-level thresholds when thresholds is null
+    if (api.getCommitColor(20) !== pal.lvl1) throw new Error('Static fallback <=25 should be lvl1');
+    if (api.getCommitColor(8000) !== pal.lvl8) throw new Error('Static fallback >7500 should be lvl8');
+
+    // Test F: formatLocalDateKey returns YYYY-MM-DD in local time and handles edge cases
+    const testDate = new Date(2026, 9, 23, 0, 0, 0); // Oct 23, 2026 local
+    const key = api.formatLocalDateKey(testDate);
+    if (key !== '2026-10-23') {
+      throw new Error(`Expected '2026-10-23', got '${key}'`);
+    }
+    // formatLocalDateKey robustness: timestamps, strings, null, invalid dates
+    if (api.formatLocalDateKey(null) !== '') throw new Error('null date should return empty string');
+    if (api.formatLocalDateKey(new Date('invalid')) !== '') throw new Error('invalid date should return empty string');
+    if (api.formatLocalDateKey('2026-10-23') !== '2026-10-23') throw new Error('valid string date should return YYYY-MM-DD');
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(api.formatLocalDateKey(1771785600000))) {
+      throw new Error('timestamp number should return valid YYYY-MM-DD string');
+    }
+
+    // Test G: updateHeatmapLegend updates #ghScaleSummary and titles
+    api.updateHeatmapLegend(hvThresholds, 'ops');
+    if (!mockElements.ghScaleSummary.textContent.includes('P50')) {
+      throw new Error(`Expected P50 in ghScaleSummary, got: ${mockElements.ghScaleSummary.textContent}`);
+    }
+    if (!mockElements.ghColorLegend.children[1].title.includes('P20')) {
+      throw new Error(`Expected P20 in swatch title, got: ${mockElements.ghColorLegend.children[1].title}`);
+    }
+
+    // updateHeatmapLegend on empty activity
+    api.updateHeatmapLegend(emptyRes, 'ops');
+    if (!mockElements.ghScaleSummary.textContent.includes('No activity')) {
+      throw new Error(`Expected 'No activity' for empty thresholds, got: ${mockElements.ghScaleSummary.textContent}`);
+    }
+    if (!mockElements.ghColorLegend.children[1].title.includes('≤ 25 ops')) {
+      throw new Error(`Expected static fallback title for empty thresholds, got: ${mockElements.ghColorLegend.children[1].title}`);
+    }
+
+    // updateHeatmapLegend on uniform activity (min === max) shows static ranges, not "10k - 10k ops"
+    api.updateHeatmapLegend(uniformRes, 'ops');
+    if (mockElements.ghColorLegend.children[2].title.includes('10,000 – 10,000') || mockElements.ghColorLegend.children[2].title.includes('10.0k – 10.0k')) {
+      throw new Error(`Uniform swatches should use static fallback ranges, got: ${mockElements.ghColorLegend.children[2].title}`);
+    }
+
+    console.log(JSON.stringify({ status: 'ok', levels: Object.keys(pal).length }));
+    """
+
+    res = subprocess.run(
+        ["node", "-e", node_script], capture_output=True, text=True, cwd=Path.cwd()
+    )
+    assert res.returncode == 0, f"Node script failed: {res.stderr}\n{res.stdout}"
+    data = json.loads(res.stdout.strip().splitlines()[-1])
+    assert data["status"] == "ok"
+    assert data["levels"] == 9
+
+
 def test_frontend_debouncing_and_abort_controller():
     """Verifies Task 4 frontend optimizations in script.js:
     - Trailing debounce timer for db_update SSE events

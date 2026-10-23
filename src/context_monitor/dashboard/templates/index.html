@@ -813,16 +813,23 @@
       </div>
 
       <!-- Footer Tooltip & Color Legend -->
-      <div class="flex items-center justify-between pt-3 border-t border-dark-700 text-xs text-gray-400 mt-3">
+      <div class="flex flex-wrap items-center justify-between gap-2 pt-3 border-t border-dark-700 text-xs text-gray-400 mt-3">
         <div id="ghTooltipText" class="font-medium text-gray-300">Hover over any commit square to see operations</div>
-        <div class="flex items-center space-x-1.5 select-none">
-          <span class="text-[11px] text-gray-400">Less</span>
-          <div class="w-3 h-3 rounded-[2px] bg-[#151d2f] border border-white/5"></div>
-          <div class="w-3 h-3 rounded-[2px] bg-[#312e81]"></div>
-          <div class="w-3 h-3 rounded-[2px] bg-[#4338ca]"></div>
-          <div class="w-3 h-3 rounded-[2px] bg-[#6366f1]"></div>
-          <div class="w-3 h-3 rounded-[2px] bg-[#a5b4fc]"></div>
-          <span class="text-[11px] text-gray-400">More</span>
+        <div class="flex items-center space-x-2 select-none">
+          <span id="ghScaleSummary" class="text-[10px] text-gray-400 font-mono hidden sm:inline-block"></span>
+          <div id="ghColorLegend" class="flex items-center space-x-1 select-none">
+            <span class="text-[11px] text-gray-400 mr-0.5">Less</span>
+            <div data-level="lvl0" class="w-3 h-3 rounded-[2px] bg-[#151d2f] border border-white/5 cursor-help" title="0 operations"></div>
+            <div data-level="lvl1" class="w-3 h-3 rounded-[2px] bg-[#1e1b4b] cursor-help" title="≤ P20"></div>
+            <div data-level="lvl2" class="w-3 h-3 rounded-[2px] bg-[#312e81] cursor-help" title="P20 – P40"></div>
+            <div data-level="lvl3" class="w-3 h-3 rounded-[2px] bg-[#3730a3] cursor-help" title="P40 – P60"></div>
+            <div data-level="lvl4" class="w-3 h-3 rounded-[2px] bg-[#4338ca] cursor-help" title="P60 – P75"></div>
+            <div data-level="lvl5" class="w-3 h-3 rounded-[2px] bg-[#4f46e5] cursor-help" title="P75 – P85"></div>
+            <div data-level="lvl6" class="w-3 h-3 rounded-[2px] bg-[#6366f1] cursor-help" title="P85 – P93"></div>
+            <div data-level="lvl7" class="w-3 h-3 rounded-[2px] bg-[#818cf8] cursor-help" title="P93 – P98"></div>
+            <div data-level="lvl8" class="w-3 h-3 rounded-[2px] bg-[#c7d2fe] cursor-help" title="> P98"></div>
+            <span class="text-[11px] text-gray-400 ml-0.5">More</span>
+          </div>
         </div>
       </div>
     </div>
