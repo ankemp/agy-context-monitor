@@ -4036,25 +4036,25 @@ def test_dashboard_token_velocity_api_and_frontend_rendering(test_db: Path):
     html_content = (dashboard_dir / "templates" / "index.html").read_text(encoding="utf-8")
     js_content = (dashboard_dir / "static" / "script.js").read_text(encoding="utf-8")
 
-    assert "cardTokenVelocity" in html_content
-    assert "dashVelocityArcFill" in html_content
-    assert "kpiBilledTpm" in html_content
-    assert "kpiBilledTph" in html_content
-    assert "kpiContextTpm" in html_content
-    assert "dashContextVelocityBar" in html_content
-    assert "btnVelocityDaily" in html_content
-    assert "btnVelocityHourly" in html_content
-    assert "velocityChartDesc" in html_content
+    assert "cardTokenVelocity" not in html_content
+    assert "dashVelocityArcFill" not in html_content
+    assert "kpiBilledTpm" not in html_content
+    assert "kpiBilledTph" not in html_content
+    assert "kpiContextTpm" not in html_content
+    assert "dashContextVelocityBar" not in html_content
+    assert "btnVelocityDaily" not in html_content
+    assert "btnVelocityHourly" not in html_content
+    assert "velocityChartDesc" not in html_content
     assert "timelineRangeGroup" in html_content
-    assert "velocityDivider" in html_content
-    assert "quotaGemini5hTph" in html_content
-    assert "dashVelocityArcFill" in js_content
-    assert "currentVelocityResolution" in js_content
-    assert "quotaGeminiWeeklyTph" in html_content
-    assert "quota3p5hTph" in html_content
-    assert "quota3pWeeklyTph" in html_content
-    assert "modalActiveTpm" in html_content
-    assert "modalBilledTph" in html_content
+    assert "velocityDivider" not in html_content
+    assert "quotaGemini5hTph" not in html_content
+    assert "dashVelocityArcFill" not in js_content
+    assert "currentVelocityResolution" not in js_content
+    assert "quotaGeminiWeeklyTph" not in html_content
+    assert "quota3p5hTph" not in html_content
+    assert "quota3pWeeklyTph" not in html_content
+    assert "modalActiveTpm" not in html_content
+    assert "modalBilledTph" not in html_content
 
     # Node simulation verifying JS execution of velocity telemetry and toggles
     node_script = """
@@ -4289,14 +4289,14 @@ def test_dashboard_token_velocity_api_and_frontend_rendering(test_db: Path):
       return {
         renderKPIs,
         renderQuotaSection,
-        setVelocityResolution,
+        setVelocityResolution: typeof setVelocityResolution !== 'undefined' ? setVelocityResolution : undefined,
         setTimelineRange,
         fetchDashboardData,
         renderConversations,
         inspectSession,
         setExpandedConvs: (s) => { expandedConvs = s; },
         setConvViewMode: (m) => { currentConvViewMode = m; },
-        getVelocityResolution: () => currentVelocityResolution,
+        getVelocityResolution: () => (typeof currentVelocityResolution !== 'undefined' ? currentVelocityResolution : undefined),
         getVelocityChart: () => velocityChart
       };
     `);
@@ -4309,7 +4309,7 @@ def test_dashboard_token_velocity_api_and_frontend_rendering(test_db: Path):
     );
 
     (async () => {
-      // 1. renderKPIs with token_velocity
+      // 1. renderKPIs with token_velocity (stat modification intact, UI removed)
       api.renderKPIs({
         token_velocity: {
           active_billed_tpm: 1250,
@@ -4325,66 +4325,37 @@ def test_dashboard_token_velocity_api_and_frontend_rendering(test_db: Path):
         ]
       });
 
-      if (!mockElements.kpiBilledTpm.textContent.includes('1.1') && !mockElements.kpiBilledTpm.textContent.includes('1,100')) {
-        throw new Error(`Expected billed TPM formatted, got: ${mockElements.kpiBilledTpm.textContent}`);
+      if (mockElements.kpiBilledTpm.textContent !== '') {
+        throw new Error(`Expected removed kpiBilledTpm to remain unpopulated, got: ${mockElements.kpiBilledTpm.textContent}`);
       }
-      if (!mockElements.kpiBilledTpm.textContent.includes('TPM')) {
-        throw new Error(`Expected TPM unit in billed TPM display, got: ${mockElements.kpiBilledTpm.textContent}`);
-      }
-      if (!mockElements.kpiBilledTph.textContent.includes('66') && !mockElements.kpiBilledTph.textContent.includes('66,000')) {
-        throw new Error(`Expected billed TPH formatted, got: ${mockElements.kpiBilledTph.textContent}`);
-      }
-      if (!mockElements.kpiContextTpm.textContent.includes('24') && !mockElements.kpiContextTpm.textContent.includes('24,000')) {
-        throw new Error(`Expected context TPM formatted, got: ${mockElements.kpiContextTpm.textContent}`);
-      }
-      if (!mockElements.dashVelocityArcFill.style.strokeDashoffset) {
-        throw new Error('Expected strokeDashoffset set on speedometer arc');
-      }
-      if (mockElements.dashContextVelocityBar.style.width !== '32.0%' && mockElements.dashContextVelocityBar.style.width !== '32%') {
-        throw new Error(`Expected 32.0% context velocity bar width, got: ${mockElements.dashContextVelocityBar.style.width}`);
+      if (mockElements.dashVelocityArcFill.style.strokeDashoffset) {
+        throw new Error('Expected no strokeDashoffset set on removed speedometer arc');
       }
 
-      // 2. renderQuotaSection with burn rate (tph)
+      // 2. renderQuotaSection with burn rate (tph) (stat modification intact, badge UI removed)
       api.renderQuotaSection({
         'gemini-weekly': { remaining_budget: 500, calibrated_capacity: 700, burn_rate_tph: 12000 },
         'gemini-5h': { remaining_budget: 150, calibrated_capacity: 236.7, burn_rate_tph: 15000 },
         '3p-weekly': { remaining_budget: 180, calibrated_capacity: 200, burn_rate_tph: 4500 },
         '3p-5h': { remaining_budget: 60, calibrated_capacity: 70, burn_rate_tph: 6000 }
       });
-      if (!mockElements.quotaGeminiWeeklyTph.textContent.includes('12') && !mockElements.quotaGeminiWeeklyTph.textContent.includes('12,000')) {
-        throw new Error(`Expected Gemini weekly burn rate, got: ${mockElements.quotaGeminiWeeklyTph.textContent}`);
-      }
-      if (!mockElements.quotaGemini5hTph.textContent.includes('15') && !mockElements.quotaGemini5hTph.textContent.includes('15,000')) {
-        throw new Error(`Expected Gemini 5h burn rate, got: ${mockElements.quotaGemini5hTph.textContent}`);
+      if (mockElements.quotaGeminiWeeklyTph.textContent !== '') {
+        throw new Error(`Expected removed quotaGeminiWeeklyTph to remain unpopulated, got: ${mockElements.quotaGeminiWeeklyTph.textContent}`);
       }
 
-      // 3. setVelocityResolution toggle and timelineRangeGroup visibility
-      api.setVelocityResolution('hourly');
-      if (api.getVelocityResolution() !== 'hourly') {
-        throw new Error(`Expected resolution hourly, got: ${api.getVelocityResolution()}`);
-      }
-      if (!mockElements.timelineRangeGroup.classList.contains('hidden')) {
-        throw new Error('Expected timelineRangeGroup to be hidden in hourly mode');
-      }
-      if (!mockElements.velocityChartDesc.textContent.includes('Hourly API token throughput')) {
-        throw new Error(`Expected hourly chart description, got: ${mockElements.velocityChartDesc.textContent}`);
+      // 3. setVelocityResolution is removed from window/api
+      if (typeof api.setVelocityResolution !== 'undefined') {
+        throw new Error('Expected setVelocityResolution to be undefined');
       }
 
-      // 4. setTimelineRange resets resolution to daily and restores rangeGroup
+      // 4. setTimelineRange operates in standard daily mode
       api.setTimelineRange(7);
-      if (api.getVelocityResolution() !== 'daily') {
-        throw new Error(`Expected resolution daily after setTimelineRange, got: ${api.getVelocityResolution()}`);
-      }
       if (mockElements.timelineRangeGroup.classList.contains('hidden')) {
         throw new Error('Expected timelineRangeGroup visible in daily mode');
       }
 
-      // 5. fetchDashboardData preserves active hourly resolution
-      api.setVelocityResolution('hourly');
+      // 5. fetchDashboardData executes cleanly
       await api.fetchDashboardData();
-      if (api.getVelocityResolution() !== 'hourly') {
-        throw new Error('Expected fetchDashboardData to preserve hourly mode');
-      }
 
       // 6. Conversation table rendering with throughput badges
       api.setConvViewMode('hierarchy');
@@ -4426,16 +4397,17 @@ def test_dashboard_token_velocity_api_and_frontend_rendering(test_db: Path):
         throw new Error(`Expected TPM and TPH in child conversation row: ${childHtml}`);
       }
 
-      // 7. inspectSession Deep-Dive modal
+      // 7. inspectSession Deep-Dive modal operates cleanly without removed modal TPM/TPH elements
       await api.inspectSession('root-vel');
-      if (!mockElements.modalActiveTpm.textContent.includes('15') && !mockElements.modalActiveTpm.textContent.includes('15,000')) {
-        throw new Error(`Expected 15k active TPM in modal, got: ${mockElements.modalActiveTpm.textContent}`);
+      if (mockElements.modalActiveTpm.textContent !== '') {
+        throw new Error(`Expected removed modalActiveTpm to remain unpopulated, got: ${mockElements.modalActiveTpm.textContent}`);
       }
-      if (!mockElements.modalBilledTph.textContent.includes('45') && !mockElements.modalBilledTph.textContent.includes('45,000')) {
-        throw new Error(`Expected 45k billed TPH in modal, got: ${mockElements.modalBilledTph.textContent}`);
+      if (mockElements.modalBilledTph.textContent !== '') {
+        throw new Error(`Expected removed modalBilledTph to remain unpopulated, got: ${mockElements.modalBilledTph.textContent}`);
       }
 
       console.log(JSON.stringify({ status: 'ok', cases: 7 }));
+      process.exit(0);
     })().catch(err => {
       console.error(err);
       process.exit(1);

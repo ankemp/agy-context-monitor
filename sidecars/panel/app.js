@@ -251,18 +251,6 @@ function renderQuota(quotaData, sessionImpactPct, fleet = null) {
     fhBarEl.style.width = `${Math.min(100, Math.max(0, rem5h))}%`;
     fhBarEl.className = `quota-bar ${rem5h <= 10 ? 'error' : rem5h <= 25 ? 'warning' : 'ok'}`;
   }
-
-  // Quota burn rate tok/hr
-  const qWeeklyTph = $('quotaWeeklyTph');
-  if (qWeeklyTph) {
-    const tphVal = weeklyBucket?.billed_tph ?? (quotaData?.weekly_billed_tph ?? 0);
-    qWeeklyTph.textContent = `${formatTokens(tphVal)} tok/hr`;
-  }
-  const q5hTph = $('quota5hTph');
-  if (q5hTph) {
-    const tphVal = fiveHBucket?.billed_tph ?? (quotaData?.five_hour_billed_tph ?? 0);
-    q5hTph.textContent = `${formatTokens(tphVal)} tok/hr`;
-  }
 }
 
 function renderCategories(container, categories) {
@@ -366,27 +354,6 @@ function renderGlobal(globalData) {
   const prunedEl = $('global-pruned');
   if (prunedEl) prunedEl.textContent = `~${formatTokens(globalData.total_pruned_tokens)} tokens`;
 
-  const gActiveTpm = $('globalActiveTpm');
-  if (gActiveTpm) {
-    const val = Number(globalData.activeBilledTpm) || 0;
-    gActiveTpm.textContent = `${formatTokens(val)} TPM`;
-  }
-  const gContextTpm = $('globalContextTpm');
-  if (gContextTpm) {
-    const val = Number(globalData.activeContextTpm) || 0;
-    gContextTpm.textContent = `${formatTokens(val)} TPM`;
-  }
-  const gPairingTph = $('globalPairingTph');
-  if (gPairingTph) {
-    const val = Number(globalData.pairingBilledTph) || 0;
-    gPairingTph.textContent = `${formatTokens(val)} TPH`;
-  }
-  const gRollingTph = $('globalRollingTph');
-  if (gRollingTph) {
-    const val = Number(globalData.rolling60mBilledTph) || 0;
-    gRollingTph.textContent = `${formatTokens(val)} TPH`;
-  }
-
   if (globalData.quota) {
     renderQuota(globalData.quota, globalData.weekly_quota_pct, null);
   }
@@ -397,18 +364,15 @@ function renderFleetCard(fleet) {
   const banner = $('inspect-banner');
   const list = $('fleet-node-list');
 
-  const fleetVelBlock = $('fleetVelocityBlock');
   if (!fleet || !fleet.is_swarm) {
     if (card) card.hidden = true;
     if (banner) banner.hidden = true;
-    if (fleetVelBlock) fleetVelBlock.hidden = true;
     if (list) list.innerHTML = '';
     inspectedCid = null;
     return;
   }
 
   if (card) card.hidden = false;
-  if (fleetVelBlock) fleetVelBlock.hidden = false;
 
   const countBadge = $('fleet-count-badge');
   if (countBadge) {
@@ -438,18 +402,6 @@ function renderFleetCard(fleet) {
     const rawRatio = Number(fleet.shielding_ratio);
     const ratioStr = (!isNaN(rawRatio) && rawRatio > 0) ? rawRatio.toFixed(1) : '1.0';
     shieldEl.textContent = `${ratioStr}x`;
-  }
-
-  const fleetVel = fleet.velocity || {};
-  const fleetTpmEl = $('fleetVelocityTpm');
-  if (fleetTpmEl) {
-    const fTpm = Number(fleetVel.rolling5mBilledTpm) || 0;
-    fleetTpmEl.textContent = `${formatTokens(fTpm)} TPM`;
-  }
-  const fleetBarEl = $('fleetVelocityBar');
-  if (fleetBarEl) {
-    const fPct = Math.min(100, Math.max(0, Number(fleetVel.arcPct) || 0));
-    fleetBarEl.style.width = `${fPct}%`;
   }
 
   if (!list) return;
@@ -600,50 +552,6 @@ async function refreshTelemetry() {
 
     // Multi-segment capacity bar
     renderMultiSegmentBar($('capacity-bar'), sessionData.categories, sessionData.max_tokens, sessionData.pct);
-
-    // Velocity Speedometer arc & Context fill bullet bar
-    const vel = sessionData.velocity || {};
-    const arcPct = Math.min(100, Math.max(0, Number(vel.arcPct) || 0));
-    const dashOffset = 157 * (1 - (arcPct / 100));
-
-    const arcFill = $('velocityArcFill');
-    if (arcFill) {
-      arcFill.setAttribute('stroke-dashoffset', String(dashOffset.toFixed(1)));
-      const arcClass = arcPct >= 80 ? 'error' : (arcPct >= 50 ? 'warning' : 'ok');
-      arcFill.setAttribute('class', `arc-fill ${arcClass}`);
-    }
-
-    const liveTpm = $('velocityLiveTpm');
-    if (liveTpm) {
-      const tpmVal = Number(vel.rolling5mBilledTpm) || 0;
-      liveTpm.textContent = `${formatTokens(tpmVal)} TPM`;
-    }
-
-    const liveTph = $('velocityLiveTph');
-    if (liveTph) {
-      const tphVal = Number(vel.rolling60mBilledTph) || 0;
-      liveTph.textContent = `${formatTokens(tphVal)} TPH`;
-    }
-
-    const activeTpm = $('velocityActiveTpm');
-    if (activeTpm) {
-      const actVal = Number(vel.activeBilledTpm) || 0;
-      activeTpm.textContent = `${formatTokens(actVal)} active`;
-    }
-
-    const ctxFill = $('contextVelocityFill');
-    if (ctxFill) {
-      const fillPct = Math.min(100, Math.max(0, Number(vel.contextFillPct) || 0));
-      ctxFill.style.width = `${fillPct}%`;
-      const ctxClass = fillPct >= 80 ? 'error' : (fillPct >= 50 ? 'warning' : 'ok');
-      ctxFill.className = `bullet-bar ${ctxClass}`;
-    }
-
-    const ctxTpm = $('contextVelocityTpm');
-    if (ctxTpm) {
-      const ctxVal = Number(vel.rolling5mContextTpm) || 0;
-      ctxTpm.textContent = `${formatTokens(ctxVal)} tok/min`;
-    }
 
     // Subscription Quota rendering
     if (sessionData.quota) {

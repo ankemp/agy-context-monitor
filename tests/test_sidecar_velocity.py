@@ -327,8 +327,8 @@ def test_sidecar_query_velocity_fleet_aggregation(tmp_path: Path):
 
 
 def test_sidecar_frontend_velocity_dom_and_static_invariants():
-    """Verifies that index.html contains all required speedometer and bullet gauge elements,
-    and styles.css enforces static visuals (transition: none !important; animation: none !important;)."""
+    """Verifies that index.html removes visual speedometer and bullet gauge elements while
+    retaining global telemetry facts, and styles.css enforces static visuals without velocity rules."""
     html_path = Path("sidecars/panel/index.html")
     css_path = Path("sidecars/panel/styles.css")
     js_path = Path("sidecars/panel/app.js")
@@ -337,45 +337,50 @@ def test_sidecar_frontend_velocity_dom_and_static_invariants():
     css = css_path.read_text()
     js = js_path.read_text()
 
-    # Active Capacity card elements
-    assert 'id="velocityArcPath"' in html
-    assert 'id="velocityArcFill"' in html
-    assert 'id="velocityLiveTpm"' in html
-    assert 'id="velocityLiveTph"' in html
-    assert 'id="velocityActiveTpm"' in html
-    assert 'id="contextVelocityFill"' in html
-    assert 'id="contextVelocityTpm"' in html
+    # Removed Active Capacity card elements
+    assert 'id="velocityArcPath"' not in html
+    assert 'id="velocityArcFill"' not in html
+    assert 'id="velocityLiveTpm"' not in html
+    assert 'id="velocityLiveTph"' not in html
+    assert 'id="velocityActiveTpm"' not in html
+    assert 'id="contextVelocityFill"' not in html
+    assert 'id="contextVelocityTpm"' not in html
 
-    # Swarm Fleet card elements
-    assert 'id="fleetVelocityBlock"' in html
-    assert 'id="fleetVelocityTpm"' in html
-    assert 'id="fleetVelocityBar"' in html
+    # Removed Swarm Fleet card elements
+    assert 'id="fleetVelocityBlock"' not in html
+    assert 'id="fleetVelocityTpm"' not in html
+    assert 'id="fleetVelocityBar"' not in html
 
-    # Subscription Quota burn labels
-    assert 'id="quota5hTph"' in html
-    assert 'id="quotaWeeklyTph"' in html
+    # Removed Subscription Quota burn labels
+    assert 'id="quota5hTph"' not in html
+    assert 'id="quotaWeeklyTph"' not in html
 
-    # Global view stats
-    assert 'id="globalActiveTpm"' in html
-    assert 'id="globalPairingTph"' in html
+    # Removed Global view velocity elements
+    assert 'id="globalActiveTpm"' not in html
+    assert 'id="globalPairingTph"' not in html
+    assert 'id="globalContextTpm"' not in html
+    assert 'id="globalRollingTph"' not in html
 
     # Static visuals invariant in CSS
     assert "transition: none !important" in css
     assert "animation: none !important" in css
-    assert "stroke-dasharray" in html or "stroke-dasharray" in css or "stroke-dasharray" in js
+    assert ".velocity-container" not in css
+    assert ".speedometer-arc" not in css
+    assert ".bullet-bar" not in css
 
-    # App.js wiring
-    assert "velocityArcFill" in js
-    assert "velocityLiveTpm" in js
-    assert "contextVelocityFill" in js
-    assert "fleetVelocityBar" in js
-    assert "quotaWeeklyTph" in js
-    assert "globalActiveTpm" in js
+    # App.js wiring: removed elements not referenced
+    assert "velocityArcFill" not in js
+    assert "velocityLiveTpm" not in js
+    assert "contextVelocityFill" not in js
+    assert "fleetVelocityBar" not in js
+    assert "quotaWeeklyTph" not in js
+    assert "globalActiveTpm" not in js
+    assert "globalPairingTph" not in js
 
 
 def test_sidecar_frontend_render_velocity_execution():
-    """Executes app.js in Node with a simulated DOM to deeply verify speedometer arc dashoffset,
-    bullet bar widths, and quota tok/hr burn rendering."""
+    """Executes app.js in Node with a simulated DOM to deeply verify sidecar session and quota
+    rendering when velocity data is received, ensuring removed visual elements are not accessed."""
     node_script = """
     const fs = require('fs');
     const code = fs.readFileSync('sidecars/panel/app.js', 'utf8');
@@ -426,16 +431,12 @@ def test_sidecar_frontend_render_velocity_execution():
       'status-badge', 'model-badge', 'cost-badge', 'quota-badge',
       'inspect-banner', 'inspect-banner-label', 'btn-reset-inspect',
       'fleet-card', 'fleet-title', 'fleet-count-badge', 'fleet-summary-strip', 'fleet-total-cost', 'fleet-total-tokens', 'fleet-shielding', 'fleet-node-list',
-      'fleetVelocityBlock', 'fleetVelocityTpm', 'fleetVelocityBar',
       'global-card', 'global-convs', 'global-tokens', 'global-cost', 'global-quota', 'global-compactions', 'global-pruned',
-      'globalActiveTpm', 'globalPairingTph',
       'compaction-banner', 'compaction-count', 'compaction-pruned', 'compaction-window',
       'quota-card', 'quota-title', 'quota-session-impact', 'quota-tab-gemini', 'quota-tab-3p',
-      'quota-weekly-pct', 'quota-weekly-reset', 'quota-weekly-bar', 'quota-weekly-sub', 'quotaWeeklyTph',
-      'quota-5h-pct', 'quota-5h-reset', 'quota-5h-bar', 'quota-5h-sub', 'quota5hTph',
+      'quota-weekly-pct', 'quota-weekly-reset', 'quota-weekly-bar', 'quota-weekly-sub',
+      'quota-5h-pct', 'quota-5h-reset', 'quota-5h-bar', 'quota-5h-sub',
       'capacity-card', 'capacity-pct', 'capacity-sub', 'capacity-bar', 'category-list',
-      'velocityArcPath', 'velocityArcFill', 'velocityLiveTpm', 'velocityLiveTph', 'velocityActiveTpm',
-      'contextVelocityFill', 'contextVelocityTpm',
       'top-steps-card', 'top-steps-list', 'steps-range',
       'actions-card', 'btn-audit', 'btn-plan', 'btn-compact', 'toast'
     ];
@@ -519,16 +520,13 @@ def test_sidecar_frontend_render_velocity_execution():
       intervals.forEach(clearTimeout);
 
       const res = {
-        arcOffset: elements['velocityArcFill'].attributes['stroke-dashoffset'],
-        liveTpm: elements['velocityLiveTpm'].textContent,
-        liveTph: elements['velocityLiveTph'].textContent,
-        activeTpm: elements['velocityActiveTpm'].textContent,
-        contextFillWidth: elements['contextVelocityFill'].style.width,
-        contextTpmText: elements['contextVelocityTpm'].textContent,
-        fleetTpmText: elements['fleetVelocityTpm'].textContent,
-        fleetBarWidth: elements['fleetVelocityBar'].style.width,
-        quotaWeeklyTph: elements['quotaWeeklyTph'].textContent,
-        quota5hTph: elements['quota5hTph'].textContent
+        capPct: elements['capacity-pct'].textContent,
+        capSub: elements['capacity-sub'].textContent,
+        modelBadge: elements['model-badge'].textContent,
+        quotaWeeklyPct: elements['quota-weekly-pct'].textContent,
+        quota5hPct: elements['quota-5h-pct'].textContent,
+        hasVelocityArcFill: 'velocityArcFill' in elements,
+        hasContextVelocityFill: 'contextVelocityFill' in elements
       };
 
       console.log(JSON.stringify(res));
@@ -545,17 +543,13 @@ def test_sidecar_frontend_render_velocity_execution():
     assert res.returncode == 0, f"Node script failed: {res.stderr}"
     data = json.loads(res.stdout)
 
-    # arcPct is 50.0% => 157 * (1 - 0.50) = 78.5
-    assert abs(float(data["arcOffset"]) - 78.5) < 1.0
-    assert "50" in data["liveTpm"] or "50.0k" in data["liveTpm"]
-    assert "1.50M" in data["liveTph"] or "1500" in data["liveTph"]
-    assert "45" in data["activeTpm"] or "45.0k" in data["activeTpm"]
-    assert data["contextFillWidth"] == "12%"
-    assert "1.2k" in data["contextTpmText"] or "1200" in data["contextTpmText"]
-    assert "80" in data["fleetTpmText"] or "80.0k" in data["fleetTpmText"]
-    assert data["fleetBarWidth"] == "80%"
-    assert "150" in data["quotaWeeklyTph"]
-    assert "80" in data["quota5hTph"]
+    assert data["capPct"] == "25.0%"
+    assert "250.0k / 1.00M tokens" in data["capSub"]
+    assert data["modelBadge"] == "Gemini 3.8 Flash"
+    assert data["quotaWeeklyPct"] == "85.0% remaining"
+    assert data["quota5hPct"] == "90.0% remaining"
+    assert data["hasVelocityArcFill"] is False
+    assert data["hasContextVelocityFill"] is False
 
 
 def test_sidecar_query_velocity_idle_window_and_zero_guards(tmp_path: Path):
@@ -928,8 +922,8 @@ def test_sidecar_query_velocity_independent_step_fallback(tmp_path: Path):
 
 
 def test_sidecar_frontend_render_global_and_bullet_classes():
-    """Verifies that renderGlobal populates #globalActiveTpm and #globalPairingTph,
-    and contextVelocityFill receives ok / warning / error threshold classes."""
+    """Verifies that renderGlobal runs cleanly with velocity payloads without populating removed
+    global throughput elements, and sidecar gracefully ignores removed bullet elements."""
     node_script = """
     const fs = require('fs');
     const code = fs.readFileSync('sidecars/panel/app.js', 'utf8');
@@ -965,11 +959,9 @@ def test_sidecar_frontend_render_global_and_bullet_classes():
       'global-tokens', 'global-cost', 'global-quota', 'global-compactions', 'global-pruned',
       'globalActiveTpm', 'globalPairingTph',
       'compaction-banner', 'quota-card', 'capacity-card', 'top-steps-card', 'actions-card',
-      'quota-weekly-pct', 'quota-weekly-reset', 'quota-weekly-bar', 'quota-weekly-sub', 'quotaWeeklyTph',
-      'quota-5h-pct', 'quota-5h-reset', 'quota-5h-bar', 'quota-5h-sub', 'quota5hTph',
+      'quota-weekly-pct', 'quota-weekly-reset', 'quota-weekly-bar', 'quota-weekly-sub',
+      'quota-5h-pct', 'quota-5h-reset', 'quota-5h-bar', 'quota-5h-sub',
       'capacity-pct', 'capacity-sub', 'capacity-bar', 'category-list',
-      'velocityArcPath', 'velocityArcFill', 'velocityLiveTpm', 'velocityLiveTph', 'velocityActiveTpm',
-      'contextVelocityFill', 'contextVelocityTpm', 'fleetVelocityBlock', 'fleetVelocityTpm', 'fleetVelocityBar',
       'top-steps-list', 'steps-range', 'toast'
     ];
     for (const id of ids) elements[id] = makeEl(id);
@@ -1007,10 +999,12 @@ def test_sidecar_frontend_render_global_and_bullet_classes():
     setTimeout(() => {
       const globalRes = {
         activeTpm: elements['globalActiveTpm'].textContent,
-        pairingTph: elements['globalPairingTph'].textContent
+        pairingTph: elements['globalPairingTph'].textContent,
+        totalTokens: elements['global-tokens'].textContent,
+        totalCost: elements['global-cost'].textContent
       };
 
-      // 2. Test bullet-bar threshold class (warning at 65%)
+      // 2. Test active session rendering without bullet bar errors
       const mockWindowActive = {
         sidecar: {
           conversationId: 'c1',
@@ -1034,12 +1028,12 @@ def test_sidecar_frontend_render_global_and_bullet_classes():
       fn2(mockWindowActive, mockDocument, mockWindowActive.sidecar.fetch, () => {});
 
       setTimeout(() => {
-        const bulletRes = {
-          fillWidth: elements['contextVelocityFill'].style.width,
-          fillClass: elements['contextVelocityFill'].className
+        const activeRes = {
+          pct: elements['capacity-pct'].textContent,
+          hasBulletBar: 'contextVelocityFill' in elements
         };
 
-        console.log(JSON.stringify({ globalRes, bulletRes }));
+        console.log(JSON.stringify({ globalRes, activeRes }));
         process.exit(0);
       }, 50);
     }, 50);
@@ -1054,9 +1048,11 @@ def test_sidecar_frontend_render_global_and_bullet_classes():
     assert res.returncode == 0, f"Node script failed: {res.stderr}"
     data = json.loads(res.stdout)
 
-    assert "12.5k TPM" in data["globalRes"]["activeTpm"]
-    assert "250.0k TPH" in data["globalRes"]["pairingTph"]
-    assert data["bulletRes"]["fillWidth"] == "65%"
-    assert "bullet-bar warning" in data["bulletRes"]["fillClass"]
+    assert data["globalRes"]["activeTpm"] == ""
+    assert data["globalRes"]["pairingTph"] == ""
+    assert data["globalRes"]["totalTokens"] == "500.0k"
+    assert data["globalRes"]["totalCost"] == "$2.50"
+    assert data["activeRes"]["pct"] == "10.0%"
+    assert data["activeRes"]["hasBulletBar"] is False
 
 
