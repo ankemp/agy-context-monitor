@@ -20,12 +20,22 @@ __all__ = [
     "DEFAULT_PEAK_CONTEXT_TPH",
     "compute_active_velocity",
     "query_rolling_velocity",
+    "safe_float_metric",
 ]
 
 DEFAULT_PEAK_BILLED_TPM: float = 100_000.0
 DEFAULT_PEAK_CONTEXT_TPM: float = 10_000.0
 DEFAULT_PEAK_BILLED_TPH: float = 2_500_000.0
 DEFAULT_PEAK_CONTEXT_TPH: float = 250_000.0
+
+
+def safe_float_metric(val: Any, default: float = 0.0) -> float:
+    """Extract a finite, non-negative float from arbitrary input."""
+    try:
+        f = float(val if val is not None else default)
+        return f if math.isfinite(f) and f >= 0.0 else default
+    except (TypeError, ValueError, OverflowError):
+        return default
 
 
 def compute_active_velocity(
@@ -140,14 +150,15 @@ def query_rolling_velocity(
     root_id: str | None = None,
     now: datetime | None = None,
     hourly_limit: int = 24,
+    project: str | None = None,
 ) -> dict[str, Any]:
     """
     Queries live rolling window (5m / 60m) token throughput, gauges, and hourly rollups.
 
-    Supports scoping by conversation_id or root_id (fleet aggregation across recursive hierarchy),
-    calibrates peak capacities against historical hourly rollups (falling back to defaults
-    under cold start), bounds queries strictly to elapsed timestamps up to `now`,
-    and returns static gauge percentages clamped to [0.0, 100.0].
+    Supports scoping by conversation_id, root_id (fleet aggregation across recursive hierarchy),
+    or project (with 'unassigned' support), calibrates peak capacities against historical
+    hourly rollups (falling back to defaults under cold start), bounds queries strictly
+    to elapsed timestamps up to `now`, and returns static gauge percentages clamped to [0.0, 100.0].
     """
     try:
         cur_chk = conn.execute(
@@ -193,6 +204,28 @@ def query_rolling_velocity(
         scope_steps_params.extend(fleet_ids)
         scope_rollups_sql = f" AND conversation_id IN ({placeholders})"
         scope_rollups_params.extend(fleet_ids)
+    elif project and project != "all":
+        try:
+            if project == "unassigned":
+                cur_proj = conn.execute(
+                    "SELECT id FROM conversations WHERE project IS NULL OR project = ''"
+                )
+            else:
+                cur_proj = conn.execute(
+                    "SELECT id FROM conversations WHERE project = ?", (project,)
+                )
+            proj_ids = [r[0] for r in cur_proj.fetchall()]
+            if proj_ids:
+                placeholders = ",".join("?" for _ in proj_ids)
+                scope_steps_sql = f" AND conversation_id IN ({placeholders})"
+                scope_steps_params.extend(proj_ids)
+                scope_rollups_sql = f" AND conversation_id IN ({placeholders})"
+                scope_rollups_params.extend(proj_ids)
+            else:
+                scope_steps_sql = " AND 1=0"
+                scope_rollups_sql = " AND 1=0"
+        except Exception:
+            pass
 
     # 1. Query live rolling 5m and 60m token metrics from steps (strictly bounded <= iso_now)
     rolling_5m_context = 0

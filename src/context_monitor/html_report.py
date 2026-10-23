@@ -8,10 +8,13 @@ for inline chat embedding via <agent-embed> and side-pane artifact viewing.
 from __future__ import annotations
 
 import html
-import math
 from typing import Any
 
-from context_monitor.velocity import DEFAULT_PEAK_CONTEXT_TPM, compute_active_velocity
+from context_monitor.velocity import (
+    DEFAULT_PEAK_CONTEXT_TPM,
+    compute_active_velocity,
+    safe_float_metric,
+)
 
 
 CHARS_PER_TOKEN = 3.8
@@ -117,26 +120,10 @@ def generate_html_report(
             active_pairing_seconds=analysis.get("active_pairing_seconds", 0.0),
         )
 
-    try:
-        ctx_tpm = float((velocity or {}).get("active_context_tpm") or 0.0)
-        if not math.isfinite(ctx_tpm) or ctx_tpm < 0.0:
-            ctx_tpm = 0.0
-    except (TypeError, ValueError):
-        ctx_tpm = 0.0
-
-    try:
-        bld_tpm = float((velocity or {}).get("active_billed_tpm") or 0.0)
-        if not math.isfinite(bld_tpm) or bld_tpm < 0.0:
-            bld_tpm = 0.0
-    except (TypeError, ValueError):
-        bld_tpm = 0.0
-
-    try:
-        bld_tph = float((velocity or {}).get("active_billed_tph") or 0.0)
-        if not math.isfinite(bld_tph) or bld_tph < 0.0:
-            bld_tph = 0.0
-    except (TypeError, ValueError):
-        bld_tph = 0.0
+    vel_dict = velocity or {}
+    ctx_tpm = safe_float_metric(vel_dict.get("active_context_tpm"))
+    bld_tpm = safe_float_metric(vel_dict.get("active_billed_tpm"))
+    bld_tph = safe_float_metric(vel_dict.get("active_billed_tph"))
 
     peak_ctx = DEFAULT_PEAK_CONTEXT_TPM if DEFAULT_PEAK_CONTEXT_TPM > 0 else 10_000.0
     bullet_pct = min(100.0, max(0.0, (ctx_tpm / peak_ctx) * 100.0))

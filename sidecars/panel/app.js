@@ -371,10 +371,20 @@ function renderGlobal(globalData) {
     const val = Number(globalData.activeBilledTpm) || 0;
     gActiveTpm.textContent = `${formatTokens(val)} TPM`;
   }
+  const gContextTpm = $('globalContextTpm');
+  if (gContextTpm) {
+    const val = Number(globalData.activeContextTpm) || 0;
+    gContextTpm.textContent = `${formatTokens(val)} TPM`;
+  }
   const gPairingTph = $('globalPairingTph');
   if (gPairingTph) {
     const val = Number(globalData.pairingBilledTph) || 0;
     gPairingTph.textContent = `${formatTokens(val)} TPH`;
+  }
+  const gRollingTph = $('globalRollingTph');
+  if (gRollingTph) {
+    const val = Number(globalData.rolling60mBilledTph) || 0;
+    gRollingTph.textContent = `${formatTokens(val)} TPH`;
   }
 
   if (globalData.quota) {

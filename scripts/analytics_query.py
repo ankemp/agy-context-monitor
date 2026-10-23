@@ -25,7 +25,6 @@ Usage:
 import os
 import sys
 import json
-import math
 import argparse
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
@@ -49,7 +48,10 @@ from context_monitor.settings import (  # noqa: E402
     DEFAULT_GEMINI_WEEKLY_CAPACITY,
 )
 from context_monitor.timings import calculate_force_multiplier  # noqa: E402
-from context_monitor.velocity import compute_active_velocity  # noqa: E402
+from context_monitor.velocity import (  # noqa: E402
+    compute_active_velocity,
+    safe_float_metric,
+)
 
 
 def format_tokens(n: int) -> str:
@@ -893,26 +895,10 @@ def print_velocity(conn):
     effective_output_hours = effective_output_sec / 3600
     pairing_dur = format_duration(denom_sec)
 
-    try:
-        ctx_tpm = float((vel or {}).get("active_context_tpm") or 0.0)
-        if not math.isfinite(ctx_tpm) or ctx_tpm < 0:
-            ctx_tpm = 0.0
-    except (TypeError, ValueError):
-        ctx_tpm = 0.0
-
-    try:
-        bld_tpm = float((vel or {}).get("active_billed_tpm") or 0.0)
-        if not math.isfinite(bld_tpm) or bld_tpm < 0:
-            bld_tpm = 0.0
-    except (TypeError, ValueError):
-        bld_tpm = 0.0
-
-    try:
-        pair_tph = float((vel or {}).get("pairing_billed_tph") or 0.0)
-        if not math.isfinite(pair_tph) or pair_tph < 0:
-            pair_tph = 0.0
-    except (TypeError, ValueError):
-        pair_tph = 0.0
+    vel_dict = vel or {}
+    ctx_tpm = safe_float_metric(vel_dict.get("active_context_tpm"))
+    bld_tpm = safe_float_metric(vel_dict.get("active_billed_tpm"))
+    pair_tph = safe_float_metric(vel_dict.get("pairing_billed_tph"))
 
     print(f" Active Context Fill Rate (TPM)       : {ctx_tpm:,.1f} tok/min")
     print(f" Active Billed Throughput (TPM)       : {bld_tpm:,.1f} tok/min")
@@ -1265,26 +1251,10 @@ def generate_global_report(
         active_pairing_seconds=total_pairing_sec,
     )
 
-    try:
-        ctx_tpm = float((global_vel or {}).get("active_context_tpm") or 0.0)
-        if not math.isfinite(ctx_tpm) or ctx_tpm < 0:
-            ctx_tpm = 0.0
-    except (TypeError, ValueError):
-        ctx_tpm = 0.0
-
-    try:
-        bld_tpm = float((global_vel or {}).get("active_billed_tpm") or 0.0)
-        if not math.isfinite(bld_tpm) or bld_tpm < 0:
-            bld_tpm = 0.0
-    except (TypeError, ValueError):
-        bld_tpm = 0.0
-
-    try:
-        pair_tph = float((global_vel or {}).get("pairing_billed_tph") or 0.0)
-        if not math.isfinite(pair_tph) or pair_tph < 0:
-            pair_tph = 0.0
-    except (TypeError, ValueError):
-        pair_tph = 0.0
+    g_vel = global_vel or {}
+    ctx_tpm = safe_float_metric(g_vel.get("active_context_tpm"))
+    bld_tpm = safe_float_metric(g_vel.get("active_billed_tpm"))
+    pair_tph = safe_float_metric(g_vel.get("pairing_billed_tph"))
 
     lines = [
         "# Antigravity Global Analytics & Intelligence Report",

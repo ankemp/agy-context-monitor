@@ -1081,18 +1081,32 @@ def calculate_quota_pacing(
                     b_tok += int(row[2] or 0)
             except Exception:
                 pass
-            if b_tok == 0 and e_tok == 0 and bucket_id is None:
+            if b_tok == 0 and e_tok == 0:
                 try:
                     start_h = start_win.strftime("%Y-%m-%dT%H")
                     end_h = now_dt.strftime("%Y-%m-%dT%H")
-                    cur = db_conn.execute(
+                    if bucket_id is not None:
+                        join_sql = """
+                            SELECT SUM(h.est_tokens), SUM(h.billed_tokens)
+                            FROM hourly_step_rollups h
+                            JOIN conversations c ON h.conversation_id = c.id
+                            WHERE h.hour_key >= ? AND h.hour_key <= ?
                         """
-                        SELECT SUM(est_tokens), SUM(billed_tokens)
-                        FROM hourly_step_rollups
-                        WHERE hour_key >= ? AND hour_key <= ?
-                        """,
-                        (start_h, end_h),
-                    )
+                        params = [start_h, end_h]
+                        if is_3p_bucket:
+                            join_sql += " AND (LOWER(c.model_name) LIKE '%claude%' OR LOWER(c.model_name) LIKE '%gpt%')"
+                        else:
+                            join_sql += " AND (c.model_name IS NULL OR (NOT (LOWER(c.model_name) LIKE '%claude%' OR LOWER(c.model_name) LIKE '%gpt%')))"
+                        cur = db_conn.execute(join_sql, params)
+                    else:
+                        cur = db_conn.execute(
+                            """
+                            SELECT SUM(est_tokens), SUM(billed_tokens)
+                            FROM hourly_step_rollups
+                            WHERE hour_key >= ? AND hour_key <= ?
+                            """,
+                            (start_h, end_h),
+                        )
                     r = cur.fetchone()
                     if r and r[1] is not None:
                         e_tok = int(r[0] or 0)

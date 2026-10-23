@@ -15,7 +15,6 @@ Performs lightweight, zero-overhead transcript analysis:
 
 from datetime import datetime
 import json
-import math
 import os
 from pathlib import Path
 import re
@@ -54,7 +53,10 @@ from context_monitor.quota import (  # noqa: E402
 )
 from context_monitor.settings import should_generate_artifacts  # noqa: E402
 from context_monitor.timings import compute_session_timings  # noqa: E402
-from context_monitor.velocity import compute_active_velocity  # noqa: E402
+from context_monitor.velocity import (  # noqa: E402
+    compute_active_velocity,
+    safe_float_metric,
+)
 
 CHARS_PER_TOKEN = 3.8
 
@@ -1988,26 +1990,10 @@ def generate_context_usage_report(
                 active_pairing_seconds=analysis.get("active_pairing_seconds", 0.0),
             )
 
-        try:
-            ctx_tpm = float((velocity or {}).get("active_context_tpm") or 0.0)
-            if not math.isfinite(ctx_tpm) or ctx_tpm < 0:
-                ctx_tpm = 0.0
-        except (TypeError, ValueError):
-            ctx_tpm = 0.0
-
-        try:
-            bld_tpm = float((velocity or {}).get("active_billed_tpm") or 0.0)
-            if not math.isfinite(bld_tpm) or bld_tpm < 0:
-                bld_tpm = 0.0
-        except (TypeError, ValueError):
-            bld_tpm = 0.0
-
-        try:
-            bld_tph = float((velocity or {}).get("active_billed_tph") or 0.0)
-            if not math.isfinite(bld_tph) or bld_tph < 0:
-                bld_tph = 0.0
-        except (TypeError, ValueError):
-            bld_tph = 0.0
+        vel_dict = velocity or {}
+        ctx_tpm = safe_float_metric(vel_dict.get("active_context_tpm"))
+        bld_tpm = safe_float_metric(vel_dict.get("active_billed_tpm"))
+        bld_tph = safe_float_metric(vel_dict.get("active_billed_tph"))
 
         lines.extend(
             [
