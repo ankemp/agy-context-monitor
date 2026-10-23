@@ -312,6 +312,9 @@
       lvl8: '#c7d2fe'
     };
 
+    const DEFAULT_HEATMAP_THRESHOLDS = [25, 100, 300, 750, 1500, 3500, 7500];
+    const DAYS_OF_WEEK = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+
     function formatTokens(n) {
       if (!n) return "0";
       if (n >= 1000000000) return (n / 1000000000).toFixed(2) + "B";
@@ -962,17 +965,18 @@
           ? legendEl.querySelectorAll('[data-level]')
           : (legendEl.children || []);
 
-        const c = (thresholds && thresholds.cutoffs) || [0, 0, 0, 0, 0, 0, 0];
+        const cutoffs = (thresholds && thresholds.cutoffs) || [0, 0, 0, 0, 0, 0, 0];
+        const t = DEFAULT_HEATMAP_THRESHOLDS;
         const titles = {
           lvl0: `0 ${unit}`,
-          lvl1: hasDynamicScale ? `≤ ${formatLegendVal(c[0])} ${unit} (P20)` : `≤ 25 ${unit}`,
-          lvl2: hasDynamicScale ? `${formatLegendVal(c[0])} – ${formatLegendVal(c[1])} ${unit} (P40)` : `26 – 100 ${unit}`,
-          lvl3: hasDynamicScale ? `${formatLegendVal(c[1])} – ${formatLegendVal(c[2])} ${unit} (P60)` : `101 – 300 ${unit}`,
-          lvl4: hasDynamicScale ? `${formatLegendVal(c[2])} – ${formatLegendVal(c[3])} ${unit} (P75)` : `301 – 750 ${unit}`,
-          lvl5: hasDynamicScale ? `${formatLegendVal(c[3])} – ${formatLegendVal(c[4])} ${unit} (P85)` : `751 – 1,500 ${unit}`,
-          lvl6: hasDynamicScale ? `${formatLegendVal(c[4])} – ${formatLegendVal(c[5])} ${unit} (P93)` : `1,501 – 3,500 ${unit}`,
-          lvl7: hasDynamicScale ? `${formatLegendVal(c[5])} – ${formatLegendVal(c[6])} ${unit} (P98)` : `3,501 – 7,500 ${unit}`,
-          lvl8: hasDynamicScale ? `> ${formatLegendVal(c[6])} ${unit} (Top 2%)` : `> 7,500 ${unit}`
+          lvl1: hasDynamicScale ? `≤ ${formatLegendVal(cutoffs[0])} ${unit} (P20)` : `≤ ${formatLegendVal(t[0])} ${unit}`,
+          lvl2: hasDynamicScale ? `${formatLegendVal(cutoffs[0])} – ${formatLegendVal(cutoffs[1])} ${unit} (P40)` : `${t[0] + 1} – ${formatLegendVal(t[1])} ${unit}`,
+          lvl3: hasDynamicScale ? `${formatLegendVal(cutoffs[1])} – ${formatLegendVal(cutoffs[2])} ${unit} (P60)` : `${t[1] + 1} – ${formatLegendVal(t[2])} ${unit}`,
+          lvl4: hasDynamicScale ? `${formatLegendVal(cutoffs[2])} – ${formatLegendVal(cutoffs[3])} ${unit} (P75)` : `${t[2] + 1} – ${formatLegendVal(t[3])} ${unit}`,
+          lvl5: hasDynamicScale ? `${formatLegendVal(cutoffs[3])} – ${formatLegendVal(cutoffs[4])} ${unit} (P85)` : `${t[3] + 1} – ${formatLegendVal(t[4])} ${unit}`,
+          lvl6: hasDynamicScale ? `${formatLegendVal(cutoffs[4])} – ${formatLegendVal(cutoffs[5])} ${unit} (P93)` : `${t[4] + 1} – ${formatLegendVal(t[5])} ${unit}`,
+          lvl7: hasDynamicScale ? `${formatLegendVal(cutoffs[5])} – ${formatLegendVal(cutoffs[6])} ${unit} (P98)` : `${t[5] + 1} – ${formatLegendVal(t[6])} ${unit}`,
+          lvl8: hasDynamicScale ? `> ${formatLegendVal(cutoffs[6])} ${unit} (Top 2%)` : `> ${formatLegendVal(t[6])} ${unit}`
         };
 
         if (swatches && swatches.length) {
@@ -997,25 +1001,50 @@
         Array.isArray(thresholds.cutoffs) &&
         thresholds.cutoffs.length === 7
       ) {
-        const c = thresholds.cutoffs;
-        if (steps <= c[0]) return COLOR_PALETTE.lvl1;
-        if (steps <= c[1]) return COLOR_PALETTE.lvl2;
-        if (steps <= c[2]) return COLOR_PALETTE.lvl3;
-        if (steps <= c[3]) return COLOR_PALETTE.lvl4;
-        if (steps <= c[4]) return COLOR_PALETTE.lvl5;
-        if (steps <= c[5]) return COLOR_PALETTE.lvl6;
-        if (steps <= c[6]) return COLOR_PALETTE.lvl7;
+        const cutoffs = thresholds.cutoffs;
+        if (steps <= cutoffs[0]) return COLOR_PALETTE.lvl1;
+        if (steps <= cutoffs[1]) return COLOR_PALETTE.lvl2;
+        if (steps <= cutoffs[2]) return COLOR_PALETTE.lvl3;
+        if (steps <= cutoffs[3]) return COLOR_PALETTE.lvl4;
+        if (steps <= cutoffs[4]) return COLOR_PALETTE.lvl5;
+        if (steps <= cutoffs[5]) return COLOR_PALETTE.lvl6;
+        if (steps <= cutoffs[6]) return COLOR_PALETTE.lvl7;
         return COLOR_PALETTE.lvl8;
       }
 
-      if (steps <= 25) return COLOR_PALETTE.lvl1;
-      if (steps <= 100) return COLOR_PALETTE.lvl2;
-      if (steps <= 300) return COLOR_PALETTE.lvl3;
-      if (steps <= 750) return COLOR_PALETTE.lvl4;
-      if (steps <= 1500) return COLOR_PALETTE.lvl5;
-      if (steps <= 3500) return COLOR_PALETTE.lvl6;
-      if (steps <= 7500) return COLOR_PALETTE.lvl7;
+      for (let i = 0; i < DEFAULT_HEATMAP_THRESHOLDS.length; i++) {
+        if (steps <= DEFAULT_HEATMAP_THRESHOLDS[i]) {
+          return COLOR_PALETTE[`lvl${i + 1}`];
+        }
+      }
       return COLOR_PALETTE.lvl8;
+    }
+
+    function collectDailyStepValues(daily, startDate, endDate) {
+      const values = [];
+      let iterDate = new Date(startDate);
+      const endOfRange = new Date(endDate.getFullYear(), endDate.getMonth(), endDate.getDate(), 23, 59, 59, 999);
+      while (iterDate <= endOfRange) {
+        const ds = formatLocalDateKey(iterDate);
+        const st = (daily && daily[ds] && daily[ds].steps) || 0;
+        values.push(st);
+        iterDate.setDate(iterDate.getDate() + 1);
+      }
+      return values;
+    }
+
+    function flattenHourlyGridValues(data) {
+      const values = [];
+      if (data) {
+        for (const dateStr in data) {
+          if (Array.isArray(data[dateStr])) {
+            for (let h = 0; h < data[dateStr].length; h++) {
+              values.push(data[dateStr][h] || 0);
+            }
+          }
+        }
+      }
+      return values;
     }
 
     function getActiveHourlyMatrix(data) {
@@ -1035,6 +1064,8 @@
 
     function formatHourlyAggTooltip(dayIdx, hour, dayName, timeFormatted, fallbackVal) {
       const d = cachedActivityMatrix;
+      const dName = dayName || DAYS_OF_WEEK[dayIdx] || 'Day';
+      const tFmt = timeFormatted || `${hour < 10 ? '0' + hour : hour}:00`;
       const hasGranularData = Boolean(
         d && (
           (d.hourly_aggregate_avg && d.hourly_aggregate_avg.length > 0) ||
@@ -1048,7 +1079,7 @@
         if (d && d.hourly_aggregate && d.hourly_aggregate[dayIdx] && d.hourly_aggregate[dayIdx][hour] !== undefined) {
           val = d.hourly_aggregate[dayIdx][hour];
         }
-        return `${dayName} at ${timeFormatted} (${localTimezoneAbbr}) — ${val.toLocaleString()} operations across all history`;
+        return `${dName} at ${tFmt} (${localTimezoneAbbr}) — ${val.toLocaleString()} operations across all history`;
       }
 
       const total = (d.hourly_aggregate && d.hourly_aggregate[dayIdx] && d.hourly_aggregate[dayIdx][hour]) || 0;
@@ -1071,13 +1102,13 @@
 
       let details = '';
       if (currentHourlyNormMode === 'avg') {
-        details = `${avgFmt} avg ops/active ${dayName} (${totalFmt} total across ${activeCount} ${dayName} · ${r30dFmt} in 30d)`;
+        details = `${avgFmt} avg ops/active ${dName} (${totalFmt} total across ${activeCount} ${dName} · ${r30dFmt} in 30d)`;
       } else if (currentHourlyNormMode === 'rolling30d') {
-        details = `${r30dFmt} ops in 30d (${totalFmt} total across ${activeCount} ${dayName} · ${avgFmt} avg/active ${dayName})`;
+        details = `${r30dFmt} ops in 30d (${totalFmt} total across ${activeCount} ${dName} · ${avgFmt} avg/active ${dName})`;
       } else {
-        details = `${totalFmt} total ops across ${activeCount} ${dayName} (${avgFmt} avg/active ${dayName} · ${r30dFmt} in 30d)`;
+        details = `${totalFmt} total ops across ${activeCount} ${dName} (${avgFmt} avg/active ${dName} · ${r30dFmt} in 30d)`;
       }
-      return `${dayName} at ${timeFormatted} (${localTimezoneAbbr}) — ${details}`;
+      return `${dName} at ${tFmt} (${localTimezoneAbbr}) — ${details}`;
     }
 
     function setHourlyAggNormMode(normMode) {
@@ -1085,7 +1116,6 @@
         normMode = 'avg';
       }
       currentHourlyNormMode = normMode;
-      window.currentHourlyNormMode = normMode;
 
       const btnClasses = {
         active: 'px-2.5 py-1 rounded-md bg-brand-600 text-white font-medium shadow transition whitespace-nowrap',
@@ -1111,6 +1141,7 @@
     }
 
     window.COLOR_PALETTE = COLOR_PALETTE;
+    window.DEFAULT_HEATMAP_THRESHOLDS = DEFAULT_HEATMAP_THRESHOLDS;
     window.formatLocalDateKey = formatLocalDateKey;
     window.computeQuantileThresholds = computeQuantileThresholds;
     window.getCommitColor = getCommitColor;
@@ -1118,7 +1149,15 @@
     window.setHourlyAggNormMode = setHourlyAggNormMode;
     window.getActiveHourlyMatrix = getActiveHourlyMatrix;
     window.formatHourlyAggTooltip = formatHourlyAggTooltip;
-    window.currentHourlyNormMode = currentHourlyNormMode;
+    try {
+      Object.defineProperty(window, 'currentHourlyNormMode', {
+        get: () => currentHourlyNormMode,
+        set: (v) => setHourlyAggNormMode(v),
+        configurable: true
+      });
+    } catch (e) {
+      window.currentHourlyNormMode = currentHourlyNormMode;
+    }
 
     function renderActiveHeatmapGrid(data) {
       const d = data || cachedActivityMatrix;
@@ -1196,15 +1235,7 @@
       const startDate = new Date(today);
       startDate.setDate(today.getDate() - totalDays + 1);
 
-      const endOfToday = new Date(today.getFullYear(), today.getMonth(), today.getDate(), 23, 59, 59, 999);
-      const viewValues = [];
-      let iterDate = new Date(startDate);
-      while (iterDate <= endOfToday) {
-        const ds = formatLocalDateKey(iterDate);
-        const st = (daily && daily[ds] && daily[ds].steps) || 0;
-        viewValues.push(st);
-        iterDate.setDate(iterDate.getDate() + 1);
-      }
+      const viewValues = collectDailyStepValues(daily, startDate, today);
       const thresholds = computeQuantileThresholds(viewValues);
       updateHeatmapLegend(thresholds, 'ops');
 
@@ -1290,15 +1321,7 @@
       const startDate = new Date(today);
       startDate.setDate(today.getDate() - totalDays + (6 - today.getDay()));
 
-      const endOfToday = new Date(today.getFullYear(), today.getMonth(), today.getDate(), 23, 59, 59, 999);
-      const viewValues = [];
-      let iterDate = new Date(startDate);
-      while (iterDate <= endOfToday) {
-        const ds = formatLocalDateKey(iterDate);
-        const st = (daily && daily[ds] && daily[ds].steps) || 0;
-        viewValues.push(st);
-        iterDate.setDate(iterDate.getDate() + 1);
-      }
+      const viewValues = collectDailyStepValues(daily, startDate, today);
       const thresholds = computeQuantileThresholds(viewValues);
       updateHeatmapLegend(thresholds, 'ops');
 
@@ -1383,16 +1406,7 @@
       if (!container) return;
       container.innerHTML = '';
 
-      const viewValues = [];
-      if (data) {
-        for (const dateStr in data) {
-          if (Array.isArray(data[dateStr])) {
-            for (let h = 0; h < data[dateStr].length; h++) {
-              viewValues.push(data[dateStr][h] || 0);
-            }
-          }
-        }
-      }
+      const viewValues = flattenHourlyGridValues(data);
       const thresholds = computeQuantileThresholds(viewValues);
       updateHeatmapLegend(thresholds, 'ops');
 
@@ -1461,16 +1475,7 @@
       if (!container) return;
       container.innerHTML = '';
 
-      const viewValues = [];
-      if (data) {
-        for (const dateStr in data) {
-          if (Array.isArray(data[dateStr])) {
-            for (let h = 0; h < data[dateStr].length; h++) {
-              viewValues.push(data[dateStr][h] || 0);
-            }
-          }
-        }
-      }
+      const viewValues = flattenHourlyGridValues(data);
       const thresholds = computeQuantileThresholds(viewValues);
       updateHeatmapLegend(thresholds, 'ops');
 
