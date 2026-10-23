@@ -42,6 +42,14 @@ from context_monitor.project import (
     extract_project_from_tool_args,
     normalize_project_name,
 )
+from context_monitor.timings import (
+    AFK_THRESHOLD_SECONDS,
+    MAX_AGENT_STEP_DELTA_SECONDS,
+    MAX_ASYNC_WAKEUP_DELTA_SECONDS,
+    calculate_force_multiplier,
+    compute_session_timings,
+    estimate_prompt_pairing_seconds,
+)
 
 __all__ = [
     "DEFAULT_DB_PATH",
@@ -80,4 +88,10 @@ __all__ = [
     "extract_project_from_text",
     "extract_project_from_tool_args",
     "backfill_db_projects",
+    "AFK_THRESHOLD_SECONDS",
+    "MAX_AGENT_STEP_DELTA_SECONDS",
+    "MAX_ASYNC_WAKEUP_DELTA_SECONDS",
+    "estimate_prompt_pairing_seconds",
+    "compute_session_timings",
+    "calculate_force_multiplier",
 ]
