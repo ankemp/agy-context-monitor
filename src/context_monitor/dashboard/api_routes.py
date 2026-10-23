@@ -18,6 +18,7 @@ from context_monitor.quota import (
     sync_and_get_quota_state,
 )
 from context_monitor.timings import calculate_force_multiplier
+from context_monitor.velocity import compute_active_velocity, query_rolling_velocity
 
 CHARS_PER_TOKEN = 3.8
 
@@ -577,6 +578,99 @@ def query_summary_data(conn, tz=None, project=None):
 
     q_data = query_quota_data(conn, billed_cost=total_billed_cost)
 
+    active_vel = compute_active_velocity(
+        est_tokens=row["total_tokens"] or 0,
+        billed_tokens=total_billed_input_tokens + total_billed_output_tokens,
+        active_agent_seconds=total_agent_work,
+        active_pairing_seconds=total_pairing_work,
+    )
+    rolling_vel = query_rolling_velocity(conn)
+    token_velocity = {
+        "active_context_tpm": active_vel["active_context_tpm"],
+        "active_billed_tpm": active_vel["active_billed_tpm"],
+        "pairing_context_tph": active_vel["pairing_context_tph"],
+        "pairing_billed_tph": active_vel["pairing_billed_tph"],
+        "rolling_5m_context_tpm": rolling_vel["rolling_5m_context_tpm"],
+        "rolling_5m_billed_tpm": rolling_vel["rolling_5m_billed_tpm"],
+        "rolling_60m_context_tph": rolling_vel["rolling_60m_context_tph"],
+        "rolling_60m_billed_tph": rolling_vel["rolling_60m_billed_tph"],
+        "peak_billed_tpm": rolling_vel["peak_billed_tpm"],
+        "peak_context_tpm": rolling_vel["peak_context_tpm"],
+        "peak_billed_tph": rolling_vel["peak_billed_tph"],
+        "gauge_pct": rolling_vel["gauge_pct"],
+        "context_gauge_pct": rolling_vel["context_gauge_pct"],
+    }
+    if project:
+        proj_filter = (
+            "(c.project IS NULL OR c.project = '')"
+            if project == "(unassigned)"
+            else "c.project = ?"
+        )
+        proj_params = () if project == "(unassigned)" else (project,)
+        try:
+            cur_series = conn.execute(
+                f"""
+                SELECT
+                    h.hour_key,
+                    SUM(h.step_count) AS step_count,
+                    SUM(h.est_tokens) AS est_tokens,
+                    SUM(h.billed_tokens) AS billed_tokens,
+                    SUM(h.billed_cost) AS billed_cost
+                FROM hourly_step_rollups h
+                JOIN conversations c ON h.conversation_id = c.id
+                WHERE h.hour_key IS NOT NULL AND h.hour_key != ''
+                  AND {proj_filter}
+                GROUP BY h.hour_key
+                ORDER BY h.hour_key DESC
+                LIMIT 24
+                """,
+                proj_params,
+            )
+            p_rows = cur_series.fetchall()
+            if not p_rows:
+                cur_series = conn.execute(
+                    f"""
+                    SELECT
+                        substr(replace(s.created_at, ' ', 'T'), 1, 13) AS hour_key,
+                        COUNT(*) AS step_count,
+                        COALESCE(SUM(s.est_tokens), 0) AS est_tokens,
+                        COALESCE(SUM(COALESCE(s.billed_input_tokens, 0) + COALESCE(s.billed_output_tokens, 0)), 0) AS billed_tokens,
+                        COALESCE(SUM(COALESCE(s.billed_cost, 0.0)), 0.0) AS billed_cost
+                    FROM steps s
+                    JOIN conversations c ON s.conversation_id = c.id
+                    WHERE s.created_at IS NOT NULL AND s.created_at != ''
+                      AND {proj_filter}
+                    GROUP BY hour_key
+                    ORDER BY hour_key DESC
+                    LIMIT 24
+                    """,
+                    proj_params,
+                )
+                p_rows = cur_series.fetchall()
+            p_series = []
+            for pr in reversed(p_rows):
+                h_k = str(pr[0])
+                s_c = int(pr[1] or 0)
+                e_t = int(pr[2] or 0)
+                b_t = int(pr[3] or 0)
+                b_c = round(float(pr[4] or 0.0), 4)
+                p_series.append(
+                    {
+                        "hour_key": h_k,
+                        "step_count": s_c,
+                        "est_tokens": e_t,
+                        "billed_tokens": b_t,
+                        "billed_cost": b_c,
+                        "est_tpm": round(e_t / 60.0, 2),
+                        "billed_tpm": round(b_t / 60.0, 2),
+                    }
+                )
+            hourly_series = p_series
+        except Exception:
+            hourly_series = []
+    else:
+        hourly_series = rolling_vel.get("hourly_series", [])
+
     return {
         "total_convs": row["total_convs"] or 0,
         "root_convs": row["root_convs"] or (row["total_convs"] or 0),
@@ -623,6 +717,8 @@ def query_summary_data(conn, tz=None, project=None):
         "categories": categories,
         "quota": q_data,
         "quota_summary": q_data,
+        "token_velocity": token_velocity,
+        "hourly_series": hourly_series,
     }
 
 
@@ -1663,6 +1759,12 @@ def query_conversations_list(
                 pass
             d_cost = round(dr["billed_cost"] or 0.0, 2)
             d_w_pct, d_5h_pct = _compute_quota_pcts(d_cost, dr_m_used, bucket_caps)
+            d_vel = compute_active_velocity(
+                est_tokens=dr["total_tokens"] or 0,
+                billed_tokens=d_act,
+                active_agent_seconds=dr["active_agent_seconds"] or 0,
+                active_pairing_seconds=dr["active_pairing_seconds"] or 0,
+            )
             descendants_by_root[rid].append(
                 {
                     "id": dr["id"],
@@ -1690,6 +1792,10 @@ def query_conversations_list(
                         float(dr["active_agent_seconds"] or 0.0), 1
                     ),
                     "active_pairing_seconds": dr["active_pairing_seconds"] or 0,
+                    "active_context_tpm": d_vel["active_context_tpm"],
+                    "active_billed_tpm": d_vel["active_billed_tpm"],
+                    "pairing_billed_tph": d_vel["pairing_billed_tph"],
+                    "velocity": d_vel,
                     "billed_cost": d_cost,
                     "weekly_quota_pct": d_w_pct,
                     "five_hour_quota_pct": d_5h_pct,
@@ -1766,6 +1872,13 @@ def query_conversations_list(
         c_w_pct, c_5h_pct = _compute_quota_pcts(c_cost, r_m_used, bucket_caps)
         f_w_pct, f_5h_pct = _compute_quota_pcts(fleet_cost, r_m_used, bucket_caps)
 
+        conv_vel = compute_active_velocity(
+            est_tokens=r["total_tokens"] or 0,
+            billed_tokens=act_tok,
+            active_agent_seconds=r["active_agent_seconds"] or 0,
+            active_pairing_seconds=r["active_pairing_seconds"] or 0,
+        )
+
         convs.append(
             {
                 "id": c_id,
@@ -1789,6 +1902,10 @@ def query_conversations_list(
                 "active_agent_seconds": r["active_agent_seconds"] or 0,
                 "fleet_agent_seconds": fleet_agent_seconds,
                 "active_pairing_seconds": r["active_pairing_seconds"] or 0,
+                "active_context_tpm": conv_vel["active_context_tpm"],
+                "active_billed_tpm": conv_vel["active_billed_tpm"],
+                "pairing_billed_tph": conv_vel["pairing_billed_tph"],
+                "velocity": conv_vel,
                 "billed_cost": c_cost,
                 "weekly_quota_pct": c_w_pct,
                 "five_hour_quota_pct": c_5h_pct,
@@ -2126,6 +2243,17 @@ def query_session_details(conn, cid, tz=None):
     conv_dict["five_hour_quota_pct"] = conv_quota["five_hour_pct"]
     conv_dict["quota"] = conv_quota
 
+    s_vel = compute_active_velocity(
+        est_tokens=conv_dict.get("total_tokens") or 0,
+        billed_tokens=c_act,
+        active_agent_seconds=conv_dict.get("active_agent_seconds") or 0,
+        active_pairing_seconds=conv_dict.get("active_pairing_seconds") or 0,
+    )
+    conv_dict["active_context_tpm"] = s_vel["active_context_tpm"]
+    conv_dict["active_billed_tpm"] = s_vel["active_billed_tpm"]
+    conv_dict["pairing_billed_tph"] = s_vel["pairing_billed_tph"]
+    conv_dict["velocity"] = s_vel
+
     compaction_meta = {
         "count": conv_dict["compaction_count"],
         "pruned_tokens": conv_dict["pruned_tokens"],
@@ -2239,6 +2367,20 @@ def query_session_details(conn, cid, tz=None):
         quota_state=quota_state,
         activity_profile=activity_profile,
     )
+    fleet_vel = compute_active_velocity(
+        est_tokens=sum(n.get("total_tokens") or 0 for n in swarm_nodes),
+        billed_tokens=total_swarm_tokens,
+        active_agent_seconds=round(
+            float(conv_dict.get("active_agent_seconds") or 0)
+            + sum(float(s.get("active_agent_seconds") or 0) for s in subagents_list),
+            1,
+        ),
+        active_pairing_seconds=round(
+            float(conv_dict.get("active_pairing_seconds") or 0)
+            + sum(float(s.get("active_pairing_seconds") or 0) for s in subagents_list),
+            1,
+        ),
+    )
     fleet_summary = {
         "root_id": effective_root,
         "is_subagent": bool(conv_dict.get("parent_id")),
@@ -2258,6 +2400,10 @@ def query_session_details(conn, cid, tz=None):
         ),
         "weekly_quota_pct": fleet_q["weekly_pct"],
         "five_hour_quota_pct": fleet_q["five_hour_pct"],
+        "active_context_tpm": fleet_vel["active_context_tpm"],
+        "active_billed_tpm": fleet_vel["active_billed_tpm"],
+        "pairing_billed_tph": fleet_vel["pairing_billed_tph"],
+        "velocity": fleet_vel,
     }
 
     # Build nested tree topology for visualization
@@ -2288,6 +2434,12 @@ def query_session_details(conn, cid, tz=None):
             if total_swarm_tokens > 0
             else 0.0
         )
+        n_vel = compute_active_velocity(
+            est_tokens=active_tokens,
+            billed_tokens=node_active_tokens,
+            active_agent_seconds=n.get("active_agent_seconds") or 0.0,
+            active_pairing_seconds=n.get("active_pairing_seconds") or 0.0,
+        )
 
         nodes_by_id[node_id] = {
             "id": node_id,
@@ -2305,6 +2457,10 @@ def query_session_details(conn, cid, tz=None):
             "pruned_tokens": n.get("pruned_tokens") or 0,
             "active_agent_seconds": round(n.get("active_agent_seconds") or 0.0, 1),
             "active_pairing_seconds": round(n.get("active_pairing_seconds") or 0.0, 1),
+            "active_context_tpm": n_vel["active_context_tpm"],
+            "active_billed_tpm": n_vel["active_billed_tpm"],
+            "pairing_billed_tph": n_vel["pairing_billed_tph"],
+            "velocity": n_vel,
             "max_tokens": max_tokens,
             "active_tokens": active_tokens,
             "context_pct": context_pct,
@@ -2332,6 +2488,10 @@ def query_session_details(conn, cid, tz=None):
 
     return {
         "conversation": conv_dict,
+        "active_context_tpm": s_vel["active_context_tpm"],
+        "active_billed_tpm": s_vel["active_billed_tpm"],
+        "pairing_billed_tph": s_vel["pairing_billed_tph"],
+        "velocity": s_vel,
         "steps": steps,
         "categories": categories,
         "phases": session_phases,
@@ -2373,3 +2533,71 @@ def query_turn_diff(
     diff_data["conversation_title"] = conv["title"] or f"Session {conv['id'][:8]}"
     diff_data["model_name"] = conv["model_name"] or "Gemini"
     return diff_data
+
+
+def get_analytics_data(
+    conn: sqlite3.Connection | None = None,
+    db_path: Path | str | None = None,
+    tz: Any = None,
+    project: str | None = None,
+) -> dict[str, Any]:
+    """
+    Returns aggregated analytics payload including summary metrics,
+    dual TPM/TPH token velocity, hourly rollup series, and recent conversations.
+    """
+    if conn is None:
+        from context_monitor.db import get_db_connection
+
+        if db_path is not None:
+            with get_db_connection(db_path) as c:
+                return get_analytics_data(c, None, tz=tz, project=project)
+        else:
+            with get_db_connection() as c:
+                return get_analytics_data(c, None, tz=tz, project=project)
+
+    target_tz = get_target_tz(tz)
+    summary = query_summary_data(conn, tz=target_tz, project=project)
+    convs = query_conversations_list(conn, limit=50, tz=target_tz, project=project)
+    hourly_series = summary.get("hourly_series", [])
+
+    return {
+        "summary": summary,
+        "recent_conversations": convs,
+        "conversations": convs,
+        "hourly_series": hourly_series,
+        "token_velocity": summary.get("token_velocity", {}),
+    }
+
+
+def get_conversation_details(
+    cid_or_conn: Any,
+    cid: str | None = None,
+    db_path: Path | str | None = None,
+    tz: Any = None,
+) -> dict[str, Any] | None:
+    """
+    Queries session deep-dive details enriched with step quota impacts,
+    ancestor lineage, subagent trees, and active TPM/TPH throughput.
+    """
+    if isinstance(cid_or_conn, sqlite3.Connection):
+        conn = cid_or_conn
+        target_cid = cid
+    else:
+        conn = None
+        target_cid = str(cid_or_conn) if cid_or_conn is not None else cid
+
+    if target_cid is None:
+        return None
+
+    if conn is None:
+        from context_monitor.db import get_db_connection
+
+        if db_path is not None:
+            with get_db_connection(db_path) as c:
+                return get_conversation_details(c, target_cid, None, tz=tz)
+        else:
+            with get_db_connection() as c:
+                return get_conversation_details(c, target_cid, None, tz=tz)
+
+    return query_session_details(conn, target_cid, tz=tz)
+

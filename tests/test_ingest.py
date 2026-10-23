@@ -1133,9 +1133,9 @@ def test_sync_to_sqlite_incremental_append_with_ephemeral_steps(tmp_path: Path):
 
         assert diff2 is not None
         assert not diff2.compaction_detected
-        assert (
-            len(executed_deletes) == 0
-        ), f"Expected 0 DELETE statements on append, got {executed_deletes}"
+        assert len(executed_deletes) == 0, (
+            f"Expected 0 DELETE statements on append, got {executed_deletes}"
+        )
 
 
 def test_analyze_transcript_project_detection_from_path_and_cmdline(tmp_path: Path):
@@ -1196,12 +1196,297 @@ def test_sync_to_sqlite_lineage_cycle_prevention(tmp_path: Path):
         sync_to_sqlite(cid_b, "Gemini Flash", analysis_b)
 
     conn = get_db_connection(db_file)
-    row_b = conn.execute("SELECT parent_id, root_id, depth FROM conversations WHERE id = ?", (cid_b,)).fetchone()
+    row_b = conn.execute(
+        "SELECT parent_id, root_id, depth FROM conversations WHERE id = ?", (cid_b,)
+    ).fetchone()
     conn.close()
 
-    assert row_b["parent_id"] is None, f"Expected parent_id to be None to break cycle, got {row_b['parent_id']}"
+    assert row_b["parent_id"] is None, (
+        f"Expected parent_id to be None to break cycle, got {row_b['parent_id']}"
+    )
     assert row_b["root_id"] == cid_b
     assert row_b["depth"] == 0
 
 
+def test_analyze_transcript_attaches_velocity_metrics(tmp_path: Path):
+    """Verifies analyze_transcript attaches active timings and velocity dict to analysis."""
+    transcript_file = tmp_path / "transcript.jsonl"
+    with open(transcript_file, "w", encoding="utf-8") as f:
+        f.write(
+            json.dumps(
+                {
+                    "step_index": 1,
+                    "type": "USER_INPUT",
+                    "created_at": "2026-10-23T10:00:00Z",
+                    "content": "Perform coding task",
+                    "characters": 19,
+                }
+            )
+            + "\n"
+        )
+        f.write(
+            json.dumps(
+                {
+                    "step_index": 2,
+                    "type": "PLANNER_RESPONSE",
+                    "created_at": "2026-10-23T10:02:00Z",
+                    "content": "Working on it now",
+                    "est_tokens": 12000,
+                    "model_name": "Gemini 3.8 Flash",
+                }
+            )
+            + "\n"
+        )
 
+    analysis = analyze_transcript(transcript_file)
+    assert "active_agent_seconds" in analysis
+    assert "active_pairing_seconds" in analysis
+    assert "velocity" in analysis
+    vel = analysis["velocity"]
+    assert isinstance(vel, dict)
+    assert "active_context_tpm" in vel
+    assert "active_billed_tpm" in vel
+    assert "active_billed_tph" in vel
+    assert "pairing_billed_tph" in vel
+
+
+def test_generate_context_usage_report_includes_velocity_lines(tmp_path: Path):
+    """Verifies generate_context_usage_report includes clean, emoji-free velocity lines."""
+    analysis = {
+        "latest_model": "Gemini 3.8 Flash",
+        "latest_max_tokens": 1_000_000,
+        "total_tokens": 60_000,
+        "active_context_tokens": 60_000,
+        "total_chars": 228_000,
+        "billed_cost": 1.25,
+        "billed_input_tokens": 240_000,
+        "billed_output_tokens": 30_000,
+        "active_agent_seconds": 180,
+        "active_pairing_seconds": 600,
+        "category_stats": {"User Requests": 228_000},
+        "steps": [],
+    }
+
+    report_md = generate_context_usage_report(
+        cid="test-vel-report",
+        model_name="Gemini 3.8 Flash",
+        max_tokens=1_000_000,
+        analysis=analysis,
+        artifact_dir=tmp_path,
+    )
+
+    assert "Active Context Fill Rate" in report_md
+    assert "Active Billed Throughput" in report_md
+    assert "tok/min" in report_md
+    assert "tok/hr" in report_md
+
+    # Zero emoji invariant check
+    emoji_pattern = re.compile(
+        r"[\U0001F600-\U0001F64F\U0001F300-\U0001F5FF\U0001F680-\U0001F6FF\U0001F700-\U0001F77F\U0001F900-\U0001F9FF\U00002702-\U000027B0]+",
+        flags=re.UNICODE,
+    )
+    assert not emoji_pattern.search(report_md), "Report must not contain emojis"
+
+
+def test_generate_context_usage_report_handles_none_and_corrupt_velocity(
+    tmp_path: Path,
+):
+    """Verifies generate_context_usage_report does not silently fail when velocity has None values."""
+    analysis = {
+        "latest_model": "Gemini 3.8 Flash",
+        "latest_max_tokens": 1_000_000,
+        "total_tokens": 10_000,
+        "active_context_tokens": 10_000,
+        "total_chars": 38_000,
+        "billed_cost": 0.5,
+        "billed_input_tokens": 50_000,
+        "billed_output_tokens": 5_000,
+        "active_agent_seconds": 60,
+        "active_pairing_seconds": 120,
+        "velocity": {
+            "active_context_tpm": None,
+            "active_billed_tpm": None,
+            "active_billed_tph": None,
+        },
+        "category_stats": {"User Requests": 38_000},
+        "steps": [],
+    }
+
+    report_md = generate_context_usage_report(
+        cid="test-none-vel",
+        model_name="Gemini 3.8 Flash",
+        max_tokens=1_000_000,
+        analysis=analysis,
+        artifact_dir=tmp_path,
+    )
+
+    # Must NOT fail silently and return empty string
+    assert report_md != "", "Report must not be empty on None velocity keys"
+    assert "**Active Context Fill Rate**: **0.0 tok/min**" in report_md
+    assert "**Active Billed Throughput**: **0.0 tok/min** / **0.0 tok/hr**" in report_md
+
+
+def test_sync_to_sqlite_populates_missing_velocity_and_subagent_zero_pairing(
+    tmp_path: Path,
+):
+    """Verifies sync_to_sqlite populates velocity if missing and recomputes for subagents with zero pairing."""
+    db_file = tmp_path / "test.db"
+    init_db(db_file)
+
+    # Root session with no pre-existing velocity key in analysis
+    analysis_root = {
+        "title": "Root Task",
+        "start_time": "2026-10-23T10:00:00Z",
+        "end_time": "2026-10-23T10:10:00Z",
+        "duration_seconds": 600.0,
+        "active_agent_seconds": 120.0,
+        "active_pairing_seconds": 480.0,
+        "total_chars": 76_000,
+        "total_tokens": 20_000,
+        "active_context_tokens": 20_000,
+        "billed_cost": 0.5,
+        "billed_input_tokens": 60_000,
+        "billed_output_tokens": 6_000,
+        "steps": [],
+    }
+
+    with patch("context_monitor.db.DEFAULT_DB_PATH", db_file):
+        sync_to_sqlite(
+            "root-sess", "Gemini 3.8 Flash", analysis_root, attach_profile=False
+        )
+
+    assert "velocity" in analysis_root
+    assert analysis_root["velocity"]["active_context_tpm"] == 10_000.0  # 20k / 2m
+    assert (
+        analysis_root["velocity"]["pairing_billed_tph"] == 495_000.0
+    )  # 66k / (480/3600 = 0.1333h)
+
+    # Subagent session with parent_id and initial pairing time
+    analysis_sub = {
+        "title": "[DeepCoder] Sub Task",
+        "start_time": "2026-10-23T10:05:00Z",
+        "end_time": "2026-10-23T10:08:00Z",
+        "duration_seconds": 180.0,
+        "active_agent_seconds": 120.0,
+        "active_pairing_seconds": 60.0,
+        "total_chars": 38_000,
+        "total_tokens": 10_000,
+        "active_context_tokens": 10_000,
+        "billed_cost": 0.25,
+        "billed_input_tokens": 30_000,
+        "billed_output_tokens": 3_000,
+        "parent_id": "root-sess",
+        "subagent_role": "DeepCoder",
+        "steps": [],
+    }
+
+    with patch("context_monitor.db.DEFAULT_DB_PATH", db_file):
+        sync_to_sqlite(
+            "sub-sess", "Gemini 3.8 Flash", analysis_sub, attach_profile=False
+        )
+
+    assert analysis_sub["active_pairing_seconds"] == 0.0
+    assert analysis_sub["velocity"]["pairing_billed_tph"] == 0.0
+    assert analysis_sub["velocity"]["active_context_tpm"] == 5_000.0  # 10k / 2m
+
+
+def test_backfill_analytics_parity_active_context_tokens_and_subagent(tmp_path: Path):
+    """Verifies backfill_analytics parse_conversation produces active_context_tokens and pass 2 recalculates velocity using active_context_tokens."""
+    import scripts.backfill_analytics as backfill
+
+    db_file = tmp_path / "backfill.db"
+    init_db(db_file)
+
+    brain_dir = tmp_path / "brain"
+    root_dir = brain_dir / "root-bf"
+    (root_dir / ".system_generated" / "logs").mkdir(parents=True)
+    with open(root_dir / ".system_generated" / "logs" / "transcript.jsonl", "w") as f:
+        f.write(
+            json.dumps(
+                {
+                    "step_index": 1,
+                    "type": "USER_INPUT",
+                    "created_at": "2026-10-23T10:00:00Z",
+                    "content": "Root task prompt",
+                    "characters": 16,
+                }
+            )
+            + "\n"
+        )
+        f.write(
+            json.dumps(
+                {
+                    "step_index": 2,
+                    "type": "PLANNER_RESPONSE",
+                    "created_at": "2026-10-23T10:02:00Z",
+                    "content": "Root working",
+                    "est_tokens": 20_000,
+                }
+            )
+            + "\n"
+        )
+
+    # Subagent with 2 steps where cumulative running_ctx is 15,000 but steps sum could differ
+    sub_dir = brain_dir / "sub-bf"
+    (sub_dir / ".system_generated" / "logs").mkdir(parents=True)
+    with open(sub_dir / ".system_generated" / "logs" / "transcript.jsonl", "w") as f:
+        f.write(
+            json.dumps(
+                {
+                    "step_index": 1,
+                    "type": "USER_INPUT",
+                    "created_at": "2026-10-23T10:03:00Z",
+                    "content": "Child task",
+                    "characters": 10,
+                }
+            )
+            + "\n"
+        )
+        f.write(
+            json.dumps(
+                {
+                    "step_index": 2,
+                    "type": "PLANNER_RESPONSE",
+                    "created_at": "2026-10-23T10:05:00Z",
+                    "content": "Child working",
+                    "est_tokens": 15_000,
+                }
+            )
+            + "\n"
+        )
+
+    # First test parse_conversation directly
+    parsed = backfill.parse_conversation(root_dir)
+    assert parsed is not None
+    conv = parsed["conversation"]
+    assert "active_context_tokens" in conv
+    assert conv["active_context_tokens"] >= 20_000
+    assert "velocity" in conv
+    assert conv["velocity"]["active_context_tpm"] > 0
+
+    # Seed parent in DB so subagent pass 2 identifies it
+    with get_db_connection(db_file) as conn:
+        conn.execute(
+            """
+            INSERT INTO conversations (id, title, active_pairing_seconds)
+            VALUES ('root-bf', 'Root BF', 600.0)
+            """
+        )
+        # Dispatch subagent
+        conn.execute(
+            """
+            INSERT INTO conversations (id, title, parent_id, root_id, depth, subagent_role, active_pairing_seconds)
+            VALUES ('sub-bf', 'Sub BF', 'root-bf', 'root-bf', 1, 'DeepCoder', 120.0)
+            """
+        )
+        conn.commit()
+
+    backfill.run_backfill(
+        brain_dir=brain_dir, conversation_id="sub-bf", db_path=db_file
+    )
+
+    with get_db_connection(db_file) as conn:
+        row = conn.execute(
+            "SELECT active_pairing_seconds FROM conversations WHERE id = 'sub-bf'"
+        ).fetchone()
+        assert row["active_pairing_seconds"] == 0.0

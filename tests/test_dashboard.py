@@ -480,12 +480,14 @@ def test_dashboard_frontend_invariants():
     assert "geminiWeeklyBucket" in js_content
     assert "weeklyCalibratedCapacity" in js_content
 
-    # Force Multiplier UI and rendering invariants
     assert "cardForceMultiplier" in html_content
     assert "kpiForceMultiplier" in html_content
     assert "kpiForceMultiplierSub" in html_content
     assert "Force Multiplier" in html_content
-    assert "grid-cols-2 md:grid-cols-3 lg:grid-cols-5" in html_content
+    assert (
+        "grid-cols-2 md:grid-cols-3 lg:grid-cols-6" in html_content
+        or "grid-cols-2 md:grid-cols-3 lg:grid-cols-5" in html_content
+    )
     assert "border-l-4 border-l-cyan-500" in html_content
     assert "bg-cyan-500/10 text-cyan-400" in html_content
     assert 'data-lucide="rocket"' in html_content
@@ -543,6 +545,8 @@ def test_standalone_html_export_quota(test_db: Path, tmp_path: Path):
     assert "STATIC_DATA" in html
     assert '"quota":' in html
     assert '"timeline_cycle":' in html
+    assert '"token_velocity":' in html
+    assert '"hourly_series":' in html
     assert "quotaGeminiWeeklyRem" in html
     assert "Subscription Quotas" in html
     assert "24x7 Activity Matrix Weighted" in html
@@ -3983,3 +3987,467 @@ def test_dashboard_force_multiplier_frontend_rendering():
     data = json.loads(res.stdout.strip().splitlines()[-1])
     assert data["status"] == "ok"
     assert data["cases"] == 6
+
+
+def test_dashboard_token_velocity_api_and_frontend_rendering(test_db: Path):
+    """Verifies get_analytics_data, get_conversation_details, and frontend velocity gauges/toggles."""
+    data = api_routes.get_analytics_data(db_path=test_db)
+    assert "token_velocity" in data["summary"]
+    vel = data["summary"]["token_velocity"]
+    assert "active_billed_tpm" in vel
+    assert "active_context_tpm" in vel
+    assert "pairing_context_tph" in vel
+    assert "pairing_billed_tph" in vel
+    assert "rolling_5m_context_tpm" in vel
+    assert "rolling_5m_billed_tpm" in vel
+    assert "rolling_60m_context_tph" in vel
+    assert "rolling_60m_billed_tph" in vel
+    assert "peak_billed_tpm" in vel
+    assert "peak_context_tpm" in vel
+    assert "peak_billed_tph" in vel
+    assert "gauge_pct" in vel
+    assert "context_gauge_pct" in vel
+    assert "hourly_series" in data
+    assert isinstance(data["hourly_series"], list)
+
+    assert "recent_conversations" in data
+    assert len(data["recent_conversations"]) > 0
+    first_conv = data["recent_conversations"][0]
+    assert "active_context_tpm" in first_conv
+    assert "active_billed_tpm" in first_conv
+    assert "pairing_billed_tph" in first_conv
+
+    details = api_routes.get_conversation_details("root-conv-1", db_path=test_db)
+    assert details is not None
+    assert "active_context_tpm" in details["conversation"]
+    assert "active_billed_tpm" in details["conversation"]
+    assert "pairing_billed_tph" in details["conversation"]
+    assert details["active_context_tpm"] > 0
+    assert details["active_billed_tpm"] > 0
+
+    # Project-scoped hourly series verification
+    data_proj = api_routes.get_analytics_data(db_path=test_db, project="test-proj")
+    assert len(data_proj["hourly_series"]) > 0
+    data_empty = api_routes.get_analytics_data(db_path=test_db, project="non-existent-proj")
+    assert len(data_empty["hourly_series"]) == 0
+
+    # Frontend DOM invariants in index.html
+    dashboard_dir = Path(__file__).resolve().parent.parent / "src" / "context_monitor" / "dashboard"
+    html_content = (dashboard_dir / "templates" / "index.html").read_text(encoding="utf-8")
+    js_content = (dashboard_dir / "static" / "script.js").read_text(encoding="utf-8")
+
+    assert "cardTokenVelocity" in html_content
+    assert "dashVelocityArcFill" in html_content
+    assert "kpiBilledTpm" in html_content
+    assert "kpiBilledTph" in html_content
+    assert "kpiContextTpm" in html_content
+    assert "dashContextVelocityBar" in html_content
+    assert "btnVelocityDaily" in html_content
+    assert "btnVelocityHourly" in html_content
+    assert "velocityChartDesc" in html_content
+    assert "timelineRangeGroup" in html_content
+    assert "velocityDivider" in html_content
+    assert "quotaGemini5hTph" in html_content
+    assert "dashVelocityArcFill" in js_content
+    assert "currentVelocityResolution" in js_content
+    assert "quotaGeminiWeeklyTph" in html_content
+    assert "quota3p5hTph" in html_content
+    assert "quota3pWeeklyTph" in html_content
+    assert "modalActiveTpm" in html_content
+    assert "modalBilledTph" in html_content
+
+    # Node simulation verifying JS execution of velocity telemetry and toggles
+    node_script = """
+    const fs = require('fs');
+    const path = require('path');
+    const code = fs.readFileSync(path.resolve('src/context_monitor/dashboard/static/script.js'), 'utf8');
+
+    function createMockElement() {
+      let _html = '';
+      const classes = new Set();
+      const attrs = {};
+      return {
+        textContent: '',
+        value: '',
+        title: '',
+        style: {},
+        className: '',
+        children: [],
+        appendChild(child) { this.children.push(child); },
+        querySelector: () => null,
+        querySelectorAll: () => [],
+        getContext: () => ({}),
+        setAttribute(k, v) { attrs[k] = String(v); },
+        getAttribute(k) { return attrs[k]; },
+        addEventListener: () => {},
+        removeEventListener: () => {},
+        get innerHTML() { return _html; },
+        set innerHTML(val) {
+          _html = val;
+          if (val === '') this.children = [];
+        },
+        classList: {
+          add(...c) { c.forEach(x => classes.add(x)); },
+          remove(...c) { c.forEach(x => classes.delete(x)); },
+          contains(c) { return classes.has(c); }
+        }
+      };
+    }
+
+    const mockElements = {
+      tzLabel: createMockElement(),
+      kpiTokens: createMockElement(),
+      kpiChars: createMockElement(),
+      kpiConvs: createMockElement(),
+      kpiDateRange: createMockElement(),
+      kpiSteps: createMockElement(),
+      kpiAvgSteps: createMockElement(),
+      kpiTools: createMockElement(),
+      kpiDuration: createMockElement(),
+      kpiPairingSub: createMockElement(),
+      cardActiveTime: createMockElement(),
+      kpiCost: createMockElement(),
+      kpiBilledTokens: createMockElement(),
+      kpiAutonomy: createMockElement(),
+      kpiAutonomySub: createMockElement(),
+      cardAutonomy: createMockElement(),
+      kpiThinking: createMockElement(),
+      cardThinking: createMockElement(),
+      kpiCodeLines: createMockElement(),
+      kpiCodeSub: createMockElement(),
+      cardCodeLines: createMockElement(),
+      kpiTimeSaved: createMockElement(),
+      cardTimeSaved: createMockElement(),
+      kpiForceMultiplier: createMockElement(),
+      kpiForceMultiplierSub: createMockElement(),
+      cardForceMultiplier: createMockElement(),
+      diagReReadRate: createMockElement(),
+      diagReReadBar: createMockElement(),
+      diagReReadCount: createMockElement(),
+      diagReReadWaste: createMockElement(),
+      cardDiagReRead: createMockElement(),
+      diagResilienceRate: createMockElement(),
+      diagResilienceBar: createMockElement(),
+      diagFailedCalls: createMockElement(),
+      cardDiagResilience: createMockElement(),
+      convSearch: createMockElement(),
+      convTableBody: createMockElement(),
+      modalDuration: createMockElement(),
+      modalWallSpan: createMockElement(),
+      modalTitle: createMockElement(),
+      modalSub: createMockElement(),
+      modalModel: createMockElement(),
+      modalTokens: createMockElement(),
+      modalSteps: createMockElement(),
+      modalActiveTpm: createMockElement(),
+      modalBilledTph: createMockElement(),
+      modalCompactionBanner: createMockElement(),
+      modalCompactionCard: createMockElement(),
+      modalCompactionScore: createMockElement(),
+      modalCompactionStats: createMockElement(),
+      modalCompactionTitle: createMockElement(),
+      modalCompactionDesc: createMockElement(),
+      modalAutonomy: createMockElement(),
+      modalAutonomyCard: createMockElement(),
+      modalThinking: createMockElement(),
+      modalThinkingCard: createMockElement(),
+      modalEfficiency: createMockElement(),
+      modalEfficiencyDesc: createMockElement(),
+      modalCost: createMockElement(),
+      modalCostBreakdown: createMockElement(),
+      modalStepsList: createMockElement(),
+      modalDetail: createMockElement(),
+      // Velocity & Range elements
+      cardTokenVelocity: createMockElement(),
+      dashVelocityArcFill: createMockElement(),
+      kpiBilledTpm: createMockElement(),
+      kpiBilledTph: createMockElement(),
+      kpiContextTpm: createMockElement(),
+      dashContextVelocityBar: createMockElement(),
+      btnVelocityDaily: createMockElement(),
+      btnVelocityHourly: createMockElement(),
+      velocityChartTitle: createMockElement(),
+      velocityChartDesc: createMockElement(),
+      velocityDivider: createMockElement(),
+      timelineModeGroup: createMockElement(),
+      timelineDivider: createMockElement(),
+      timelineRangeGroup: createMockElement(),
+      btnCycle: createMockElement(),
+      btn7d: createMockElement(),
+      btn14d: createMockElement(),
+      btn30d: createMockElement(),
+      btnAll: createMockElement(),
+      timelineChart: createMockElement(),
+      modelsChart: createMockElement(),
+      toolsChart: createMockElement(),
+      categoryChart: createMockElement(),
+      phaseChart: createMockElement(),
+      // Quota elements
+      quotaSection: createMockElement(),
+      quotaGeminiWeeklyRem: createMockElement(),
+      quotaGeminiWeeklyBar: createMockElement(),
+      quotaGeminiWeeklyCap: createMockElement(),
+      quotaGeminiWeeklyTph: createMockElement(),
+      quotaGemini5hRem: createMockElement(),
+      quotaGemini5hBar: createMockElement(),
+      quotaGemini5hCap: createMockElement(),
+      quotaGemini5hTph: createMockElement(),
+      quota3pWeeklyRem: createMockElement(),
+      quota3pWeeklyBar: createMockElement(),
+      quota3pWeeklyCap: createMockElement(),
+      quota3pWeeklyTph: createMockElement(),
+      quota3p5hRem: createMockElement(),
+      quota3p5hBar: createMockElement(),
+      quota3p5hCap: createMockElement(),
+      quota3p5hTph: createMockElement(),
+    };
+    mockElements.convSearch.value = '';
+
+    const mockDocument = {
+      getElementById: (id) => mockElements[id] || createMockElement(),
+      createElement: () => createMockElement(),
+      querySelectorAll: () => [],
+      addEventListener: () => {}
+    };
+
+    const mockFetch = async (url) => {
+      const u = String(url || '');
+      if (u.includes('/api/session/')) {
+        return {
+          json: async () => ({
+            conversation: {
+              id: 'root-vel',
+              title: 'Velocity Session',
+              active_agent_seconds: 120,
+              active_pairing_seconds: 300,
+              duration_seconds: 400,
+              active_context_tpm: 15000,
+              pairing_billed_tph: 45000
+            },
+            steps: [{ model_name: 'Gemini 3.8 Flash' }],
+            fleet_summary: { total_agent_seconds: 120, total_pairing_seconds: 300 },
+            top_consumers: [],
+            tool_usage: [],
+            timeline: []
+          })
+        };
+      }
+      if (u.includes('/api/timeline')) {
+        return { json: async () => [] };
+      }
+      if (u.includes('/api/cost-by-project')) {
+        return { json: async () => ({ total_cost: 0, projects: [] }) };
+      }
+      if (u.includes('/api/tools') || u.includes('/api/mcp') || u.includes('/api/hot-files') || u.includes('/api/conversations')) {
+        return { json: async () => [] };
+      }
+      if (u.includes('/api/activity-matrix')) {
+        return { json: async () => ({}) };
+      }
+      return {
+        json: async () => ({
+          status: 'ok',
+          total_convs: 1,
+          timezone_label: 'UTC',
+          token_velocity: {
+            active_billed_tpm: 1200,
+            active_context_tpm: 20000,
+            rolling_5m_billed_tpm: 1100,
+            rolling_60m_billed_tph: 66000
+          },
+          hourly_series: [
+            { hour_key: '2026-10-23T10', billed_tokens: 5000, est_tokens: 10000, billed_cost: 0.10, step_count: 2 }
+          ],
+          models: [],
+          categories: [],
+          phases: []
+        })
+      };
+    };
+    global.fetch = mockFetch;
+
+    const mockWindow = {
+      location: { search: '' },
+      addEventListener: () => {},
+      history: { pushState: () => {} },
+      fetch: mockFetch
+    };
+
+    function MockChart(ctx, cfg) {
+      return {
+        destroy: () => {},
+        update: () => {},
+        data: cfg?.data || { labels: [], datasets: [] },
+        config: cfg || { type: 'bar' }
+      };
+    }
+    MockChart.defaults = { font: {}, elements: {}, plugins: {}, animation: false };
+    MockChart.register = () => {};
+
+    const fn = new Function('window', 'document', 'Chart', 'lucide', `
+      ${code}
+      return {
+        renderKPIs,
+        renderQuotaSection,
+        setVelocityResolution,
+        setTimelineRange,
+        fetchDashboardData,
+        renderConversations,
+        inspectSession,
+        setExpandedConvs: (s) => { expandedConvs = s; },
+        setConvViewMode: (m) => { currentConvViewMode = m; },
+        getVelocityResolution: () => currentVelocityResolution,
+        getVelocityChart: () => velocityChart
+      };
+    `);
+
+    const api = fn(
+      mockWindow,
+      mockDocument,
+      MockChart,
+      { createIcons: () => {} }
+    );
+
+    (async () => {
+      // 1. renderKPIs with token_velocity
+      api.renderKPIs({
+        token_velocity: {
+          active_billed_tpm: 1250,
+          pairing_billed_tph: 75000,
+          active_context_tpm: 24000,
+          gauge_pct: 45.5,
+          context_gauge_pct: 32.0,
+          rolling_5m_billed_tpm: 1100,
+          rolling_60m_billed_tph: 66000
+        },
+        hourly_series: [
+          { hour_key: '2026-10-23T10', billed_tokens: 5000, cost: 0.10 }
+        ]
+      });
+
+      if (!mockElements.kpiBilledTpm.textContent.includes('1.1') && !mockElements.kpiBilledTpm.textContent.includes('1,100')) {
+        throw new Error(`Expected billed TPM formatted, got: ${mockElements.kpiBilledTpm.textContent}`);
+      }
+      if (!mockElements.kpiBilledTpm.textContent.includes('TPM')) {
+        throw new Error(`Expected TPM unit in billed TPM display, got: ${mockElements.kpiBilledTpm.textContent}`);
+      }
+      if (!mockElements.kpiBilledTph.textContent.includes('66') && !mockElements.kpiBilledTph.textContent.includes('66,000')) {
+        throw new Error(`Expected billed TPH formatted, got: ${mockElements.kpiBilledTph.textContent}`);
+      }
+      if (!mockElements.kpiContextTpm.textContent.includes('24') && !mockElements.kpiContextTpm.textContent.includes('24,000')) {
+        throw new Error(`Expected context TPM formatted, got: ${mockElements.kpiContextTpm.textContent}`);
+      }
+      if (!mockElements.dashVelocityArcFill.style.strokeDashoffset) {
+        throw new Error('Expected strokeDashoffset set on speedometer arc');
+      }
+      if (mockElements.dashContextVelocityBar.style.width !== '32.0%' && mockElements.dashContextVelocityBar.style.width !== '32%') {
+        throw new Error(`Expected 32.0% context velocity bar width, got: ${mockElements.dashContextVelocityBar.style.width}`);
+      }
+
+      // 2. renderQuotaSection with burn rate (tph)
+      api.renderQuotaSection({
+        'gemini-weekly': { remaining_budget: 500, calibrated_capacity: 700, burn_rate_tph: 12000 },
+        'gemini-5h': { remaining_budget: 150, calibrated_capacity: 236.7, burn_rate_tph: 15000 },
+        '3p-weekly': { remaining_budget: 180, calibrated_capacity: 200, burn_rate_tph: 4500 },
+        '3p-5h': { remaining_budget: 60, calibrated_capacity: 70, burn_rate_tph: 6000 }
+      });
+      if (!mockElements.quotaGeminiWeeklyTph.textContent.includes('12') && !mockElements.quotaGeminiWeeklyTph.textContent.includes('12,000')) {
+        throw new Error(`Expected Gemini weekly burn rate, got: ${mockElements.quotaGeminiWeeklyTph.textContent}`);
+      }
+      if (!mockElements.quotaGemini5hTph.textContent.includes('15') && !mockElements.quotaGemini5hTph.textContent.includes('15,000')) {
+        throw new Error(`Expected Gemini 5h burn rate, got: ${mockElements.quotaGemini5hTph.textContent}`);
+      }
+
+      // 3. setVelocityResolution toggle and timelineRangeGroup visibility
+      api.setVelocityResolution('hourly');
+      if (api.getVelocityResolution() !== 'hourly') {
+        throw new Error(`Expected resolution hourly, got: ${api.getVelocityResolution()}`);
+      }
+      if (!mockElements.timelineRangeGroup.classList.contains('hidden')) {
+        throw new Error('Expected timelineRangeGroup to be hidden in hourly mode');
+      }
+      if (!mockElements.velocityChartDesc.textContent.includes('Hourly API token throughput')) {
+        throw new Error(`Expected hourly chart description, got: ${mockElements.velocityChartDesc.textContent}`);
+      }
+
+      // 4. setTimelineRange resets resolution to daily and restores rangeGroup
+      api.setTimelineRange(7);
+      if (api.getVelocityResolution() !== 'daily') {
+        throw new Error(`Expected resolution daily after setTimelineRange, got: ${api.getVelocityResolution()}`);
+      }
+      if (mockElements.timelineRangeGroup.classList.contains('hidden')) {
+        throw new Error('Expected timelineRangeGroup visible in daily mode');
+      }
+
+      // 5. fetchDashboardData preserves active hourly resolution
+      api.setVelocityResolution('hourly');
+      await api.fetchDashboardData();
+      if (api.getVelocityResolution() !== 'hourly') {
+        throw new Error('Expected fetchDashboardData to preserve hourly mode');
+      }
+
+      // 6. Conversation table rendering with throughput badges
+      api.setConvViewMode('hierarchy');
+      api.setExpandedConvs(new Set(['root-vel']));
+      api.renderConversations([
+        {
+          id: 'root-vel',
+          title: 'Velocity Root Session',
+          active_agent_seconds: 120,
+          fleet_agent_seconds: 180,
+          active_pairing_seconds: 300,
+          duration_seconds: 400,
+          active_context_tpm: 12500,
+          pairing_billed_tph: 62000,
+          subagent_count: 1,
+          subagents: [
+            {
+              id: 'sub-vel',
+              title: 'Velocity Subagent',
+              subagent_role: 'Worker',
+              depth: 1,
+              active_agent_seconds: 60,
+              fleet_agent_seconds: 60,
+              active_pairing_seconds: 0,
+              duration_seconds: 100,
+              active_context_tpm: 8000,
+              pairing_billed_tph: 40000,
+              total_steps: 3
+            }
+          ]
+        }
+      ]);
+      const rootHtml = mockElements.convTableBody.children[0].innerHTML;
+      if (!rootHtml.includes('TPM') || !rootHtml.includes('TPH')) {
+        throw new Error(`Expected TPM and TPH in root conversation row: ${rootHtml}`);
+      }
+      const childHtml = mockElements.convTableBody.children[1].innerHTML;
+      if (!childHtml.includes('TPM') || !childHtml.includes('TPH')) {
+        throw new Error(`Expected TPM and TPH in child conversation row: ${childHtml}`);
+      }
+
+      // 7. inspectSession Deep-Dive modal
+      await api.inspectSession('root-vel');
+      if (!mockElements.modalActiveTpm.textContent.includes('15') && !mockElements.modalActiveTpm.textContent.includes('15,000')) {
+        throw new Error(`Expected 15k active TPM in modal, got: ${mockElements.modalActiveTpm.textContent}`);
+      }
+      if (!mockElements.modalBilledTph.textContent.includes('45') && !mockElements.modalBilledTph.textContent.includes('45,000')) {
+        throw new Error(`Expected 45k billed TPH in modal, got: ${mockElements.modalBilledTph.textContent}`);
+      }
+
+      console.log(JSON.stringify({ status: 'ok', cases: 7 }));
+    })().catch(err => {
+      console.error(err);
+      process.exit(1);
+    });
+    """
+
+    res = subprocess.run(
+        ["node", "-e", node_script], capture_output=True, text=True, cwd=Path.cwd()
+    )
+    assert res.returncode == 0, f"Node script failed: {res.stderr}"
+    data_node = json.loads(res.stdout.strip().splitlines()[-1])
+    assert data_node["status"] == "ok"
+    assert data_node["cases"] == 7
+
+

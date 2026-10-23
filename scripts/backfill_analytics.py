@@ -47,6 +47,7 @@ from context_monitor.project import (  # noqa: E402
 )
 from context_monitor.quota import sync_and_get_quota_state  # noqa: E402
 from context_monitor.timings import compute_session_timings  # noqa: E402
+from context_monitor.velocity import compute_active_velocity  # noqa: E402
 
 CHARS_PER_TOKEN = 3.8
 
@@ -930,6 +931,15 @@ def parse_conversation(
         conv_model_name = cur_model
         models_used_str = cur_model
 
+    billed_tokens = total_billed_input_tokens + total_billed_output_tokens
+    est_tok = running_ctx if running_ctx > 0 else total_tokens
+    velocity = compute_active_velocity(
+        est_tokens=est_tok,
+        billed_tokens=billed_tokens,
+        active_agent_seconds=active_agent_seconds,
+        active_pairing_seconds=active_pairing_seconds,
+    )
+
     return {
         "conversation": {
             "id": cid,
@@ -942,9 +952,11 @@ def parse_conversation(
             "total_steps": len(steps),
             "total_characters": total_chars,
             "total_tokens": total_tokens,
+            "active_context_tokens": running_ctx,
             "duration_seconds": duration_seconds,
             "active_agent_seconds": active_agent_seconds,
             "active_pairing_seconds": active_pairing_seconds,
+            "velocity": velocity,
             "thinking_tokens": total_thinking_tokens,
             "user_prompts": user_prompts,
             "tool_calls_count": len(tool_execs),
@@ -1152,6 +1164,31 @@ def run_backfill(
                 ):
                     conv["active_pairing_seconds"] = 0.0
                     data["active_pairing_seconds"] = 0.0
+                    conv["velocity"] = compute_active_velocity(
+                        est_tokens=conv.get(
+                            "active_context_tokens", conv.get("total_tokens", 0)
+                        ),
+                        billed_tokens=(
+                            conv.get("billed_input_tokens", 0)
+                            + conv.get("billed_output_tokens", 0)
+                        ),
+                        active_agent_seconds=conv.get("active_agent_seconds", 0.0),
+                        active_pairing_seconds=0.0,
+                    )
+                    data["velocity"] = conv["velocity"]
+                elif "velocity" not in conv or not conv["velocity"]:
+                    conv["velocity"] = compute_active_velocity(
+                        est_tokens=conv.get(
+                            "active_context_tokens", conv.get("total_tokens", 0)
+                        ),
+                        billed_tokens=(
+                            conv.get("billed_input_tokens", 0)
+                            + conv.get("billed_output_tokens", 0)
+                        ),
+                        active_agent_seconds=conv.get("active_agent_seconds", 0.0),
+                        active_pairing_seconds=conv.get("active_pairing_seconds", 0.0),
+                    )
+                    data["velocity"] = conv["velocity"]
 
                 # Inherit project from swarm or ancestors if missing
                 if not conv.get("project"):

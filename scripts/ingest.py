@@ -15,6 +15,7 @@ Performs lightweight, zero-overhead transcript analysis:
 
 from datetime import datetime
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -53,6 +54,7 @@ from context_monitor.quota import (  # noqa: E402
 )
 from context_monitor.settings import should_generate_artifacts  # noqa: E402
 from context_monitor.timings import compute_session_timings  # noqa: E402
+from context_monitor.velocity import compute_active_velocity  # noqa: E402
 
 CHARS_PER_TOKEN = 3.8
 
@@ -1025,6 +1027,15 @@ def analyze_transcript(
         s["billed_input_tokens"] = step_in_tokens
         s["billed_output_tokens"] = step_out_tokens
 
+    billed_tokens = total_billed_input_tokens + total_billed_output_tokens
+    est_tok = running_ctx if running_ctx > 0 else total_tokens
+    velocity = compute_active_velocity(
+        est_tokens=est_tok,
+        billed_tokens=billed_tokens,
+        active_agent_seconds=active_agent_seconds,
+        active_pairing_seconds=active_pairing_seconds,
+    )
+
     return {
         "title": title or "Active Session",
         "start_time": start_time,
@@ -1032,6 +1043,7 @@ def analyze_transcript(
         "duration_seconds": duration_seconds,
         "active_agent_seconds": active_agent_seconds,
         "active_pairing_seconds": active_pairing_seconds,
+        "velocity": velocity,
         "thinking_tokens": total_thinking_tokens,
         "user_prompts": user_prompts,
         "tool_calls_count": len(tool_execs),
@@ -1274,6 +1286,31 @@ def sync_to_sqlite(
 
                 if parent_id is not None or subagent_role is not None or depth > 0:
                     analysis["active_pairing_seconds"] = 0.0
+                    analysis["velocity"] = compute_active_velocity(
+                        est_tokens=analysis.get(
+                            "active_context_tokens", analysis.get("total_tokens", 0)
+                        ),
+                        billed_tokens=(
+                            analysis.get("billed_input_tokens", 0)
+                            + analysis.get("billed_output_tokens", 0)
+                        ),
+                        active_agent_seconds=analysis.get("active_agent_seconds", 0.0),
+                        active_pairing_seconds=0.0,
+                    )
+                elif "velocity" not in analysis or not analysis["velocity"]:
+                    analysis["velocity"] = compute_active_velocity(
+                        est_tokens=analysis.get(
+                            "active_context_tokens", analysis.get("total_tokens", 0)
+                        ),
+                        billed_tokens=(
+                            analysis.get("billed_input_tokens", 0)
+                            + analysis.get("billed_output_tokens", 0)
+                        ),
+                        active_agent_seconds=analysis.get("active_agent_seconds", 0.0),
+                        active_pairing_seconds=analysis.get(
+                            "active_pairing_seconds", 0.0
+                        ),
+                    )
 
                 if not analysis.get("project") and existing:
                     try:
@@ -1942,9 +1979,41 @@ def generate_context_usage_report(
             lines.append(
                 f"> **Lineage**: Sub-Agent (Role: `{parent_info['role']}`, Tier: {parent_info['depth']}) spawned by [{parent_info['title']}](conversation://{parent_info['id']})  "
             )
+        velocity = analysis.get("velocity")
+        if not velocity:
+            velocity = compute_active_velocity(
+                est_tokens=active_tokens,
+                billed_tokens=in_toks + out_toks,
+                active_agent_seconds=analysis.get("active_agent_seconds", 0.0),
+                active_pairing_seconds=analysis.get("active_pairing_seconds", 0.0),
+            )
+
+        try:
+            ctx_tpm = float((velocity or {}).get("active_context_tpm") or 0.0)
+            if not math.isfinite(ctx_tpm) or ctx_tpm < 0:
+                ctx_tpm = 0.0
+        except (TypeError, ValueError):
+            ctx_tpm = 0.0
+
+        try:
+            bld_tpm = float((velocity or {}).get("active_billed_tpm") or 0.0)
+            if not math.isfinite(bld_tpm) or bld_tpm < 0:
+                bld_tpm = 0.0
+        except (TypeError, ValueError):
+            bld_tpm = 0.0
+
+        try:
+            bld_tph = float((velocity or {}).get("active_billed_tph") or 0.0)
+            if not math.isfinite(bld_tph) or bld_tph < 0:
+                bld_tph = 0.0
+        except (TypeError, ValueError):
+            bld_tph = 0.0
+
         lines.extend(
             [
                 f"> **Active Context Window**: **{active_pct:.1f}%** ({format_tokens(active_tokens)} / {format_tokens(active_max)} estimated tokens)  ",
+                f"> **Active Context Fill Rate**: **{ctx_tpm:,.1f} tok/min**  ",
+                f"> **Active Billed Throughput**: **{bld_tpm:,.1f} tok/min** / **{bld_tph:,.1f} tok/hr**  ",
                 f"> **Cumulative Disk Footprint**: **{format_tokens(used_tokens)} tokens** across {len(analysis.get('steps', []))} logged steps  ",
                 f"> **Session API Value**: **${cost:,.4f}** (~{format_tokens(in_toks)} in / {format_tokens(out_toks)} out)\n",
                 "## Subscription & Quota Impact\n",

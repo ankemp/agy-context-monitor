@@ -220,7 +220,7 @@
     </div>
 
     <!-- 1b. Developer Velocity & Autonomy ROI Banner -->
-    <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-5 gap-4">
+    <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">
       <div id="cardAutonomy" class="card p-3.5 flex items-center space-x-3.5 border-l-4 border-l-indigo-500 cursor-help" title="Autonomous leverage ratio: Average automated tool operations executed per human prompt (total_tools / user_prompts). Higher ratios represent deeper autonomous execution per instruction.">
         <div class="p-2.5 rounded-lg bg-indigo-500/10 text-indigo-400">
           <i data-lucide="zap" class="w-5 h-5"></i>
@@ -275,6 +275,44 @@
           <div class="text-[10px] text-gray-400" id="kpiForceMultiplierSub">Effective output</div>
         </div>
       </div>
+
+      <!-- Token Throughput Speedometer Arc Gauge & Context Fill Bullet Bar -->
+      <div id="cardTokenVelocity" class="card p-3.5 flex flex-col justify-between border-l-4 border-l-brand-500 cursor-help" title="Token Throughput Velocity: Live Rolling Billed API Throughput (TPM/TPH) and Active Context Growth Rate.">
+        <div class="flex items-center justify-between">
+          <div class="flex items-center space-x-2">
+            <div class="p-1.5 rounded-lg bg-brand-500/10 text-brand-400">
+              <i data-lucide="gauge" class="w-4 h-4"></i>
+            </div>
+            <div>
+              <div class="text-[10px] font-medium text-gray-400 uppercase tracking-wider">Token Throughput</div>
+              <div class="flex items-baseline space-x-1.5">
+                <span id="kpiBilledTpm" class="text-xl font-bold text-white tracking-tight">--</span>
+                <span class="text-[10px] text-gray-400 font-mono">TPM</span>
+              </div>
+            </div>
+          </div>
+          <!-- Static Semi-circular SVG speedometer arc -->
+          <div class="relative w-14 h-8 overflow-hidden flex items-center justify-center shrink-0">
+            <svg viewBox="0 0 120 68" class="w-full h-full" style="transition: none !important; animation: none !important;">
+              <path d="M 10 60 A 50 50 0 0 1 110 60" fill="none" stroke="#1f2937" stroke-width="12" stroke-linecap="round"/>
+              <path id="dashVelocityArcFill" d="M 10 60 A 50 50 0 0 1 110 60" fill="none" stroke="#6366f1" stroke-width="12" stroke-linecap="round" stroke-dasharray="157.08" stroke-dashoffset="157.08" style="transition: none !important; animation: none !important;"/>
+            </svg>
+          </div>
+        </div>
+        <div class="mt-2 pt-2 border-t border-dark-700/60 flex flex-col gap-1">
+          <div class="flex justify-between items-center text-[10px]">
+            <span class="text-gray-400">Hourly Pace:</span>
+            <span id="kpiBilledTph" class="font-mono text-gray-300 font-medium">-- TPH</span>
+          </div>
+          <div class="flex justify-between items-center text-[10px]">
+            <span class="text-gray-400">Context Fill:</span>
+            <span id="kpiContextTpm" class="font-mono text-cyan-400 font-medium">-- TPM</span>
+          </div>
+          <div class="w-full bg-dark-900 rounded-full h-1.5 overflow-hidden">
+            <div id="dashContextVelocityBar" class="bg-cyan-400 h-1.5 rounded-full" style="width: 0%; transition: none !important; animation: none !important;"></div>
+          </div>
+        </div>
+      </div>
     </div>
 
     <!-- 1c. Subscription Quota & Rate Limit Capacity -->
@@ -307,8 +345,9 @@
               <div id="quotaGeminiWeeklyBar" class="bg-cyan-500 h-2 rounded-full" style="width: 0%; transition: none;"></div>
             </div>
           </div>
-          <div class="text-[11px] text-gray-400 flex justify-between font-mono pt-1.5 border-t border-dark-700/60">
+          <div class="text-[11px] text-gray-400 flex justify-between font-mono pt-1.5 border-t border-dark-700/60 items-center">
             <span id="quotaGeminiWeeklyReset">Reset: --</span>
+            <span id="quotaGeminiWeeklyTph" class="text-cyan-400 font-semibold" title="Window Billed Token Throughput">-- tok/hr</span>
             <span id="quotaGeminiWeeklyCap" class="text-gray-300" title="Calibrated Window Compute Capacity">Cap: $--</span>
           </div>
         </div>
@@ -327,8 +366,9 @@
               <div id="quotaGemini5hBar" class="bg-indigo-500 h-2 rounded-full" style="width: 0%; transition: none;"></div>
             </div>
           </div>
-          <div class="text-[11px] text-gray-400 flex justify-between font-mono pt-1.5 border-t border-dark-700/60">
+          <div class="text-[11px] text-gray-400 flex justify-between font-mono pt-1.5 border-t border-dark-700/60 items-center">
             <span id="quotaGemini5hReset">Reset: --</span>
+            <span id="quotaGemini5hTph" class="text-indigo-400 font-semibold" title="Window Billed Token Throughput">-- tok/hr</span>
             <span id="quotaGemini5hCap" class="text-gray-300" title="Calibrated Window Compute Capacity">Cap: $--</span>
           </div>
         </div>
@@ -347,8 +387,9 @@
               <div id="quota3pWeeklyBar" class="bg-purple-500 h-2 rounded-full" style="width: 0%; transition: none;"></div>
             </div>
           </div>
-          <div class="text-[11px] text-gray-400 flex justify-between font-mono pt-1.5 border-t border-dark-700/60">
+          <div class="text-[11px] text-gray-400 flex justify-between font-mono pt-1.5 border-t border-dark-700/60 items-center">
             <span id="quota3pWeeklyReset">Reset: --</span>
+            <span id="quota3pWeeklyTph" class="text-purple-400 font-semibold" title="Window Billed Token Throughput">-- tok/hr</span>
             <span id="quota3pWeeklyCap" class="text-gray-300" title="Calibrated Window Compute Capacity">Cap: $--</span>
           </div>
         </div>
@@ -367,8 +408,9 @@
               <div id="quota3p5hBar" class="bg-pink-500 h-2 rounded-full" style="width: 0%; transition: none;"></div>
             </div>
           </div>
-          <div class="text-[11px] text-gray-400 flex justify-between font-mono pt-1.5 border-t border-dark-700/60">
+          <div class="text-[11px] text-gray-400 flex justify-between font-mono pt-1.5 border-t border-dark-700/60 items-center">
             <span id="quota3p5hReset">Reset: --</span>
+            <span id="quota3p5hTph" class="text-pink-400 font-semibold" title="Window Billed Token Throughput">-- tok/hr</span>
             <span id="quota3p5hCap" class="text-gray-300" title="Calibrated Window Compute Capacity">Cap: $--</span>
           </div>
         </div>
@@ -399,15 +441,20 @@
               <i data-lucide="trending-up" class="w-4 h-4 text-indigo-400"></i>
               <span>Token Consumption Velocity</span>
             </h2>
-            <p class="text-xs text-gray-400 mt-0.5">Daily API tokens consumed (prompt in + completion out), estimated billing value with % weekly quota capacity, and session counts</p>
+            <p id="velocityChartDesc" class="text-xs text-gray-400 mt-0.5">Daily API tokens consumed (prompt in + completion out), estimated billing value with % weekly quota capacity, and session counts</p>
           </div>
           <div class="flex items-center bg-dark-800 border border-dark-700 rounded-lg p-0.5 shrink-0 self-start sm:self-auto">
+            <div id="velocityResolutionGroup" class="flex items-center space-x-0.5">
+              <button onclick="setVelocityResolution('daily')" id="btnVelocityDaily" class="px-2.5 py-1 rounded-md bg-brand-600 text-white font-medium shadow-sm transition text-[11px] whitespace-nowrap outline-none focus:outline-none">Daily</button>
+              <button onclick="setVelocityResolution('hourly')" id="btnVelocityHourly" class="px-2.5 py-1 rounded-md text-gray-400 hover:text-white transition text-[11px] whitespace-nowrap outline-none focus:outline-none">Hourly (TPH)</button>
+            </div>
+            <div id="velocityDivider" class="h-3.5 w-px bg-dark-700 mx-1"></div>
             <div id="timelineModeGroup" class="flex items-center space-x-0.5">
               <button onclick="setTimelineViewMode('stacked')" id="btnTmStacked" class="px-2.5 py-1 rounded-md bg-brand-600 text-white font-medium shadow-sm transition text-[11px] whitespace-nowrap outline-none focus:outline-none">By Project</button>
               <button onclick="setTimelineViewMode('aggregate')" id="btnTmAggregate" class="px-2.5 py-1 rounded-md text-gray-400 hover:text-white transition text-[11px] whitespace-nowrap outline-none focus:outline-none">Aggregate</button>
             </div>
             <div id="timelineDivider" class="h-3.5 w-px bg-dark-700 mx-1"></div>
-            <div class="flex items-center space-x-0.5">
+            <div id="timelineRangeGroup" class="flex items-center space-x-0.5">
               <button onclick="setTimelineRange('cycle')" id="btnCycle" class="px-2.5 py-1 rounded-md bg-brand-600 text-white font-medium shadow-sm transition text-[11px] whitespace-nowrap outline-none focus:outline-none">Cycle</button>
               <button onclick="setTimelineRange(7)" id="btn7d" class="px-2.5 py-1 rounded-md text-gray-400 hover:text-white transition text-[11px] whitespace-nowrap outline-none focus:outline-none">7D</button>
               <button onclick="setTimelineRange(14)" id="btn14d" class="px-2.5 py-1 rounded-md text-gray-400 hover:text-white transition text-[11px] whitespace-nowrap outline-none focus:outline-none">14D</button>
@@ -942,7 +989,7 @@
       </div>
 
       <div class="flex-1 overflow-y-auto p-6 space-y-6">
-        <div class="grid grid-cols-4 gap-3 text-center">
+        <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3 text-center">
           <div class="bg-dark-800 p-3 rounded-lg border border-dark-700">
             <div class="text-[11px] text-gray-400">Total Tokens</div>
             <div id="modalTokens" class="text-lg font-bold text-indigo-400 mt-0.5">--</div>
@@ -959,6 +1006,16 @@
             <div class="text-[11px] text-gray-400">Agent Work Time</div>
             <div id="modalDuration" class="text-lg font-bold text-emerald-400 mt-0.5">--</div>
             <div id="modalWallSpan" class="text-[10px] text-gray-400 mt-0.5">-- span</div>
+          </div>
+          <div class="bg-dark-800 p-3 rounded-lg border border-dark-700 cursor-help" title="Active Context Growth Rate: Estimated context tokens added per minute of active reasoning">
+            <div class="text-[11px] text-gray-400">Context Fill</div>
+            <div id="modalActiveTpm" class="text-lg font-bold text-cyan-400 mt-0.5">--</div>
+            <div class="text-[10px] text-gray-400 mt-0.5 font-mono">TPM</div>
+          </div>
+          <div class="bg-dark-800 p-3 rounded-lg border border-dark-700 cursor-help" title="Pairing Billed API Throughput: Billed input and output tokens consumed per hour of human pairing time">
+            <div class="text-[11px] text-gray-400">Billed Throughput</div>
+            <div id="modalBilledTph" class="text-lg font-bold text-rose-400 mt-0.5">--</div>
+            <div class="text-[10px] text-gray-400 mt-0.5 font-mono">TPH</div>
           </div>
         </div>
 

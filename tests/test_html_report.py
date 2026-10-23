@@ -162,3 +162,81 @@ def test_generate_html_report_compaction_banner():
     assert "Memory Compaction" in html_out
     assert "Pruned 4 historical steps (~45.0k freed)" in html_out
     assert "Active: #10–#11" in html_out
+
+
+def test_generate_html_report_includes_static_velocity_telemetry():
+    analysis = {
+        "latest_model": "Gemini 3.8 Flash",
+        "latest_max_tokens": 1_000_000,
+        "total_tokens": 60_000,
+        "active_context_tokens": 60_000,
+        "total_chars": 228_000,
+        "billed_cost": 1.25,
+        "billed_input_tokens": 240_000,
+        "billed_output_tokens": 30_000,
+        "active_agent_seconds": 180,
+        "active_pairing_seconds": 600,
+        "category_stats": {"User Requests": 228_000},
+        "steps": [],
+    }
+    html_out = generate_html_report("cid-vel", "Gemini 3.8 Flash", 1_000_000, analysis)
+    assert "tok/min" in html_out
+    assert "tok/hr" in html_out
+    assert "Context Fill TPM" in html_out
+    assert "Billed TPM / TPH" in html_out
+    assert "transition: none !important;" in html_out
+    assert "animation: none !important;" in html_out
+
+
+def test_generate_html_report_with_precomputed_velocity_and_gauge_clamping():
+    """Verifies precomputed velocity is respected, bullet bar clamps at 100%, and None values are safely handled."""
+    # Case 1: Pre-computed high velocity exceeding DEFAULT_PEAK_CONTEXT_TPM (10,000)
+    analysis = {
+        "latest_model": "Gemini 3.8 Flash",
+        "latest_max_tokens": 1_000_000,
+        "total_tokens": 50_000,
+        "active_context_tokens": 50_000,
+        "total_chars": 190_000,
+        "billed_cost": 2.0,
+        "billed_input_tokens": 400_000,
+        "billed_output_tokens": 50_000,
+        "active_agent_seconds": 60,
+        "active_pairing_seconds": 120,
+        "velocity": {
+            "active_context_tpm": 50_000.0,
+            "active_billed_tpm": 450_000.0,
+            "active_billed_tph": 27_000_000.0,
+            "pairing_billed_tph": 13_500_000.0,
+        },
+        "category_stats": {"User Requests": 190_000},
+        "steps": [],
+    }
+    html_out = generate_html_report("cid-pre", "Gemini 3.8 Flash", 1_000_000, analysis)
+    assert "50.0k tok/min" in html_out
+    assert "450.0k tok/min · 27.00M tok/hr" in html_out
+    # Clamped to 100.0%
+    assert "width: 100.0%;" in html_out
+
+    # Case 2: Velocity with None values
+    analysis_none = {
+        "latest_model": "Gemini 3.8 Flash",
+        "latest_max_tokens": 1_000_000,
+        "total_tokens": 10_000,
+        "active_context_tokens": 10_000,
+        "total_chars": 38_000,
+        "billed_cost": 0.1,
+        "billed_input_tokens": 10_000,
+        "billed_output_tokens": 1_000,
+        "velocity": {
+            "active_context_tpm": None,
+            "active_billed_tpm": None,
+            "active_billed_tph": None,
+        },
+        "category_stats": {},
+        "steps": [],
+    }
+    html_out_none = generate_html_report(
+        "cid-none", "Gemini 3.8 Flash", 1_000_000, analysis_none
+    )
+    assert "0 tok/min" in html_out_none
+    assert "width: 0.0%;" in html_out_none

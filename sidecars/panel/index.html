@@ -43,6 +43,8 @@
         <dt>Total Tokens</dt><dd id="global-tokens">0</dd>
         <dt>Total Value</dt><dd id="global-cost">$0.00</dd>
         <dt>Weekly Quota</dt><dd id="global-quota">0.00% wk</dd>
+        <dt>Active Velocity</dt><dd id="globalActiveTpm">0 TPM</dd>
+        <dt>Pairing Throughput</dt><dd id="globalPairingTph">0 TPH</dd>
         <dt>Compactions</dt><dd id="global-compactions">0 events</dd>
         <dt>Tokens Pruned</dt><dd id="global-pruned">0</dd>
       </dl>
@@ -84,6 +86,7 @@
         <div class="quota-row">
           <span class="quota-name">Weekly Quota</span>
           <div class="quota-meta">
+            <span id="quotaWeeklyTph" class="quota-tph muted small">0 tok/hr</span>
             <span id="quota-weekly-pct" class="quota-val">100.0% remaining</span>
             <span id="quota-weekly-reset" class="quota-reset muted small">resets in --</span>
           </div>
@@ -101,6 +104,7 @@
         <div class="quota-row">
           <span class="quota-name">5-Hour Limit</span>
           <div class="quota-meta">
+            <span id="quota5hTph" class="quota-tph muted small">0 tok/hr</span>
             <span id="quota-5h-pct" class="quota-val">100.0% remaining</span>
             <span id="quota-5h-reset" class="quota-reset muted small">resets in --</span>
           </div>
@@ -129,6 +133,32 @@
         <div class="segment-container" id="capacity-bar"></div>
       </div>
 
+      <!-- Velocity Speedometer & Throughput Telemetry -->
+      <div class="velocity-container" id="velocity-container">
+        <div class="speedometer-block">
+          <svg class="speedometer-svg" viewBox="0 0 120 68" aria-hidden="true">
+            <path id="velocityArcPath" class="arc-bg" d="M 10 60 A 50 50 0 0 1 110 60" />
+            <path id="velocityArcFill" class="arc-fill" d="M 10 60 A 50 50 0 0 1 110 60" stroke-dasharray="157" stroke-dashoffset="157" />
+          </svg>
+          <div class="speedometer-data">
+            <span id="velocityLiveTpm" class="speedometer-val">0 TPM</span>
+            <div class="speedometer-sub muted small">
+              <span id="velocityLiveTph">0 TPH</span> · <span id="velocityActiveTpm">0 active</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="context-velocity-block">
+          <div class="context-velocity-header">
+            <span class="small muted">Context Fill Rate</span>
+            <span id="contextVelocityTpm" class="small font-mono">0 tok/min</span>
+          </div>
+          <div class="progress-track bullet-track">
+            <div id="contextVelocityFill" class="bullet-bar" style="width: 0%;"></div>
+          </div>
+        </div>
+      </div>
+
       <div class="section-subtitle muted small">Category Breakdown</div>
       <div id="category-list" class="category-list">
         <div class="empty-state small muted">No telemetry recorded yet</div>
@@ -153,6 +183,15 @@
         <div class="fleet-kpi">
           <span class="kpi-label">Context Shielding</span>
           <span id="fleet-shielding" class="kpi-val">1.0x</span>
+        </div>
+      </div>
+      <div id="fleetVelocityBlock" class="fleet-velocity-block">
+        <div class="fleet-velocity-header">
+          <span class="small muted">Fleet Throughput</span>
+          <span id="fleetVelocityTpm" class="small font-mono">0 TPM</span>
+        </div>
+        <div class="progress-track bullet-track">
+          <div id="fleetVelocityBar" class="bullet-bar fleet" style="width: 0%;"></div>
         </div>
       </div>
       <div id="fleet-node-list" class="fleet-list"></div>

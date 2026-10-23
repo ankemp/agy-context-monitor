@@ -9,6 +9,7 @@
     }
 
     let timelineChart = null;
+    let velocityChart = null;
     let modelsChart = null;
     let projectCostChart = null;
     let toolsChart = null;
@@ -94,6 +95,10 @@
     let allTimelineData = [];
     let cycleTimelineData = (typeof STATIC_DATA !== 'undefined' && STATIC_DATA && STATIC_DATA.timeline_cycle) ? STATIC_DATA.timeline_cycle : null;
     let cachedCycleProject = (typeof STATIC_DATA !== 'undefined' && STATIC_DATA && STATIC_DATA.timeline_cycle) ? 'all' : null;
+    let currentVelocityResolution = 'daily'; // 'daily' | 'hourly'
+    let allHourlySeries = (typeof STATIC_DATA !== 'undefined' && STATIC_DATA)
+      ? (STATIC_DATA.hourly_series || STATIC_DATA.summary?.hourly_series || [])
+      : [];
 
     function getCycleTimelineQuery(clientTz, project) {
       let params = ['days=cycle'];
@@ -214,6 +219,47 @@
       if (btnAggregate) btnAggregate.className = mode === 'aggregate' ? btnClasses.active : btnClasses.inactive;
       setTimelineRange(currentTimelineDays);
     };
+
+    function setVelocityResolution(mode) {
+      const prevResolution = currentVelocityResolution;
+      currentVelocityResolution = mode;
+      const btnDaily = document.getElementById('btnVelocityDaily');
+      const btnHourly = document.getElementById('btnVelocityHourly');
+      const activeCls = 'px-2.5 py-1 rounded-md bg-brand-600 text-white font-medium shadow-sm transition text-[11px] whitespace-nowrap outline-none focus:outline-none';
+      const inactiveCls = 'px-2.5 py-1 rounded-md text-gray-400 hover:text-white transition text-[11px] whitespace-nowrap outline-none focus:outline-none';
+      if (btnDaily) btnDaily.className = mode === 'daily' ? activeCls : inactiveCls;
+      if (btnHourly) btnHourly.className = mode === 'hourly' ? activeCls : inactiveCls;
+
+      const modeGroup = document.getElementById('timelineModeGroup');
+      const divider = document.getElementById('timelineDivider');
+      const velDivider = document.getElementById('velocityDivider');
+      const rangeGroup = document.getElementById('timelineRangeGroup');
+      const descEl = document.getElementById('velocityChartDesc');
+
+      if (prevResolution !== mode && timelineChart) {
+        try { timelineChart.destroy(); } catch (e) {}
+        timelineChart = null;
+        velocityChart = null;
+        window.velocityChart = null;
+      }
+
+      if (mode === 'hourly') {
+        if (modeGroup) modeGroup.classList.add('hidden');
+        if (divider) divider.classList.add('hidden');
+        if (rangeGroup) rangeGroup.classList.add('hidden');
+        if (velDivider) velDivider.classList.add('hidden');
+        if (descEl) descEl.textContent = 'Hourly API token throughput (Tokens / Hour), estimated cost, and step volume';
+        renderHourlyTimelineChart(allHourlySeries);
+      } else {
+        if (rangeGroup) rangeGroup.classList.remove('hidden');
+        if (velDivider) velDivider.classList.remove('hidden');
+        if (currentProject === 'all' && modeGroup) modeGroup.classList.remove('hidden');
+        if (currentProject === 'all' && divider) divider.classList.remove('hidden');
+        if (descEl) descEl.textContent = 'Daily API tokens consumed (prompt in + completion out), estimated billing value with % weekly quota capacity, and session counts';
+        setTimelineRange(currentTimelineDays);
+      }
+    }
+    window.setVelocityResolution = setVelocityResolution;
 
     let currentConvViewMode = 'hierarchy'; // 'hierarchy' | 'flat'
     let expandedConvs = new Set();
@@ -439,7 +485,11 @@
         if (summaryRes.quota || summaryRes.quota_summary) {
           renderQuotaSection(summaryRes.quota || summaryRes.quota_summary);
         }
-        setTimelineRange(currentTimelineDays);
+        if (currentVelocityResolution === 'hourly') {
+          renderHourlyTimelineChart(allHourlySeries);
+        } else {
+          setTimelineRange(currentTimelineDays);
+        }
         renderModelsChart(summaryRes.models);
         renderProjectCostSection(allProjectCostData, currentProject);
         renderToolsChart(allToolsData);
@@ -480,10 +530,15 @@
         const elBar = document.getElementById('quotaGeminiWeeklyBar');
         const elReset = document.getElementById('quotaGeminiWeeklyReset');
         const elCap = document.getElementById('quotaGeminiWeeklyCap');
+        const elTph = document.getElementById('quotaGeminiWeeklyTph');
         if (elRem) elRem.textContent = `${Number(rem).toFixed(1)}% rem`;
         if (elBar) elBar.style.width = `${Math.min(Math.max(0, 100 - rem), 100)}%`;
         if (elReset) elReset.textContent = cd ? `Reset: ${cd}` : 'Reset: --';
         if (elCap) elCap.textContent = `Cap: $${Number(cap).toFixed(2)}`;
+        if (elTph) {
+          const tph = gw.pacing?.billed_tph != null ? gw.pacing.billed_tph : (gw.billed_tph != null ? gw.billed_tph : (gw.burn_rate_tph != null ? gw.burn_rate_tph : 0));
+          elTph.textContent = `${formatTokens(Math.round(tph))} tok/hr`;
+        }
       }
 
       if (g5) {
@@ -494,10 +549,15 @@
         const elBar = document.getElementById('quotaGemini5hBar');
         const elReset = document.getElementById('quotaGemini5hReset');
         const elCap = document.getElementById('quotaGemini5hCap');
+        const elTph = document.getElementById('quotaGemini5hTph');
         if (elRem) elRem.textContent = `${Number(rem).toFixed(1)}% rem`;
         if (elBar) elBar.style.width = `${Math.min(Math.max(0, 100 - rem), 100)}%`;
         if (elReset) elReset.textContent = cd ? `Reset: ${cd}` : 'Reset: --';
         if (elCap) elCap.textContent = `Cap: $${Number(cap).toFixed(2)}`;
+        if (elTph) {
+          const tph = g5.pacing?.billed_tph != null ? g5.pacing.billed_tph : (g5.billed_tph != null ? g5.billed_tph : (g5.burn_rate_tph != null ? g5.burn_rate_tph : 0));
+          elTph.textContent = `${formatTokens(Math.round(tph))} tok/hr`;
+        }
       }
 
       if (pw) {
@@ -508,10 +568,15 @@
         const elBar = document.getElementById('quota3pWeeklyBar');
         const elReset = document.getElementById('quota3pWeeklyReset');
         const elCap = document.getElementById('quota3pWeeklyCap');
+        const elTph = document.getElementById('quota3pWeeklyTph');
         if (elRem) elRem.textContent = `${Number(rem).toFixed(1)}% rem`;
         if (elBar) elBar.style.width = `${Math.min(Math.max(0, 100 - rem), 100)}%`;
         if (elReset) elReset.textContent = cd ? `Reset: ${cd}` : 'Reset: --';
         if (elCap) elCap.textContent = `Cap: $${Number(cap).toFixed(2)}`;
+        if (elTph) {
+          const tph = pw.pacing?.billed_tph != null ? pw.pacing.billed_tph : (pw.billed_tph != null ? pw.billed_tph : (pw.burn_rate_tph != null ? pw.burn_rate_tph : 0));
+          elTph.textContent = `${formatTokens(Math.round(tph))} tok/hr`;
+        }
       }
 
       if (p5) {
@@ -522,10 +587,15 @@
         const elBar = document.getElementById('quota3p5hBar');
         const elReset = document.getElementById('quota3p5hReset');
         const elCap = document.getElementById('quota3p5hCap');
+        const elTph = document.getElementById('quota3p5hTph');
         if (elRem) elRem.textContent = `${Number(rem).toFixed(1)}% rem`;
         if (elBar) elBar.style.width = `${Math.min(Math.max(0, 100 - rem), 100)}%`;
         if (elReset) elReset.textContent = cd ? `Reset: ${cd}` : 'Reset: --';
         if (elCap) elCap.textContent = `Cap: $${Number(cap).toFixed(2)}`;
+        if (elTph) {
+          const tph = p5.pacing?.billed_tph != null ? p5.pacing.billed_tph : (p5.billed_tph != null ? p5.billed_tph : (p5.burn_rate_tph != null ? p5.burn_rate_tph : 0));
+          elTph.textContent = `${formatTokens(Math.round(tph))} tok/hr`;
+        }
       }
 
       // Pacing and projection calculation
@@ -781,6 +851,57 @@
           `• Agent Work Time: ${agentDur} (fleet execution)\n` +
           `• Equivalent Dev Time Saved: ~${savedHours}h (automated actions)\n` +
           `• Direct speed-up ratio: +${speedUpRatio}x speed-up vs manual`;
+      }
+
+      // 1b (cont). Token Throughput Velocity
+      const vel = data.token_velocity || {};
+      const billedTpm = vel.rolling_5m_billed_tpm != null ? vel.rolling_5m_billed_tpm : (vel.active_billed_tpm || 0);
+      const billedTph = vel.rolling_60m_billed_tph != null ? vel.rolling_60m_billed_tph : (vel.pairing_billed_tph || (billedTpm * 60));
+      const ctxTpm = vel.rolling_5m_context_tpm != null ? vel.rolling_5m_context_tpm : (vel.active_context_tpm || 0);
+
+      const elBilledTpm = document.getElementById('kpiBilledTpm');
+      if (elBilledTpm) elBilledTpm.textContent = `${formatTokens(Math.round(billedTpm))} TPM`;
+
+      const elBilledTph = document.getElementById('kpiBilledTph');
+      if (elBilledTph) elBilledTph.textContent = `${formatTokens(Math.round(billedTph))} TPH`;
+
+      const elCtxTpm = document.getElementById('kpiContextTpm');
+      if (elCtxTpm) elCtxTpm.textContent = `${formatTokens(Math.round(ctxTpm))} TPM`;
+
+      // Static Semi-circular SVG Speedometer Arc (arc length ~157.08)
+      const elArcFill = document.getElementById('dashVelocityArcFill');
+      if (elArcFill) {
+        const arcLength = 157.08;
+        const gaugePct = Math.max(0, Math.min(100, Number(vel.gauge_pct != null ? vel.gauge_pct : 0)));
+        const offset = arcLength * (1 - (gaugePct / 100));
+        elArcFill.style.strokeDashoffset = offset.toFixed(2);
+        if (typeof elArcFill.setAttribute === 'function') {
+          elArcFill.setAttribute('stroke-dashoffset', offset.toFixed(2));
+        }
+      }
+
+      // Static Compact Context Growth Bullet Bar
+      const elCtxBar = document.getElementById('dashContextVelocityBar');
+      if (elCtxBar) {
+        const ctxPct = Math.max(0, Math.min(100, Number(vel.context_gauge_pct != null ? vel.context_gauge_pct : (ctxTpm > 0 ? Math.min(100, (ctxTpm / 10000) * 100) : 0))));
+        elCtxBar.style.width = `${ctxPct.toFixed(1)}%`;
+      }
+
+      const cardTokenVelocity = document.getElementById('cardTokenVelocity');
+      if (cardTokenVelocity) {
+        const peakBld = vel.peak_billed_tpm != null ? formatTokens(Math.round(vel.peak_billed_tpm)) : '100k';
+        cardTokenVelocity.title = `Token Throughput Velocity:\n` +
+          `• Live Rolling (5m): ~${formatTokens(Math.round(billedTpm))} Billed TPM (${vel.gauge_pct || 0}% of peak ${peakBld} TPM)\n` +
+          `• Live Rolling (60m): ~${formatTokens(Math.round(billedTph))} Billed TPH\n` +
+          `• Active Context Fill: ~${formatTokens(Math.round(ctxTpm))} TPM\n` +
+          `• Active Session Throughput: ~${formatTokens(Math.round(vel.active_billed_tpm || 0))} TPM`;
+      }
+
+      if (data.hourly_series && Array.isArray(data.hourly_series)) {
+        allHourlySeries = data.hourly_series;
+        if (currentVelocityResolution === 'hourly') {
+          renderHourlyTimelineChart(allHourlySeries);
+        }
       }
 
       // Context Hygiene Diagnostics
@@ -1293,6 +1414,25 @@
     // ==========================================
     function setTimelineRange(days) {
       currentTimelineDays = days;
+      currentVelocityResolution = 'daily';
+      const btnDaily = document.getElementById('btnVelocityDaily');
+      const btnHourly = document.getElementById('btnVelocityHourly');
+      const resActiveCls = 'px-2.5 py-1 rounded-md bg-brand-600 text-white font-medium shadow-sm transition text-[11px] whitespace-nowrap outline-none focus:outline-none';
+      const resInactiveCls = 'px-2.5 py-1 rounded-md text-gray-400 hover:text-white transition text-[11px] whitespace-nowrap outline-none focus:outline-none';
+      if (btnDaily) btnDaily.className = resActiveCls;
+      if (btnHourly) btnHourly.className = resInactiveCls;
+
+      const rangeGroup = document.getElementById('timelineRangeGroup');
+      if (rangeGroup) rangeGroup.classList.remove('hidden');
+      const velDivider = document.getElementById('velocityDivider');
+      if (velDivider) velDivider.classList.remove('hidden');
+      const modeGroup = document.getElementById('timelineModeGroup');
+      const divider = document.getElementById('timelineDivider');
+      if (currentProject === 'all' && modeGroup) modeGroup.classList.remove('hidden');
+      if (currentProject === 'all' && divider) divider.classList.remove('hidden');
+      const descEl = document.getElementById('velocityChartDesc');
+      if (descEl) descEl.textContent = 'Daily API tokens consumed (prompt in + completion out), estimated billing value with % weekly quota capacity, and session counts';
+
       const isCycle = (typeof days === 'string' && days.toLowerCase().trim() === 'cycle');
       const btnCycle = document.getElementById('btnCycle');
       const btn7d = document.getElementById('btn7d');
@@ -1321,13 +1461,13 @@
             .then(res => {
               cycleTimelineData = Array.isArray(res) ? res : [];
               cachedCycleProject = currentProject;
-              if (currentTimelineDays === 'cycle' || (typeof currentTimelineDays === 'string' && currentTimelineDays.toLowerCase().trim() === 'cycle')) {
+              if ((currentTimelineDays === 'cycle' || (typeof currentTimelineDays === 'string' && currentTimelineDays.toLowerCase().trim() === 'cycle')) && currentVelocityResolution === 'daily') {
                 renderTimelineChart(cycleTimelineData);
               }
             })
             .catch(e => {
               console.error('Failed to fetch cycle timeline data', e);
-              if (currentTimelineDays === 'cycle' || (typeof currentTimelineDays === 'string' && currentTimelineDays.toLowerCase().trim() === 'cycle')) {
+              if ((currentTimelineDays === 'cycle' || (typeof currentTimelineDays === 'string' && currentTimelineDays.toLowerCase().trim() === 'cycle')) && currentVelocityResolution === 'daily') {
                 renderTimelineChart([]);
               }
             });
@@ -1345,7 +1485,7 @@
           .then(r => r.json())
           .then(res => {
             allTimelineData = Array.isArray(res) ? res : [];
-            if (currentTimelineDays === days) {
+            if (currentTimelineDays === days && currentVelocityResolution === 'daily') {
               setTimelineRange(days);
             }
           })
@@ -1642,6 +1782,160 @@
           }
         }
       });
+      velocityChart = timelineChart;
+      window.velocityChart = timelineChart;
+    }
+
+    function renderHourlyTimelineChart(hourlySeries) {
+      const canvas = document.getElementById('timelineChart');
+      if (!canvas || !canvas.getContext) return;
+      const series = Array.isArray(hourlySeries) ? hourlySeries : [];
+      const labels = series.map(h => {
+        if (!h.hour_key) return '';
+        const parts = h.hour_key.split('T');
+        if (parts.length > 1) {
+          const datePart = parts[0].slice(5);
+          return `${datePart} ${parts[1]}:00`;
+        }
+        return h.hour_key;
+      });
+
+      const billedTokens = series.map(h => h.billed_tokens || 0);
+      const estTokens = series.map(h => h.est_tokens || 0);
+      const costs = series.map(h => h.billed_cost || 0);
+      const steps = series.map(h => h.step_count || 0);
+
+      const datasets = [
+        {
+          label: 'Billed Tokens / Hr (TPH)',
+          type: 'bar',
+          data: billedTokens,
+          backgroundColor: 'rgba(99, 102, 241, 0.65)',
+          borderColor: '#6366f1',
+          borderWidth: 1,
+          borderRadius: 4,
+          yAxisID: 'y',
+          order: 3
+        },
+        {
+          label: 'Context Growth (Tokens / Hr)',
+          type: 'bar',
+          data: estTokens,
+          backgroundColor: 'rgba(56, 189, 248, 0.4)',
+          borderColor: '#38bdf8',
+          borderWidth: 1,
+          borderRadius: 4,
+          yAxisID: 'y',
+          order: 4
+        },
+        {
+          label: 'Est. API Value ($)',
+          data: costs,
+          type: 'line',
+          borderColor: '#f43f5e',
+          backgroundColor: '#f43f5e',
+          borderWidth: 2,
+          tension: 0.3,
+          pointRadius: 2,
+          pointHoverRadius: 4,
+          yAxisID: 'yCost',
+          order: 1
+        },
+        {
+          label: 'Steps',
+          data: steps,
+          type: 'line',
+          borderColor: '#e0e7ff',
+          backgroundColor: '#e0e7ff',
+          borderWidth: 2,
+          borderDash: [4, 4],
+          tension: 0.3,
+          pointRadius: 2,
+          pointHoverRadius: 4,
+          yAxisID: 'y1',
+          order: 2
+        }
+      ];
+
+      timelineChart = upsertChart(timelineChart, canvas, {
+        type: 'bar',
+        data: {
+          labels: labels,
+          datasets: datasets
+        },
+        options: {
+          animation: false,
+          responsive: true,
+          maintainAspectRatio: false,
+          interaction: { mode: 'index', intersect: false },
+          plugins: {
+            legend: {
+              labels: {
+                color: '#9ca3af',
+                font: { size: 10 },
+                usePointStyle: true,
+                boxWidth: 8
+              }
+            },
+            tooltip: {
+              callbacks: {
+                title: (items) => {
+                  if (!items || items.length === 0) return '';
+                  const idx = items[0].dataIndex;
+                  const item = series[idx];
+                  if (!item) return items[0].label || '';
+                  return `Hour: ${item.hour_key || items[0].label}`;
+                },
+                afterBody: (items) => {
+                  if (!items || items.length === 0) return '';
+                  const idx = items[0].dataIndex;
+                  const item = series[idx];
+                  if (!item) return '';
+                  const bTpm = item.billed_tpm != null ? item.billed_tpm : Math.round((item.billed_tokens || 0) / 60);
+                  const eTpm = item.est_tpm != null ? item.est_tpm : Math.round((item.est_tokens || 0) / 60);
+                  return `Throughput: ~${formatTokens(Math.round(bTpm))} Billed TPM · ~${formatTokens(Math.round(eTpm))} Context TPM`;
+                }
+              }
+            }
+          },
+          scales: {
+            x: {
+              grid: { color: '#1f2937' },
+              ticks: { color: '#9ca3af', maxTicksLimit: 12, font: { size: 10 } }
+            },
+            y: {
+              type: 'linear',
+              position: 'left',
+              beginAtZero: true,
+              grid: { color: '#1f2937' },
+              ticks: { color: '#9ca3af', callback: v => formatTokens(v), font: { size: 10 } },
+              title: { display: true, text: 'Tokens / Hour (TPH)', color: '#6b7280', font: { size: 10 } }
+            },
+            y1: {
+              type: 'linear',
+              position: 'right',
+              beginAtZero: true,
+              grid: { drawOnChartArea: false },
+              ticks: { color: '#e0e7ff', font: { size: 10 }, precision: 0 },
+              title: { display: true, text: 'Steps', color: '#e0e7ff', font: { size: 10 } }
+            },
+            yCost: {
+              type: 'linear',
+              position: 'right',
+              beginAtZero: true,
+              grid: { drawOnChartArea: false },
+              ticks: {
+                color: '#f43f5e',
+                callback: v => '$' + v.toFixed(2),
+                font: { size: 10 }
+              },
+              title: { display: true, text: 'Cost ($)', color: '#f43f5e', font: { size: 10 } }
+            }
+          }
+        }
+      });
+      velocityChart = timelineChart;
+      window.velocityChart = timelineChart;
     }
 
     function renderModelsChart(models) {
@@ -2204,7 +2498,7 @@
     }
 
     function renderHotFiles(files) {
-      allHotFiles = files;
+      allHotFiles = Array.isArray(files) ? files : [];
       filterHotFiles();
     }
 
@@ -2364,6 +2658,12 @@
           tokensHtml = `<span class="font-semibold text-indigo-400 font-mono text-[11px]" title="${formatTokens(c.disk_tokens || 0)} disk footprint">${formatTokens(c.tokens || c.total_tokens)}</span>`;
         }
 
+        const actTpm = c.active_context_tpm != null ? Math.round(c.active_context_tpm) : 0;
+        const bldTph = c.pairing_billed_tph != null ? Math.round(c.pairing_billed_tph) : (c.active_billed_tpm != null ? Math.round(c.active_billed_tpm * 60) : 0);
+        if (actTpm > 0 || bldTph > 0) {
+          tokensHtml += `<span class="text-[10px] text-cyan-400 font-mono block" title="Active Context: ${actTpm.toLocaleString()} TPM | Pairing Billed: ${bldTph.toLocaleString()} TPH">${formatTokens(actTpm)} TPM · ${formatTokens(bldTph)} TPH</span>`;
+        }
+
         tr.innerHTML = `
           <td class="py-2.5 px-3 text-gray-300 whitespace-nowrap font-mono text-[11px]" title="Started: ${startedStr}">
             <span class="font-medium text-emerald-400">${lastActiveStr}</span>
@@ -2409,6 +2709,12 @@
             const childLastActiveStr = sub.updated_at || sub.created_at || '--';
             const childStartedStr = sub.created_at || '--';
 
+            const subActTpm = sub.active_context_tpm != null ? Math.round(sub.active_context_tpm) : 0;
+            const subBldTph = sub.pairing_billed_tph != null ? Math.round(sub.pairing_billed_tph) : (sub.active_billed_tpm != null ? Math.round(sub.active_billed_tpm * 60) : 0);
+            const subVelHtml = (subActTpm > 0 || subBldTph > 0)
+              ? `<span class="text-[9px] text-cyan-400 font-mono block" title="Active Context: ${subActTpm.toLocaleString()} TPM | Pairing Billed: ${subBldTph.toLocaleString()} TPH">${formatTokens(subActTpm)} TPM · ${formatTokens(subBldTph)} TPH</span>`
+              : '';
+
             childTr.innerHTML = `
               <td class="py-2 px-3 text-gray-400 whitespace-nowrap font-mono text-[10px] pl-6" title="Started: ${childStartedStr}">
                 <span class="text-emerald-400/80">${childLastActiveStr}</span>
@@ -2425,7 +2731,7 @@
               <td class="py-2 px-3 max-w-[220px] align-middle">${formatModelBadgeHtml(sub.model_name || 'inherit')}</td>
               <td class="py-2 px-3 text-right text-gray-400 font-mono text-xs">${sub.total_steps}</td>
               <td class="py-2 px-3 text-right font-mono font-medium text-rose-400/80 text-xs">$${(sub.billed_cost || 0).toFixed(2)}${sub.weekly_quota_pct != null ? ` <span class="text-[10px] text-cyan-300 font-mono">(${sub.weekly_quota_pct.toFixed(2)}% wk)</span>` : ''}</td>
-              <td class="py-2 px-3 text-right font-mono font-medium text-indigo-400/80 text-xs">${formatTokens(sub.tokens || sub.total_tokens)}</td>
+              <td class="py-2 px-3 text-right font-mono font-medium text-indigo-400/80 text-xs">${formatTokens(sub.tokens || sub.total_tokens)}${subVelHtml}</td>
               <td class="py-2 px-3 text-right text-gray-400 whitespace-nowrap text-xs" title="${childTimeTitle}">
                 <span class="text-emerald-400/80">${formatDuration(childActiveSec)}</span>
                 ${hasChildFleetDiff ? `<span class="text-[10px] text-pink-300 font-mono font-medium block">Fleet: ${formatDuration(childFleetSec)}</span>` : ''}
@@ -2500,6 +2806,21 @@
             modalStepsEl.textContent = stepVal.toLocaleString();
             modalStepsEl.title = `${stepVal.toLocaleString()} logged steps in this conversation`;
           }
+        }
+
+        const elModalActiveTpm = document.getElementById('modalActiveTpm');
+        const elModalBilledTph = document.getElementById('modalBilledTph');
+        const convVel = conv.velocity || data.velocity || {};
+        const actTpm = conv.active_context_tpm ?? convVel.active_context_tpm ?? (data.active_context_tpm ?? 0);
+        const bldTph = conv.pairing_billed_tph ?? convVel.pairing_billed_tph ?? (data.pairing_billed_tph ?? (conv.active_billed_tpm ? conv.active_billed_tpm * 60 : 0));
+
+        if (elModalActiveTpm) {
+          elModalActiveTpm.textContent = formatTokens(Math.round(actTpm));
+          elModalActiveTpm.title = `Active Context Growth Rate: ~${Math.round(actTpm).toLocaleString()} tokens/min during agent work time`;
+        }
+        if (elModalBilledTph) {
+          elModalBilledTph.textContent = formatTokens(Math.round(bldTph));
+          elModalBilledTph.title = `Billed Throughput: ~${Math.round(bldTph).toLocaleString()} tokens/hr during human pairing time`;
         }
 
         // Context Compaction & Working Memory Status

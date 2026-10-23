@@ -8,7 +8,10 @@ for inline chat embedding via <agent-embed> and side-pane artifact viewing.
 from __future__ import annotations
 
 import html
+import math
 from typing import Any
+
+from context_monitor.velocity import DEFAULT_PEAK_CONTEXT_TPM, compute_active_velocity
 
 
 CHARS_PER_TOKEN = 3.8
@@ -101,6 +104,59 @@ def generate_html_report(
 
     # Top consumers
     top_steps = sorted(steps, key=lambda s: s.get("characters", 0), reverse=True)[:3]
+
+    # Velocity telemetry & horizontal bullet bar
+    velocity = analysis.get("velocity")
+    if not velocity:
+        in_toks = analysis.get("billed_input_tokens", 0)
+        out_toks = analysis.get("billed_output_tokens", 0)
+        velocity = compute_active_velocity(
+            est_tokens=active_tokens,
+            billed_tokens=in_toks + out_toks,
+            active_agent_seconds=analysis.get("active_agent_seconds", 0.0),
+            active_pairing_seconds=analysis.get("active_pairing_seconds", 0.0),
+        )
+
+    try:
+        ctx_tpm = float((velocity or {}).get("active_context_tpm") or 0.0)
+        if not math.isfinite(ctx_tpm) or ctx_tpm < 0.0:
+            ctx_tpm = 0.0
+    except (TypeError, ValueError):
+        ctx_tpm = 0.0
+
+    try:
+        bld_tpm = float((velocity or {}).get("active_billed_tpm") or 0.0)
+        if not math.isfinite(bld_tpm) or bld_tpm < 0.0:
+            bld_tpm = 0.0
+    except (TypeError, ValueError):
+        bld_tpm = 0.0
+
+    try:
+        bld_tph = float((velocity or {}).get("active_billed_tph") or 0.0)
+        if not math.isfinite(bld_tph) or bld_tph < 0.0:
+            bld_tph = 0.0
+    except (TypeError, ValueError):
+        bld_tph = 0.0
+
+    peak_ctx = DEFAULT_PEAK_CONTEXT_TPM if DEFAULT_PEAK_CONTEXT_TPM > 0 else 10_000.0
+    bullet_pct = min(100.0, max(0.0, (ctx_tpm / peak_ctx) * 100.0))
+
+    velocity_bullet_html = f"""
+    <!-- Velocity & Throughput Bullet Bar -->
+    <div class="space-y-1.5 py-1 border-t border-[var(--border)]">
+      <div class="flex items-center justify-between text-xs">
+        <span class="text-[var(--muted-foreground)]">Context Fill TPM</span>
+        <span class="font-mono font-medium text-[var(--foreground)]">{format_tokens(ctx_tpm)} tok/min</span>
+      </div>
+      <div class="w-full h-2 bg-[var(--sidebar)] rounded-full overflow-hidden border border-[var(--border)] relative" style="transition: none !important; animation: none !important;">
+        <div style="width: {bullet_pct:.1f}%; background-color: #3b82f6; transition: none !important; animation: none !important;" class="h-full rounded-full"></div>
+      </div>
+      <div class="flex items-center justify-between text-[11px] text-[var(--muted-foreground)] font-mono">
+        <span>Billed TPM / TPH</span>
+        <span>{format_tokens(bld_tpm)} tok/min · {format_tokens(bld_tph)} tok/hr</span>
+      </div>
+    </div>
+    """
 
     # Generate segments HTML
     bar_segments_html = []
@@ -206,8 +262,11 @@ def generate_html_report(
       {"".join(legend_html)}
     </div>
 
+    {velocity_bullet_html}
+
     <!-- Memory Boundary / Compaction Status -->
     {compaction_banner_html}
+
 
     <!-- Top Token Consuming Steps -->
     <div class="space-y-1">

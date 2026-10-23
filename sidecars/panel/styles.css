@@ -769,3 +769,153 @@ button.action-btn.secondary:hover:not(:disabled) {
   font-size: 10px;
   white-space: nowrap;
 }
+
+/* Token Velocity Speedometer Arc & Bullet Bars --------------------------- */
+
+.velocity-container {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 8px 0;
+  border-top: 1px dashed color-mix(in srgb, var(--border, #e0e0e0) 60%, transparent);
+  border-bottom: 1px dashed color-mix(in srgb, var(--border, #e0e0e0) 60%, transparent);
+  transition: none !important;
+  animation: none !important;
+}
+
+.speedometer-block {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  justify-content: center;
+  flex-wrap: wrap;
+  transition: none !important;
+  animation: none !important;
+}
+
+.speedometer-svg {
+  width: 84px;
+  height: 48px;
+  flex-shrink: 0;
+  overflow: visible;
+  transition: none !important;
+  animation: none !important;
+}
+
+.arc-bg {
+  fill: none;
+  stroke: var(--secondary, #e8eaed);
+  stroke-width: 8;
+  stroke-linecap: round;
+  transition: none !important;
+  animation: none !important;
+}
+
+.arc-fill {
+  fill: none;
+  stroke: var(--primary, #1a73e8);
+  stroke-width: 8;
+  stroke-linecap: round;
+  transition: none !important;
+  animation: none !important;
+}
+
+.arc-fill.ok {
+  stroke: #1e8e3e;
+}
+
+.arc-fill.warning {
+  stroke: #e37400;
+}
+
+.arc-fill.error {
+  stroke: #d93025;
+}
+
+.speedometer-data {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  transition: none !important;
+  animation: none !important;
+}
+
+.speedometer-val {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--foreground, #1f1f1f);
+  transition: none !important;
+  animation: none !important;
+}
+
+.speedometer-sub {
+  font-size: 10px;
+  color: var(--muted-foreground, #666666);
+  transition: none !important;
+  animation: none !important;
+}
+
+.context-velocity-block,
+.fleet-velocity-block {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  transition: none !important;
+  animation: none !important;
+}
+
+.context-velocity-header,
+.fleet-velocity-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  transition: none !important;
+  animation: none !important;
+}
+
+.font-mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-weight: 600;
+}
+
+.bullet-track {
+  height: 6px;
+  border-radius: 3px;
+  background: var(--secondary, #e8eaed);
+  transition: none !important;
+  animation: none !important;
+}
+
+.bullet-bar {
+  height: 100%;
+  min-width: 2px;
+  border-radius: 3px;
+  background: var(--primary, #1a73e8);
+  transition: none !important;
+  animation: none !important;
+}
+
+.bullet-bar.fleet {
+  background: #a142f4;
+}
+
+.bullet-bar.ok {
+  background: #1e8e3e;
+}
+
+.bullet-bar.warning {
+  background: #e37400;
+}
+
+.bullet-bar.error {
+  background: #d93025;
+}
+
+.quota-tph {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 10px;
+  transition: none !important;
+  animation: none !important;
+}

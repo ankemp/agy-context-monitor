@@ -25,6 +25,7 @@ Usage:
 import os
 import sys
 import json
+import math
 import argparse
 from pathlib import Path
 from datetime import datetime, timedelta, timezone
@@ -48,6 +49,7 @@ from context_monitor.settings import (  # noqa: E402
     DEFAULT_GEMINI_WEEKLY_CAPACITY,
 )
 from context_monitor.timings import calculate_force_multiplier  # noqa: E402
+from context_monitor.velocity import compute_active_velocity  # noqa: E402
 
 
 def format_tokens(n: int) -> str:
@@ -825,7 +827,7 @@ def print_efficiency(conn):
 
 def print_velocity(conn):
     print("\n" + "=" * 75)
-    print(" ⚡ DEVELOPER VELOCITY & AUTONOMOUS ROI METRICS")
+    print(" DEVELOPER VELOCITY & AUTONOMOUS ROI METRICS")
     print("=" * 75)
 
     cur = conn.cursor()
@@ -833,6 +835,9 @@ def print_velocity(conn):
         SELECT 
             COUNT(*) as total_convs,
             SUM(total_steps) as total_steps,
+            SUM(total_tokens) as total_tokens,
+            SUM(billed_input_tokens) as total_billed_in,
+            SUM(billed_output_tokens) as total_billed_out,
             SUM(user_prompts) as total_prompts,
             SUM(tool_calls_count) as total_tools,
             SUM(thinking_tokens) as total_thinking,
@@ -852,6 +857,19 @@ def print_velocity(conn):
     total_fails = row["total_fails"] or 0
     total_agent_sec = max(0.0, float(row["total_agent_sec"] or 0))
     total_pairing_sec = max(0.0, float(row["total_pairing_sec"] or 0))
+
+    total_tokens = row["total_tokens"] or 0
+    total_billed = (row["total_billed_in"] or 0) + (row["total_billed_out"] or 0)
+    if total_billed == 0:
+        _, b_in, b_out = calculate_billed_cost(conn)
+        total_billed = b_in + b_out
+
+    vel = compute_active_velocity(
+        est_tokens=total_tokens,
+        billed_tokens=total_billed,
+        active_agent_seconds=total_agent_sec,
+        active_pairing_seconds=total_pairing_sec,
+    )
 
     autonomy = total_tools / max(1, total_prompts)
     success_rate = ((total_tools - total_fails) / max(1, total_tools)) * 100
@@ -875,6 +893,30 @@ def print_velocity(conn):
     effective_output_hours = effective_output_sec / 3600
     pairing_dur = format_duration(denom_sec)
 
+    try:
+        ctx_tpm = float((vel or {}).get("active_context_tpm") or 0.0)
+        if not math.isfinite(ctx_tpm) or ctx_tpm < 0:
+            ctx_tpm = 0.0
+    except (TypeError, ValueError):
+        ctx_tpm = 0.0
+
+    try:
+        bld_tpm = float((vel or {}).get("active_billed_tpm") or 0.0)
+        if not math.isfinite(bld_tpm) or bld_tpm < 0:
+            bld_tpm = 0.0
+    except (TypeError, ValueError):
+        bld_tpm = 0.0
+
+    try:
+        pair_tph = float((vel or {}).get("pairing_billed_tph") or 0.0)
+        if not math.isfinite(pair_tph) or pair_tph < 0:
+            pair_tph = 0.0
+    except (TypeError, ValueError):
+        pair_tph = 0.0
+
+    print(f" Active Context Fill Rate (TPM)       : {ctx_tpm:,.1f} tok/min")
+    print(f" Active Billed Throughput (TPM)       : {bld_tpm:,.1f} tok/min")
+    print(f" Pairing Throughput (TPH)             : {pair_tph:,.1f} tok/hr")
     print(
         f" Autonomy Multiplier                  : {autonomy:.1f}x ({total_tools:,} tool actions across {total_prompts:,} user prompts)"
     )
@@ -1166,6 +1208,8 @@ def generate_global_report(
             SUM(duration_seconds) as total_duration,
             SUM(active_agent_seconds) as total_agent_sec,
             SUM(active_pairing_seconds) as total_pairing_sec,
+            SUM(billed_input_tokens) as total_billed_in,
+            SUM(billed_output_tokens) as total_billed_out,
             SUM(thinking_tokens) as total_thinking,
             SUM(user_prompts) as total_prompts,
             SUM(tool_calls_count) as total_tools,
@@ -1210,6 +1254,38 @@ def generate_global_report(
     total_mcp_calls = mcp_row["mcp_calls"] or 0
     total_mcp_servers = mcp_row["servers"] or 0
 
+    total_billed = (totals["total_billed_in"] or 0) + (totals["total_billed_out"] or 0)
+    if total_billed == 0:
+        total_billed = total_in + total_out
+
+    global_vel = compute_active_velocity(
+        est_tokens=total_tokens,
+        billed_tokens=total_billed,
+        active_agent_seconds=total_agent_sec,
+        active_pairing_seconds=total_pairing_sec,
+    )
+
+    try:
+        ctx_tpm = float((global_vel or {}).get("active_context_tpm") or 0.0)
+        if not math.isfinite(ctx_tpm) or ctx_tpm < 0:
+            ctx_tpm = 0.0
+    except (TypeError, ValueError):
+        ctx_tpm = 0.0
+
+    try:
+        bld_tpm = float((global_vel or {}).get("active_billed_tpm") or 0.0)
+        if not math.isfinite(bld_tpm) or bld_tpm < 0:
+            bld_tpm = 0.0
+    except (TypeError, ValueError):
+        bld_tpm = 0.0
+
+    try:
+        pair_tph = float((global_vel or {}).get("pairing_billed_tph") or 0.0)
+        if not math.isfinite(pair_tph) or pair_tph < 0:
+            pair_tph = 0.0
+    except (TypeError, ValueError):
+        pair_tph = 0.0
+
     lines = [
         "# Antigravity Global Analytics & Intelligence Report",
         f"\n> **Generated**: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  ",
@@ -1217,6 +1293,9 @@ def generate_global_report(
         f"> **Total Operations**: {total_steps:,} logged steps  ",
         f"> **Autonomy Multiplier**: **{autonomy:.1f}x actions per prompt**  ",
         f"> **Force Multiplier**: **{force_multiplier:.1f}x effective output**  ",
+        f"> **Active Context Fill Rate (TPM)**: **{ctx_tpm:,.1f} tok/min**  ",
+        f"> **Active Billed Throughput (TPM)**: **{bld_tpm:,.1f} tok/min**  ",
+        f"> **Pairing Throughput (TPH)**: **{pair_tph:,.1f} tok/hr**  ",
         f"> **Human Pairing Time (Inter-Turn)**: {format_duration(total_pairing_sec)}  ",
         f"> **Agent Work Time (Root + Subagent Fleet)**: {format_duration(total_agent_sec)}  ",
         f"> **Est. Dev Time Saved (Tool Execution)**: ~{saved_hours:,.0f} hours ({format_duration(saved_seconds)})  ",
@@ -1354,10 +1433,28 @@ def generate_global_report(
             f"| `{p_name}` | ${c:,.2f} | {wk_quota_pct:.2f}% | {pct:.1f}% | {r['session_count']:,} | {format_tokens(act_tok)} |"
         )
 
+    lines.extend(
+        [
+            "\n## 7. Developer Velocity & Token Throughput\n",
+            f"- Active Context Fill Rate (TPM): `{ctx_tpm:,.1f} tok/min`",
+            f"- Active Billed Throughput (TPM): `{bld_tpm:,.1f} tok/min`",
+            f"- Pairing Throughput (TPH): `{pair_tph:,.1f} tok/hr`",
+            f"- Autonomy Multiplier: `{autonomy:.1f}x`",
+            f"- Force Multiplier: `{force_multiplier:.1f}x`",
+        ]
+    )
+
+    report_text = "\n".join(lines) + "\n"
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines) + "\n")
+        f.write(report_text)
 
     print(f"\nGlobal Analytics Markdown Report written to: {output_path}")
+    return report_text
+
+
+generate_analytics_report = generate_global_report
 
 
 def main():

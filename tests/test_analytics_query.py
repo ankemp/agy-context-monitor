@@ -909,3 +909,91 @@ def test_backfill_subagent_from_existing_db_lineage(tmp_path: Path):
         assert row["depth"] == 1
         assert row["subagent_role"] == "DeepCoder"
         assert row["active_pairing_seconds"] == 0.0
+
+
+def test_generate_analytics_report_velocity_metrics(
+    analytics_test_db: Path, tmp_path: Path
+):
+    """Verifies generate_analytics_report includes Active Context Fill Rate (TPM), Active Billed Throughput (TPM), and Pairing Throughput (TPH)."""
+    report_file = tmp_path / "global_analytics_vel.md"
+    with patch(
+        "context_monitor.quota.discover_language_server_credentials",
+        return_value=(None, None),
+    ):
+        with get_db_connection(analytics_test_db) as conn:
+            # Seed active agent and pairing time on root conv
+            conn.execute(
+                """
+                UPDATE conversations
+                SET active_agent_seconds = 600.0, active_pairing_seconds = 1800.0
+                WHERE id = 'test-conv-root'
+                """
+            )
+            conn.commit()
+            content = analytics_query.generate_analytics_report(
+                conn, output_path=report_file
+            )
+
+    assert "Active Context Fill Rate (TPM)" in content
+    assert "Active Billed Throughput (TPM)" in content
+    assert "Pairing Throughput (TPH)" in content
+    assert "tok/min" in content
+    assert "tok/hr" in content
+
+    # Clean markdown invariant: zero emojis in the generated report
+    assert not EMOJI_PATTERN.search(content), "Report must not contain emojis"
+
+
+def test_print_velocity_includes_tpm_tph_rates(
+    analytics_test_db: Path, capsys: pytest.CaptureFixture
+):
+    """Verifies print_velocity includes TPM and TPH velocity lines without decorative emojis."""
+    with get_db_connection(analytics_test_db) as conn:
+        conn.execute(
+            """
+            UPDATE conversations
+            SET active_agent_seconds = 600.0, active_pairing_seconds = 1800.0
+            WHERE id = 'test-conv-root'
+            """
+        )
+        conn.commit()
+        analytics_query.print_velocity(conn)
+
+    captured = capsys.readouterr().out
+    assert "Active Context Fill Rate (TPM)" in captured
+    assert "Active Billed Throughput (TPM)" in captured
+    assert "Pairing Throughput (TPH)" in captured
+    assert "tok/min" in captured
+    assert "tok/hr" in captured
+
+    # Zero emojis in CLI output
+    assert not EMOJI_PATTERN.search(captured), (
+        "Velocity CLI output must not contain emojis"
+    )
+
+
+def test_generate_analytics_report_creates_parent_directory_and_empty_db(
+    tmp_path: Path,
+):
+    """Verifies generate_analytics_report creates parent directories and handles an empty database safely."""
+    empty_db = tmp_path / "empty.db"
+    init_db(empty_db)
+
+    deep_report_file = tmp_path / "nested" / "reports" / "deep_analytics.md"
+
+    with patch(
+        "context_monitor.quota.discover_language_server_credentials",
+        return_value=(None, None),
+    ):
+        with get_db_connection(empty_db) as conn:
+            content = analytics_query.generate_analytics_report(
+                conn, output_path=deep_report_file
+            )
+
+    assert deep_report_file.exists()
+    assert "Active Context Fill Rate (TPM)" in content
+    assert "Active Billed Throughput (TPM)" in content
+    assert "Pairing Throughput (TPH)" in content
+    assert "0.0 tok/min" in content
+    assert "0.0 tok/hr" in content
+    assert not EMOJI_PATTERN.search(content)

@@ -17,6 +17,350 @@ export const DEFAULT_CAPACITIES = {
   '3p-5h': 70.0
 };
 
+export const DEFAULT_PEAK_BILLED_TPM = 100000.0;
+export const DEFAULT_PEAK_CONTEXT_TPM = 10000.0;
+export const DEFAULT_PEAK_BILLED_TPH = 2500000.0;
+export const DEFAULT_PEAK_CONTEXT_TPH = 250000.0;
+
+export function resolveFleetIds(db, rootId) {
+  if (!db || !rootId) return [rootId].filter(Boolean);
+  try {
+    const rows = db.prepare(`
+      WITH RECURSIVE fleet(id) AS (
+        SELECT id FROM conversations WHERE id = ? OR root_id = ? OR parent_id = ?
+        UNION
+        SELECT c.id FROM conversations c JOIN fleet f ON c.parent_id = f.id OR c.root_id = f.id
+      )
+      SELECT DISTINCT id FROM fleet
+    `).all(rootId, rootId, rootId);
+    if (rows && rows.length > 0) {
+      return rows.map(r => String(r.id)).filter(Boolean);
+    }
+  } catch {
+    // Recursive CTE or columns might not be supported in older schemas
+  }
+  try {
+    const rows = db.prepare('SELECT DISTINCT id FROM conversations WHERE root_id = ? OR id = ?').all(rootId, rootId);
+    if (rows && rows.length > 0) {
+      return rows.map(r => String(r.id)).filter(Boolean);
+    }
+  } catch {
+    // fallback
+  }
+  return [String(rootId)];
+}
+
+function calcP95(vals) {
+  if (!vals || vals.length === 0) return 0.0;
+  const sorted = [...vals].sort((a, b) => a - b);
+  const k = (sorted.length - 1) * 0.95;
+  const f = Math.floor(k);
+  const c = Math.ceil(k);
+  if (f === c) return Number(sorted[f]);
+  const d0 = sorted[f] * (c - k);
+  const d1 = sorted[c] * (k - f);
+  return Number(d0 + d1);
+}
+
+export function queryVelocityMetrics(db, options = {}) {
+  if (!db) {
+    return {
+      rolling5mContextTpm: 0.0,
+      rolling5mBilledTpm: 0.0,
+      rolling60mContextTph: 0.0,
+      rolling60mBilledTph: 0.0,
+      activeContextTpm: 0.0,
+      activeBilledTpm: 0.0,
+      pairingBilledTph: 0.0,
+      peakBilledTpm: DEFAULT_PEAK_BILLED_TPM,
+      peakContextTpm: DEFAULT_PEAK_CONTEXT_TPM,
+      arcPct: 0.0,
+      contextFillPct: 0.0
+    };
+  }
+
+  const opts = (typeof options === 'string') ? { conversationId: options } : (options || {});
+  const conversationId = opts.conversationId || opts.conversation_id || null;
+  const rootId = opts.rootId || opts.root_id || null;
+  const rawNow = opts.now || Date.now();
+  let nowDt = (rawNow instanceof Date) ? rawNow : new Date(rawNow);
+  if (isNaN(nowDt.getTime())) {
+    nowDt = new Date();
+  }
+  const isoNow = nowDt.toISOString().replace(/\.\d{3}Z$/, 'Z').slice(0, 19);
+  const t5m = new Date(nowDt.getTime() - 5 * 60 * 1000).toISOString().replace(/\.\d{3}Z$/, 'Z').slice(0, 19);
+  const t60m = new Date(nowDt.getTime() - 60 * 60 * 1000).toISOString().replace(/\.\d{3}Z$/, 'Z').slice(0, 19);
+  const nowHour = isoNow.slice(0, 13);
+
+  // 1. Resolve scope
+  let scopeStepsSql = '';
+  let scopeStepsParams = [];
+  let scopeConvSql = '';
+  let scopeConvParams = [];
+
+  if (conversationId) {
+    scopeStepsSql = ' AND conversation_id = ?';
+    scopeStepsParams = [conversationId];
+    scopeConvSql = ' WHERE id = ?';
+    scopeConvParams = [conversationId];
+  } else if (rootId) {
+    const fleetIds = resolveFleetIds(db, rootId);
+    const placeholders = fleetIds.map(() => '?').join(',');
+    scopeStepsSql = ` AND conversation_id IN (${placeholders})`;
+    scopeStepsParams = fleetIds;
+    scopeConvSql = ` WHERE id IN (${placeholders})`;
+    scopeConvParams = fleetIds;
+  }
+
+  // 2. Live rolling windows from steps
+  let rolling5mContext = 0;
+  let rolling5mBilled = 0;
+  let rolling60mContext = 0;
+  let rolling60mBilled = 0;
+
+  try {
+    const rollingSql = `
+      SELECT
+        COALESCE(SUM(CASE WHEN substr(replace(created_at, ' ', 'T'), 1, 19) >= ? THEN est_tokens ELSE 0 END), 0) AS c_5m,
+        COALESCE(SUM(CASE WHEN substr(replace(created_at, ' ', 'T'), 1, 19) >= ? THEN (COALESCE(billed_input_tokens, 0) + COALESCE(billed_output_tokens, 0)) ELSE 0 END), 0) AS b_5m,
+        COALESCE(SUM(est_tokens), 0) AS c_60m,
+        COALESCE(SUM(COALESCE(billed_input_tokens, 0) + COALESCE(billed_output_tokens, 0)), 0) AS b_60m
+      FROM steps
+      WHERE created_at IS NOT NULL AND created_at != ''
+        AND substr(replace(created_at, ' ', 'T'), 1, 19) >= ?
+        AND substr(replace(created_at, ' ', 'T'), 1, 19) <= ?
+        ${scopeStepsSql}
+    `;
+    const row = db.prepare(rollingSql).get(t5m, t5m, t60m, isoNow, ...scopeStepsParams);
+    if (row) {
+      rolling5mContext = Number(row.c_5m) || 0;
+      rolling5mBilled = Number(row.b_5m) || 0;
+      rolling60mContext = Number(row.c_60m) || 0;
+      rolling60mBilled = Number(row.b_60m) || 0;
+    }
+  } catch {
+    // If billed_output_tokens column is missing, try fallback with only billed_input_tokens
+    try {
+      const fallbackSql = `
+        SELECT
+          COALESCE(SUM(CASE WHEN substr(replace(created_at, ' ', 'T'), 1, 19) >= ? THEN est_tokens ELSE 0 END), 0) AS c_5m,
+          COALESCE(SUM(CASE WHEN substr(replace(created_at, ' ', 'T'), 1, 19) >= ? THEN COALESCE(billed_input_tokens, 0) ELSE 0 END), 0) AS b_5m,
+          COALESCE(SUM(est_tokens), 0) AS c_60m,
+          COALESCE(SUM(COALESCE(billed_input_tokens, 0)), 0) AS b_60m
+        FROM steps
+        WHERE created_at IS NOT NULL AND created_at != ''
+          AND substr(replace(created_at, ' ', 'T'), 1, 19) >= ?
+          AND substr(replace(created_at, ' ', 'T'), 1, 19) <= ?
+          ${scopeStepsSql}
+      `;
+      const row = db.prepare(fallbackSql).get(t5m, t5m, t60m, isoNow, ...scopeStepsParams);
+      if (row) {
+        rolling5mContext = Number(row.c_5m) || 0;
+        rolling5mBilled = Number(row.b_5m) || 0;
+        rolling60mContext = Number(row.c_60m) || 0;
+        rolling60mBilled = Number(row.b_60m) || 0;
+      }
+    } catch {
+      try {
+        const minimalSql = `
+          SELECT
+            COALESCE(SUM(CASE WHEN substr(replace(created_at, ' ', 'T'), 1, 19) >= ? THEN est_tokens ELSE 0 END), 0) AS c_5m,
+            COALESCE(SUM(est_tokens), 0) AS c_60m
+          FROM steps
+          WHERE created_at IS NOT NULL AND created_at != ''
+            AND substr(replace(created_at, ' ', 'T'), 1, 19) >= ?
+            AND substr(replace(created_at, ' ', 'T'), 1, 19) <= ?
+            ${scopeStepsSql}
+        `;
+        const row = db.prepare(minimalSql).get(t5m, t60m, isoNow, ...scopeStepsParams);
+        if (row) {
+          rolling5mContext = Number(row.c_5m) || 0;
+          rolling60mContext = Number(row.c_60m) || 0;
+        }
+      } catch {
+        // steps table might not exist
+      }
+    }
+  }
+
+  const rolling5mContextTpm = Math.round((rolling5mContext / 5.0) * 100) / 100;
+  const rolling5mBilledTpm = Math.round((rolling5mBilled / 5.0) * 100) / 100;
+  const rolling60mContextTph = Math.round(Number(rolling60mContext) * 100) / 100;
+  const rolling60mBilledTph = Math.round(Number(rolling60mBilled) * 100) / 100;
+
+  // 3. Active-time velocity
+  let totalEstTokens = 0;
+  let totalBilledTokens = 0;
+  let activeAgentSec = 0.0;
+  let activePairingSec = 0.0;
+
+  try {
+    const convRow = db.prepare(`
+      SELECT
+        COALESCE(SUM(active_agent_seconds), 0.0) as active_agent_seconds,
+        COALESCE(SUM(active_pairing_seconds), 0.0) as active_pairing_seconds,
+        COALESCE(SUM(total_tokens), 0) as total_tokens,
+        COALESCE(SUM(COALESCE(billed_input_tokens, 0) + COALESCE(billed_output_tokens, 0)), 0) as billed_tokens
+      FROM conversations
+      ${scopeConvSql}
+    `).get(...scopeConvParams);
+
+    if (convRow) {
+      totalEstTokens = Number(convRow.total_tokens) || 0;
+      totalBilledTokens = Number(convRow.billed_tokens) || 0;
+      activeAgentSec = Number(convRow.active_agent_seconds) || 0.0;
+      activePairingSec = Number(convRow.active_pairing_seconds) || 0.0;
+    }
+  } catch {
+    try {
+      const convRow = db.prepare(`
+        SELECT
+          COALESCE(SUM(active_agent_seconds), 0.0) as active_agent_seconds,
+          COALESCE(SUM(total_tokens), 0) as total_tokens
+        FROM conversations
+        ${scopeConvSql}
+      `).get(...scopeConvParams);
+      if (convRow) {
+        totalEstTokens = Number(convRow.total_tokens) || 0;
+        activeAgentSec = Number(convRow.active_agent_seconds) || 0.0;
+      }
+    } catch {
+      // conversations table missing or columns missing
+    }
+  }
+
+  // Fallback to steps if conversations has 0 tokens but steps has them (independent fallbacks)
+  if (totalEstTokens === 0 || totalBilledTokens === 0) {
+    try {
+      const stepRow = db.prepare(`
+        SELECT
+          COALESCE(SUM(est_tokens), 0) as est_tok,
+          COALESCE(SUM(COALESCE(billed_input_tokens, 0) + COALESCE(billed_output_tokens, 0)), 0) as bld_tok
+        FROM steps
+        WHERE 1=1 ${scopeStepsSql}
+      `).get(...scopeStepsParams);
+      if (stepRow) {
+        if (totalEstTokens === 0) totalEstTokens = Number(stepRow.est_tok) || 0;
+        if (totalBilledTokens === 0) totalBilledTokens = Number(stepRow.bld_tok) || 0;
+      }
+    } catch {
+      try {
+        const stepRow = db.prepare(`
+          SELECT
+            COALESCE(SUM(est_tokens), 0) as est_tok,
+            COALESCE(SUM(COALESCE(billed_input_tokens, 0)), 0) as bld_tok
+          FROM steps
+          WHERE 1=1 ${scopeStepsSql}
+        `).get(...scopeStepsParams);
+        if (stepRow) {
+          if (totalEstTokens === 0) totalEstTokens = Number(stepRow.est_tok) || 0;
+          if (totalBilledTokens === 0) totalBilledTokens = Number(stepRow.bld_tok) || 0;
+        }
+      } catch {
+        // fallback
+      }
+    }
+  }
+
+  function calcRate(tokens, seconds, multiplier) {
+    if (!tokens || tokens <= 0 || !seconds || isNaN(seconds) || seconds <= 0) {
+      return 0.0;
+    }
+    const effSec = Math.max(Number(seconds), 60.0);
+    return Math.round((tokens / effSec) * multiplier * 100) / 100;
+  }
+
+  const activeContextTpm = calcRate(totalEstTokens, activeAgentSec, 60.0);
+  const activeBilledTpm = calcRate(totalBilledTokens, activeAgentSec, 60.0);
+  const pairingBilledTph = calcRate(totalBilledTokens, activePairingSec, 3600.0);
+
+  // 4. Peak calibration from hourly_step_rollups / steps
+  let distinctHours = [];
+  try {
+    const rows = db.prepare(`
+      SELECT
+        SUM(est_tokens) AS est_tok,
+        SUM(billed_tokens) AS bld_tok
+      FROM hourly_step_rollups
+      WHERE hour_key IS NOT NULL AND hour_key != ''
+        AND hour_key <= ?
+      GROUP BY hour_key
+    `).all(nowHour);
+    distinctHours = rows.map(r => ({ est: Number(r.est_tok) || 0, bld: Number(r.bld_tok) || 0 }));
+  } catch {
+    distinctHours = [];
+  }
+
+  if (distinctHours.length < 3) {
+    try {
+      const rows = db.prepare(`
+        SELECT
+          COALESCE(SUM(est_tokens), 0) AS est_tok,
+          COALESCE(SUM(COALESCE(billed_input_tokens, 0) + COALESCE(billed_output_tokens, 0)), 0) AS bld_tok
+        FROM steps
+        WHERE created_at IS NOT NULL AND created_at != ''
+          AND substr(replace(created_at, ' ', 'T'), 1, 13) <= ?
+        GROUP BY substr(replace(created_at, ' ', 'T'), 1, 13)
+      `).all(nowHour);
+      distinctHours = rows.map(r => ({ est: Number(r.est_tok) || 0, bld: Number(r.bld_tok) || 0 }));
+    } catch {
+      try {
+        const rows = db.prepare(`
+          SELECT
+            COALESCE(SUM(est_tokens), 0) AS est_tok,
+            COALESCE(SUM(COALESCE(billed_input_tokens, 0)), 0) AS bld_tok
+          FROM steps
+          WHERE created_at IS NOT NULL AND created_at != ''
+            AND substr(replace(created_at, ' ', 'T'), 1, 13) <= ?
+          GROUP BY substr(replace(created_at, ' ', 'T'), 1, 13)
+        `).all(nowHour);
+        distinctHours = rows.map(r => ({ est: Number(r.est_tok) || 0, bld: Number(r.bld_tok) || 0 }));
+      } catch {
+        distinctHours = [];
+      }
+    }
+  }
+
+  let peakBilledTpm = DEFAULT_PEAK_BILLED_TPM;
+  let peakContextTpm = DEFAULT_PEAK_CONTEXT_TPM;
+  let peakBilledTph = DEFAULT_PEAK_BILLED_TPH;
+  let peakContextTph = DEFAULT_PEAK_CONTEXT_TPH;
+
+  if (distinctHours.length >= 3) {
+    const bldHourly = distinctHours.map(d => d.bld);
+    const ctxHourly = distinctHours.map(d => d.est);
+    const p95Bld = calcP95(bldHourly);
+    const p95Ctx = calcP95(ctxHourly);
+
+    peakBilledTph = p95Bld > 0 ? Math.round(p95Bld * 100) / 100 : DEFAULT_PEAK_BILLED_TPH;
+    peakBilledTpm = p95Bld > 0 ? Math.round((peakBilledTph / 60.0) * 100) / 100 : DEFAULT_PEAK_BILLED_TPM;
+    peakContextTph = p95Ctx > 0 ? Math.round(p95Ctx * 100) / 100 : DEFAULT_PEAK_CONTEXT_TPH;
+    peakContextTpm = p95Ctx > 0 ? Math.round((peakContextTph / 60.0) * 100) / 100 : DEFAULT_PEAK_CONTEXT_TPM;
+  }
+
+  const arcPct = peakBilledTpm > 0
+    ? Math.round(Math.max(0.0, Math.min(100.0, (rolling5mBilledTpm / peakBilledTpm) * 100.0)) * 100) / 100
+    : 0.0;
+
+  const contextFillPct = peakContextTpm > 0
+    ? Math.round(Math.max(0.0, Math.min(100.0, (rolling5mContextTpm / peakContextTpm) * 100.0)) * 100) / 100
+    : 0.0;
+
+  return {
+    rolling5mContextTpm,
+    rolling5mBilledTpm,
+    rolling60mContextTph,
+    rolling60mBilledTph,
+    activeContextTpm,
+    activeBilledTpm,
+    pairingBilledTph,
+    peakBilledTpm,
+    peakContextTpm,
+    arcPct,
+    contextFillPct
+  };
+}
+
 export function getModelContextLimit(modelName) {
   const lower = (modelName || '').toLowerCase();
   for (const rule of MODEL_LIMIT_RULES) {
@@ -64,7 +408,7 @@ export function formatResetCountdown(resetTimeIso, now = new Date()) {
   }
 }
 
-export function getQuotaSummary(db, modelName = 'Gemini 3.7 Flash', sessionCost = 0, costMap = null) {
+export function getQuotaSummary(db, modelName = 'Gemini 3.7 Flash', sessionCost = 0, costMap = null, now = new Date()) {
   let dbRows = [];
   if (db) {
     try {
@@ -104,7 +448,7 @@ export function getQuotaSummary(db, modelName = 'Gemini 3.7 Flash', sessionCost 
     const remPct = Math.round(remFrac * 1000) / 10;
     const usedPct = Math.round((1 - remFrac) * 1000) / 10;
     const resetTime = r?.reset_time || '';
-    const resetCountdown = formatResetCountdown(resetTime);
+    const resetCountdown = formatResetCountdown(resetTime, now);
     const cap = (r && r.calibrated_capacity && Number(r.calibrated_capacity) > 0)
       ? Number(r.calibrated_capacity)
       : (DEFAULT_CAPACITIES[def.bucket_id] || (def.bucket_id.startsWith('3p') ? 200.0 : 672.0));
@@ -126,6 +470,68 @@ export function getQuotaSummary(db, modelName = 'Gemini 3.7 Flash', sessionCost 
 
     const sessionImpactPct = cap > 0 ? Number(((applicableCost / cap) * 100).toFixed(4)) : 0;
 
+    let bucketTph = 0;
+    if (db && resetTime) {
+      try {
+        const is3p = def.bucket_id.startsWith('3p');
+        const is5h = def.bucket_id.includes('5h');
+        const windowHours = is5h ? 5.0 : 168.0;
+        let str = String(resetTime).trim();
+        if (!str.endsWith('Z') && !/[+-]\d{2}(:?\d{2})?$/.test(str)) {
+          str = str.replace(' ', 'T') + 'Z';
+        }
+        const resetDate = new Date(str);
+        let nowDate = (now instanceof Date) ? now : new Date(now || Date.now());
+        if (isNaN(nowDate.getTime())) {
+          nowDate = new Date();
+        }
+        if (!isNaN(resetDate.getTime())) {
+          const diffSec = Math.max(0, Math.floor((resetDate.getTime() - nowDate.getTime()) / 1000));
+          const remainingHours = diffSec / 3600.0;
+          const elapsedHours = Math.max(0, Math.min(windowHours, windowHours - remainingHours));
+          const startWin = new Date(resetDate.getTime() - windowHours * 3600 * 1000).toISOString().replace(/\.\d{3}Z$/, 'Z').slice(0, 19);
+          const endWin = nowDate.toISOString().replace(/\.\d{3}Z$/, 'Z').slice(0, 19);
+
+          const filterClause = is3p
+            ? `AND (model_name IS NOT NULL AND (LOWER(model_name) LIKE '%claude%' OR LOWER(model_name) LIKE '%sonnet%' OR LOWER(model_name) LIKE '%opus%' OR LOWER(model_name) LIKE '%gpt%' OR LOWER(model_name) LIKE '%o1%' OR LOWER(model_name) LIKE '%o3%'))`
+            : `AND (model_name IS NULL OR NOT (LOWER(model_name) LIKE '%claude%' OR LOWER(model_name) LIKE '%sonnet%' OR LOWER(model_name) LIKE '%opus%' OR LOWER(model_name) LIKE '%gpt%' OR LOWER(model_name) LIKE '%o1%' OR LOWER(model_name) LIKE '%o3%'))`;
+
+          let tokRow = null;
+          try {
+            tokRow = db.prepare(`
+              SELECT COALESCE(SUM(COALESCE(billed_input_tokens, 0) + COALESCE(billed_output_tokens, 0)), 0) as b_tok
+              FROM steps
+              WHERE created_at IS NOT NULL AND created_at != ''
+                AND substr(replace(created_at, ' ', 'T'), 1, 19) >= ?
+                AND substr(replace(created_at, ' ', 'T'), 1, 19) <= ?
+                ${filterClause}
+            `).get(startWin, endWin);
+          } catch {
+            try {
+              tokRow = db.prepare(`
+                SELECT COALESCE(SUM(COALESCE(billed_input_tokens, 0)), 0) as b_tok
+                FROM steps
+                WHERE created_at IS NOT NULL AND created_at != ''
+                  AND substr(replace(created_at, ' ', 'T'), 1, 19) >= ?
+                  AND substr(replace(created_at, ' ', 'T'), 1, 19) <= ?
+                  ${filterClause}
+              `).get(startWin, endWin);
+            } catch {
+              tokRow = null;
+            }
+          }
+
+          const bTok = Number(tokRow?.b_tok) || 0;
+          if (elapsedHours > 0 && bTok > 0) {
+            const effHours = Math.max(elapsedHours, 1.0 / 60.0);
+            bucketTph = Math.round((bTok / effHours) * 100) / 100;
+          }
+        }
+      } catch {
+        // fallback
+      }
+    }
+
     buckets[def.bucket_id] = {
       bucket_id: def.bucket_id,
       group_name: r?.group_name || def.group_name,
@@ -137,6 +543,7 @@ export function getQuotaSummary(db, modelName = 'Gemini 3.7 Flash', sessionCost 
       reset_countdown: resetCountdown,
       calibrated_capacity: cap,
       session_impact_pct: sessionImpactPct,
+      billed_tph: bucketTph,
       fetched_at: r?.fetched_at || ''
     };
   }
@@ -165,9 +572,10 @@ export function getQuotaSummary(db, modelName = 'Gemini 3.7 Flash', sessionCost 
         remaining_pct: remPct,
         used_pct: Math.max(0, usedPct),
         reset_time: resetTime,
-        reset_countdown: formatResetCountdown(resetTime),
+        reset_countdown: formatResetCountdown(resetTime, now),
         calibrated_capacity: cap,
         session_impact_pct: sessionImpactPct,
+        billed_tph: 0,
         fetched_at: r?.fetched_at || ''
       };
     }
@@ -181,14 +589,16 @@ export function getQuotaSummary(db, modelName = 'Gemini 3.7 Flash', sessionCost 
     reset_time: '',
     reset_countdown: '',
     calibrated_capacity: prefix === '3p' ? 200.0 : 672.0,
-    session_impact_pct: 0
+    session_impact_pct: 0,
+    billed_tph: 0
   };
   const active5h = buckets[fiveHKey] || {
     remaining_pct: 100.0,
     reset_time: '',
     reset_countdown: '',
     calibrated_capacity: prefix === '3p' ? 70.0 : 236.7,
-    session_impact_pct: 0
+    session_impact_pct: 0,
+    billed_tph: 0
   };
 
   return {
@@ -206,6 +616,8 @@ export function getQuotaSummary(db, modelName = 'Gemini 3.7 Flash', sessionCost 
     calibrated_5h_capacity: active5h.calibrated_capacity,
     session_weekly_pct: activeWeekly.session_impact_pct,
     session_5h_pct: active5h.session_impact_pct,
+    weekly_billed_tph: activeWeekly.billed_tph || 0,
+    five_hour_billed_tph: active5h.billed_tph || 0,
   };
 }
 
@@ -235,9 +647,22 @@ export function getDatabase(customPath) {
   return cachedDb;
 }
 
-export function createDefaultSession(cid = null, title = 'No conversation records', modelName = 'Gemini 3.7 Flash', db = null) {
+export function createDefaultSession(cid = null, title = 'No conversation records', modelName = 'Gemini 3.7 Flash', db = null, now = new Date()) {
   const maxTokens = getModelContextLimit(modelName);
-  const quotaSummary = getQuotaSummary(db, modelName, 0);
+  const quotaSummary = getQuotaSummary(db, modelName, 0, null, now);
+  const defaultVelocity = {
+    rolling5mContextTpm: 0.0,
+    rolling5mBilledTpm: 0.0,
+    rolling60mContextTph: 0.0,
+    rolling60mBilledTph: 0.0,
+    activeContextTpm: 0.0,
+    activeBilledTpm: 0.0,
+    pairingBilledTph: 0.0,
+    peakBilledTpm: DEFAULT_PEAK_BILLED_TPM,
+    peakContextTpm: DEFAULT_PEAK_CONTEXT_TPM,
+    arcPct: 0.0,
+    contextFillPct: 0.0
+  };
   const defaultFleet = {
     is_swarm: false,
     root_id: cid || null,
@@ -255,6 +680,7 @@ export function createDefaultSession(cid = null, title = 'No conversation record
     five_hour_quota_pct: 0,
     shielded_tokens: 0,
     shielding_ratio: 1.0,
+    velocity: null,
     nodes: []
   };
 
@@ -282,6 +708,7 @@ export function createDefaultSession(cid = null, title = 'No conversation record
     quota_remaining_5h_pct: quotaSummary.five_hour_remaining_pct,
     quota_reset_time: quotaSummary.weekly_reset_time,
     quota: quotaSummary,
+    velocity: defaultVelocity,
     fleet: defaultFleet
   };
 }
@@ -304,9 +731,9 @@ function resolveConversationRoot(db, conv) {
   }
 }
 
-export function getSessionData(db, cid, inspectCid = null) {
+export function getSessionData(db, cid, inspectCid = null, now = new Date()) {
   if (!db) {
-    return createDefaultSession(inspectCid || cid || null, 'No analytics database', 'Unknown', null);
+    return createDefaultSession(inspectCid || cid || null, 'No analytics database', 'Unknown', null, now);
   }
 
   let activeCid = cid || null;
@@ -325,7 +752,7 @@ export function getSessionData(db, cid, inspectCid = null) {
       // If a specific conversation was requested but is not found yet in SQLite,
       // do NOT fall back to another conversation (prevents cross-session data leakage).
       if (!activeConv) {
-        return createDefaultSession(activeCid, 'Active Session (indexing...)', 'Gemini 3.7 Flash', db);
+        return createDefaultSession(activeCid, 'Active Session (indexing...)', 'Gemini 3.7 Flash', db, now);
       }
     }
 
@@ -349,7 +776,7 @@ export function getSessionData(db, cid, inspectCid = null) {
       `).get();
 
       if (!targetConv) {
-        return createDefaultSession(null, 'No conversation records', 'Gemini 3.7 Flash', db);
+        return createDefaultSession(null, 'No conversation records', 'Gemini 3.7 Flash', db, now);
       }
       targetCid = targetConv.id;
       activeCid = targetConv.id;
@@ -361,7 +788,7 @@ export function getSessionData(db, cid, inspectCid = null) {
         targetConv = activeConv;
         targetCid = activeCid;
       } else {
-        return createDefaultSession(targetCid || activeCid, 'Active Session (indexing...)', 'Gemini 3.7 Flash', db);
+        return createDefaultSession(targetCid || activeCid, 'Active Session (indexing...)', 'Gemini 3.7 Flash', db, now);
       }
     }
 
@@ -376,7 +803,7 @@ export function getSessionData(db, cid, inspectCid = null) {
     }
   } catch {
     // conversations table might not exist yet
-    return createDefaultSession(targetCid || activeCid, 'No analytics database', 'Gemini 3.7 Flash', db);
+    return createDefaultSession(targetCid || activeCid, 'No analytics database', 'Gemini 3.7 Flash', db, now);
   }
 
   const resolvedCid = targetConv.id;
@@ -439,7 +866,7 @@ export function getSessionData(db, cid, inspectCid = null) {
   const maxTokens = getModelContextLimit(modelName);
   const pct = maxTokens ? (activeTokens / maxTokens) * 100 : 0;
 
-  const quotaSummary = getQuotaSummary(db, modelName, billedCost);
+  const quotaSummary = getQuotaSummary(db, modelName, billedCost, null, now);
   const cap = quotaSummary.calibrated_weekly_capacity || DEFAULT_CAPACITIES['gemini-weekly'];
 
   // Swarm fleet rollups and topology
@@ -662,11 +1089,17 @@ export function getSessionData(db, cid, inspectCid = null) {
     quota_remaining_5h_pct: quotaSummary.five_hour_remaining_pct,
     quota_reset_time: quotaSummary.weekly_reset_time,
     quota: quotaSummary,
-    fleet
+    velocity: queryVelocityMetrics(db, { conversationId: resolvedCid, now }),
+    fleet: {
+      ...fleet,
+      velocity: fleet.is_swarm ? queryVelocityMetrics(db, { rootId: effectiveRoot, now }) : null
+    }
   };
 }
 
-export function getGlobalData(db) {
+export const loadSessionById = getSessionData;
+
+export function getGlobalData(db, now = new Date()) {
   if (!db) {
     const quotaSummary = getQuotaSummary(null, 'Gemini 3.7 Flash', 0);
     return {
@@ -679,6 +1112,11 @@ export function getGlobalData(db) {
       total_compactions: 0,
       total_pruned_tokens: 0,
       weekly_quota_pct: 0,
+      activeContextTpm: 0.0,
+      activeBilledTpm: 0.0,
+      pairingBilledTph: 0.0,
+      rolling60mBilledTph: 0.0,
+      velocity: null,
       quota: quotaSummary
     };
   }
@@ -838,7 +1276,21 @@ export function getGlobalData(db) {
 
   const weeklyCost = costGemini + cost3p;
   const costMap = { gemini: costGemini, '3p': cost3p };
-  const quotaSummary = getQuotaSummary(db, 'Gemini 3.7 Flash', weeklyCost, costMap);
+  const quotaSummary = getQuotaSummary(db, 'Gemini 3.7 Flash', weeklyCost, costMap, now);
+
+  let globalVelocity = null;
+  if (db) {
+    try {
+      globalVelocity = queryVelocityMetrics(db, { now });
+    } catch {
+      globalVelocity = null;
+    }
+  }
+
+  const activeContextTpm = globalVelocity?.activeContextTpm ?? 0.0;
+  const activeBilledTpm = globalVelocity?.activeBilledTpm ?? 0.0;
+  const pairingBilledTph = globalVelocity?.pairingBilledTph ?? 0.0;
+  const rolling60mBilledTph = globalVelocity?.rolling60mBilledTph ?? 0.0;
 
   return {
     total_conversations: totalConversations,
@@ -850,7 +1302,14 @@ export function getGlobalData(db) {
     total_compactions: totalCompactions,
     total_pruned_tokens: totalPrunedTokens,
     weekly_quota_pct: quotaSummary.session_weekly_pct,
+    activeContextTpm,
+    activeBilledTpm,
+    pairingBilledTph,
+    rolling60mBilledTph,
+    velocity: globalVelocity,
     quota: quotaSummary
   };
 }
+
+export const queryGlobal = getGlobalData;
 
