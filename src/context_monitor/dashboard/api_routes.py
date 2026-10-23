@@ -1452,7 +1452,14 @@ def query_hot_files_data(conn, project=None):
 
 def query_activity_matrix(conn, tz=None, project=None):
     try:
-        ensure_rollups_synced(conn)
+        has_steps = (
+            conn.execute(
+                "SELECT 1 FROM steps WHERE created_at IS NOT NULL AND created_at != '' LIMIT 1"
+            ).fetchone()
+            is not None
+        )
+        if has_steps:
+            ensure_rollups_synced(conn)
     except Exception:
         pass
 
@@ -1499,6 +1506,8 @@ def query_activity_matrix(conn, tz=None, project=None):
 
     daily_map = {}
     hourly_aggregate = [[0 for _ in range(24)] for _ in range(7)]
+    hourly_aggregate_30d = [[0 for _ in range(24)] for _ in range(7)]
+    weekday_dates = [set() for _ in range(7)]
     past_30_days_hourly = {}
 
     today = datetime.now(target_tz).date()
@@ -1517,7 +1526,7 @@ def query_activity_matrix(conn, tz=None, project=None):
     for r in rows:
         hour_key = r["hour_key"]
         cid = r["conversation_id"]
-        step_cnt = r["step_count"]
+        step_cnt = r["step_count"] or 0
         tokens = r["tokens"] or 0
 
         cached = hour_cache.get(hour_key)
@@ -1528,9 +1537,12 @@ def query_activity_matrix(conn, tz=None, project=None):
         d_str, weekday, hour = cached
 
         hourly_aggregate[weekday][hour] += step_cnt
+        if step_cnt > 0:
+            weekday_dates[weekday].add(d_str)
 
         if d_str in past_30_days_hourly:
             past_30_days_hourly[d_str][hour] += step_cnt
+            hourly_aggregate_30d[weekday][hour] += step_cnt
         if d_str in past_7_days_hourly:
             past_7_days_hourly[d_str][hour] += step_cnt
 
@@ -1544,6 +1556,15 @@ def query_activity_matrix(conn, tz=None, project=None):
 
     for d_str, s_set in day_sessions.items():
         daily_map[d_str]["sessions"] = len(s_set)
+
+    weekday_active_counts = [len(s) for s in weekday_dates]
+    hourly_aggregate_avg = [
+        [
+            round(hourly_aggregate[w][h] / max(1, weekday_active_counts[w]), 1)
+            for h in range(24)
+        ]
+        for w in range(7)
+    ]
 
     active_days = set(daily_map.keys())
     cur_streak = 0
@@ -1571,6 +1592,9 @@ def query_activity_matrix(conn, tz=None, project=None):
     return {
         "daily": daily_map,
         "hourly_aggregate": hourly_aggregate,
+        "hourly_aggregate_30d": hourly_aggregate_30d,
+        "hourly_aggregate_avg": hourly_aggregate_avg,
+        "weekday_active_counts": weekday_active_counts,
         "past_7_days_hourly": past_7_days_hourly,
         "past_30_days_hourly": past_30_days_hourly,
         "timezone": str(tz_info),

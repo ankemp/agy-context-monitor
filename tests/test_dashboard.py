@@ -20,7 +20,18 @@ from zoneinfo import ZoneInfo
 
 import pytest
 from context_monitor.dashboard import api_routes, server
+from context_monitor.dashboard.api_routes import query_activity_matrix
 from context_monitor.db import get_db_connection, init_db, upsert_quota_state
+
+get_connection = get_db_connection
+
+
+@pytest.fixture
+def temp_db(tmp_path: Path):
+    """Creates a fresh temporary SQLite test database initialized with full schema."""
+    db_file = tmp_path / "temp_dashboard.db"
+    init_db(db_file)
+    return db_file
 
 
 @pytest.fixture
@@ -3099,6 +3110,184 @@ def test_query_timeline_data_cycle_edge_cases(tmp_path: Path):
         assert len(tl_3p) >= 8
         assert tl_3p[0]["is_start"] is True
         assert tl_3p[-1]["is_reset"] is True
+
+
+def test_query_activity_matrix_granular_normalizations(temp_db):
+    conn = get_connection(temp_db)
+    now_utc = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+    recent_hk = now_utc.strftime("%Y-%m-%dT%H")
+    older_dt = now_utc - timedelta(days=7)
+    older_hk = older_dt.strftime("%Y-%m-%dT%H")
+    ancient_dt = now_utc - timedelta(days=49)
+    ancient_hk = ancient_dt.strftime("%Y-%m-%dT%H")
+
+    conn.execute("INSERT INTO conversations (id, project) VALUES ('c1', 'proj-a')")
+    conn.execute(
+        """
+        INSERT INTO hourly_step_rollups (hour_key, conversation_id, step_count, est_tokens, billed_tokens, billed_cost)
+        VALUES (?, 'c1', 300, 1500, 0, 0.0),
+               (?, 'c1', 600, 3000, 0, 0.0),
+               (?, 'c1', 900, 4500, 0, 0.0)
+        """,
+        (recent_hk, older_hk, ancient_hk),
+    )
+    conn.commit()
+
+    matrix = query_activity_matrix(conn, tz="UTC")
+    wd = now_utc.weekday()
+    hr = now_utc.hour
+
+    assert "hourly_aggregate_30d" in matrix
+    assert "hourly_aggregate_avg" in matrix
+    assert "weekday_active_counts" in matrix
+    assert len(matrix["hourly_aggregate_30d"]) == 7
+    assert len(matrix["hourly_aggregate_avg"]) == 7
+    assert len(matrix["weekday_active_counts"]) == 7
+
+    # Strict type verification across all dimensions
+    assert all(len(row) == 24 for row in matrix["hourly_aggregate_30d"])
+    assert all(len(row) == 24 for row in matrix["hourly_aggregate_avg"])
+    assert all(isinstance(x, int) for row in matrix["hourly_aggregate_30d"] for x in row)
+    assert all(isinstance(x, float) for row in matrix["hourly_aggregate_avg"] for x in row)
+    assert all(isinstance(x, int) for x in matrix["weekday_active_counts"])
+
+    # All-time total includes all 3 Mondays/weekdays (300 + 600 + 900 = 1800)
+    assert matrix["hourly_aggregate"][wd][hr] == 1800
+    # 30-day rolling window includes only recent + 7d-ago (300 + 600 = 900)
+    assert matrix["hourly_aggregate_30d"][wd][hr] == 900
+    # 3 distinct active dates on that weekday -> avg = 1800 / 3 = 600.0
+    assert matrix["weekday_active_counts"][wd] == 3
+    assert matrix["hourly_aggregate_avg"][wd][hr] == 600.0
+
+    # Inactive hours on that weekday must be float 0.0
+    inactive_hr = (hr + 1) % 24
+    assert matrix["hourly_aggregate_avg"][wd][inactive_hr] == 0.0
+    assert isinstance(matrix["hourly_aggregate_avg"][wd][inactive_hr], float)
+
+    # Invariant: 30-day hourly aggregate sum matches sum of past_30_days_hourly cells
+    sum_30d_agg = sum(sum(row) for row in matrix["hourly_aggregate_30d"])
+    sum_30d_daily = sum(sum(hours) for hours in matrix["past_30_days_hourly"].values())
+    assert sum_30d_agg == sum_30d_daily == 900
+
+    # Invariant: All-time hourly aggregate sum matches sum of daily steps
+    sum_all_agg = sum(sum(row) for row in matrix["hourly_aggregate"])
+    sum_all_daily = sum(d["steps"] for d in matrix["daily"].values())
+    assert sum_all_agg == sum_all_daily == 1800
+
+    conn.close()
+
+
+def test_query_activity_matrix_granular_normalizations_edge_cases(temp_db):
+    conn = get_connection(temp_db)
+
+    # 1. Empty database verification: strict types and zeros
+    matrix_empty = query_activity_matrix(conn, tz="UTC")
+    assert "hourly_aggregate_30d" in matrix_empty
+    assert "hourly_aggregate_avg" in matrix_empty
+    assert "weekday_active_counts" in matrix_empty
+    assert matrix_empty["weekday_active_counts"] == [0] * 7
+    assert matrix_empty["hourly_aggregate_30d"] == [[0] * 24 for _ in range(7)]
+    assert matrix_empty["hourly_aggregate_avg"] == [[0.0] * 24 for _ in range(7)]
+    assert all(isinstance(x, float) for row in matrix_empty["hourly_aggregate_avg"] for x in row)
+    assert all(isinstance(x, int) for row in matrix_empty["hourly_aggregate_30d"] for x in row)
+
+    # 2. Multiple conversations & hours on the same calendar day count as 1 active date
+    now_utc = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+    hk1 = now_utc.strftime("%Y-%m-%dT%H")
+    hr1 = now_utc.hour
+    prev_hour_dt = now_utc - timedelta(hours=2)
+    hk2 = prev_hour_dt.strftime("%Y-%m-%dT%H")
+    hr2 = prev_hour_dt.hour
+    wd = now_utc.weekday()
+
+    conn.execute("INSERT INTO conversations (id, project) VALUES ('c1', 'proj-alpha'), ('c2', 'proj-beta'), ('c3', NULL)")
+    conn.execute(
+        """
+        INSERT INTO hourly_step_rollups (hour_key, conversation_id, step_count, est_tokens, billed_tokens, billed_cost)
+        VALUES (?, 'c1', 100, 500, 0, 0.0),
+               (?, 'c2', 200, 1000, 0, 0.0),
+               (?, 'c1', 50, 250, 0, 0.0),
+               (?, 'c3', 75, 300, 0, 0.0)
+        """,
+        (hk1, hk1, hk2, hk1),
+    )
+    conn.commit()
+
+    matrix = query_activity_matrix(conn, tz="UTC")
+    # Same calendar day -> weekday active count should be 1
+    assert matrix["weekday_active_counts"][wd] == 1
+    assert matrix["hourly_aggregate"][wd][hr1] == 375
+    assert matrix["hourly_aggregate_30d"][wd][hr1] == 375
+    assert matrix["hourly_aggregate_avg"][wd][hr1] == 375.0
+    assert matrix["hourly_aggregate"][wd][hr2] == 50
+    assert matrix["hourly_aggregate_30d"][wd][hr2] == 50
+    assert matrix["hourly_aggregate_avg"][wd][hr2] == 50.0
+
+    # 3. Project filtering (including unassigned)
+    matrix_alpha = query_activity_matrix(conn, tz="UTC", project="proj-alpha")
+    assert matrix_alpha["weekday_active_counts"][wd] == 1
+    assert matrix_alpha["hourly_aggregate"][wd][hr1] == 100
+    assert matrix_alpha["hourly_aggregate_30d"][wd][hr1] == 100
+    assert matrix_alpha["hourly_aggregate_avg"][wd][hr1] == 100.0
+
+    matrix_beta = query_activity_matrix(conn, tz="UTC", project="proj-beta")
+    assert matrix_beta["weekday_active_counts"][wd] == 1
+    assert matrix_beta["hourly_aggregate"][wd][hr1] == 200
+    assert matrix_beta["hourly_aggregate_30d"][wd][hr1] == 200
+    assert matrix_beta["hourly_aggregate_avg"][wd][hr1] == 200.0
+
+    matrix_unassigned = query_activity_matrix(conn, tz="UTC", project="(unassigned)")
+    assert matrix_unassigned["weekday_active_counts"][wd] == 1
+    assert matrix_unassigned["hourly_aggregate"][wd][hr1] == 75
+    assert matrix_unassigned["hourly_aggregate_30d"][wd][hr1] == 75
+    assert matrix_unassigned["hourly_aggregate_avg"][wd][hr1] == 75.0
+
+    # 4. Null / zero step_count resilience
+    conn.execute(
+        """
+        INSERT INTO hourly_step_rollups (hour_key, conversation_id, step_count, est_tokens, billed_tokens, billed_cost)
+        VALUES ('2020-01-01T12', 'c1', NULL, 0, 0, 0.0),
+               ('2020-01-02T12', 'c1', 0, 0, 0, 0.0)
+        """
+    )
+    conn.commit()
+    matrix_null_resilient = query_activity_matrix(conn, tz="UTC")
+    assert isinstance(matrix_null_resilient["hourly_aggregate_avg"][0][0], float)
+
+    # 5. Non-UTC timezone conversion verification
+    # A step at 02:00 UTC on Wednesday is 21:00 on Tuesday in America/New_York (UTC-5 in winter, UTC-4 in daylight savings)
+    tz_ny = ZoneInfo("America/New_York")
+    dt_utc = datetime(2026, 4, 15, 2, 0, 0, tzinfo=timezone.utc)  # Wednesday 02:00 UTC -> Tuesday 22:00 EDT
+    hk_ny = dt_utc.strftime("%Y-%m-%dT%H")
+    conn.execute(
+        """
+        INSERT INTO hourly_step_rollups (hour_key, conversation_id, step_count, est_tokens, billed_tokens, billed_cost)
+        VALUES (?, 'c1', 88, 440, 0, 0.0)
+        """,
+        (hk_ny,),
+    )
+    conn.commit()
+
+    matrix_ny = query_activity_matrix(conn, tz="America/New_York")
+    dt_local = dt_utc.astimezone(tz_ny)
+    local_wd = dt_local.weekday()
+    local_hr = dt_local.hour
+    assert matrix_ny["hourly_aggregate"][local_wd][local_hr] >= 88
+    assert matrix_ny["weekday_active_counts"][local_wd] >= 1
+
+    # 6. Legacy fallback to steps table when hourly_step_rollups is dropped
+    conn.execute("INSERT INTO steps (conversation_id, step_index, created_at, est_tokens) VALUES ('c1', 1, '2026-10-23T14:15:00', 500)")
+    conn.execute("DROP TABLE hourly_step_rollups")
+    conn.commit()
+
+    matrix_fallback = query_activity_matrix(conn, tz="UTC")
+    assert "hourly_aggregate_30d" in matrix_fallback
+    assert "hourly_aggregate_avg" in matrix_fallback
+    assert "weekday_active_counts" in matrix_fallback
+    assert all(isinstance(x, float) for row in matrix_fallback["hourly_aggregate_avg"] for x in row)
+    assert all(isinstance(x, int) for row in matrix_fallback["hourly_aggregate_30d"] for x in row)
+
+    conn.close()
 
 
 def test_frontend_debouncing_and_abort_controller():
