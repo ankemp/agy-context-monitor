@@ -23,7 +23,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from context_monitor.db import get_quota_state, upsert_quota_state
+from context_monitor.db import get_db_connection, get_quota_state, upsert_quota_state
 from context_monitor.pricing import get_pricing_key
 from context_monitor.settings import (
     get_3p_5h_capacity,
@@ -870,6 +870,13 @@ def calculate_quota_pacing(
     calibrated_capacity: float = 672.0,
     now: datetime | None = None,
     activity_profile: dict[str, Any] | list[list[float]] | None = None,
+    *,
+    conn: sqlite3.Connection | None = None,
+    db_path: Path | str | None = None,
+    billed_tokens: int | None = None,
+    est_tokens: int | None = None,
+    bucket_id: str | None = None,
+    **kwargs: Any,
 ) -> dict[str, Any]:
     """
     Calculates quota pacing, burn rate, and projected end-of-window consumption.
@@ -1024,6 +1031,96 @@ def calculate_quota_pacing(
 
     projected_cost = round((projected_pct / 100.0) * cap, 2)
 
+    eff_billed = 0
+    eff_est = 0
+    if billed_tokens is not None or est_tokens is not None:
+        try:
+            b_f = float(billed_tokens or 0)
+            eff_billed = 0 if math.isnan(b_f) or math.isinf(b_f) or b_f <= 0 else max(0, int(b_f))
+        except (ValueError, TypeError, OverflowError):
+            eff_billed = 0
+        try:
+            e_f = float(est_tokens or 0)
+            eff_est = 0 if math.isnan(e_f) or math.isinf(e_f) or e_f <= 0 else max(0, int(e_f))
+        except (ValueError, TypeError, OverflowError):
+            eff_est = 0
+    elif conn is not None or db_path is not None:
+        def _query_tokens(db_conn: sqlite3.Connection) -> tuple[int, int]:
+            if reset_dt is not None:
+                start_win = reset_dt - timedelta(hours=eff_window)
+            else:
+                start_win = now_dt - timedelta(hours=elapsed_hours if elapsed_hours > 0 else eff_window)
+            start_iso = start_win.strftime("%Y-%m-%dT%H:%M:%S")
+            end_iso = now_dt.strftime("%Y-%m-%dT%H:%M:%S")
+            b_tok = 0
+            e_tok = 0
+            is_3p_bucket = bucket_id is not None and any(k in bucket_id for k in ("3p", "claude", "gpt"))
+            try:
+                cur = db_conn.execute(
+                    """
+                    SELECT model_name,
+                           COALESCE(est_tokens, 0),
+                           COALESCE(billed_input_tokens, 0) + COALESCE(billed_output_tokens, 0)
+                    FROM steps
+                    WHERE created_at IS NOT NULL AND created_at != ''
+                      AND substr(replace(created_at, ' ', 'T'), 1, 19) >= ?
+                      AND substr(replace(created_at, ' ', 'T'), 1, 19) <= ?
+                    """,
+                    (start_iso, end_iso),
+                )
+                for row in cur.fetchall():
+                    m = row[0] or ""
+                    pkey = get_pricing_key(m)
+                    s_is_3p = pkey in ("claude", "gpt")
+                    if bucket_id is not None:
+                        if is_3p_bucket and not s_is_3p:
+                            continue
+                        if not is_3p_bucket and s_is_3p:
+                            continue
+                    e_tok += int(row[1] or 0)
+                    b_tok += int(row[2] or 0)
+            except Exception:
+                pass
+            if b_tok == 0 and e_tok == 0 and bucket_id is None:
+                try:
+                    start_h = start_win.strftime("%Y-%m-%dT%H")
+                    end_h = now_dt.strftime("%Y-%m-%dT%H")
+                    cur = db_conn.execute(
+                        """
+                        SELECT SUM(est_tokens), SUM(billed_tokens)
+                        FROM hourly_step_rollups
+                        WHERE hour_key >= ? AND hour_key <= ?
+                        """,
+                        (start_h, end_h),
+                    )
+                    r = cur.fetchone()
+                    if r and r[1] is not None:
+                        e_tok = int(r[0] or 0)
+                        b_tok = int(r[1] or 0)
+                except Exception:
+                    pass
+            return b_tok, e_tok
+
+        if conn is not None:
+            eff_billed, eff_est = _query_tokens(conn)
+        elif db_path is not None:
+            try:
+                with get_db_connection(db_path) as local_conn:
+                    eff_billed, eff_est = _query_tokens(local_conn)
+            except Exception:
+                pass
+
+    if elapsed_hours > 0 and (eff_billed > 0 or eff_est > 0):
+        # Denominator clamped to minimum 60s (1 min = 1/60 hr) to guard against sub-minute rate spikes
+        eff_hours = max(elapsed_hours, 1.0 / 60.0)
+        billed_tph = round(eff_billed / eff_hours, 2)
+        est_tph = round(eff_est / eff_hours, 2)
+        billed_tpm = round(billed_tph / 60.0, 2)
+    else:
+        billed_tph = 0.0
+        est_tph = 0.0
+        billed_tpm = 0.0
+
     return {
         "used_pct": used_pct,
         "projected_pct": projected_pct,
@@ -1038,6 +1135,9 @@ def calculate_quota_pacing(
         "elapsed_activity_pct": elapsed_activity_pct,
         "linear_projected_pct": linear_projected_pct,
         "weighting_mode": weighting_mode,
+        "billed_tph": billed_tph,
+        "est_tph": est_tph,
+        "billed_tpm": billed_tpm,
     }
 
 
@@ -1148,6 +1248,11 @@ def calculate_quota_metrics(
             calibrated_capacity=cap,
             now=eff_now,
             activity_profile=eff_activity_profile,
+            conn=kwargs.get("conn"),
+            db_path=kwargs.get("db_path"),
+            billed_tokens=kwargs.get("billed_tokens"),
+            est_tokens=kwargs.get("est_tokens"),
+            bucket_id=bid,
         )
 
         bucket_metrics[bid] = {
@@ -1158,6 +1263,9 @@ def calculate_quota_metrics(
             "calibrated_capacity": cap,
             "reset_countdown": format_reset_countdown(r_time, now=eff_now),
             "pacing": pacing,
+            "billed_tph": pacing.get("billed_tph", 0.0),
+            "est_tph": pacing.get("est_tph", 0.0),
+            "billed_tpm": pacing.get("billed_tpm", 0.0),
         }
 
     pkey = get_pricing_key(eff_model)
@@ -1205,6 +1313,12 @@ def calculate_quota_metrics(
         "projected_weekly_cost": weekly_pacing["projected_cost"],
         "pacing_status": weekly_pacing["status"],
         "projected_5h_pct": five_h_pacing["projected_pct"],
+        "weekly_billed_tph": weekly_pacing.get("billed_tph", 0.0),
+        "weekly_billed_tpm": weekly_pacing.get("billed_tpm", 0.0),
+        "weekly_est_tph": weekly_pacing.get("est_tph", 0.0),
+        "five_hour_billed_tph": five_h_pacing.get("billed_tph", 0.0),
+        "five_hour_billed_tpm": five_h_pacing.get("billed_tpm", 0.0),
+        "five_hour_est_tph": five_h_pacing.get("est_tph", 0.0),
     }
     return result
 

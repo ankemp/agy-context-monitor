@@ -852,6 +852,12 @@ def test_calculate_quota_pacing_nominal():
     assert abs(res["projected_cost"] - 483.0) < 1.0
     assert res["hours_until_exhaustion"] is None
     assert res["days_until_exhaustion"] is None
+    assert "billed_tph" in res
+    assert "est_tph" in res
+    assert "billed_tpm" in res
+    assert isinstance(res["billed_tph"], float)
+    assert isinstance(res["est_tph"], float)
+    assert isinstance(res["billed_tpm"], float)
 
 
 def test_calculate_quota_pacing_early_cycle_guard():
@@ -2183,3 +2189,146 @@ def test_calculate_quota_pacing_fully_exhausted_activity_weighted():
     assert res["status"] == "exceeding"
     assert res["hours_until_exhaustion"] == 0.0
     assert res["days_until_exhaustion"] == 0.0
+
+
+def test_calculate_quota_pacing_velocity_telemetry(tmp_path: Path):
+    """Verifies that calculate_quota_pacing computes window-scoped billed_tph, est_tph, and billed_tpm."""
+    now = datetime(2026, 10, 14, 12, 0, 0, tzinfo=timezone.utc)
+    reset_iso = "2026-10-20T16:00:00Z"  # 148h ahead -> 20h elapsed in 168h window
+
+    # Test explicit token counts passed directly
+    res_direct = calculate_quota_pacing(
+        0.885,
+        reset_iso,
+        window_hours=168.0,
+        calibrated_capacity=500.0,
+        now=now,
+        billed_tokens=200_000,
+        est_tokens=20_000,
+    )
+    assert res_direct["billed_tph"] == 10_000.0  # 200,000 / 20.0 hrs
+    assert res_direct["est_tph"] == 1_000.0  # 20,000 / 20.0 hrs
+    assert res_direct["billed_tpm"] == round(10_000.0 / 60.0, 2)  # 166.67
+
+    # Test database-backed token query
+    db_file = tmp_path / "test_pacing_vel.db"
+    init_db(db_file)
+    with get_db_connection(db_file) as conn:
+        conn.execute("INSERT INTO conversations (id, title) VALUES ('c1', 'Test Conv')")
+        # Step within elapsed window (now is 2026-10-14 12:00, cycle started 2026-10-13 16:00)
+        conn.execute(
+            """
+            INSERT INTO steps (conversation_id, step_index, created_at, est_tokens, billed_input_tokens, billed_output_tokens, model_name)
+            VALUES ('c1', 1, '2026-10-14T10:00:00Z', 50_000, 300_000, 100_000, 'Gemini 3.8 Flash')
+            """
+        )
+        conn.commit()
+
+        res_db = calculate_quota_pacing(
+            0.885,
+            reset_iso,
+            window_hours=168.0,
+            calibrated_capacity=500.0,
+            now=now,
+            conn=conn,
+        )
+        assert res_db["billed_tph"] == 20_000.0  # 400,000 / 20.0 hrs
+        assert res_db["est_tph"] == 2_500.0  # 50,000 / 20.0 hrs
+        assert res_db["billed_tpm"] == round(20_000.0 / 60.0, 2)
+
+        # Test calculate_quota_metrics forwards conn to calculate_quota_pacing
+        mock_state = [
+            {
+                "bucket_id": "gemini-weekly",
+                "remaining_fraction": 0.885,
+                "reset_time": reset_iso,
+                "calibrated_capacity": 500.0,
+            }
+        ]
+        qm = calculate_quota_metrics(
+            billed_cost=1.5,
+            model_name="Gemini 3.8 Flash",
+            quota_state=mock_state,
+            now=now,
+            conn=conn,
+        )
+        assert "billed_tph" in qm["gemini-weekly"]["pacing"]
+        assert qm["gemini-weekly"]["pacing"]["billed_tph"] == 20_000.0
+
+        # Test forwarding billed_tokens and est_tokens directly through calculate_quota_metrics
+        qm_direct = calculate_quota_metrics(
+            billed_cost=1.5,
+            model_name="Gemini 3.8 Flash",
+            quota_state=mock_state,
+            now=now,
+            billed_tokens=400_000,
+            est_tokens=50_000,
+        )
+        assert qm_direct["weekly_billed_tph"] == 20_000.0
+        assert qm_direct["gemini-weekly"]["pacing"]["billed_tph"] == 20_000.0
+
+
+def test_calculate_quota_pacing_sub_minute_clamp_and_non_finite_inputs():
+    """Verifies that sub-minute elapsed time clamps denominator to 60s and non-finite inputs are cleaned."""
+    now = datetime(2026, 10, 14, 12, 0, 5, tzinfo=timezone.utc)
+    reset_iso = "2026-10-21T12:00:00Z"  # 168h window, 5s elapsed
+
+    # 5 seconds elapsed with 100k tokens: clamped to 1/60 hr denominator
+    res = calculate_quota_pacing(
+        0.999,
+        reset_iso,
+        window_hours=168.0,
+        now=now,
+        billed_tokens=100_000,
+        est_tokens=10_000,
+    )
+    # Expected with 1/60 hr denominator:
+    # billed_tph: 100_000 * 60 = 6_000_000.0 (not 72,000,000.0 from 5s)
+    # billed_tpm: 6_000_000.0 / 60 = 100_000.0
+    assert res["billed_tph"] == 6_000_000.0
+    assert res["billed_tpm"] == 100_000.0
+    assert res["est_tph"] == 600_000.0
+
+    # Non-finite tokens (NaN / Inf)
+    res_nan = calculate_quota_pacing(
+        0.90,
+        "2026-10-20T16:00:00Z",
+        now=datetime(2026, 10, 14, 12, 0, 0, tzinfo=timezone.utc),
+        billed_tokens=float("nan"),  # type: ignore
+        est_tokens=float("inf"),  # type: ignore
+    )
+    assert res_nan["billed_tph"] == 0.0
+    assert res_nan["est_tph"] == 0.0
+    assert res_nan["billed_tpm"] == 0.0
+
+
+def test_calculate_quota_pacing_boundary_z_timestamp_inclusion(tmp_path: Path):
+    """Verifies that steps at the exact boundary of now with 'Z' suffix are correctly included."""
+    db_file = tmp_path / "test_boundary_z.db"
+    init_db(db_file)
+
+    now = datetime(2026, 10, 14, 12, 0, 0, tzinfo=timezone.utc)
+    reset_iso = "2026-10-20T16:00:00Z"  # 20h elapsed
+
+    with get_db_connection(db_file) as conn:
+        conn.execute("INSERT INTO conversations (id, title) VALUES ('c1', 'Test Conv')")
+        # Step at exact now timestamp with 'Z'
+        conn.execute(
+            """
+            INSERT INTO steps (conversation_id, step_index, created_at, est_tokens, billed_input_tokens, billed_output_tokens, model_name)
+            VALUES ('c1', 1, '2026-10-14T12:00:00Z', 10_000, 80_000, 20_000, 'Gemini 3.8 Flash')
+            """
+        )
+        conn.commit()
+
+        res = calculate_quota_pacing(
+            0.885,
+            reset_iso,
+            window_hours=168.0,
+            now=now,
+            conn=conn,
+        )
+
+    # 100,000 billed tokens / 20.0 hrs = 5,000.0
+    assert res["billed_tph"] == 5_000.0
+    assert res["est_tph"] == 500.0
