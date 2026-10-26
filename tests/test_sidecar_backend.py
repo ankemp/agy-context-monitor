@@ -1352,3 +1352,443 @@ def test_sidecar_global_data_schema_without_parent_id(tmp_path):
     assert data["subagent_conversations"] == 0
 
 
+def test_sidecar_conversation_fingerprint_isolation(tmp_path):
+    """Verifies getConversationFingerprint changes only when target conversation, its swarm fleet, inspect target, or quota changes."""
+    db_path = tmp_path / "test_fp.db"
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    cur.executescript("""
+    CREATE TABLE conversations (
+        id TEXT PRIMARY KEY, title TEXT, model_name TEXT,
+        updated_at TEXT, total_steps INTEGER DEFAULT 0,
+        total_tokens INTEGER DEFAULT 0, billed_cost REAL DEFAULT 0.0,
+        parent_id TEXT, root_id TEXT, compaction_count INTEGER DEFAULT 0
+    );
+    CREATE TABLE quota_state (
+        bucket_id TEXT PRIMARY KEY, group_name TEXT, window TEXT,
+        remaining_fraction REAL, reset_time TEXT, calibrated_capacity REAL, fetched_at TEXT
+    );
+    INSERT INTO conversations VALUES
+        ('conv-a', 'Conv A', 'Gemini 3.8 Flash', '2026-10-26T10:00:00Z', 5, 1000, 0.10, NULL, 'conv-a', 0),
+        ('sub-a1', 'Sub A1', 'Gemini 3.8 Flash', '2026-10-26T10:01:00Z', 3, 500, 0.05, 'conv-a', 'conv-a', 0),
+        ('conv-b', 'Conv B', 'Gemini 3.8 Flash', '2026-10-26T10:00:00Z', 2, 400, 0.02, NULL, 'conv-b', 0);
+    INSERT INTO quota_state VALUES
+        ('gemini-weekly', 'Gemini', 'weekly', 0.85, '2026-10-28T14:00:00Z', 672.0, '2026-10-26T10:00:00Z');
+    """)
+    conn.commit()
+
+    node_code = f"""
+    import {{ openDatabase, getConversationFingerprint }} from './sidecars/panel/query.mjs';
+    const db = openDatabase('{db_path}');
+    console.log(JSON.stringify({{
+      fpA: getConversationFingerprint(db, 'conv-a'),
+      fpA_inspecting_sub: getConversationFingerprint(db, 'conv-a', 'sub-a1'),
+      fpB: getConversationFingerprint(db, 'conv-b'),
+      fpGlobal: getConversationFingerprint(db, null),
+      fpNullDb: getConversationFingerprint(null, 'conv-a')
+    }}));
+    """
+    res1 = subprocess.run(["node", "--input-type=module", "-e", node_code], capture_output=True, text=True, cwd=Path.cwd())
+    assert res1.returncode == 0, res1.stderr
+    initial = json.loads(res1.stdout)
+
+    assert initial["fpNullDb"] == "empty|||0||0|0|0|0|"
+    assert initial["fpA"] != initial["fpB"]
+    assert initial["fpA"] != initial["fpA_inspecting_sub"]
+
+    # 1. Update unrelated conv-b: conv-a must be isolated
+    cur.execute("UPDATE conversations SET total_steps = 10, total_tokens = 9000, updated_at = '2026-10-26T10:05:00Z' WHERE id = 'conv-b'")
+    conn.commit()
+    res2 = subprocess.run(["node", "--input-type=module", "-e", node_code], capture_output=True, text=True, cwd=Path.cwd())
+    after_b = json.loads(res2.stdout)
+    assert after_b["fpA"] == initial["fpA"], "Unrelated conversation update must not change conv-a fingerprint"
+    assert after_b["fpA_inspecting_sub"] == initial["fpA_inspecting_sub"], "Unrelated conversation update must not change conv-a inspect sub fingerprint"
+    assert after_b["fpB"] != initial["fpB"]
+    assert after_b["fpGlobal"] != initial["fpGlobal"]
+
+    # 2. Update swarm child sub-a1: both conv-a root fingerprint and inspecting fingerprint must update
+    cur.execute("UPDATE conversations SET total_steps = 4, total_tokens = 800, updated_at = '2026-10-26T10:06:00Z' WHERE id = 'sub-a1'")
+    conn.commit()
+    res3 = subprocess.run(["node", "--input-type=module", "-e", node_code], capture_output=True, text=True, cwd=Path.cwd())
+    after_sub = json.loads(res3.stdout)
+    assert after_sub["fpA"] != initial["fpA"], "Swarm child update must change root conv-a fingerprint"
+    assert after_sub["fpA_inspecting_sub"] != initial["fpA_inspecting_sub"]
+    assert after_sub["fpB"] == after_b["fpB"], "conv-b fingerprint must remain unchanged when sub-a1 updates"
+
+    # 3. Update compaction_count on conv-a
+    cur.execute("UPDATE conversations SET compaction_count = 1 WHERE id = 'conv-a'")
+    conn.commit()
+    res4 = subprocess.run(["node", "--input-type=module", "-e", node_code], capture_output=True, text=True, cwd=Path.cwd())
+    after_comp = json.loads(res4.stdout)
+    assert after_comp["fpA"] != after_sub["fpA"], "Compaction count change must alter conv-a fingerprint"
+    assert after_comp["fpB"] == after_b["fpB"]
+
+    # 4. Update quota_state: all non-empty fingerprints must reflect quota change
+    cur.execute("UPDATE quota_state SET remaining_fraction = 0.80, fetched_at = '2026-10-26T10:10:00Z' WHERE bucket_id = 'gemini-weekly'")
+    conn.commit()
+    res5 = subprocess.run(["node", "--input-type=module", "-e", node_code], capture_output=True, text=True, cwd=Path.cwd())
+    after_quota = json.loads(res5.stdout)
+    assert after_quota["fpA"] != after_comp["fpA"], "Quota update must update conv-a fingerprint"
+    assert after_quota["fpB"] != after_b["fpB"], "Quota update must update conv-b fingerprint"
+    assert after_quota["fpGlobal"] != after_b["fpGlobal"], "Quota update must update global fingerprint"
+    conn.close()
+
+
+def test_sidecar_steps_queries_use_created_at_index(tmp_path):
+    """Verifies that queryVelocityMetrics (global, session, fleet) and getQuotaSummary use idx_steps_created index,
+    and accurately match space-separated, ISO, and microsecond timestamps."""
+    db_path = tmp_path / "test_steps_index.db"
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    cur.executescript("""
+    CREATE TABLE conversations (
+        id TEXT PRIMARY KEY, title TEXT, model_name TEXT,
+        created_at TEXT, updated_at TEXT, total_steps INTEGER DEFAULT 0,
+        total_tokens INTEGER DEFAULT 0, billed_cost REAL DEFAULT 0.0,
+        parent_id TEXT, root_id TEXT
+    );
+    CREATE TABLE steps (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        conversation_id TEXT NOT NULL,
+        step_index INTEGER NOT NULL,
+        created_at TEXT,
+        model_name TEXT,
+        step_type TEXT,
+        category TEXT,
+        activity TEXT,
+        tool_or_source TEXT,
+        est_tokens INTEGER DEFAULT 0,
+        billed_cost REAL DEFAULT 0.0,
+        billed_input_tokens INTEGER DEFAULT 0,
+        billed_output_tokens INTEGER DEFAULT 0,
+        detail TEXT
+    );
+    CREATE INDEX idx_steps_created ON steps(created_at);
+
+    CREATE TABLE quota_state (
+        bucket_id TEXT PRIMARY KEY,
+        group_name TEXT NOT NULL,
+        window TEXT NOT NULL,
+        remaining_fraction REAL NOT NULL,
+        reset_time TEXT NOT NULL,
+        calibrated_capacity REAL NOT NULL,
+        fetched_at TEXT NOT NULL
+    );
+    INSERT INTO quota_state VALUES
+        ('gemini-weekly', 'Gemini Models', 'weekly', 0.90, '2026-10-28T14:00:00Z', 672.0, '2026-10-23T14:00:00Z'),
+        ('gemini-5h', 'Gemini Models', '5h', 0.95, '2026-10-23T18:00:00Z', 236.7, '2026-10-23T14:00:00Z');
+
+    INSERT INTO conversations VALUES
+        ('conv-1', 'Test Conv', 'Gemini 3.7 Flash', '2026-10-23T10:00:00Z', '2026-10-23T14:00:00Z', 3, 3000, 0.15, NULL, 'conv-1');
+
+    -- Insert steps with mixed timestamp formats: ISO Z, space-separated, and microseconds
+    INSERT INTO steps (conversation_id, step_index, created_at, model_name, est_tokens, billed_input_tokens, billed_output_tokens)
+    VALUES
+        ('conv-1', 1, '2026-10-23T13:30:00Z', 'Gemini 3.7 Flash', 1000, 5000, 1000),
+        ('conv-1', 2, '2026-10-23 13:58:00', 'Gemini 3.7 Flash', 1000, 5000, 1000),
+        ('conv-1', 3, '2026-10-23T13:59:30.123456Z', 'Gemini 3.7 Flash', 1000, 5000, 1000);
+    """)
+    conn.commit()
+    conn.close()
+
+    node_code = f"""
+    import {{ openDatabase, queryVelocityMetrics, getQuotaSummary }} from './sidecars/panel/query.mjs';
+    const db = openDatabase('{db_path}');
+
+    // Spy on db.prepare to capture executed queries and their EXPLAIN QUERY PLAN
+    const plans = [];
+    const origPrepare = db.prepare.bind(db);
+    db.prepare = function(sql) {{
+      if (sql.includes('FROM steps') && (sql.includes('created_at') || sql.includes('substr(replace(created_at'))) {{
+        try {{
+          const planRows = origPrepare('EXPLAIN QUERY PLAN ' + sql).all();
+          plans.push({{ sql, planRows }});
+        }} catch (e) {{
+          plans.push({{ sql, error: e.message }});
+        }}
+      }}
+      return origPrepare(sql);
+    }};
+
+    const now = new Date('2026-10-23T14:00:00Z');
+    const vSession = queryVelocityMetrics(db, {{ conversationId: 'conv-1', now }});
+    const vGlobal = queryVelocityMetrics(db, {{ now }});
+    const vFleet = queryVelocityMetrics(db, {{ rootId: 'conv-1', now }});
+    const quota = getQuotaSummary(db, 'Gemini 3.7 Flash', 0.15, null, now);
+
+    console.log(JSON.stringify({{
+      plans,
+      rolling5mBilledTpmSession: vSession.rolling5mBilledTpm,
+      rolling60mBilledTphSession: vSession.rolling60mBilledTph,
+      rolling60mBilledTphGlobal: vGlobal.rolling60mBilledTph,
+      weeklyBilledTph: quota.weekly_billed_tph
+    }}));
+    """
+    res = subprocess.run(["node", "--input-type=module", "-e", node_code], capture_output=True, text=True, cwd=Path.cwd())
+    assert res.returncode == 0, res.stderr
+    data = json.loads(res.stdout)
+    plans = data["plans"]
+    assert len(plans) >= 3, f"Expected at least 3 steps queries, got: {len(plans)}"
+    for p in plans:
+        assert "planRows" in p, f"Query plan error: {p}"
+        details = [r["detail"] for r in p["planRows"]]
+        assert any("idx_steps_created" in d and "SEARCH" in d for d in details), (
+            f"Expected SEARCH using idx_steps_created in plan for SQL:\n{p['sql']}\nPlan details: {details}"
+        )
+
+    # Verify that steps across mixed timestamp formats are accurately captured:
+    # 2 steps in 5m window (13:58:00 with space and 13:59:30 with microseconds) -> (6000 + 6000) / 5 = 2400.0 TPM
+    assert data["rolling5mBilledTpmSession"] == 2400.0
+    # 3 steps in 60m window (13:30 ISO, 13:58 space, 13:59 microsecond) -> 3 * 6000 = 18000.0 TPH
+    assert data["rolling60mBilledTphSession"] == 18000.0
+    assert data["rolling60mBilledTphGlobal"] == 18000.0
+    assert data["weeklyBilledTph"] > 0
+
+
+def test_sidecar_query_cache_and_clear(tmp_path):
+    """Verifies getSessionData and getGlobalData cache responses, clearQueryCache evicts them,
+    fingerprint changes automatically invalidate cache, and FIFO capacity bounding works."""
+    db_path = tmp_path / "test_cache.db"
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    cur.executescript("""
+    CREATE TABLE conversations (
+        id TEXT PRIMARY KEY, title TEXT, model_name TEXT,
+        created_at TEXT, updated_at TEXT, total_steps INTEGER DEFAULT 0,
+        total_tokens INTEGER DEFAULT 0, billed_cost REAL DEFAULT 0.0
+    );
+    INSERT INTO conversations VALUES
+        ('conv-c', 'Cache Conv', 'Gemini 3.7 Flash', '2026-10-26T10:00:00Z', '2026-10-26T10:00:00Z', 1, 100, 0.01);
+    """)
+    conn.commit()
+
+    node_code = f"""
+    import {{ openDatabase, getSessionData, getGlobalData, clearQueryCache }} from './sidecars/panel/query.mjs';
+    const db = openDatabase('{db_path}');
+
+    let prepareCount = 0;
+    const origPrepare = db.prepare.bind(db);
+    db.prepare = function(sql) {{
+      prepareCount++;
+      return origPrepare(sql);
+    }};
+
+    // First calls: populate cache
+    const s1 = getSessionData(db, 'conv-c');
+    const g1 = getGlobalData(db);
+    const countAfterFirst = prepareCount;
+
+    // Second calls: should hit cache directly returning cached references
+    const s2 = getSessionData(db, 'conv-c');
+    const g2 = getGlobalData(db);
+    const countAfterCached = prepareCount;
+
+    // Clear cache explicitly
+    clearQueryCache();
+
+    // Third calls: should execute queries again and produce new references
+    const s3 = getSessionData(db, 'conv-c');
+    const g3 = getGlobalData(db);
+    const countAfterEvict = prepareCount;
+
+    console.log(JSON.stringify({{
+      countAfterFirst,
+      countAfterCached,
+      countAfterEvict,
+      isCachedSameRefS: s1 === s2,
+      isCachedSameRefG: g1 === g2,
+      isEvictedDifferentRefS: s1 !== s3,
+      isEvictedDifferentRefG: g1 !== g3
+    }}));
+    """
+    res = subprocess.run(["node", "--input-type=module", "-e", node_code], capture_output=True, text=True, cwd=Path.cwd())
+    assert res.returncode == 0, res.stderr
+    data = json.loads(res.stdout)
+    assert data["isCachedSameRefS"] is True, "Second getSessionData must return cached reference"
+    assert data["isCachedSameRefG"] is True, "Second getGlobalData must return cached reference"
+    assert data["isEvictedDifferentRefS"] is True, "getSessionData after clearQueryCache must return new object"
+    assert data["isEvictedDifferentRefG"] is True, "getGlobalData after clearQueryCache must return new object"
+    assert (data["countAfterCached"] - data["countAfterFirst"]) < (data["countAfterEvict"] - data["countAfterCached"]), (
+        "Cached calls should only execute fingerprint checks, not full queries"
+    )
+
+    # Test that DB mutation changes fingerprint and produces fresh session data without clearQueryCache()
+    mutate_node_code = f"""
+    import {{ openDatabase, getSessionData }} from './sidecars/panel/query.mjs';
+    const db = openDatabase('{db_path}');
+    const first = getSessionData(db, 'conv-c');
+    console.log(JSON.stringify({{ tokens: first.total_tokens }}));
+    """
+    res_m1 = subprocess.run(["node", "--input-type=module", "-e", mutate_node_code], capture_output=True, text=True, cwd=Path.cwd())
+    assert json.loads(res_m1.stdout)["tokens"] == 100
+
+    cur.execute("UPDATE conversations SET total_tokens = 999, updated_at = '2026-10-26T11:00:00Z' WHERE id = 'conv-c'")
+    conn.commit()
+    conn.close()
+
+    res_m2 = subprocess.run(["node", "--input-type=module", "-e", mutate_node_code], capture_output=True, text=True, cwd=Path.cwd())
+    assert json.loads(res_m2.stdout)["tokens"] == 999
+
+
+def test_sidecar_sse_filtered_by_conversation(tmp_path):
+    """Verifies that the SSE hub:
+    1. Only delivers 'update' events to clients whose subscribed conversation or swarm fleet changed.
+    2. Swarm child updates notify the root conversation subscriber.
+    3. Unrelated conversation updates do not leak events to other subscribers.
+    4. Idle watcher and heartbeat timers stop when all clients disconnect."""
+    db_path = tmp_path / "test_sse.db"
+    conn = sqlite3.connect(db_path)
+    cur = conn.cursor()
+    cur.executescript("""
+    CREATE TABLE conversations (
+        id TEXT PRIMARY KEY, title TEXT, model_name TEXT,
+        created_at TEXT, updated_at TEXT, total_steps INTEGER DEFAULT 0,
+        total_tokens INTEGER DEFAULT 0, billed_cost REAL DEFAULT 0.0,
+        parent_id TEXT, root_id TEXT, compaction_count INTEGER DEFAULT 0
+    );
+    CREATE TABLE quota_state (
+        bucket_id TEXT PRIMARY KEY, group_name TEXT, window TEXT,
+        remaining_fraction REAL, reset_time TEXT, calibrated_capacity REAL, fetched_at TEXT
+    );
+    INSERT INTO conversations VALUES
+        ('conv-a', 'Conv A', 'Gemini 3.7 Flash', '2026-10-26T10:00:00Z', '2026-10-26T10:00:00Z', 5, 1000, 0.10, NULL, 'conv-a', 0),
+        ('sub-a1', 'Sub A1', 'Gemini 3.7 Flash', '2026-10-26T10:01:00Z', '2026-10-26T10:01:00Z', 3, 500, 0.05, 'conv-a', 'conv-a', 0),
+        ('conv-b', 'Conv B', 'Gemini 3.7 Flash', '2026-10-26T10:00:00Z', '2026-10-26T10:00:00Z', 2, 400, 0.02, NULL, 'conv-b', 0);
+    """)
+    conn.commit()
+    conn.close()
+
+    node_code = f"""
+    import http from 'node:http';
+    import {{ DatabaseSync }} from 'node:sqlite';
+    import {{ getConversationFingerprint, clearQueryCache }} from './sidecars/panel/query.mjs';
+    import {{ createSseHub, attachSseRoute }} from './sidecars/panel/sse.mjs';
+
+    let db = new DatabaseSync('{db_path}');
+    let cacheInvalidated = 0;
+
+    const hub = createSseHub({{
+      getDb: () => db,
+      getFingerprint: getConversationFingerprint,
+      onCacheInvalidate: () => {{
+        cacheInvalidated++;
+        clearQueryCache();
+      }},
+      checkIntervalMs: 50,
+      settleWindowMs: 20,
+      heartbeatMs: 500,
+      dbPath: '{db_path}'
+    }});
+
+    const server = http.createServer((req, res) => {{
+      res.writeHead(404);
+      res.end('Not found');
+    }});
+    attachSseRoute(server, hub);
+
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const port = server.address().port;
+
+    function connectClient(urlPath) {{
+      return new Promise((resolve, reject) => {{
+        const events = [];
+        let raw = '';
+        const req = http.get(`http://127.0.0.1:${{port}}${{urlPath}}`, (res) => {{
+          res.setEncoding('utf8');
+          res.on('data', (chunk) => {{
+            raw += chunk;
+            const parts = raw.split('\\n\\n');
+            while (parts.length > 1) {{
+              const block = parts.shift().trim();
+              if (block.startsWith('event: update')) {{
+                const dataLine = block.split('\\n').find(l => l.startsWith('data: '));
+                if (dataLine) {{
+                  events.push(JSON.parse(dataLine.slice(6)));
+                }}
+              }}
+            }}
+          }});
+          res.on('end', () => {{}});
+        }});
+        req.on('error', reject);
+        setTimeout(() => resolve({{ req, events }}), 50);
+      }});
+    }}
+
+    const clientA = await connectClient('/api/events?cid=conv-a');
+    const clientB = await connectClient('/api/events?cid=conv-b');
+
+    // 1. Initial state: neither should have received any update events yet
+    const initLenA = clientA.events.length;
+    const initLenB = clientB.events.length;
+
+    // 2. Mutate conv-b
+    db.prepare("UPDATE conversations SET total_steps = 10, total_tokens = 9999, updated_at = '2026-10-26T10:10:00Z' WHERE id = 'conv-b'").run();
+    await hub.checkChanges();
+    await new Promise((r) => setTimeout(r, 40));
+
+    const afterBLenA = clientA.events.length;
+    const afterBLenB = clientB.events.length;
+
+    // 3. Mutate sub-a1 (swarm fleet child of conv-a)
+    db.prepare("UPDATE conversations SET total_steps = 8, total_tokens = 1200, updated_at = '2026-10-26T10:15:00Z' WHERE id = 'sub-a1'").run();
+    await hub.checkChanges();
+    await new Promise((r) => setTimeout(r, 40));
+
+    const afterSubLenA = clientA.events.length;
+    const afterSubLenB = clientB.events.length;
+
+    // 4. Verify client disconnect closes timers
+    const activeCountBefore = hub.activeClientCount;
+    clientA.req.destroy();
+    clientB.req.destroy();
+
+    // Give destroy time to fire close event on server
+    await new Promise((r) => setTimeout(r, 80));
+    const activeCountAfter = hub.activeClientCount;
+    const isWatcherRunning = hub.isWatcherRunning;
+
+    hub.close();
+    await new Promise((r) => server.close(r));
+    db.close();
+
+    console.log(JSON.stringify({{
+      initLenA,
+      initLenB,
+      afterBLenA,
+      afterBLenB,
+      afterSubLenA,
+      afterSubLenB,
+      activeCountBefore,
+      activeCountAfter,
+      isWatcherRunning,
+      clientBLastEvent: clientB.events[clientB.events.length - 1],
+      clientALastEvent: clientA.events[clientA.events.length - 1]
+    }}));
+    """
+    res = subprocess.run(["node", "--input-type=module", "-e", node_code], capture_output=True, text=True, cwd=Path.cwd())
+    assert res.returncode == 0, f"Node script failed with: {res.stderr}\nStdout: {res.stdout}"
+    data = json.loads(res.stdout)
+
+    assert data["initLenA"] == 0
+    assert data["initLenB"] == 0
+
+    # Only client B received an event on conv-b mutation
+    assert data["afterBLenA"] == 0, "Client A must NOT receive event when conv-b mutates"
+    assert data["afterBLenB"] == 1, "Client B MUST receive event when conv-b mutates"
+    assert data["clientBLastEvent"]["cid"] == "conv-b"
+
+    # Swarm child sub-a1 mutation MUST notify client A and NOT client B
+    assert data["afterSubLenA"] == 1, "Client A MUST receive event when subagent of conv-a mutates"
+    assert data["afterSubLenB"] == 1, "Client B must NOT receive event when subagent of conv-a mutates"
+    assert data["clientALastEvent"]["cid"] == "conv-a"
+
+    # Verify zero-polling / zero-client cleanup
+    assert data["activeCountBefore"] == 2
+    assert data["activeCountAfter"] == 0
+    assert data["isWatcherRunning"] is False, "Watcher must stop running when all clients disconnect"
+
+
+
+
+

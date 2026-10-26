@@ -627,16 +627,18 @@ def test_rollup_query_plans_and_calibrate_capacity(tmp_path):
     conn = get_db_connection(db_file)
     cur = conn.cursor()
 
+    today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
     # 1. Insert conversations and steps
-    cur.execute("""
+    cur.execute(f"""
         INSERT INTO conversations (id, title, project, model_name, created_at, total_steps, total_tokens)
-        VALUES ('conv-1', 'Conv 1', 'project-a', 'Gemini Pro', '2026-10-18T10:00:00Z', 2, 1000)
+        VALUES ('conv-1', 'Conv 1', 'project-a', 'Gemini Pro', '{today_str}T10:00:00Z', 2, 1000)
     """)
-    cur.execute("""
+    cur.execute(f"""
         INSERT INTO steps (conversation_id, step_index, created_at, model_name, est_tokens, billed_cost, billed_input_tokens, billed_output_tokens)
         VALUES 
-        ('conv-1', 1, '2026-10-18T10:15:00Z', 'Gemini Pro', 400, 0.05, 200, 100),
-        ('conv-1', 2, '2026-10-18T10:45:00Z', 'Gemini Pro', 600, 0.07, 400, 150)
+        ('conv-1', 1, '{today_str}T10:15:00Z', 'Gemini Pro', 400, 0.05, 200, 100),
+        ('conv-1', 2, '{today_str}T10:45:00Z', 'Gemini Pro', 600, 0.07, 400, 150)
     """)
     conn.commit()
 
@@ -644,7 +646,7 @@ def test_rollup_query_plans_and_calibrate_capacity(tmp_path):
     # Verify EXPLAIN QUERY PLAN uses idx_steps_created_cost
     eqp = cur.execute(
         "EXPLAIN QUERY PLAN SELECT model_name, SUM(billed_cost) FROM steps INDEXED BY idx_steps_created_cost WHERE created_at >= ? GROUP BY model_name",
-        ("2026-10-18T00:00:00",)
+        (f"{today_str}T00:00:00",)
     ).fetchall()
     eqp_str = " ".join([str(tuple(r)) for r in eqp])
     assert "idx_steps_created_cost" in eqp_str, f"Query plan did not use idx_steps_created_cost: {eqp_str}"

@@ -7,7 +7,10 @@ const sidecar = window.sidecar;
 const $ = (id) => document.getElementById(id);
 
 let isInitialized = false;
-let pollTimer = null;
+let eventSource = null;
+let streamKey = null;
+let isRefreshing = false;
+let pendingRefresh = false;
 let activeQuota = null;
 let activeQuotaFamily = 'gemini';
 let userSelectedQuotaFamily = false;
@@ -471,14 +474,78 @@ function renderFleetCard(fleet) {
   }
 }
 
+function closeEventStream() {
+  if (eventSource) {
+    try {
+      eventSource.close();
+    } catch {}
+    eventSource = null;
+  }
+  streamKey = null;
+}
+
+function connectEventStream() {
+  if (typeof document !== 'undefined' && document.hidden) return;
+
+  const cid = (sidecar && sidecar.conversationId) || null;
+  const currentKey = `${cid || ''}::${inspectedCid || ''}`;
+
+  if (eventSource && streamKey === currentKey) {
+    return;
+  }
+
+  closeEventStream();
+
+  const EventSourceCtor =
+    (typeof window !== 'undefined' && window.EventSource) ||
+    (typeof EventSource !== 'undefined' ? EventSource : null);
+
+  if (!EventSourceCtor) {
+    return;
+  }
+
+  const params = new URLSearchParams();
+  if (cid) params.set('cid', cid);
+  if (inspectedCid) params.set('inspect_cid', inspectedCid);
+
+  if (typeof window !== 'undefined' && window.location && window.location.search) {
+    const urlParams = new URLSearchParams(window.location.search);
+    const token = urlParams.get('token');
+    if (token) params.set('token', token);
+  }
+
+  const queryStr = params.toString();
+  const sseUrl = `/api/events${queryStr ? '?' + queryStr : ''}`;
+
+  try {
+    const es = new EventSourceCtor(sseUrl);
+    eventSource = es;
+    streamKey = currentKey;
+
+    const handleIncomingUpdate = () => {
+      refreshTelemetry();
+    };
+
+    es.addEventListener('update', handleIncomingUpdate);
+    es.addEventListener('message', handleIncomingUpdate);
+    es.onerror = () => {
+      // EventSource automatically reconnects per SSE specification
+    };
+  } catch (err) {
+    console.warn('[app.js] Failed to connect EventSource:', err);
+  }
+}
+
 function selectFleetNode(nodeId) {
   const activeCid = (sidecar && sidecar.conversationId) || lastCid;
   inspectedCid = (nodeId === activeCid ? null : nodeId);
+  connectEventStream();
   refreshTelemetry();
 }
 
 function resetInspectedNode() {
   inspectedCid = null;
+  connectEventStream();
   refreshTelemetry();
 }
 
@@ -489,15 +556,13 @@ if (typeof window !== 'undefined') {
 
 async function refreshTelemetry() {
   // Respect visibility state: pause work when side panel or tab is hidden
-  if (document.hidden) return;
+  if (typeof document !== 'undefined' && document.hidden) return;
 
-  const cid = sidecar ? sidecar.conversationId : null;
-  if (lastCid !== cid) {
-    lastCid = cid;
-    userSelectedQuotaFamily = false;
-    inspectedCid = null;
+  if (isRefreshing) {
+    pendingRefresh = true;
+    return;
   }
-  isGlobalMode = !cid;
+  isRefreshing = true;
 
   const statusBadge = $('status-badge');
   const globalCard = $('global-card');
@@ -508,6 +573,14 @@ async function refreshTelemetry() {
   const quotaCard = $('quota-card');
 
   try {
+    const cid = sidecar ? sidecar.conversationId : null;
+    if (lastCid !== cid) {
+      lastCid = cid;
+      userSelectedQuotaFamily = false;
+      inspectedCid = null;
+      connectEventStream();
+    }
+    isGlobalMode = !cid;
     if (!cid) {
       // Global Aggregate Overview
       const globalData = await callApi('/api/global');
@@ -587,7 +660,13 @@ async function refreshTelemetry() {
       statusBadge.textContent = 'Offline';
       statusBadge.className = 'badge error';
     }
-    console.error('Context Monitor poll failed:', err);
+    console.error('Context Monitor refresh failed:', err);
+  } finally {
+    isRefreshing = false;
+    if (pendingRefresh) {
+      pendingRefresh = false;
+      refreshTelemetry();
+    }
   }
 }
 
@@ -671,20 +750,19 @@ function init() {
     btnResetInspect.addEventListener('click', resetInspectedNode);
   }
 
-  // Handle visibility changes: halt polling when hidden, resume when visible
+  // Handle visibility changes: close event stream when hidden, reconnect and refresh when visible
   document.addEventListener('visibilitychange', () => {
-    if (!document.hidden) {
+    if (document.hidden) {
+      closeEventStream();
+    } else {
+      connectEventStream();
       refreshTelemetry();
     }
   });
 
-  // Initial fetch and lifecycle-managed polling interval
+  // Initial fetch and SSE event stream subscription
+  connectEventStream();
   refreshTelemetry();
-  pollTimer = setInterval(() => {
-    if (!document.hidden) {
-      refreshTelemetry();
-    }
-  }, 4000);
 }
 
 document.addEventListener('DOMContentLoaded', init);

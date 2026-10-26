@@ -2,6 +2,7 @@ import sqlite3
 import pytest
 
 from context_monitor.db import (
+    checkpoint_wal_if_needed,
     get_db_connection,
     init_db,
     upsert_quota_state,
@@ -391,3 +392,107 @@ def test_context_monitor_package_exports():
     assert hasattr(context_monitor, "get_quota_state")
     assert callable(context_monitor.upsert_quota_state)
     assert callable(context_monitor.get_quota_state)
+
+
+def test_db_connection_sets_journal_size_limit(tmp_path):
+    db_path = tmp_path / "wal_limit.db"
+    with get_db_connection(db_path) as conn:
+        limit = conn.execute("PRAGMA journal_size_limit;").fetchone()[0]
+        assert limit == 67108864
+
+
+def test_checkpoint_wal_if_needed(tmp_path):
+    db_path = tmp_path / "wal_test.db"
+    with get_db_connection(db_path) as conn:
+        conn.execute("CREATE TABLE t (x TEXT);")
+        conn.commit()
+
+        # Insert some rows to ensure WAL has data
+        conn.executemany("INSERT INTO t VALUES (?);", [(f"val-{i}",) for i in range(100)])
+        conn.commit()
+
+        wal_path = tmp_path / "wal_test.db-wal"
+        assert wal_path.exists()
+        current_wal_size = wal_path.stat().st_size
+        assert current_wal_size > 0
+
+        # If WAL is smaller than max_wal_bytes, no checkpoint is performed
+        assert not checkpoint_wal_if_needed(conn, db_path, max_wal_bytes=current_wal_size + 10000)
+
+        # If WAL size is >= max_wal_bytes, checkpoint is performed and WAL is truncated
+        assert checkpoint_wal_if_needed(conn, db_path, max_wal_bytes=current_wal_size)
+        assert wal_path.stat().st_size == 0
+
+
+def test_get_db_connection_accepts_str_path(tmp_path):
+    str_path = str(tmp_path / "str_path.db")
+    with get_db_connection(str_path) as conn:
+        limit = conn.execute("PRAGMA journal_size_limit;").fetchone()[0]
+        assert limit == 67108864
+
+
+def test_checkpoint_wal_if_needed_auto_resolves_db_path(tmp_path):
+    db_path = tmp_path / "wal_auto.db"
+    with get_db_connection(db_path) as conn:
+        conn.execute("CREATE TABLE t (x TEXT);")
+        conn.commit()
+        conn.executemany("INSERT INTO t VALUES (?);", [(f"val-{i}",) for i in range(50)])
+        conn.commit()
+
+        wal_path = tmp_path / "wal_auto.db-wal"
+        assert wal_path.exists()
+        assert wal_path.stat().st_size > 0
+
+        # db_path=None should auto-extract db path from conn
+        assert checkpoint_wal_if_needed(conn, db_path=None, max_wal_bytes=1)
+        assert wal_path.stat().st_size == 0
+
+
+def test_checkpoint_wal_if_needed_handles_active_readers_busy(tmp_path):
+    db_path = tmp_path / "wal_busy.db"
+    conn1 = get_db_connection(db_path)
+    conn1.execute("CREATE TABLE t (x TEXT);")
+    conn1.commit()
+    conn1.execute("INSERT INTO t VALUES ('initial');")
+    conn1.commit()
+
+    # Open reader with active read transaction
+    conn2 = get_db_connection(db_path)
+    cur2 = conn2.cursor()
+    cur2.execute("BEGIN")
+    cur2.execute("SELECT * FROM t").fetchall()
+
+    # conn1 writes more to generate uncheckpointed WAL frames
+    conn1.execute("INSERT INTO t VALUES ('more');")
+    conn1.commit()
+
+    wal_path = tmp_path / "wal_busy.db-wal"
+    assert wal_path.exists()
+    assert wal_path.stat().st_size > 0
+
+    # Reader blocks TRUNCATE checkpoint; must return False and not truncate
+    assert not checkpoint_wal_if_needed(conn1, db_path, max_wal_bytes=1)
+    assert wal_path.stat().st_size > 0
+
+    # Reader finishes and closes
+    conn2.commit()
+    conn2.close()
+
+    # Checkpoint now succeeds and truncates WAL
+    assert checkpoint_wal_if_needed(conn1, db_path, max_wal_bytes=1)
+    assert wal_path.stat().st_size == 0
+    conn1.close()
+
+
+def test_checkpoint_wal_if_needed_edge_cases():
+    conn = sqlite3.connect(":memory:")
+    # Memory DB has no WAL file; should return False without error
+    assert not checkpoint_wal_if_needed(conn, db_path=":memory:", max_wal_bytes=1)
+    assert not checkpoint_wal_if_needed(conn, db_path=None, max_wal_bytes=1)
+    conn.close()
+    # Closed connection should return False without error
+    assert not checkpoint_wal_if_needed(conn, max_wal_bytes=1)
+
+
+
+

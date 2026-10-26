@@ -23,6 +23,7 @@ __all__ = [
     "TABLES_SQL",
     "INDEXES_SQL",
     "get_db_connection",
+    "checkpoint_wal_if_needed",
     "init_db",
     "upsert_quota_state",
     "get_quota_state",
@@ -174,11 +175,12 @@ CREATE INDEX IF NOT EXISTS idx_rollups_conv ON hourly_step_rollups(conversation_
 
 
 def get_db_connection(
-    db_path: Path = DEFAULT_DB_PATH, timeout: float = 30.0
+    db_path: Path | str = DEFAULT_DB_PATH, timeout: float = 30.0
 ) -> sqlite3.Connection:
     """Returns an initialized SQLite connection configured for concurrent WAL-mode access."""
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(db_path), timeout=timeout)
+    path = Path(db_path) if isinstance(db_path, str) else db_path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(path), timeout=timeout)
     conn.row_factory = sqlite3.Row
 
     # Configure WAL mode & concurrency safeguards
@@ -189,8 +191,41 @@ def get_db_connection(
     conn.execute("PRAGMA cache_size = -64000;")
     conn.execute("PRAGMA mmap_size = 268435456;")
     conn.execute("PRAGMA temp_store = MEMORY;")
+    conn.execute("PRAGMA journal_size_limit = 67108864;")
+
+    # Automatically checkpoint and truncate bloated WAL file on open if needed
+    checkpoint_wal_if_needed(conn, path)
 
     return conn
+
+
+def checkpoint_wal_if_needed(
+    conn: sqlite3.Connection,
+    db_path: Path | str | None = None,
+    max_wal_bytes: int = 67108864,
+) -> bool:
+    """Runs PRAGMA wal_checkpoint(TRUNCATE) if WAL file size meets or exceeds max_wal_bytes.
+
+    Returns True if a checkpoint was performed and truncated, False otherwise (including when
+    active readers block the checkpoint).
+    """
+    if db_path is None:
+        extracted = _extract_db_path(conn)
+        if not extracted:
+            return False
+        target_path = Path(extracted)
+    else:
+        target_path = Path(db_path)
+
+    wal_path = Path(f"{target_path}-wal")
+    try:
+        if wal_path.exists() and wal_path.stat().st_size >= max_wal_bytes:
+            row = conn.execute("PRAGMA wal_checkpoint(TRUNCATE);").fetchone()
+            if row is not None and row[0] == 0:
+                return True
+    except Exception:
+        pass
+    return False
 
 
 def init_db(db_or_conn: Path | str | sqlite3.Connection = DEFAULT_DB_PATH):

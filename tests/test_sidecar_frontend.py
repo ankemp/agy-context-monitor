@@ -87,8 +87,10 @@ def test_frontend_files_exist_and_invariants():
     assert "quota-weekly-pct" in js
     assert "quota-tab-gemini" in js
     assert "visibilitychange" in js, (
-        "Must guard polling with visibility change listener"
+        "Must guard stream with visibility change listener"
     )
+    assert "setInterval" not in js, "Must eliminate polling loop to satisfy Zero polling invariant"
+    assert "EventSource" in js, "Must use EventSource for reactive SSE updates"
     assert "sidecar.agent.sendMessage" in js or "agent.sendMessage" in js
 
 
@@ -1427,5 +1429,205 @@ def test_sidecar_frontend_zero_tokens_and_accessibility():
     assert data["roleAttr"] == "button"
     assert data["tabindexAttr"] == "0"
     assert "~0 / 1.00M (0.0%)" in data["innerHTML"]
+
+
+def test_sidecar_frontend_sse_subscription_and_no_polling():
+    """Verifies that app.js adheres to the Zero Polling invariant:
+    1. Removes setInterval polling.
+    2. Opens EventSource to /api/events?cid=<cid> on load.
+    3. Handles incoming 'update' SSE events to refresh telemetry.
+    4. Reconnects EventSource with inspect_cid when inspecting a swarm subagent.
+    5. Disconnects EventSource on visibilitychange hidden=true, reconnects on hidden=false."""
+    import json
+    import subprocess
+
+    js_code = Path("sidecars/panel/app.js").read_text(encoding="utf-8")
+    assert "setInterval" not in js_code, "app.js must not contain setInterval polling"
+    assert "EventSource" in js_code, "app.js must use EventSource"
+
+    node_script = """
+    import fs from 'node:fs';
+
+    const code = fs.readFileSync('sidecars/panel/app.js', 'utf8');
+
+    class MockEventSource {
+      static instances = [];
+      constructor(url) {
+        this.url = url;
+        this.listeners = {};
+        this.readyState = 0;
+        this.closed = false;
+        MockEventSource.instances.push(this);
+      }
+      addEventListener(event, fn) {
+        if (!this.listeners[event]) this.listeners[event] = [];
+        this.listeners[event].push(fn);
+      }
+      removeEventListener(event, fn) {
+        if (this.listeners[event]) {
+          this.listeners[event] = this.listeners[event].filter(l => l !== fn);
+        }
+      }
+      close() {
+        this.closed = true;
+        this.readyState = 2;
+      }
+      emit(event, data) {
+        if (this.listeners[event]) {
+          for (const fn of this.listeners[event]) {
+            fn({ data: JSON.stringify(data) });
+          }
+        }
+      }
+    }
+
+    const elements = {};
+    const makeEl = (tag) => {
+      const el = {
+        tagName: tag,
+        attributes: {},
+        style: {},
+        classList: {
+          contains: () => false,
+          add: () => {},
+          remove: () => {},
+          toggle: () => {}
+        },
+        children: [],
+        appendChild: (child) => { el.children.push(child); return child; },
+        setAttribute: (k, v) => { el.attributes[k] = v; },
+        getAttribute: (k) => el.attributes[k] || null,
+        removeAttribute: (k) => { delete el.attributes[k]; },
+        addEventListener: () => {},
+        hidden: false,
+        textContent: '',
+        innerHTML: ''
+      };
+      return el;
+    };
+
+    const ids = [
+      'capacity-bar', 'top-steps-list', 'top-steps-card', 'capacity-card',
+      'actions-card', 'status-badge', 'cost-badge', 'quota-badge', 'global-card',
+      'compaction-banner', 'compaction-banner-text', 'banner-compaction-count',
+      'banner-pruned-tokens', 'quota-card', 'quota-weekly-pct', 'quota-weekly-bar',
+      'quota-5h-pct', 'quota-5h-bar', 'quota-session-impact', 'quota-tab-gemini',
+      'quota-tab-3p', 'inspect-banner', 'inspect-banner-label', 'btn-reset-inspect',
+      'fleet-card', 'fleet-title', 'fleet-count-badge', 'fleet-summary-strip',
+      'fleet-total-cost', 'fleet-total-tokens', 'fleet-shielding', 'fleet-node-list',
+      'velocity-strip', 'velocity-5m-tpm', 'velocity-60m-tph', 'velocity-pct-hour',
+      'velocity-bullet-marker', 'toast', 'btn-compact'
+    ];
+    for (const id of ids) elements[id] = makeEl('div');
+
+    const docListeners = {};
+    let fetchCount = 0;
+    const fetchCalls = [];
+
+    const mockDocument = {
+      getElementById: (id) => elements[id],
+      createElement: (tag) => makeEl(tag),
+      addEventListener: (evt, fn) => {
+        if (!docListeners[evt]) docListeners[evt] = [];
+        docListeners[evt].push(fn);
+      },
+      readyState: 'complete',
+      hidden: false
+    };
+
+    const mockWindow = {
+      EventSource: MockEventSource,
+      location: { search: '?token=secret123' },
+      sidecar: {
+        conversationId: 'conv-root-1',
+        fetch: async (url) => {
+          fetchCount++;
+          fetchCalls.push(url);
+          return {
+            ok: true,
+            json: async () => ({
+              cid: 'conv-root-1',
+              model_name: 'Gemini 3.7 Flash',
+              billed_cost: 0.50,
+              pct: 25.0,
+              active_tokens: 250000,
+              max_tokens: 1000000,
+              fleet: {
+                is_swarm: true,
+                agent_count: 2,
+                total_cost: 1.00,
+                nodes: [
+                  { id: 'subagent-worker-1', model_name: 'Gemini 3.7 Flash', billed_cost: 0.50, active_tokens: 50000, is_root: false, role: 'Worker' },
+                  { id: 'conv-root-1', model_name: 'Gemini 3.7 Flash', billed_cost: 0.50, active_tokens: 200000, is_root: true, role: 'Root' }
+                ]
+              }
+            })
+          };
+        }
+      }
+    };
+
+    const fn = new Function('window', 'document', 'EventSource', 'fetch', code);
+    fn(mockWindow, mockDocument, MockEventSource, mockWindow.sidecar.fetch);
+
+    await new Promise((r) => setTimeout(r, 60));
+
+    // 1. Initial connection
+    const firstES = MockEventSource.instances[0];
+    const initialUrl = firstES ? firstES.url : null;
+    const fetchAfterInit = fetchCount;
+
+    // 2. Incoming SSE 'update' event
+    firstES.emit('update', { cid: 'conv-root-1', timestamp: new Date().toISOString() });
+    await new Promise((r) => setTimeout(r, 60));
+    const fetchAfterUpdate = fetchCount;
+
+    // 3. Inspect swarm subagent node
+    mockWindow.selectFleetNode('subagent-worker-1');
+    await new Promise((r) => setTimeout(r, 60));
+    const secondES = MockEventSource.instances[MockEventSource.instances.length - 1];
+    const inspectUrl = secondES ? secondES.url : null;
+    const firstClosedOnInspect = firstES.closed;
+
+    // 4. Hide document (visibilitychange)
+    mockDocument.hidden = true;
+    for (const l of (docListeners['visibilitychange'] || [])) l();
+    const secondClosedOnHide = secondES.closed;
+
+    // 5. Show document again
+    mockDocument.hidden = false;
+    for (const l of (docListeners['visibilitychange'] || [])) l();
+    await new Promise((r) => setTimeout(r, 60));
+    const thirdES = MockEventSource.instances[MockEventSource.instances.length - 1];
+    const resumedUrl = thirdES ? thirdES.url : null;
+
+    console.log(JSON.stringify({
+      instanceCount: MockEventSource.instances.length,
+      initialUrl,
+      fetchAfterInit,
+      fetchAfterUpdate,
+      inspectUrl,
+      firstClosedOnInspect,
+      secondClosedOnHide,
+      resumedUrl
+    }));
+    """
+    res = subprocess.run(
+        ["node", "--input-type=module", "-e", node_script],
+        capture_output=True,
+        text=True,
+        cwd=Path.cwd()
+    )
+    assert res.returncode == 0, f"Node script failed: {res.stderr}\nStdout: {res.stdout}"
+    data = json.loads(res.stdout)
+
+    assert "/api/events?cid=conv-root-1" in data["initialUrl"]
+    assert "token=secret123" in data["initialUrl"]
+    assert data["fetchAfterUpdate"] > data["fetchAfterInit"]
+    assert "inspect_cid=subagent-worker-1" in data["inspectUrl"]
+    assert data["firstClosedOnInspect"] is True
+    assert data["secondClosedOnHide"] is True
+    assert "inspect_cid=subagent-worker-1" in data["resumedUrl"]
+
 
 

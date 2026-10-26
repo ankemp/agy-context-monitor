@@ -8,7 +8,8 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Response, SidecarApp } from 'sidecar_sdk';
-import { getDatabase, getSessionData, getGlobalData } from './query.mjs';
+import { getDatabase, getSessionData, getGlobalData, getConversationFingerprint, clearQueryCache } from './query.mjs';
+import { createSseHub, attachSseRoute } from './sse.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const app = new SidecarApp();
@@ -24,4 +25,11 @@ app.api('/styles.css', () => new Response(readLocal('styles.css'), { contentType
 app.api('/api/session', (data) => getSessionData(getDatabase(), data?.cid, data?.inspect_cid), 'GET');
 app.api('/api/global', () => getGlobalData(getDatabase()), 'GET');
 
-app.run();
+const sseHub = createSseHub({
+  getDb: getDatabase,
+  getFingerprint: getConversationFingerprint,
+  onCacheInvalidate: clearQueryCache,
+});
+
+const server = await app.run();
+attachSseRoute(server, sseHub);
