@@ -576,7 +576,7 @@ class TestSubagentHierarchy(unittest.TestCase):
 
     def test_clean_arg_str_and_extract_subagent_specs_edge_cases(self):
         """Test edge cases in _clean_arg_str and extract_subagent_specs."""
-        from scripts.ingest import _clean_arg_str, extract_subagent_specs
+        from context_monitor.subagent import _clean_arg_str, extract_subagent_specs
         import scripts.backfill_analytics as backfill
 
         # _clean_arg_str edge cases
@@ -1932,6 +1932,434 @@ class TestSubagentHierarchy(unittest.TestCase):
             self.assertIsNotNone(c_row)
             self.assertEqual(c_row["model_name"], "Gemini 4 Argon (Medium)")
             self.assertAlmostEqual(c_row["billed_cost"], 0.010, places=3)
+
+    def test_subagent_module_exports_and_false_positive_filtering(self):
+        """Test subagent parsing helpers, ID validation, and false-positive filtering."""
+        from context_monitor.subagent import (
+            is_valid_subagent_id,
+            is_subagent_dispatch_output,
+            is_manage_subagents_output,
+            extract_invoked_subagent_ids,
+            parse_manage_subagents_output,
+        )
+        from context_monitor.pricing import recompute_step_costs
+
+        # 1. Dispatch output filtering
+        self.assertFalse(
+            is_subagent_dispatch_output("read_file", '829: or "Created the following subagent" in content')
+        )
+        self.assertFalse(
+            is_subagent_dispatch_output("view_file", 'Created the following subagent: {"conversationId": "child-1"}')
+        )
+        self.assertFalse(
+            is_subagent_dispatch_output("", "Created At: 2026-10-28\nShowing lines 1-50 of 100\n10: Created the following subagent")
+        )
+        self.assertFalse(
+            is_subagent_dispatch_output("", "File Path: /some/path\nCreated the following subagent: child-1")
+        )
+        self.assertFalse(
+            is_subagent_dispatch_output("", "Command exited with code 0.\nCreated the following subagents:\n- child-1")
+        )
+        self.assertTrue(
+            is_subagent_dispatch_output(
+                "invoke_subagent",
+                'Created the following subagent:\n{"conversationId": "49a774e0-203d-4fa8-9d10-edc5b945fe77"}',
+            )
+        )
+        self.assertTrue(
+            is_subagent_dispatch_output(
+                "",
+                'Created the following subagents:\n- DeepCoder Coordinator (conversationId: child-456, type: self)',
+            )
+        )
+
+        # 2. Manage subagents output filtering
+        self.assertFalse(is_manage_subagents_output("view_file", "active subagent list"))
+        self.assertFalse(is_manage_subagents_output("read_file", "Showing lines 1-10 of 20\nactive subagent"))
+        self.assertTrue(is_manage_subagents_output("manage_subagents", "active subagent(s):\n- child-1"))
+        self.assertTrue(is_manage_subagents_output("", "active subagent(s):\n- child-1"))
+
+        # 3. ID Validation
+        self.assertTrue(is_valid_subagent_id("49a774e0-203d-4fa8-9d10-edc5b945fe77"))
+        self.assertTrue(is_valid_subagent_id("child-1"))
+        self.assertTrue(is_valid_subagent_id("sub-pro-downgraded"))
+        self.assertTrue(is_valid_subagent_id("wave-child-1"))
+
+        self.assertFalse(is_valid_subagent_id(""))
+        self.assertFalse(is_valid_subagent_id("s"))
+        self.assertFalse(is_valid_subagent_id("1104"))
+        self.assertFalse(is_valid_subagent_id("cid_found"))
+        self.assertFalse(is_valid_subagent_id("step_index"))
+        self.assertFalse(is_valid_subagent_id("transcripts"))
+        self.assertFalse(is_valid_subagent_id("TRANSCRIPTS"))
+        self.assertFalse(is_valid_subagent_id("directory"))
+        self.assertFalse(is_valid_subagent_id("asc"))
+        self.assertFalse(is_valid_subagent_id("DESC"))
+        self.assertFalse(is_valid_subagent_id("text"))
+        self.assertFalse(is_valid_subagent_id("subagents"))
+
+        # 4. Extract invoked subagent IDs
+        self.assertEqual(
+            extract_invoked_subagent_ids("Found 535 total conversation transcripts and conversation directory 1104"),
+            [],
+        )
+        self.assertEqual(
+            parse_manage_subagents_output("active subagent(s): SELECT id FROM conversations ORDER BY id ASC, id DESC"),
+            [],
+        )
+        self.assertEqual(
+            extract_invoked_subagent_ids('Created the following subagent:\n{\n  "conversationId": "child-1"\n}'),
+            ["child-1"],
+        )
+        self.assertEqual(
+            extract_invoked_subagent_ids(
+                'Created the following subagents:\n- DeepCoder Coordinator (conversationId: child-456, type: self)'
+            ),
+            ["child-456"],
+        )
+
+    def test_pricing_recompute_step_costs(self):
+        """Test pricing.recompute_step_costs with checkpoints, ephemerals, and planners."""
+        from context_monitor.pricing import recompute_step_costs
+
+        steps = [
+            {"step_type": "USER_INPUT", "est_tokens": 500, "model_name": "Gemini 3.8 Flash (High)"},
+            {"step_type": "PLANNER_RESPONSE", "est_tokens": 1000, "model_name": "Gemini 3.8 Flash (High)"},
+            {"step_type": "EPHEMERAL_MESSAGE", "est_tokens": 200},
+            {"step_type": "PLANNER_RESPONSE", "est_tokens": 800, "model_name": "Gemini 3.8 Flash (High)"},
+            {"step_type": "CHECKPOINT", "est_tokens": 1200},  # Compaction from 2300 down to 1200
+            {"step_type": "PLANNER_RESPONSE", "est_tokens": 400, "model_name": "Gemini 3.8 Flash (High)"},
+        ]
+
+        res = recompute_step_costs(steps, "Gemini 3.8 Flash (High)")
+        self.assertEqual(res["compaction_count"], 1)
+        self.assertEqual(res["pruned_tokens"], 1100)  # 2300 - 1200
+        self.assertEqual(res["active_context_tokens"], 1600)  # 1200 + 400
+        self.assertGreater(res["billed_cost"], 0.0)
+        self.assertGreater(res["billed_input_tokens"], 0)
+        self.assertGreater(res["billed_output_tokens"], 0)
+
+        # Ensure each step has billed fields populated
+        for s in steps:
+            self.assertIn("billed_cost", s)
+            self.assertIn("billed_input_tokens", s)
+            self.assertIn("billed_output_tokens", s)
+
+    def test_subagent_helpers_model_application_and_stubs(self):
+        """Test apply_step_model_switch, apply_native_step_models_fallback, and upsert_dispatched_subagent_stubs."""
+        from context_monitor.subagent import (
+            apply_step_model_switch,
+            apply_native_step_models_fallback,
+            upsert_dispatched_subagent_stubs,
+        )
+        from context_monitor.pricing import DEFAULT_MODEL
+
+        # 1. apply_step_model_switch
+        steps = [
+            {"step_index": 1, "model_name": DEFAULT_MODEL},
+            {"step_index": 2, "model_name": DEFAULT_MODEL},
+        ]
+        models_used = []
+        model_transitions = []
+        first_m, cur_m = apply_step_model_switch(
+            "Gemini 4 Argon (Medium)", None, DEFAULT_MODEL, steps, models_used, model_transitions
+        )
+        self.assertEqual(first_m, "Gemini 4 Argon (Medium)")
+        self.assertEqual(cur_m, "Gemini 4 Argon (Medium)")
+        self.assertEqual(steps[0]["model_name"], "Gemini 4 Argon (Medium)")
+        self.assertEqual(steps[1]["model_name"], "Gemini 4 Argon (Medium)")
+        self.assertEqual(models_used, ["Gemini 4 Argon (Medium)"])
+        self.assertEqual(model_transitions, ["Gemini 4 Argon (Medium)"])
+
+        # Mid-session switch
+        first_m, cur_m = apply_step_model_switch(
+            "Gemini 3.8 Flash (Tiered)", first_m, cur_m, steps, models_used, model_transitions
+        )
+        self.assertEqual(first_m, "Gemini 4 Argon (Medium)")
+        self.assertEqual(cur_m, "Gemini 3.8 Flash (Tiered)")
+        self.assertEqual(models_used, ["Gemini 4 Argon (Medium)", "Gemini 3.8 Flash (Tiered)"])
+        self.assertEqual(model_transitions, ["Gemini 4 Argon (Medium)", "Gemini 3.8 Flash (Tiered)"])
+
+        # 2. apply_native_step_models_fallback
+        native_map = {1: "Gemini 3.8 Flash (High)", 3: "Gemini 4 Argon (High)"}
+        steps2 = [
+            {"step_index": 1, "model_name": "Old"},
+            {"step_index": 2, "model_name": "Old"},
+            {"step_index": 3, "model_name": "Old"},
+            {"step_index": 4, "model_name": "Old"},
+        ]
+        f_m, c_m, used, trans = apply_native_step_models_fallback(native_map, steps2)
+        self.assertEqual(f_m, "Gemini 3.8 Flash (High)")
+        self.assertEqual(c_m, "Gemini 4 Argon (High)")
+        self.assertEqual(used, ["Gemini 3.8 Flash (High)", "Gemini 4 Argon (High)"])
+        self.assertEqual(trans, ["Gemini 3.8 Flash (High)", "Gemini 4 Argon (High)"])
+        self.assertEqual(steps2[0]["model_name"], "Gemini 3.8 Flash (High)")
+        self.assertEqual(steps2[1]["model_name"], "Gemini 3.8 Flash (High)")
+        self.assertEqual(steps2[2]["model_name"], "Gemini 4 Argon (High)")
+        self.assertEqual(steps2[3]["model_name"], "Gemini 4 Argon (High)")
+
+        # 3. upsert_dispatched_subagent_stubs
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_path = Path(tmp_dir) / "test_stubs.db"
+            init_db(db_path)
+            conn = get_db_connection(db_path)
+
+            # Insert parent
+            conn.execute(
+                "INSERT INTO conversations (id, title, root_id, depth, total_steps, model_name) VALUES (?, ?, ?, ?, ?, ?)",
+                ("parent-root", "Parent Task", "parent-root", 0, 10, "Gemini 4 Argon (High)"),
+            )
+            # Insert a bogus stale 0-step stub
+            conn.execute(
+                "INSERT INTO conversations (id, title, root_id, parent_id, depth, total_steps) VALUES (?, ?, ?, ?, ?, ?)",
+                ("stale-stub-1", "Stale Stub", "parent-root", "parent-root", 1, 0),
+            )
+            # Insert an active child with steps > 0
+            conn.execute(
+                "INSERT INTO conversations (id, title, root_id, parent_id, depth, total_steps, model_name) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                ("active-child-1", "Active Child", "parent-root", "parent-root", 1, 5, "Gemini 3.8 Flash (High)"),
+            )
+            conn.commit()
+
+            dispatched = [
+                {"id": "new-child-1", "role": "Worker 1", "type": "self", "model": "pro", "step_index": 2},
+                {"id": "active-child-1", "role": "Active Child", "type": "self", "model": "inherit", "step_index": 1},
+            ]
+
+            upsert_dispatched_subagent_stubs(
+                conn,
+                parent_id="parent-root",
+                root_id="parent-root",
+                parent_depth=0,
+                parent_title="Parent Task",
+                parent_project="test-proj",
+                parent_model="Gemini 4 Argon (High)",
+                dispatched_subagents=dispatched,
+            )
+            conn.commit()
+
+            # stale-stub-1 should have been deleted because it had total_steps=0 and was not in dispatched
+            stale_row = conn.execute("SELECT id FROM conversations WHERE id = 'stale-stub-1'").fetchone()
+            self.assertIsNone(stale_row)
+
+            # new-child-1 should have been inserted with pro model -> Gemini 4 Argon (Medium)
+            new_row = conn.execute("SELECT id, title, model_name, depth FROM conversations WHERE id = 'new-child-1'").fetchone()
+            self.assertIsNotNone(new_row)
+            self.assertEqual(new_row["depth"], 1)
+            self.assertEqual(new_row["model_name"], "Gemini 4 Argon (Medium)")
+
+            # active-child-1 should have retained its existing model_name because total_steps > 0
+            active_row = conn.execute("SELECT id, model_name FROM conversations WHERE id = 'active-child-1'").fetchone()
+            self.assertIsNotNone(active_row)
+            self.assertEqual(active_row["model_name"], "Gemini 3.8 Flash (High)")
+
+            conn.close()
+
+    def test_ingest_ignores_subagent_strings_inside_read_file_and_prunes_stale_stubs(self):
+        """Verify ingest ignores subagent strings inside read_file and prunes stale stubs."""
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            db_file = tmp_path / "test_analytics.db"
+            init_db(db_file)
+
+            root_cid = "root-agent-123"
+            transcript_dir = tmp_path / root_cid / ".system_generated" / "logs"
+            transcript_dir.mkdir(parents=True)
+            transcript_file = transcript_dir / "transcript.jsonl"
+
+            # Pre-insert a bogus 0-step stub row ("bogus-stub", parent_id=root_cid, total_steps=0)
+            conn = get_db_connection(db_file)
+            conn.execute(
+                "INSERT INTO conversations (id, title, root_id, depth, total_steps, model_name) VALUES (?, ?, ?, ?, ?, ?)",
+                (root_cid, "Root Agent", root_cid, 0, 10, "Gemini 4 Argon (High)"),
+            )
+            conn.execute(
+                "INSERT INTO conversations (id, title, root_id, parent_id, depth, total_steps) VALUES (?, ?, ?, ?, ?, ?)",
+                ("bogus-stub", "Bogus Child", root_cid, root_cid, 1, 0),
+            )
+            conn.commit()
+            conn.close()
+
+            transcript_lines = [
+                {
+                    "step_index": 1,
+                    "type": "USER_INPUT",
+                    "source": "USER_EXPLICIT",
+                    "content": "Please read the file and launch subagent",
+                    "created_at": "2026-10-28T10:00:00Z",
+                },
+                {
+                    "step_index": 2,
+                    "type": "PLANNER_RESPONSE",
+                    "source": "MODEL",
+                    "content": "Reading file...",
+                    "tool_calls": [
+                        {
+                            "name": "read_file",
+                            "args": {
+                                "Path": "/tmp/dummy.py",
+                            },
+                        }
+                    ],
+                },
+                {
+                    "step_index": 3,
+                    "type": "GENERIC",
+                    "source": "TOOL",
+                    "content": (
+                        "Created At: 2026-10-28\n"
+                        "Showing lines 1-50 of 100\n"
+                        '829: or "Created the following subagent" in content\n'
+                        '882: or "active subagent" in content.lower()\n'
+                        'Found 535 total conversation transcripts and conversation directory 1104\n'
+                        '{"conversationId": "child-fake"}\n'
+                    ),
+                },
+                {
+                    "step_index": 4,
+                    "type": "PLANNER_RESPONSE",
+                    "source": "MODEL",
+                    "content": "Launching real subagent...",
+                    "tool_calls": [
+                        {
+                            "name": "invoke_subagent",
+                            "args": {
+                                "Role": "Real Worker",
+                                "TypeName": "self",
+                                "Prompt": "Do work",
+                            },
+                        }
+                    ],
+                },
+                {
+                    "step_index": 5,
+                    "type": "GENERIC",
+                    "source": "TOOL",
+                    "content": 'Created the following subagent:\n{\n  "conversationId": "child-real"\n}',
+                },
+            ]
+            with open(transcript_file, "w", encoding="utf-8") as f:
+                for line in transcript_lines:
+                    f.write(json.dumps(line) + "\n")
+
+            analysis = ingest.analyze_transcript(transcript_file, cid=root_cid)
+            dispatched = analysis.get("dispatched_subagents", [])
+            dispatched_ids = [d["id"] for d in dispatched]
+            self.assertEqual(dispatched_ids, ["child-real"])
+
+            ingest.sync_to_sqlite(root_cid, analysis["latest_model"], analysis, db_path=db_file)
+
+            conn = get_db_connection(db_file)
+            rows = conn.execute("SELECT id FROM conversations WHERE parent_id = ?", (root_cid,)).fetchall()
+            child_ids = [r["id"] for r in rows]
+            conn.close()
+
+            self.assertEqual(child_ids, ["child-real"])
+
+    def test_backfill_purges_bogus_zero_step_stubs_and_ignores_read_file_subagent_text(self):
+        import scripts.backfill_analytics as backfill
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            db_file = tmp_path / "test_analytics.db"
+            init_db(db_file)
+
+            # Pre-populate analytics.db with bogus 0-step stub rows ("transcripts", "1104", "cid", "and", total_steps=0)
+            conn = get_db_connection(db_file)
+            bogus_ids = ["transcripts", "1104", "cid", "and"]
+            for bid in bogus_ids:
+                conn.execute(
+                    "INSERT INTO conversations (id, title, total_steps, model_name) VALUES (?, ?, 0, ?)",
+                    (bid, f"Bogus {bid}", "Gemini 4 Argon (High)"),
+                )
+            conn.commit()
+            conn.close()
+
+            # Create a conversation in brain_dir that calls read_file on text containing "Created the following subagent"
+            # and dispatches one real subagent "sub-valid-1".
+            brain_dir = tmp_path / "brain"
+            parent_cid = "bf-parent-root"
+            parent_dir = brain_dir / parent_cid / ".system_generated" / "logs"
+            parent_dir.mkdir(parents=True)
+            transcript_file = parent_dir / "transcript.jsonl"
+
+            transcript_lines = [
+                {
+                    "step_index": 1,
+                    "type": "USER_INPUT",
+                    "source": "USER_EXPLICIT",
+                    "content": "Please inspect files and launch worker",
+                    "created_at": "2026-10-28T10:00:00Z",
+                },
+                {
+                    "step_index": 2,
+                    "type": "PLANNER_RESPONSE",
+                    "source": "MODEL",
+                    "content": "Reading file...",
+                    "tool_calls": [
+                        {
+                            "name": "read_file",
+                            "args": {
+                                "Path": "/tmp/dummy.py",
+                            },
+                        }
+                    ],
+                },
+                {
+                    "step_index": 3,
+                    "type": "GENERIC",
+                    "source": "TOOL",
+                    "content": (
+                        "Created At: 2026-10-28\n"
+                        "Showing lines 1-50 of 100\n"
+                        '829: or "Created the following subagent" in content\n'
+                        '882: or "active subagent" in content.lower()\n'
+                        'Found 535 total conversation transcripts and conversation directory 1104\n'
+                        '{"conversationId": "fake-subagent-from-file"}\n'
+                    ),
+                },
+                {
+                    "step_index": 4,
+                    "type": "PLANNER_RESPONSE",
+                    "source": "MODEL",
+                    "content": "Launching real worker...",
+                    "tool_calls": [
+                        {
+                            "name": "invoke_subagent",
+                            "args": {
+                                "Role": "Real Worker",
+                                "TypeName": "self",
+                                "Prompt": "Do work",
+                            },
+                        }
+                    ],
+                },
+                {
+                    "step_index": 5,
+                    "type": "GENERIC",
+                    "source": "TOOL",
+                    "content": 'Created the following subagent:\n{\n  "conversationId": "sub-valid-1"\n}',
+                },
+            ]
+            with open(transcript_file, "w", encoding="utf-8") as f:
+                for line in transcript_lines:
+                    f.write(json.dumps(line) + "\n")
+
+            backfill.run_backfill(brain_dir=brain_dir, db_path=db_file, force=True)
+
+            conn = get_db_connection(db_file)
+            rows = conn.execute("SELECT id, total_steps FROM conversations").fetchall()
+            conv_ids = {r["id"] for r in rows}
+            conn.close()
+
+            # Assert that "transcripts", "1104", "cid", and "and" are deleted
+            for bid in bogus_ids:
+                self.assertNotIn(bid, conv_ids)
+            # Assert "fake-subagent-from-file" was NOT created as a stub
+            self.assertNotIn("fake-subagent-from-file", conv_ids)
+            # Assert parent and "sub-valid-1" are present
+            self.assertIn(parent_cid, conv_ids)
+            self.assertIn("sub-valid-1", conv_ids)
 
 
 if __name__ == "__main__":

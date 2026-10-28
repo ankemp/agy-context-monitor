@@ -50,6 +50,20 @@ from context_monitor.timings import (
     compute_session_timings,
     estimate_prompt_pairing_seconds,
 )
+from context_monitor.pricing import recompute_step_costs
+from context_monitor.subagent import (
+    DEFAULT_CONVERSATIONS_DIR,
+    apply_native_step_models_fallback,
+    apply_step_model_switch,
+    extract_invoked_subagent_ids,
+    extract_native_step_models,
+    extract_subagent_specs,
+    is_manage_subagents_output,
+    is_subagent_dispatch_output,
+    is_valid_subagent_id,
+    parse_manage_subagents_output,
+    upsert_dispatched_subagent_stubs,
+)
 
 __all__ = [
     "DEFAULT_DB_PATH",
@@ -94,4 +108,16 @@ __all__ = [
     "estimate_prompt_pairing_seconds",
     "compute_session_timings",
     "calculate_force_multiplier",
+    "DEFAULT_CONVERSATIONS_DIR",
+    "recompute_step_costs",
+    "apply_native_step_models_fallback",
+    "apply_step_model_switch",
+    "extract_invoked_subagent_ids",
+    "extract_native_step_models",
+    "extract_subagent_specs",
+    "is_manage_subagents_output",
+    "is_subagent_dispatch_output",
+    "is_valid_subagent_id",
+    "parse_manage_subagents_output",
+    "upsert_dispatched_subagent_stubs",
 ]

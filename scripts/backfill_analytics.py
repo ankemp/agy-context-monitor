@@ -15,6 +15,7 @@ import os
 import sys
 import json
 import re
+import sqlite3
 import time
 from pathlib import Path
 from datetime import datetime
@@ -37,9 +38,21 @@ from context_monitor.pricing import (  # noqa: E402
     DEFAULT_MODEL,
     calculate_step_cost,
     extract_model_switch,
-    extract_native_step_models,
     get_model_context_limit,
+    recompute_step_costs,
     resolve_subagent_model,
+)
+from context_monitor.subagent import (  # noqa: E402
+    apply_native_step_models_fallback,
+    apply_step_model_switch,
+    extract_invoked_subagent_ids,
+    extract_native_step_models,
+    extract_subagent_specs,
+    is_manage_subagents_output,
+    is_subagent_dispatch_output,
+    is_valid_subagent_id,
+    parse_manage_subagents_output,
+    upsert_dispatched_subagent_stubs,
 )
 from context_monitor.project import (  # noqa: E402
     backfill_db_projects,
@@ -106,219 +119,6 @@ def detect_model_from_transcript(transcript_path: Path) -> tuple[str, str, int]:
     return first_model, latest_model, max_tokens
 
 
-def _clean_arg_str(val: Any) -> str:
-    """Strips whitespace and unquotes double/single-encoded JSON strings."""
-    if val is None:
-        return ""
-    s = str(val).strip()
-    while True:
-        if s.startswith('"') and s.endswith('"') and len(s) >= 2:
-            try:
-                unquoted = json.loads(s)
-                if isinstance(unquoted, str):
-                    s = unquoted.strip()
-                    continue
-            except Exception:
-                pass
-            inner = s[1:-1].strip()
-            if not re.search(r'(?<!\\)"', inner):
-                s = inner.replace(r"\"", '"').strip()
-                continue
-        if s.startswith("'") and s.endswith("'") and len(s) >= 2:
-            inner = s[1:-1].strip()
-            if not re.search(r"(?<!\\)'", inner):
-                s = inner.replace(r"\'", "'").strip()
-                continue
-        break
-    return s
-
-
-def extract_subagent_specs(tc_args: dict[str, Any]) -> list[dict[str, str]]:
-    """Extracts subagent specifications from invoke_subagent tool call arguments.
-
-    Handles Antigravity 1.0 (Subagents list or JSON string) and Antigravity 2.0 flat arguments
-    (Role, role, TypeName, type, Prompt, prompt, Model, model), cleaning inner quotes.
-    """
-    if not isinstance(tc_args, dict):
-        return []
-
-    sub_raw = tc_args.get("Subagents") or tc_args.get("subagents")
-    if sub_raw:
-        specs_list = []
-        if isinstance(sub_raw, str):
-            s = sub_raw.strip()
-            if (s.startswith('"') and s.endswith('"')) or (
-                s.startswith("'") and s.endswith("'")
-            ):
-                s = _clean_arg_str(s)
-            try:
-                parsed = json.loads(s)
-                if isinstance(parsed, str):
-                    parsed = json.loads(parsed)
-                if isinstance(parsed, list):
-                    specs_list = parsed
-            except Exception:
-                pass
-        elif isinstance(sub_raw, list):
-            specs_list = sub_raw
-
-        if specs_list:
-            results = []
-            for item in specs_list:
-                if isinstance(item, dict):
-                    role = _clean_arg_str(item.get("Role") or item.get("role") or "")
-                    sub_type = _clean_arg_str(
-                        item.get("TypeName")
-                        or item.get("type")
-                        or item.get("subagent_type")
-                        or ""
-                    )
-                    model = _clean_arg_str(item.get("Model") or item.get("model") or "")
-                    results.append(
-                        {
-                            "role": role or "Autonomous Worker",
-                            "type": sub_type or "self",
-                            "model": model or "inherit",
-                            "Role": role or "Autonomous Worker",
-                            "TypeName": sub_type or "self",
-                            "Model": model or "inherit",
-                        }
-                    )
-            if results:
-                return results
-
-    flat_keys = (
-        "Role",
-        "role",
-        "TypeName",
-        "type",
-        "subagent_type",
-        "subagentType",
-        "Prompt",
-        "prompt",
-        "Model",
-        "model",
-    )
-    if any(k in tc_args for k in flat_keys):
-        raw_role = tc_args.get("Role") or tc_args.get("role")
-        raw_type = (
-            tc_args.get("TypeName")
-            or tc_args.get("type")
-            or tc_args.get("subagent_type")
-            or tc_args.get("subagentType")
-        )
-        raw_model = tc_args.get("Model") or tc_args.get("model")
-
-        role = _clean_arg_str(raw_role)
-        sub_type = _clean_arg_str(raw_type)
-        model = _clean_arg_str(raw_model)
-
-        return [
-            {
-                "role": role if role else "Autonomous Worker",
-                "type": sub_type if sub_type else "self",
-                "model": model if model else "inherit",
-                "Role": role if role else "Autonomous Worker",
-                "TypeName": sub_type if sub_type else "self",
-                "Model": model if model else "inherit",
-            }
-        ]
-
-    return []
-
-
-def parse_manage_subagents_output(content: str) -> list[dict[str, str]]:
-    """Parse manage_subagents tool output when active subagent(s): appears."""
-    if not content or (
-        "active subagent" not in content.lower()
-        and "active sub-agent" not in content.lower()
-    ):
-        return []
-
-    results: list[dict[str, str]] = []
-
-    # 1. Try to find and parse JSON array
-    json_match = re.search(r"\[\s*\{.*?\}\s*\]", content, re.DOTALL)
-    if json_match:
-        try:
-            data = json.loads(json_match.group(0))
-            if isinstance(data, list):
-                for item in data:
-                    if isinstance(item, dict):
-                        cid = _clean_arg_str(
-                            item.get("conversationId")
-                            or item.get("conversation_id")
-                            or item.get("id")
-                            or ""
-                        )
-                        if cid:
-                            role = _clean_arg_str(
-                                item.get("role") or item.get("Role") or ""
-                            )
-                            sub_type = _clean_arg_str(
-                                item.get("type") or item.get("TypeName") or ""
-                            )
-                            model = _clean_arg_str(
-                                item.get("model") or item.get("Model") or ""
-                            )
-                            results.append(
-                                {
-                                    "id": cid,
-                                    "conversationId": cid,
-                                    "role": role or "Autonomous Worker",
-                                    "type": sub_type or "self",
-                                    "model": model or "inherit",
-                                    "Role": role or "Autonomous Worker",
-                                    "TypeName": sub_type or "self",
-                                    "Model": model or "inherit",
-                                }
-                            )
-        except Exception:
-            pass
-
-    if results:
-        return results
-
-    # 2. Line-by-line regex extraction for text or bullet points
-    for line in content.splitlines():
-        cid_m = re.search(
-            r'\b(?:conversation_?id|cid|id)["\':\s]+([a-zA-Z0-9_\-]+)',
-            line,
-            re.IGNORECASE,
-        )
-        if not cid_m:
-            cid_m = re.search(
-                r"\b([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})\b",
-                line,
-                re.IGNORECASE,
-            )
-        if cid_m:
-            cid = cid_m.group(1).strip()
-            role_m = re.search(r'\brole["\':\s]+([^,\n\)]+)', line, re.IGNORECASE)
-            type_m = re.search(
-                r'\btype(?:Name)?["\':\s]+([^,\n\)]+)', line, re.IGNORECASE
-            )
-            model_m = re.search(r'\bmodel["\':\s]+([^,\n\)]+)', line, re.IGNORECASE)
-
-            role = _clean_arg_str(role_m.group(1)) if role_m else ""
-            sub_type = _clean_arg_str(type_m.group(1)) if type_m else ""
-            model = _clean_arg_str(model_m.group(1)) if model_m else ""
-            results.append(
-                {
-                    "id": cid,
-                    "conversationId": cid,
-                    "role": role or "Autonomous Worker",
-                    "type": sub_type or "self",
-                    "model": model or "inherit",
-                    "Role": role or "Autonomous Worker",
-                    "TypeName": sub_type or "self",
-                    "Model": model or "inherit",
-                }
-            )
-
-    return results
-
-
 def classify_phase(step_type: str, tool_name: str) -> str:
     """Categorizes a step into one of 4 development phases."""
     s_upper = step_type.upper()
@@ -326,6 +126,7 @@ def classify_phase(step_type: str, tool_name: str) -> str:
 
     if t_lower in (
         "view_file",
+        "read_file",
         "grep_search",
         "find_by_name",
         "list_dir",
@@ -335,6 +136,7 @@ def classify_phase(step_type: str, tool_name: str) -> str:
         "list_resources",
     ) or s_upper in (
         "VIEW_FILE",
+        "READ_FILE",
         "GREP_SEARCH",
         "FIND",
         "LIST_DIRECTORY",
@@ -345,12 +147,14 @@ def classify_phase(step_type: str, tool_name: str) -> str:
 
     if t_lower in (
         "write_to_file",
+        "write_file",
+        "edit_file",
         "replace_file_content",
         "multi_replace_file_content",
         "generate_image",
         "create_or_update_file",
         "push_files",
-    ) or s_upper in ("CODE_ACTION", "GENERATE_IMAGE"):
+    ) or s_upper in ("CODE_ACTION", "GENERATE_IMAGE", "WRITE_FILE", "EDIT_FILE"):
         return "execution"
 
     if (
@@ -363,7 +167,7 @@ def classify_phase(step_type: str, tool_name: str) -> str:
             "send_message",
             "manage_subagents",
         )
-        or t_lower.startswith("mcp_")
+        or t_lower.startswith("mcp")
         or s_upper in ("RUN_COMMAND", "INVOKE_SUBAGENT", "SYSTEM_MESSAGE")
     ):
         return "verification"
@@ -452,37 +256,25 @@ def parse_conversation(
             if step_type == "USER_INPUT":
                 switched_model = extract_model_switch(content)
                 if switched_model:
-                    if first_model is None:
-                        first_model = switched_model
-                        for s in steps:
-                            if s.get("model_name") == DEFAULT_MODEL:
-                                s["model_name"] = first_model
-                        cur_model = switched_model
-                        models_used = [cur_model]
-                        model_transitions = [cur_model]
-                    else:
-                        cur_model = switched_model
-                        if not model_transitions or model_transitions[-1] != cur_model:
-                            model_transitions.append(cur_model)
-                        if cur_model not in models_used:
-                            models_used.append(cur_model)
+                    first_model, cur_model = apply_step_model_switch(
+                        switched_model,
+                        first_model,
+                        cur_model,
+                        steps,
+                        models_used,
+                        model_transitions,
+                    )
 
             if step_idx in native_step_models:
                 native_m = native_step_models[step_idx]
-                if first_model is None:
-                    first_model = native_m
-                    for s in steps:
-                        if s.get("model_name") == DEFAULT_MODEL:
-                            s["model_name"] = first_model
-                    cur_model = native_m
-                    models_used = [cur_model]
-                    model_transitions = [cur_model]
-                elif native_m != cur_model:
-                    cur_model = native_m
-                    if not model_transitions or model_transitions[-1] != cur_model:
-                        model_transitions.append(cur_model)
-                    if cur_model not in models_used:
-                        models_used.append(cur_model)
+                first_model, cur_model = apply_step_model_switch(
+                    native_m,
+                    first_model,
+                    cur_model,
+                    steps,
+                    models_used,
+                    model_transitions,
+                )
 
             if not project and content:
                 project = extract_project_from_text(content)
@@ -570,21 +362,22 @@ def parse_conversation(
                                     }
                                 ]
                             pending_subagent_specs.extend(specs)
-                        elif tc_name == "view_file" and clean_path:
+                        elif tc_name in ("view_file", "read_file") and clean_path:
                             norm_path = clean_path.lower()
                             if norm_path in seen_files:
                                 redundant_reads += 1
                             else:
                                 seen_files.add(norm_path)
-                        elif tc_name == "write_to_file":
-                            code = tc_args.get("CodeContent", "")
-                            lines_written += len(code.splitlines())
+                        elif tc_name in ("write_to_file", "write_file"):
+                            code = tc_args.get("Content") or tc_args.get("CodeContent", "")
+                            lines_written += len(str(code).splitlines())
                         elif tc_name in (
+                            "edit_file",
                             "replace_file_content",
                             "multi_replace_file_content",
                         ):
-                            rep = tc_args.get("ReplacementContent", "")
-                            lines_edited += len(rep.splitlines())
+                            rep = tc_args.get("Replacement") or tc_args.get("ReplacementContent", "")
+                            lines_edited += len(str(rep).splitlines())
 
                         mcp_server = None
                         mcp_tool = None
@@ -663,36 +456,19 @@ def parse_conversation(
                 pending_tool_calls = []
                 detail = "Compacted conversation context"
 
-            elif pending_tool_calls:
-                tool_info = pending_tool_calls.pop(0)
+            elif step_type == "GENERIC" or pending_tool_calls:
+                tool_info = (
+                    pending_tool_calls.pop(0) if pending_tool_calls else ("", {})
+                )
                 tool_name = tool_info[0]
                 tool_args = tool_info[1]
                 primary_tool_name = tool_name
 
-                if (
-                    tool_name == "invoke_subagent"
-                    or "Created the following subagent" in content
-                    or "Created the following subagents:" in content
-                ) and tool_name not in (
-                    "run_command",
-                    "view_file",
-                    "search_web",
-                    "manage_task",
-                ):
+                if is_subagent_dispatch_output(tool_name, content):
                     activity = "Subagent Dispatched"
                     tool_or_source = "`invoke_subagent`"
                     category = "Tool Output: `invoke_subagent`"
-                    found_cids = re.findall(
-                        r'conversation(?:_?id)?["\':\s]+([a-zA-Z0-9_\-]+)',
-                        content,
-                        re.IGNORECASE,
-                    )
-                    if not found_cids:
-                        found_cids = re.findall(
-                            r"([a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12})",
-                            content,
-                        )
-                    found_cids = list(dict.fromkeys(found_cids))
+                    found_cids = extract_invoked_subagent_ids(content)
                     if not found_cids and is_error and pending_subagent_specs:
                         pending_subagent_specs.pop(0)
 
@@ -722,16 +498,7 @@ def parse_conversation(
                         if found_cids
                         else "Subagent dispatch"
                     )
-                elif (
-                    tool_name == "manage_subagents"
-                    or "active subagent" in content.lower()
-                    or "active sub-agent" in content.lower()
-                ) and tool_name not in (
-                    "run_command",
-                    "view_file",
-                    "search_web",
-                    "manage_task",
-                ):
+                elif is_manage_subagents_output(tool_name, content):
                     activity = "Subagent Status"
                     tool_or_source = "`manage_subagents`"
                     category = "Tool Output: `manage_subagents`"
@@ -769,16 +536,24 @@ def parse_conversation(
                         if parsed_agents
                         else "Manage subagents"
                     )
-                elif tool_name == "view_file" or "File Path:" in content:
+                elif tool_name in ("view_file", "read_file") or "File Path:" in content:
                     activity = "File Content"
-                    tool_or_source = "`view_file`"
-                    category = "Tool Output: File Contents (`view_file`)"
-                    if "AbsolutePath" in tool_args:
-                        target = str(tool_args["AbsolutePath"]).strip("\"'")
+                    tool_or_source = f"`{tool_name}`" if tool_name else "`view_file`"
+                    category = f"Tool Output: File Contents (`{tool_name}`)" if tool_name else "Tool Output: File Contents (`view_file`)"
+                    target = (
+                        tool_args.get("Path")
+                        or tool_args.get("path")
+                        or tool_args.get("TargetFile")
+                        or tool_args.get("AbsolutePath")
+                        or ""
+                    )
+                    target = str(target).strip("\"'")
+                    if target:
                         detail = f"File: {Path(target).name}"
+                    elif "AbsolutePath" in tool_args:
+                        detail = f"File: {Path(tool_args['AbsolutePath']).name}"
                     else:
-                        target = extract_file_basename(content)
-                        detail = f"File: {target}"
+                        detail = f"File: {extract_file_basename(content)}"
                 elif tool_name == "run_command" or "The command exited" in content:
                     activity = "Shell Output"
                     tool_or_source = "`run_command`"
@@ -816,34 +591,48 @@ def parse_conversation(
                     category = "Tool Output: Pattern Search (`grep_search`)"
                     query = str(tool_args.get("Query", "")).strip("\"' ")
                     detail = f"Grep: {query}" if query else "Ripgrep search"
-                elif tool_name == "write_to_file" or "Created file" in content:
+                elif tool_name in ("write_to_file", "write_file") or "Created file" in content:
                     activity = "File Write"
-                    tool_or_source = "`write_to_file`"
-                    category = "Tool Output: `write_to_file`"
-                    target = str(tool_args.get("TargetFile", "")).strip("\"' ")
+                    tool_or_source = f"`{tool_name}`" if tool_name else "`write_to_file`"
+                    category = f"Tool Output: `{tool_name}`" if tool_name else "Tool Output: `write_to_file`"
+                    target = (
+                        tool_args.get("TargetFile")
+                        or tool_args.get("Path")
+                        or tool_args.get("path")
+                        or ""
+                    )
+                    target = str(target).strip("\"'")
                     detail = (
                         f"File: {Path(target).name}" if target else "Write confirmation"
                     )
                 elif (
-                    tool_name == "replace_file_content"
+                    tool_name in ("replace_file_content", "edit_file", "multi_replace_file_content")
                     or "The following changes were made" in content
                 ):
                     activity = "File Edit"
-                    tool_or_source = "`replace_file_content`"
-                    category = "Tool Output: `replace_file_content`"
-                    target = str(tool_args.get("TargetFile", "")).strip("\"' ")
+                    tool_or_source = f"`{tool_name}`" if tool_name else "`replace_file_content`"
+                    category = f"Tool Output: `{tool_name}`" if tool_name else "Tool Output: `replace_file_content`"
+                    target = (
+                        tool_args.get("TargetFile")
+                        or tool_args.get("Path")
+                        or tool_args.get("path")
+                        or ""
+                    )
+                    target = str(target).strip("\"'")
                     detail = (
                         f"Edit: {Path(target).name}" if target else "Edit diff block"
                     )
-                elif tool_name.startswith("mcp_"):
-                    activity = f"MCP Tool ({tool_name})"
-                    tool_or_source = f"`{tool_name}`"
+                elif tool_name == "call_mcp_tool" or tool_name.startswith("mcp_"):
+                    srv = tool_args.get("ServerName", "")
+                    t_n = tool_args.get("ToolName", tool_name)
+                    activity = f"MCP: {srv}/{t_n}" if srv else f"MCP: {t_n}"
+                    tool_or_source = f"`{t_n}`"
                     category = "Tool Output: MCP Tools"
                     clean = re.sub(r"\s+", " ", content).strip()
                     detail = clean[:60] + ("..." if len(clean) > 60 else "")
                 else:
-                    activity = f"Tool: {tool_name}"
-                    tool_or_source = f"`{tool_name}`"
+                    activity = f"Tool: {tool_name}" if tool_name else "Generic Output"
+                    tool_or_source = f"`{tool_name}`" if tool_name else "Tool"
                     category = "Tool Output: Other"
                     clean = re.sub(r"\s+", " ", content).strip()
                     detail = clean[:60] + ("..." if len(clean) > 60 else "")
@@ -883,24 +672,12 @@ def parse_conversation(
     total_tokens = int(total_chars / CHARS_PER_TOKEN)
 
     if first_model is None and native_step_models:
-        sorted_steps = sorted(native_step_models.items())
-        first_model = sorted_steps[0][1]
-        cur_model = sorted_steps[-1][1]
-        models_used = []
-        for _, m in sorted_steps:
-            if m not in models_used:
-                models_used.append(m)
-        model_transitions = []
-        for _, m in sorted_steps:
-            if not model_transitions or model_transitions[-1] != m:
-                model_transitions.append(m)
-        for s in steps:
-            s_idx = s.get("step_index", 0)
-            if s_idx in native_step_models:
-                s["model_name"] = native_step_models[s_idx]
-            else:
-                preceding = [m for idx, m in sorted_steps if idx <= s_idx]
-                s["model_name"] = preceding[-1] if preceding else first_model
+        (
+            first_model,
+            cur_model,
+            models_used,
+            model_transitions,
+        ) = apply_native_step_models_fallback(native_step_models, steps)
 
     has_explicit_model = bool(first_model is not None)
     if first_model is None:
@@ -915,49 +692,13 @@ def parse_conversation(
         parsed_blocks.extend(block_parser.load_tool_schemas())
 
     # Calculate billed cost based on steps
-    total_billed_cost = 0.0
-    total_billed_input_tokens = 0
-    total_billed_output_tokens = 0
-    running_ctx = 0
-    current_ephemeral = 0
-
-    compaction_count = 0
-    pruned_tokens = 0
-
-    for s in steps:
-        m_name = s.get("model_name", cur_model)
-        s_type = s.get("step_type")
-        tokens = s.get("est_tokens", 0)
-
-        step_cost = 0.0
-        step_in_tokens = 0
-        step_out_tokens = 0
-
-        if s_type == "CHECKPOINT":
-            # Context truncation: reset running_ctx to checkpoint tokens
-            compaction_count += 1
-            if running_ctx > tokens:
-                pruned_tokens += running_ctx - tokens
-            running_ctx = tokens
-            current_ephemeral = 0
-        elif s_type == "EPHEMERAL_MESSAGE":
-            # Transient injection for immediate turn only
-            current_ephemeral = tokens
-        elif s_type == "PLANNER_RESPONSE":
-            step_cost, step_in_tokens, step_out_tokens = calculate_step_cost(
-                running_ctx, current_ephemeral, tokens, m_name
-            )
-            total_billed_cost += step_cost
-            total_billed_input_tokens += step_in_tokens
-            total_billed_output_tokens += step_out_tokens
-            running_ctx += tokens
-            current_ephemeral = 0
-        else:
-            running_ctx += tokens
-
-        s["billed_cost"] = step_cost
-        s["billed_input_tokens"] = step_in_tokens
-        s["billed_output_tokens"] = step_out_tokens
+    cost_summary = recompute_step_costs(steps, cur_model)
+    total_billed_cost = cost_summary["billed_cost"]
+    total_billed_input_tokens = int(cost_summary["billed_input_tokens"])
+    total_billed_output_tokens = int(cost_summary["billed_output_tokens"])
+    running_ctx = int(cost_summary["active_context_tokens"])
+    compaction_count = int(cost_summary["compaction_count"])
+    pruned_tokens = int(cost_summary["pruned_tokens"])
 
     if not models_used and cur_model:
         models_used = [cur_model]
@@ -1026,51 +767,17 @@ def parse_conversation(
 
 
 def _recompute_conv_costs(data: dict, active_model: str) -> None:
-    """Recalculates billed cost and input/output tokens across steps for a given model."""
     conv = data["conversation"]
     steps = data["steps"]
-    total_billed_cost = 0.0
-    total_billed_input_tokens = 0
-    total_billed_output_tokens = 0
-    running_ctx = 0
-    current_ephemeral = 0
+    metrics = recompute_step_costs(steps, active_model)
+    conv["billed_cost"] = metrics["billed_cost"]
+    conv["billed_input_tokens"] = metrics["billed_input_tokens"]
+    conv["billed_output_tokens"] = metrics["billed_output_tokens"]
+    conv["active_context_tokens"] = metrics["active_context_tokens"]
+    conv["compaction_count"] = metrics["compaction_count"]
+    conv["pruned_tokens"] = metrics["pruned_tokens"]
 
-    for s in steps:
-        m_name = s.get("model_name", active_model)
-        s_type = s.get("step_type")
-        tokens = s.get("est_tokens", 0)
-
-        step_cost = 0.0
-        step_in_tokens = 0
-        step_out_tokens = 0
-
-        if s_type == "CHECKPOINT":
-            running_ctx = tokens
-            current_ephemeral = 0
-        elif s_type == "EPHEMERAL_MESSAGE":
-            current_ephemeral = tokens
-        elif s_type == "PLANNER_RESPONSE":
-            step_cost, step_in_tokens, step_out_tokens = calculate_step_cost(
-                running_ctx, current_ephemeral, tokens, m_name
-            )
-            total_billed_cost += step_cost
-            total_billed_input_tokens += step_in_tokens
-            total_billed_output_tokens += step_out_tokens
-            running_ctx += tokens
-            current_ephemeral = 0
-        else:
-            running_ctx += tokens
-
-        s["billed_cost"] = step_cost
-        s["billed_input_tokens"] = step_in_tokens
-        s["billed_output_tokens"] = step_out_tokens
-
-    conv["billed_cost"] = total_billed_cost
-    conv["billed_input_tokens"] = total_billed_input_tokens
-    conv["billed_output_tokens"] = total_billed_output_tokens
-    conv["active_context_tokens"] = running_ctx
-
-    billed_tokens = total_billed_input_tokens + total_billed_output_tokens
+    billed_tokens = conv["billed_input_tokens"] + conv["billed_output_tokens"]
     est_tok = (
         conv.get("active_context_tokens")
         if conv.get("active_context_tokens", 0) > 0
@@ -1367,6 +1074,27 @@ def run_backfill(
                         s["model_name"] = resolved_m
                     _recompute_conv_costs(data, resolved_m)
 
+            if conversation_id is None:
+                # Clean invalid/orphan zero-step stub rows from conversations
+                valid_stub_ids = set(data_by_id.keys()) | set(subagent_meta.keys())
+                # Delete any total_steps = 0 rows that are not valid subagents or have invalid IDs
+                all_stubs = conn.execute(
+                    "SELECT id, parent_id, depth, subagent_role FROM conversations WHERE total_steps = 0"
+                ).fetchall()
+                stubs_to_delete = []
+                for st_row in all_stubs:
+                    st_id = st_row["id"] if isinstance(st_row, sqlite3.Row) else st_row[0]
+                    st_pid = st_row["parent_id"] if isinstance(st_row, sqlite3.Row) else st_row[1]
+                    st_depth = st_row["depth"] if isinstance(st_row, sqlite3.Row) else st_row[2]
+                    st_role = st_row["subagent_role"] if isinstance(st_row, sqlite3.Row) else st_row[3]
+
+                    is_subagent_stub = bool(st_pid is not None or (st_depth and st_depth > 0) or st_role is not None)
+                    if not is_valid_subagent_id(st_id) or (is_subagent_stub and st_id not in valid_stub_ids):
+                        stubs_to_delete.append((st_id,))
+                if stubs_to_delete:
+                    conn.executemany("DELETE FROM conversations WHERE id = ?", stubs_to_delete)
+                conn.commit()
+
             for i, data in enumerate(data_list, 1):
                 conv = data["conversation"]
                 cid = conv["id"]
@@ -1569,75 +1297,18 @@ def run_backfill(
                 )
 
                 # Upsert dispatched subagents so child rows have lineage and model right away even if not in brain_dir
-                for child in conv.get("dispatched_subagents", []):
-                    ch_id = child["id"]
-                    ch_role = child.get("role") or "Autonomous Worker"
-                    ch_type = child.get("type") or "self"
-                    ch_step = child.get("step_index")
-
-                    native_ch_models = extract_native_step_models(
-                        ch_id, conversations_dir=conversations_dir
-                    )
-                    if native_ch_models:
-                        ch_model = sorted(native_ch_models.items())[-1][1]
-                    else:
-                        ch_model = resolve_subagent_model(
-                            child.get("model"), parent_model=conv["model_name"]
-                        )
-
-                    clean_t = conv.get("title", "")
-                    m_sub = re.match(r"^\[.+?\]\s*(.+)", clean_t)
-                    if m_sub:
-                        clean_t = m_sub.group(1)
-                    ch_title = f"[{ch_role}] {clean_t[:90]}"
-
-                    conn.execute(
-                        """
-                        INSERT INTO conversations (
-                            id, title, project, parent_id, root_id, depth, subagent_role, subagent_type, invoking_step_index, active_pairing_seconds,
-                            model_name, models_used
-                        )
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0.0, ?, ?)
-                        ON CONFLICT(id) DO UPDATE SET
-                            parent_id = excluded.parent_id,
-                            root_id = excluded.root_id,
-                            depth = excluded.depth,
-                            active_pairing_seconds = 0.0,
-                            subagent_role = CASE
-                                WHEN excluded.subagent_role IS NOT NULL AND excluded.subagent_role != 'Autonomous Worker' THEN excluded.subagent_role
-                                ELSE COALESCE(conversations.subagent_role, excluded.subagent_role)
-                            END,
-                            title = CASE
-                                WHEN (conversations.title LIKE '[Autonomous Worker]%' OR conversations.title IS NULL OR conversations.title = '')
-                                     AND excluded.title NOT LIKE '[Autonomous Worker]%' THEN excluded.title
-                                ELSE conversations.title
-                            END,
-                            subagent_type = COALESCE(excluded.subagent_type, conversations.subagent_type),
-                            invoking_step_index = COALESCE(excluded.invoking_step_index, conversations.invoking_step_index),
-                            project = COALESCE(conversations.project, excluded.project),
-                            model_name = CASE
-                                WHEN conversations.total_steps IS NULL OR conversations.total_steps = 0 OR conversations.model_name IS NULL OR conversations.model_name = '' THEN excluded.model_name
-                                ELSE conversations.model_name
-                            END,
-                            models_used = CASE
-                                WHEN conversations.total_steps IS NULL OR conversations.total_steps = 0 OR conversations.models_used IS NULL OR conversations.models_used = '' THEN excluded.models_used
-                                ELSE conversations.models_used
-                            END
-                    """,
-                        (
-                            ch_id,
-                            ch_title,
-                            conv.get("project"),
-                            cid,
-                            root_id,
-                            depth + 1,
-                            ch_role,
-                            ch_type,
-                            ch_step,
-                            ch_model,
-                            ch_model,
-                        ),
-                    )
+                upsert_dispatched_subagent_stubs(
+                    conn,
+                    parent_id=conv["id"],
+                    root_id=root_id,
+                    parent_depth=depth,
+                    parent_title=conv.get("title", ""),
+                    parent_project=conv.get("project"),
+                    parent_model=conv["model_name"],
+                    dispatched_subagents=conv.get("dispatched_subagents", []),
+                    conversations_dir=conversations_dir,
+                    resolve_native=True,
+                )
 
                 # Bulk insert steps (replace existing)
                 conn.execute(
