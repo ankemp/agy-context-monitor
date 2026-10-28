@@ -37,7 +37,9 @@ from context_monitor.pricing import (  # noqa: E402
     DEFAULT_MODEL,
     calculate_step_cost,
     extract_model_switch,
+    extract_native_step_models,
     get_model_context_limit,
+    resolve_subagent_model,
 )
 from context_monitor.project import (  # noqa: E402
     backfill_db_projects,
@@ -373,6 +375,7 @@ def parse_conversation(
     conv_dir: Path,
     *,
     include_tool_schemas: bool = False,
+    conversations_dir: Path | None = None,
 ) -> dict | None:
     transcript_path = conv_dir / ".system_generated" / "logs" / "transcript.jsonl"
     if not transcript_path.exists():
@@ -386,6 +389,11 @@ def parse_conversation(
 
     cid = conv_dir.name
     first_model = None
+    native_step_models = (
+        extract_native_step_models(cid, conversations_dir=conversations_dir)
+        if cid
+        else {}
+    )
 
     steps = []
     tool_execs = []
@@ -458,6 +466,23 @@ def parse_conversation(
                             model_transitions.append(cur_model)
                         if cur_model not in models_used:
                             models_used.append(cur_model)
+
+            if step_idx in native_step_models:
+                native_m = native_step_models[step_idx]
+                if first_model is None:
+                    first_model = native_m
+                    for s in steps:
+                        if s.get("model_name") == DEFAULT_MODEL:
+                            s["model_name"] = first_model
+                    cur_model = native_m
+                    models_used = [cur_model]
+                    model_transitions = [cur_model]
+                elif native_m != cur_model:
+                    cur_model = native_m
+                    if not model_transitions or model_transitions[-1] != cur_model:
+                        model_transitions.append(cur_model)
+                    if cur_model not in models_used:
+                        models_used.append(cur_model)
 
             if not project and content:
                 project = extract_project_from_text(content)
@@ -857,6 +882,27 @@ def parse_conversation(
 
     total_tokens = int(total_chars / CHARS_PER_TOKEN)
 
+    if first_model is None and native_step_models:
+        sorted_steps = sorted(native_step_models.items())
+        first_model = sorted_steps[0][1]
+        cur_model = sorted_steps[-1][1]
+        models_used = []
+        for _, m in sorted_steps:
+            if m not in models_used:
+                models_used.append(m)
+        model_transitions = []
+        for _, m in sorted_steps:
+            if not model_transitions or model_transitions[-1] != m:
+                model_transitions.append(m)
+        for s in steps:
+            s_idx = s.get("step_index", 0)
+            if s_idx in native_step_models:
+                s["model_name"] = native_step_models[s_idx]
+            else:
+                preceding = [m for idx, m in sorted_steps if idx <= s_idx]
+                s["model_name"] = preceding[-1] if preceding else first_model
+
+    has_explicit_model = bool(first_model is not None)
     if first_model is None:
         first_model = cur_model
         if not models_used:
@@ -971,6 +1017,7 @@ def parse_conversation(
             "dispatched_subagents": dispatched_subagents,
             "compaction_count": compaction_count,
             "pruned_tokens": pruned_tokens,
+            "has_explicit_model": has_explicit_model,
         },
         "steps": steps,
         "tool_executions": tool_execs,
@@ -978,11 +1025,72 @@ def parse_conversation(
     }
 
 
+def _recompute_conv_costs(data: dict, active_model: str) -> None:
+    """Recalculates billed cost and input/output tokens across steps for a given model."""
+    conv = data["conversation"]
+    steps = data["steps"]
+    total_billed_cost = 0.0
+    total_billed_input_tokens = 0
+    total_billed_output_tokens = 0
+    running_ctx = 0
+    current_ephemeral = 0
+
+    for s in steps:
+        m_name = s.get("model_name", active_model)
+        s_type = s.get("step_type")
+        tokens = s.get("est_tokens", 0)
+
+        step_cost = 0.0
+        step_in_tokens = 0
+        step_out_tokens = 0
+
+        if s_type == "CHECKPOINT":
+            running_ctx = tokens
+            current_ephemeral = 0
+        elif s_type == "EPHEMERAL_MESSAGE":
+            current_ephemeral = tokens
+        elif s_type == "PLANNER_RESPONSE":
+            step_cost, step_in_tokens, step_out_tokens = calculate_step_cost(
+                running_ctx, current_ephemeral, tokens, m_name
+            )
+            total_billed_cost += step_cost
+            total_billed_input_tokens += step_in_tokens
+            total_billed_output_tokens += step_out_tokens
+            running_ctx += tokens
+            current_ephemeral = 0
+        else:
+            running_ctx += tokens
+
+        s["billed_cost"] = step_cost
+        s["billed_input_tokens"] = step_in_tokens
+        s["billed_output_tokens"] = step_out_tokens
+
+    conv["billed_cost"] = total_billed_cost
+    conv["billed_input_tokens"] = total_billed_input_tokens
+    conv["billed_output_tokens"] = total_billed_output_tokens
+    conv["active_context_tokens"] = running_ctx
+
+    billed_tokens = total_billed_input_tokens + total_billed_output_tokens
+    est_tok = (
+        conv.get("active_context_tokens")
+        if conv.get("active_context_tokens", 0) > 0
+        else conv.get("total_tokens", 0)
+    )
+    conv["velocity"] = compute_active_velocity(
+        est_tokens=est_tok,
+        billed_tokens=billed_tokens,
+        active_agent_seconds=conv.get("active_agent_seconds", 0.0),
+        active_pairing_seconds=conv.get("active_pairing_seconds", 0.0),
+    )
+    data["velocity"] = conv["velocity"]
+
+
 def run_backfill(
     brain_dir: Path = Path(os.path.expanduser("~/.gemini/antigravity/brain")),
     conversation_id: str | None = None,
     force: bool = False,
     db_path: Path | None = None,
+    conversations_dir: Path | None = None,
 ):
     target_db = Path(db_path) if db_path else DEFAULT_DB_PATH
     init_db(target_db)
@@ -1021,7 +1129,7 @@ def run_backfill(
         "  [Pass 1/2] Parsing transcripts and discovering agent lineage...", flush=True
     )
     for i, cdir in enumerate(conv_dirs, 1):
-        data = parse_conversation(cdir)
+        data = parse_conversation(cdir, conversations_dir=conversations_dir)
         if not data:
             continue
         cid = data["conversation"]["id"]
@@ -1035,6 +1143,18 @@ def run_backfill(
         for ch in data["conversation"].get("dispatched_subagents", []):
             parent_map[ch["id"]] = cid
             subagent_meta[ch["id"]] = ch
+
+    if conversation_id and data_list:
+        for d in list(data_list):
+            p_id = d["conversation"].get("parent_id")
+            if p_id and p_id not in data_by_id and (brain_dir / p_id).is_dir():
+                p_data = parse_conversation(
+                    brain_dir / p_id, conversations_dir=conversations_dir
+                )
+                if p_data:
+                    for ch in p_data["conversation"].get("dispatched_subagents", []):
+                        if ch["id"] not in subagent_meta:
+                            subagent_meta[ch["id"]] = ch
 
     # Pass 2: Resolve root_id, depth, project inheritance, semantic titles, and commit to SQLite
     total_parsed = len(data_list)
@@ -1128,6 +1248,124 @@ def run_backfill(
                         }
             except Exception:
                 pass
+
+            # Calculate depth and sort data_list topologically (roots first, then subagents)
+            for data in data_list:
+                c_conv = data["conversation"]
+                c_id = c_conv["id"]
+                c_curr = c_id
+                c_depth = 0
+                c_visited = set()
+                while c_curr in parent_map and c_curr not in c_visited and c_depth < 25:
+                    c_visited.add(c_curr)
+                    c_curr = parent_map[c_curr]
+                    c_depth += 1
+                c_conv["root_id"] = c_curr
+                c_conv["parent_id"] = parent_map.get(c_id)
+                c_conv["depth"] = c_depth
+
+            data_list.sort(key=lambda d: d["conversation"]["depth"])
+
+            # Pre-resolve models across all conversations in lineage order
+            resolved_models = {}
+
+            def _resolve_conv_model(c_id: str, visited: set | None = None) -> str:
+                if c_id in resolved_models:
+                    return resolved_models[c_id]
+
+                if visited is None:
+                    visited = set()
+                if c_id in visited:
+                    return DEFAULT_MODEL
+                visited.add(c_id)
+
+                c_data = data_by_id.get(c_id)
+                if c_data:
+                    c_conv = c_data["conversation"]
+                    if c_conv.get("has_explicit_model"):
+                        m = c_conv["model_name"]
+                        resolved_models[c_id] = m
+                        return m
+
+                    p_id = parent_map.get(c_id)
+                    if p_id and p_id != c_id:
+                        parent_m = _resolve_conv_model(p_id, visited)
+                        meta = subagent_meta.get(c_id, {})
+                        req_model = meta.get("model")
+                        resolved_m = resolve_subagent_model(
+                            req_model, parent_model=parent_m
+                        )
+                        resolved_models[c_id] = resolved_m
+                        return resolved_m
+
+                    resolved_models[c_id] = (
+                        c_conv.get("model_name") or DEFAULT_MODEL
+                    )
+                    return resolved_models[c_id]
+
+                # If not in data_by_id, check native DB in conversations_dir first
+                native_m_map = extract_native_step_models(
+                    c_id, conversations_dir=conversations_dir
+                )
+                if native_m_map:
+                    resolved_m = sorted(native_m_map.items())[-1][1]
+                    resolved_models[c_id] = resolved_m
+                    return resolved_m
+
+                # Check existing DB
+                try:
+                    row = conn.execute(
+                        "SELECT model_name, parent_id FROM conversations WHERE id = ?",
+                        (c_id,),
+                    ).fetchone()
+                    if row:
+                        try:
+                            m_val = row["model_name"]
+                            p_val = row["parent_id"]
+                        except (IndexError, TypeError):
+                            m_val = row[0]
+                            p_val = row[1]
+                        if m_val:
+                            resolved_models[c_id] = m_val
+                            return m_val
+                        if p_val and p_val != c_id:
+                            parent_m = _resolve_conv_model(p_val, visited)
+                            meta = subagent_meta.get(c_id, {})
+                            req_model = meta.get("model")
+                            resolved_m = resolve_subagent_model(
+                                req_model, parent_model=parent_m
+                            )
+                            resolved_models[c_id] = resolved_m
+                            return resolved_m
+                except Exception:
+                    pass
+
+                # If subagent has parent in parent_map
+                p_id = parent_map.get(c_id)
+                if p_id and p_id != c_id:
+                    parent_m = _resolve_conv_model(p_id, visited)
+                    meta = subagent_meta.get(c_id, {})
+                    req_model = meta.get("model")
+                    resolved_m = resolve_subagent_model(
+                        req_model, parent_model=parent_m
+                    )
+                    resolved_models[c_id] = resolved_m
+                    return resolved_m
+
+                resolved_models[c_id] = DEFAULT_MODEL
+                return DEFAULT_MODEL
+
+            for data in data_list:
+                c_conv = data["conversation"]
+                c_id = c_conv["id"]
+                c_steps = data["steps"]
+                resolved_m = _resolve_conv_model(c_id)
+                if resolved_m != c_conv["model_name"]:
+                    c_conv["model_name"] = resolved_m
+                    c_conv["models_used"] = resolved_m
+                    for s in c_steps:
+                        s["model_name"] = resolved_m
+                    _recompute_conv_costs(data, resolved_m)
 
             for i, data in enumerate(data_list, 1):
                 conv = data["conversation"]
@@ -1227,6 +1465,30 @@ def run_backfill(
                     clean_root_title = re.sub(r"^(\[.+?\]\s*)+", "", root_title).strip()
                     conv["title"] = f"[{role}] {clean_root_title[:90]}"
 
+                # Ensure parent row exists to satisfy foreign key constraint if parent hasn't been backfilled yet
+                if conv.get("parent_id"):
+                    p_id_check = conv["parent_id"]
+                    p_check = conn.execute(
+                        "SELECT id FROM conversations WHERE id = ?", (p_id_check,)
+                    ).fetchone()
+                    if not p_check:
+                        p_model = _resolve_conv_model(p_id_check)
+                        conn.execute(
+                            """
+                            INSERT OR IGNORE INTO conversations (
+                                id, title, model_name, models_used, depth, total_steps, active_pairing_seconds
+                            )
+                            VALUES (?, ?, ?, ?, ?, 0, 0.0)
+                            """,
+                            (
+                                p_id_check,
+                                f"Session {p_id_check[:8]}",
+                                p_model,
+                                p_model,
+                                max(0, depth - 1),
+                            ),
+                        )
+
                 # Upsert conversation with hierarchy metrics
                 conn.execute(
                     """
@@ -1305,6 +1567,77 @@ def run_backfill(
                         conv.get("pruned_tokens", 0),
                     ),
                 )
+
+                # Upsert dispatched subagents so child rows have lineage and model right away even if not in brain_dir
+                for child in conv.get("dispatched_subagents", []):
+                    ch_id = child["id"]
+                    ch_role = child.get("role") or "Autonomous Worker"
+                    ch_type = child.get("type") or "self"
+                    ch_step = child.get("step_index")
+
+                    native_ch_models = extract_native_step_models(
+                        ch_id, conversations_dir=conversations_dir
+                    )
+                    if native_ch_models:
+                        ch_model = sorted(native_ch_models.items())[-1][1]
+                    else:
+                        ch_model = resolve_subagent_model(
+                            child.get("model"), parent_model=conv["model_name"]
+                        )
+
+                    clean_t = conv.get("title", "")
+                    m_sub = re.match(r"^\[.+?\]\s*(.+)", clean_t)
+                    if m_sub:
+                        clean_t = m_sub.group(1)
+                    ch_title = f"[{ch_role}] {clean_t[:90]}"
+
+                    conn.execute(
+                        """
+                        INSERT INTO conversations (
+                            id, title, project, parent_id, root_id, depth, subagent_role, subagent_type, invoking_step_index, active_pairing_seconds,
+                            model_name, models_used
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0.0, ?, ?)
+                        ON CONFLICT(id) DO UPDATE SET
+                            parent_id = excluded.parent_id,
+                            root_id = excluded.root_id,
+                            depth = excluded.depth,
+                            active_pairing_seconds = 0.0,
+                            subagent_role = CASE
+                                WHEN excluded.subagent_role IS NOT NULL AND excluded.subagent_role != 'Autonomous Worker' THEN excluded.subagent_role
+                                ELSE COALESCE(conversations.subagent_role, excluded.subagent_role)
+                            END,
+                            title = CASE
+                                WHEN (conversations.title LIKE '[Autonomous Worker]%' OR conversations.title IS NULL OR conversations.title = '')
+                                     AND excluded.title NOT LIKE '[Autonomous Worker]%' THEN excluded.title
+                                ELSE conversations.title
+                            END,
+                            subagent_type = COALESCE(excluded.subagent_type, conversations.subagent_type),
+                            invoking_step_index = COALESCE(excluded.invoking_step_index, conversations.invoking_step_index),
+                            project = COALESCE(conversations.project, excluded.project),
+                            model_name = CASE
+                                WHEN conversations.total_steps IS NULL OR conversations.total_steps = 0 OR conversations.model_name IS NULL OR conversations.model_name = '' THEN excluded.model_name
+                                ELSE conversations.model_name
+                            END,
+                            models_used = CASE
+                                WHEN conversations.total_steps IS NULL OR conversations.total_steps = 0 OR conversations.models_used IS NULL OR conversations.models_used = '' THEN excluded.models_used
+                                ELSE conversations.models_used
+                            END
+                    """,
+                        (
+                            ch_id,
+                            ch_title,
+                            conv.get("project"),
+                            cid,
+                            root_id,
+                            depth + 1,
+                            ch_role,
+                            ch_type,
+                            ch_step,
+                            ch_model,
+                            ch_model,
+                        ),
+                    )
 
                 # Bulk insert steps (replace existing)
                 conn.execute(
@@ -1476,7 +1809,16 @@ if __name__ == "__main__":
         default=None,
         help="Target SQLite database file path",
     )
+    parser.add_argument(
+        "--conversations-dir",
+        type=Path,
+        default=None,
+        help="Path to native conversations directory (~/.gemini/antigravity/conversations)",
+    )
     args = parser.parse_args()
     run_backfill(
-        conversation_id=args.conversation_id, force=args.force, db_path=args.db_path
+        conversation_id=args.conversation_id,
+        force=args.force,
+        db_path=args.db_path,
+        conversations_dir=args.conversations_dir,
     )

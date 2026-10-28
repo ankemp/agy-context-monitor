@@ -37,7 +37,9 @@ from context_monitor.pricing import (  # noqa: E402
     DEFAULT_MODEL,
     calculate_step_cost,
     extract_model_switch,
+    extract_native_step_models,
     get_model_context_limit,
+    resolve_subagent_model,
 )
 from context_monitor.project import (  # noqa: E402
     extract_project_from_text,
@@ -494,16 +496,54 @@ def classify_phase(step_type: str, tool_name: str) -> str:
 
 
 def analyze_transcript(
-    transcript_path: Path,
+    transcript_path: Path | str,
     initial_model: str | None = None,
     *,
     include_tool_schemas: bool = False,
+    cid: str | None = None,
+    conversations_dir: Path | None = None,
 ) -> dict:
+    transcript_path = Path(transcript_path)
+    if cid is None:
+        p = transcript_path.resolve()
+        if (
+            p.name in ("transcript.jsonl", "transcript_full.jsonl")
+            and p.parent.name == "logs"
+            and len(p.parents) >= 3
+            and p.parents[1].name == ".system_generated"
+        ):
+            cid = p.parents[2].name
+        elif (
+            p.name in ("transcript.jsonl", "transcript_full.jsonl")
+            and p.parent.name == "logs"
+            and len(p.parents) >= 2
+        ):
+            cid = p.parents[1].name
+        elif "brain" in p.parts:
+            b_idx = p.parts.index("brain")
+            if b_idx + 1 < len(p.parts):
+                cid = p.parts[b_idx + 1]
+        elif p.is_dir():
+            cid = p.name
+        elif p.name in ("transcript.jsonl", "transcript_full.jsonl"):
+            cid = p.parent.name
+        else:
+            cid = p.stem
+
+    if cid and cid.endswith(".db"):
+        cid = cid[:-3]
+
     if transcript_path.is_dir():
         t_file = transcript_path / ".system_generated" / "logs" / "transcript.jsonl"
         if not t_file.exists():
             t_file = transcript_path / "transcript.jsonl"
         transcript_path = t_file
+
+    native_step_models = (
+        extract_native_step_models(cid, conversations_dir=conversations_dir)
+        if cid
+        else {}
+    )
 
     steps = []
     category_stats = {}
@@ -583,6 +623,23 @@ def analyze_transcript(
                             model_transitions.append(cur_model)
                         if cur_model not in models_used:
                             models_used.append(cur_model)
+
+            if step_idx in native_step_models:
+                native_m = native_step_models[step_idx]
+                if first_model is None:
+                    first_model = native_m
+                    for s in steps:
+                        if s.get("model_name") == DEFAULT_MODEL:
+                            s["model_name"] = first_model
+                    cur_model = native_m
+                    models_used = [cur_model]
+                    model_transitions = [cur_model]
+                elif native_m != cur_model:
+                    cur_model = native_m
+                    if not model_transitions or model_transitions[-1] != cur_model:
+                        model_transitions.append(cur_model)
+                    if cur_model not in models_used:
+                        models_used.append(cur_model)
 
             if not project and content:
                 project = extract_project_from_text(content)
@@ -979,6 +1036,27 @@ def analyze_transcript(
         compute_session_timings(steps, is_subagent=bool(detected_parent_id))
     )
 
+    if first_model is None and native_step_models:
+        sorted_steps = sorted(native_step_models.items())
+        first_model = sorted_steps[0][1]
+        cur_model = sorted_steps[-1][1]
+        models_used = []
+        for _, m in sorted_steps:
+            if m not in models_used:
+                models_used.append(m)
+        model_transitions = []
+        for _, m in sorted_steps:
+            if not model_transitions or model_transitions[-1] != m:
+                model_transitions.append(m)
+        for s in steps:
+            s_idx = s.get("step_index", 0)
+            if s_idx in native_step_models:
+                s["model_name"] = native_step_models[s_idx]
+            else:
+                preceding = [m for idx, m in sorted_steps if idx <= s_idx]
+                s["model_name"] = preceding[-1] if preceding else first_model
+
+    has_explicit_model = bool(first_model is not None)
     if first_model is None:
         first_model = cur_model
         if not models_used:
@@ -1070,7 +1148,52 @@ def analyze_transcript(
         "parsed_blocks": parsed_blocks,
         "parent_id": detected_parent_id,
         "dispatched_subagents": dispatched_subagents,
+        "has_explicit_model": has_explicit_model,
     }
+
+
+def _recompute_step_costs(analysis: dict, active_model: str) -> None:
+    """Recalculates billed cost and input/output tokens across steps for a given model."""
+    total_billed_cost = 0.0
+    total_billed_input_tokens = 0
+    total_billed_output_tokens = 0
+    running_ctx = 0
+    current_ephemeral = 0
+
+    for s in analysis.get("steps", []):
+        m_name = s.get("model_name", active_model)
+        s_type = s.get("step_type")
+        tokens = s.get("est_tokens", 0)
+
+        step_cost = 0.0
+        step_in_tokens = 0
+        step_out_tokens = 0
+
+        if s_type == "CHECKPOINT":
+            running_ctx = tokens
+            current_ephemeral = 0
+        elif s_type == "EPHEMERAL_MESSAGE":
+            current_ephemeral = tokens
+        elif s_type == "PLANNER_RESPONSE":
+            step_cost, step_in_tokens, step_out_tokens = calculate_step_cost(
+                running_ctx, current_ephemeral, tokens, m_name
+            )
+            total_billed_cost += step_cost
+            total_billed_input_tokens += step_in_tokens
+            total_billed_output_tokens += step_out_tokens
+            running_ctx += tokens
+            current_ephemeral = 0
+        else:
+            running_ctx += tokens
+
+        s["billed_cost"] = step_cost
+        s["billed_input_tokens"] = step_in_tokens
+        s["billed_output_tokens"] = step_out_tokens
+
+    analysis["billed_cost"] = total_billed_cost
+    analysis["billed_input_tokens"] = total_billed_input_tokens
+    analysis["billed_output_tokens"] = total_billed_output_tokens
+    analysis["active_context_tokens"] = running_ctx
 
 
 def sync_to_sqlite(
@@ -1080,6 +1203,7 @@ def sync_to_sqlite(
     *,
     attach_profile: bool = True,
     db_path: Path | None = None,
+    conversations_dir: Path | None = None,
 ):
     """Safely and incrementally syncs session data to SQLite in WAL mode and computes turn diff."""
     diff_res = None
@@ -1204,7 +1328,7 @@ def sync_to_sqlite(
 
                 # Check if an existing row already has lineage from a parent's dispatch
                 existing = cur.execute(
-                    "SELECT parent_id, root_id, depth, subagent_role, subagent_type, invoking_step_index, project, title, compaction_count, pruned_tokens FROM conversations WHERE id = ?",
+                    "SELECT parent_id, root_id, depth, subagent_role, subagent_type, invoking_step_index, project, title, compaction_count, pruned_tokens, model_name, models_used, total_steps FROM conversations WHERE id = ?",
                     (cid,),
                 ).fetchone()
 
@@ -1240,6 +1364,7 @@ def sync_to_sqlite(
                 if subagent_role and not analysis.get("subagent_role"):
                     analysis["subagent_role"] = subagent_role
 
+                p_row = None
                 if parent_id:
                     if parent_id == cid:
                         parent_id = None
@@ -1247,7 +1372,7 @@ def sync_to_sqlite(
                         depth = 0
                     else:
                         p_row = cur.execute(
-                            "SELECT id, root_id, parent_id, project, depth, title FROM conversations WHERE id = ?",
+                            "SELECT id, root_id, parent_id, project, depth, title, model_name FROM conversations WHERE id = ?",
                             (parent_id,),
                         ).fetchone()
                         if p_row and (
@@ -1285,6 +1410,75 @@ def sync_to_sqlite(
                         else:
                             root_id = parent_id
                             depth = 1
+
+                if not analysis.get("has_explicit_model"):
+                    native_step_models = extract_native_step_models(
+                        cid, conversations_dir=conversations_dir
+                    )
+                    if native_step_models:
+                        sorted_native = sorted(native_step_models.items())
+                        first_native = sorted_native[0][1]
+                        active_model = sorted_native[-1][1]
+                        analysis["latest_model"] = active_model
+                        models_used_list = []
+                        for _, m in sorted_native:
+                            if m not in models_used_list:
+                                models_used_list.append(m)
+                        model_transitions = []
+                        for _, m in sorted_native:
+                            if not model_transitions or model_transitions[-1] != m:
+                                model_transitions.append(m)
+                        analysis["models_used"] = models_used_list
+                        analysis["model_transitions"] = model_transitions
+                        analysis["latest_max_tokens"] = get_model_context_limit(active_model)
+
+                        for s in analysis.get("steps", []):
+                            s_idx = s.get("step_index", 0)
+                            if s_idx in native_step_models:
+                                s["model_name"] = native_step_models[s_idx]
+                            else:
+                                preceding = [m for idx, m in sorted_native if idx <= s_idx]
+                                s["model_name"] = preceding[-1] if preceding else first_native
+
+                        _recompute_step_costs(analysis, active_model)
+                        is_append_only = False
+                    else:
+                        existing_model = None
+                        existing_steps = 0
+                        existing_invoking_step = None
+                        if existing:
+                            try:
+                                existing_model = existing["model_name"]
+                                existing_steps = existing["total_steps"] or 0
+                                existing_invoking_step = existing["invoking_step_index"]
+                            except (IndexError, KeyError):
+                                pass
+
+                        p_model = None
+                        if p_row:
+                            try:
+                                p_model = p_row["model_name"]
+                            except (IndexError, KeyError):
+                                pass
+
+                        inherited_m = None
+                        if existing_model:
+                            inherited_m = existing_model
+                        elif p_model:
+                            inherited_m = resolve_subagent_model("inherit", p_model)
+
+                        if inherited_m and inherited_m != active_model:
+                            active_model = inherited_m
+                            analysis["latest_model"] = active_model
+                            analysis["models_used"] = [active_model]
+                            analysis["model_transitions"] = [active_model]
+                            analysis["latest_max_tokens"] = get_model_context_limit(active_model)
+
+                            for s in analysis.get("steps", []):
+                                s["model_name"] = active_model
+
+                            _recompute_step_costs(analysis, active_model)
+                            is_append_only = False
 
                 if parent_id is not None or subagent_role is not None or depth > 0:
                     analysis["active_pairing_seconds"] = 0.0
@@ -1453,6 +1647,9 @@ def sync_to_sqlite(
                     ch_role = child.get("role")
                     ch_type = child.get("type")
                     ch_step = child.get("step_index")
+                    ch_model = resolve_subagent_model(
+                        child.get("model"), parent_model=active_model
+                    )
                     clean_t = analysis["title"]
                     m_sub = re.match(r"^\[.+?\]\s*(.+)", clean_t)
                     if m_sub:
@@ -1462,9 +1659,10 @@ def sync_to_sqlite(
                     conn.execute(
                         """
                         INSERT INTO conversations (
-                            id, title, project, parent_id, root_id, depth, subagent_role, subagent_type, invoking_step_index, active_pairing_seconds
+                            id, title, project, parent_id, root_id, depth, subagent_role, subagent_type, invoking_step_index, active_pairing_seconds,
+                            model_name, models_used
                         )
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0.0)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0.0, ?, ?)
                         ON CONFLICT(id) DO UPDATE SET
                             parent_id = excluded.parent_id,
                             root_id = excluded.root_id,
@@ -1481,7 +1679,15 @@ def sync_to_sqlite(
                             END,
                             subagent_type = COALESCE(excluded.subagent_type, conversations.subagent_type),
                             invoking_step_index = COALESCE(excluded.invoking_step_index, conversations.invoking_step_index),
-                            project = COALESCE(conversations.project, excluded.project)
+                            project = COALESCE(conversations.project, excluded.project),
+                            model_name = CASE
+                                WHEN conversations.total_steps = 0 OR conversations.model_name IS NULL OR conversations.model_name = '' THEN excluded.model_name
+                                ELSE conversations.model_name
+                            END,
+                            models_used = CASE
+                                WHEN conversations.total_steps = 0 OR conversations.models_used IS NULL OR conversations.models_used = '' THEN excluded.models_used
+                                ELSE conversations.models_used
+                            END
                     """,
                         (
                             ch_id,
@@ -1493,6 +1699,8 @@ def sync_to_sqlite(
                             ch_role,
                             ch_type,
                             ch_step,
+                            ch_model,
+                            ch_model,
                         ),
                     )
 
@@ -2156,7 +2364,12 @@ def main():
                 conversation_id = parts[idx + 1]
 
     transcript_path = Path(transcript_path_str)
-    analysis = analyze_transcript(transcript_path)
+    analysis = analyze_transcript(
+        transcript_path,
+        cid=conversation_id
+        if conversation_id and conversation_id != "unknown"
+        else None,
+    )
     latest_model = analysis.get("latest_model", DEFAULT_MODEL)
     max_tokens = analysis.get(
         "latest_max_tokens", get_model_context_limit(latest_model)
@@ -2167,6 +2380,12 @@ def main():
         latest_model,
         analysis,
         attach_profile=should_generate_artifacts(),
+    )
+
+    # Refresh latest_model and max_tokens in case sync_to_sqlite resolved an inherited or native model
+    latest_model = analysis.get("latest_model", latest_model)
+    max_tokens = analysis.get(
+        "latest_max_tokens", get_model_context_limit(latest_model)
     )
 
     # Artifact reports (context_usage.md / .html) are deprecated in favor of the native
