@@ -799,3 +799,234 @@ def test_models_used_backfill_migration_in_init_db(tmp_path):
         ).fetchone()
         assert "Gemini 4 Argon (High)" in r2["models_used"]
         assert "Gemini 3.8 Flash (High)" in r2["models_used"]
+
+
+def test_carbon_hydrogen_pricing_and_context_limits():
+    from context_monitor.pricing import (
+        CACHED_INPUT_PRICING,
+        PRICING,
+        calculate_step_cost,
+        get_model_context_limit,
+        get_pricing_key,
+        normalize_native_model_name,
+        resolve_subagent_model,
+    )
+
+    assert PRICING["carbon"] == (2.00, 2.00, 10.00)
+    assert PRICING["argon"] == (2.00, 2.00, 10.00)
+    assert PRICING["hydrogen"] == (1.50, 1.50, 7.50)
+    assert CACHED_INPUT_PRICING["carbon"] == pytest.approx(0.10)
+    assert CACHED_INPUT_PRICING["argon"] == pytest.approx(0.10)
+    assert CACHED_INPUT_PRICING["hydrogen"] == pytest.approx(0.075)
+
+    for name in [
+        "Gemini 4 Carbon (Medium)",
+        "Gemini 4 Carbon (Low)",
+        "gemini-4-carbon",
+        "Orchestrator (Carbon)",
+        "gemini-pro-orchestrator",
+    ]:
+        assert get_pricing_key(name) == "carbon"
+        assert get_model_context_limit(name) == 1_000_000
+
+    for name in [
+        "Gemini 4 Hydrogen (High)",
+        "Gemini 4 Hydrogen (Medium)",
+        "Gemini 4 Hydrogen (XHigh)",
+        "gemini-4-hydrogen",
+    ]:
+        assert get_pricing_key(name) == "hydrogen"
+        assert get_model_context_limit(name) == 1_000_000
+
+    # Hydrogen: 100k uncached + 200k cached + 10k output (flat across 1M context)
+    # 100k * 1.50/M (0.15) + 200k * 0.075/M (0.015) + 10k * 7.50/M (0.075) = 0.24
+    cost_h, in_h, out_h = calculate_step_cost(
+        300_000,
+        0,
+        10_000,
+        "Gemini 4 Hydrogen (High)",
+        cached_tokens=200_000,
+    )
+    assert cost_h == pytest.approx(0.24)
+    assert in_h == 300_000
+    assert out_h == 10_000
+
+    # Carbon introductory vs post-Dec 1, 2026 standard pricing
+    cost_c_intro, _, _ = calculate_step_cost(
+        100_000,
+        0,
+        10_000,
+        "Gemini 4 Carbon (Medium)",
+        cached_tokens=50_000,
+        created_at="2026-11-16T10:00:00Z",
+    )
+    # 50k * 2.00/M (0.10) + 50k * 0.10/M (0.005) + 10k * 10.00/M (0.10) = 0.205
+    assert cost_c_intro == pytest.approx(0.205)
+
+    cost_c_std, _, _ = calculate_step_cost(
+        100_000,
+        0,
+        10_000,
+        "Gemini 4 Carbon (Medium)",
+        cached_tokens=50_000,
+        created_at="2026-12-01T00:00:00Z",
+    )
+    # 50k * 4.00/M (0.20) + 50k * 0.20/M (0.010) + 10k * 20.00/M (0.20) = 0.410
+    assert cost_c_std == pytest.approx(0.410)
+
+    # Native placeholder & model ID normalization + subagent tiers
+    assert (
+        normalize_native_model_name("gemini-4-carbon", "", "MODEL_PLACEHOLDER_M438")
+        == "Gemini 4 Carbon (Low)"
+    )
+    assert (
+        normalize_native_model_name("gemini-4-hydrogen", "", "MODEL_PLACEHOLDER_M528")
+        == "Gemini 4 Hydrogen (XHigh)"
+    )
+    assert (
+        normalize_native_model_name("gemini-pro-orchestrator", "", "MODEL_PLACEHOLDER_M667")
+        == "Orchestrator (Carbon)"
+    )
+    assert resolve_subagent_model("hydrogen", "Gemini 4 Carbon (Medium)") == "Gemini 4 Hydrogen (High)"
+    assert resolve_subagent_model("carbon", "Gemini 4 Hydrogen (High)") == "Gemini 4 Carbon (Medium)"
+
+
+def test_recompute_step_costs_native_tokens_and_implicit_cache_ttl():
+    from context_monitor.pricing import recompute_step_costs
+
+    # 1. Native token telemetry (input_tokens, cache_read_tokens, output_tokens) + trailing step
+    native_steps = [
+        {"step_type": "USER_INPUT", "est_tokens": 500, "created_at": "2026-11-16T10:00:00Z"},
+        {
+            "step_type": "PLANNER_RESPONSE",
+            "est_tokens": 400,
+            "input_tokens": 20_000,
+            "cache_read_tokens": 0,
+            "output_tokens": 1_000,
+            "model_name": "Gemini 4 Hydrogen (High)",
+            "created_at": "2026-11-16T10:00:05Z",
+        },
+        {"step_type": "GENERIC", "est_tokens": 1_500, "created_at": "2026-11-16T10:00:10Z"},
+        {
+            "step_type": "PLANNER_RESPONSE",
+            "est_tokens": 300,
+            "input_tokens": 2_000,
+            "cache_read_tokens": 21_000,
+            "output_tokens": 500,
+            "model_name": "Gemini 4 Hydrogen (High)",
+            "created_at": "2026-11-16T10:00:15Z",
+        },
+        {"step_type": "GENERIC", "est_tokens": 200, "created_at": "2026-11-16T10:00:20Z"},
+    ]
+    res_native = recompute_step_costs(native_steps, "Gemini 4 Hydrogen (High)")
+    # Step 1: 20k * 1.50/M (0.03) + 1k * 7.50/M (0.0075) = 0.0375
+    assert native_steps[1]["billed_cost"] == pytest.approx(0.0375)
+    assert native_steps[1]["billed_input_tokens"] == 20_000
+    assert native_steps[1]["billed_output_tokens"] == 1_000
+    # Step 3: 2k * 1.50/M (0.003) + 21k * 0.075/M (0.001575) + 500 * 7.50/M (0.00375) = 0.008325
+    assert native_steps[3]["billed_cost"] == pytest.approx(0.008325)
+    assert native_steps[3]["billed_input_tokens"] == 23_000
+    assert native_steps[3]["billed_output_tokens"] == 500
+    # Active context: (2000 + 21000 + 500) + trailing 200 = 23,700
+    assert res_native["active_context_tokens"] == 23_700
+
+    # 2. Fallback implicit KV cache estimation (warm within 300s, cold after >300s, reset on CHECKPOINT)
+    fallback_steps = [
+        {"step_type": "USER_INPUT", "est_tokens": 10_000, "created_at": "2026-11-16T10:00:00Z"},
+        {
+            "step_type": "PLANNER_RESPONSE",
+            "est_tokens": 1_000,
+            "model_name": "Gemini 4 Carbon (Low)",
+            "created_at": "2026-11-16T10:00:10Z",
+        },
+        {"step_type": "GENERIC", "est_tokens": 2_000, "created_at": "2026-11-16T10:00:20Z"},
+        {
+            "step_type": "PLANNER_RESPONSE",
+            "est_tokens": 1_000,
+            "model_name": "Gemini 4 Carbon (Low)",
+            "created_at": "2026-11-16T10:01:00Z",  # 50s later -> cache warm (11k cached, 2k fresh)
+        },
+        {"step_type": "GENERIC", "est_tokens": 1_000, "created_at": "2026-11-16T10:10:00Z"},
+        {
+            "step_type": "PLANNER_RESPONSE",
+            "est_tokens": 1_000,
+            "model_name": "Gemini 4 Carbon (Low)",
+            "created_at": "2026-11-16T10:10:10Z",  # >300s after 10:01:00 -> cache expired (15k uncached)
+        },
+        {"step_type": "CHECKPOINT", "est_tokens": 5_000, "created_at": "2026-11-16T10:10:20Z"},
+        {
+            "step_type": "PLANNER_RESPONSE",
+            "est_tokens": 500,
+            "model_name": "Gemini 4 Carbon (Low)",
+            "created_at": "2026-11-16T10:10:30Z",  # right after CHECKPOINT -> cache invalidated (5k uncached)
+        },
+    ]
+    recompute_step_costs(fallback_steps, "Gemini 4 Carbon (Low)")
+    # Step 1: 10k * 2.00/M (0.02) + 1k * 10.00/M (0.01) = 0.03
+    assert fallback_steps[1]["billed_cost"] == pytest.approx(0.03)
+    # Step 3 (warm): 11k * 0.10/M (0.0011) + 2k * 2.00/M (0.004) + 1k * 10.00/M (0.01) = 0.0151
+    assert fallback_steps[3]["billed_cost"] == pytest.approx(0.0151)
+    # Step 5 (expired >300s): 15k * 2.00/M (0.03) + 1k * 10.00/M (0.01) = 0.04
+    assert fallback_steps[5]["billed_cost"] == pytest.approx(0.04)
+    # Step 7 (post-checkpoint): 5k * 2.00/M (0.01) + 500 * 10.00/M (0.005) = 0.015
+    assert fallback_steps[7]["billed_cost"] == pytest.approx(0.015)
+
+
+def test_ingest_and_backfill_parity_with_native_gemini4_tokens(tmp_path):
+    import json
+    from scripts import backfill_analytics, ingest
+
+    t_dir = tmp_path / "conv-g4"
+    logs_dir = t_dir / ".system_generated" / "logs"
+    logs_dir.mkdir(parents=True)
+    tx_path = logs_dir / "transcript.jsonl"
+    lines = [
+        {
+            "step_index": 0,
+            "type": "USER_INPUT",
+            "source": "USER",
+            "created_at": "2026-11-16T10:00:00Z",
+            "content": "<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection` from None to Gemini 4 Hydrogen (High).\n</USER_SETTINGS_CHANGE>\nHello",
+        },
+        {
+            "step_index": 1,
+            "type": "PLANNER_RESPONSE",
+            "source": "MODEL",
+            "created_at": "2026-11-16T10:00:05Z",
+            "content": "Hi!",
+            "input_tokens": 20_000,
+            "cache_read_tokens": 0,
+            "output_tokens": 1_000,
+        },
+        {
+            "step_index": 2,
+            "type": "GENERIC",
+            "source": "SYSTEM",
+            "created_at": "2026-11-16T10:00:08Z",
+            "content": "Tool output here",
+        },
+        {
+            "step_index": 3,
+            "type": "PLANNER_RESPONSE",
+            "source": "MODEL",
+            "created_at": "2026-11-16T10:00:12Z",
+            "content": "Done.",
+            "input_tokens": 2_000,
+            "cache_read_tokens": 21_000,
+            "output_tokens": 500,
+        },
+    ]
+    tx_path.write_text("\n".join(json.dumps(x) for x in lines) + "\n", encoding="utf-8")
+
+    ing = ingest.analyze_transcript(t_dir)
+    bf = backfill_analytics.parse_conversation(t_dir)
+    assert bf is not None
+
+    assert ing["latest_model"] == "Gemini 4 Hydrogen (High)"
+    assert ing["latest_max_tokens"] == 1_000_000
+    assert ing["active_context_tokens"] == 23_500
+    assert ing["billed_cost"] == pytest.approx(0.0375 + 0.008325)
+    assert bf["conversation"]["billed_cost"] == pytest.approx(ing["billed_cost"])
+    assert bf["conversation"]["billed_input_tokens"] == ing["billed_input_tokens"]
+    assert bf["conversation"]["billed_output_tokens"] == ing["billed_output_tokens"]
+    assert bf["conversation"]["active_context_tokens"] == ing["active_context_tokens"]

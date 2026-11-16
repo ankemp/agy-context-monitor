@@ -466,12 +466,22 @@ def test_sidecar_model_detection_and_naive_utc_countdown():
     const opusPrefix = getModelQuotaPrefix('Claude 3 Opus');
     const argonLimit = getModelContextLimit('Gemini 4 Argon');
     const argonPrefix = getModelQuotaPrefix('Gemini 4 Argon');
+    const carbonLimit = getModelContextLimit('Gemini 4 Carbon (Medium)');
+    const carbonPrefix = getModelQuotaPrefix('Gemini 4 Carbon (Medium)');
+    const hydrogenLimit = getModelContextLimit('Gemini 4 Hydrogen (High)');
+    const hydrogenPrefix = getModelQuotaPrefix('Gemini 4 Hydrogen (High)');
+    const orchLimit = getModelContextLimit('gemini-pro-orchestrator');
+    const orchPrefix = getModelQuotaPrefix('Orchestrator (Carbon)');
 
     const now = new Date('2026-10-14T12:00:00Z');
     const utcZ = formatResetCountdown('2026-10-14T14:00:00Z', now);
     const naive = formatResetCountdown('2026-10-14T14:00:00', now);
 
-    console.log(JSON.stringify({ sonnetLimit, sonnetPrefix, opusLimit, opusPrefix, argonLimit, argonPrefix, utcZ, naive }));
+    console.log(JSON.stringify({
+      sonnetLimit, sonnetPrefix, opusLimit, opusPrefix, argonLimit, argonPrefix,
+      carbonLimit, carbonPrefix, hydrogenLimit, hydrogenPrefix, orchLimit, orchPrefix,
+      utcZ, naive
+    }));
     """
 
     res = subprocess.run(
@@ -488,6 +498,12 @@ def test_sidecar_model_detection_and_naive_utc_countdown():
     assert data["opusPrefix"] == "3p"
     assert data["argonLimit"] == 1000000
     assert data["argonPrefix"] == "gemini"
+    assert data["carbonLimit"] == 1000000
+    assert data["carbonPrefix"] == "gemini"
+    assert data["hydrogenLimit"] == 1000000
+    assert data["hydrogenPrefix"] == "gemini"
+    assert data["orchLimit"] == 1000000
+    assert data["orchPrefix"] == "gemini"
     assert data["utcZ"] == "2h 0m"
     assert data["naive"] == "2h 0m"
 

@@ -37,6 +37,7 @@ from context_monitor.pricing import (  # noqa: E402
     DEFAULT_MODEL,
     calculate_step_cost,
     extract_model_switch,
+    extract_native_step_tokens,
     get_model_context_limit,
     recompute_step_costs,
     resolve_subagent_model,
@@ -446,10 +447,16 @@ def analyze_transcript(
             thinking_len = len(thinking)
             tool_calls_len = len(json.dumps(tool_calls)) if tool_calls else 0
             step_chars = content_len + thinking_len + tool_calls_len
+            native_tok = extract_native_step_tokens(step)
             est_tokens = (
                 step.get("est_tokens")
                 if step.get("est_tokens") is not None
-                else int(step_chars / CHARS_PER_TOKEN)
+                else (
+                    native_tok["output_tokens"]
+                    if step_type == "PLANNER_RESPONSE"
+                    and "output_tokens" in native_tok
+                    else int(step_chars / CHARS_PER_TOKEN)
+                )
             )
             step_thinking_tokens = (
                 int(thinking_len / CHARS_PER_TOKEN) if thinking_len else 0
@@ -798,23 +805,24 @@ def analyze_transcript(
             phase = classify_phase(step_type, primary_tool_name)
             category_stats[category] = category_stats.get(category, 0) + step_chars
 
-            steps.append(
-                {
-                    "step_index": step_idx,
-                    "created_at": created_at,
-                    "source": source,
-                    "step_type": step_type,
-                    "category": category,
-                    "activity": activity,
-                    "tool_or_source": tool_or_source,
-                    "characters": step_chars,
-                    "est_tokens": est_tokens,
-                    "thinking_tokens": step_thinking_tokens,
-                    "phase": phase,
-                    "model_name": cur_model,
-                    "detail": detail,
-                }
-            )
+            step_record = {
+                "step_index": step_idx,
+                "created_at": created_at,
+                "source": source,
+                "step_type": step_type,
+                "category": category,
+                "activity": activity,
+                "tool_or_source": tool_or_source,
+                "characters": step_chars,
+                "est_tokens": est_tokens,
+                "thinking_tokens": step_thinking_tokens,
+                "phase": phase,
+                "model_name": cur_model,
+                "detail": detail,
+            }
+            if native_tok:
+                step_record.update(native_tok)
+            steps.append(step_record)
 
     total_tokens = int(total_chars / CHARS_PER_TOKEN)
     duration_seconds, active_agent_seconds, active_pairing_seconds = (

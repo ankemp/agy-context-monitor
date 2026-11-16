@@ -35,7 +35,7 @@ if str(_root / "src") not in sys.path:
 
 from context_monitor.db import get_db_connection, DEFAULT_DB_PATH, ensure_rollups_synced  # noqa: E402
 from context_monitor.pricing import (  # noqa: E402
-    calculate_step_cost,
+    recompute_step_costs,
 )
 from context_monitor.quota import (  # noqa: E402
     calculate_quota_metrics,
@@ -98,9 +98,9 @@ def calculate_billed_cost(conn):
     except Exception:
         pass
 
-    # Fallback to accurate multi-turn calculation
+    # Fallback to accurate multi-turn calculation via shared recompute_step_costs
     cur.execute("""
-        SELECT s.conversation_id, COALESCE(s.model_name, c.model_name, 'Gemini Flash'), s.step_type, s.est_tokens
+        SELECT s.conversation_id, COALESCE(s.model_name, c.model_name, 'Gemini Flash'), s.step_type, s.est_tokens, s.created_at
         FROM steps s
         JOIN conversations c ON s.conversation_id = c.id
         ORDER BY s.conversation_id, s.step_index ASC
@@ -110,31 +110,31 @@ def calculate_billed_cost(conn):
     total_in = 0
     total_out = 0
     cur_conv = None
-    running_ctx = 0
-    current_ephemeral = 0
+    conv_steps: list[dict] = []
 
-    for cid, model_name, s_type, tokens in cur.fetchall():
+    def _flush_conv(batch: list[dict]) -> None:
+        nonlocal total_cost, total_in, total_out
+        if not batch:
+            return
+        res = recompute_step_costs(batch, batch[-1]["model_name"])
+        total_cost += float(res["billed_cost"])
+        total_in += int(res["billed_input_tokens"])
+        total_out += int(res["billed_output_tokens"])
+
+    for cid, model_name, s_type, tokens, created_at in cur.fetchall():
         if cid != cur_conv:
+            _flush_conv(conv_steps)
             cur_conv = cid
-            running_ctx = 0
-            current_ephemeral = 0
-
-        if s_type == "CHECKPOINT":
-            running_ctx = tokens
-            current_ephemeral = 0
-        elif s_type == "EPHEMERAL_MESSAGE":
-            current_ephemeral = tokens
-        elif s_type == "PLANNER_RESPONSE":
-            step_cost, step_in, step_out = calculate_step_cost(
-                running_ctx, current_ephemeral, tokens, model_name
-            )
-            total_cost += step_cost
-            total_in += step_in
-            total_out += step_out
-            running_ctx += tokens
-            current_ephemeral = 0
-        else:
-            running_ctx += tokens
+            conv_steps = []
+        conv_steps.append(
+            {
+                "model_name": model_name,
+                "step_type": s_type,
+                "est_tokens": tokens or 0,
+                "created_at": created_at,
+            }
+        )
+    _flush_conv(conv_steps)
 
     return total_cost, total_in, total_out
 
