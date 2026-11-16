@@ -274,6 +274,22 @@
     });
 
     let currentProjectMetric = 'cost'; // 'cost' | 'tokens'
+    let showAllProjects = false;
+    let showAllMcpServers = false;
+
+    window.toggleProjectShowAll = function(forceState) {
+      showAllProjects = typeof forceState === 'boolean' ? forceState : !showAllProjects;
+      if (allProjectCostData) {
+        renderProjectCostSection(allProjectCostData, currentProject);
+      }
+    };
+
+    window.toggleMcpShowAll = function(forceState) {
+      showAllMcpServers = typeof forceState === 'boolean' ? forceState : !showAllMcpServers;
+      if (allMcpData && allMcpData.length > 0) {
+        renderMcpSection(allMcpData);
+      }
+    };
 
     window.setProjectCostMetric = function(metric) {
       currentProjectMetric = metric;
@@ -288,16 +304,179 @@
       }
     };
 
+    let currentModelGroupMode = 'family'; // 'family' | 'variant'
+    let currentModelLegacyMode = 'active'; // 'active' | 'all'
+    let lastModelsData = [];
+
+    const _MODEL_PILL_ACTIVE_CLS = 'px-2 py-0.5 rounded-md bg-brand-600 text-white font-medium shadow-sm transition text-[11px] whitespace-nowrap outline-none focus:outline-none';
+    const _MODEL_PILL_INACTIVE_CLS = 'px-2 py-0.5 rounded-md text-gray-400 hover:text-white transition text-[11px] whitespace-nowrap outline-none focus:outline-none';
+
+    window.setModelGroupMode = function(mode) {
+      currentModelGroupMode = mode === 'variant' ? 'variant' : 'family';
+      const btnFamily = document.getElementById('btnModelFamily');
+      const btnVariant = document.getElementById('btnModelVariant');
+      if (btnFamily) btnFamily.className = currentModelGroupMode === 'family' ? _MODEL_PILL_ACTIVE_CLS : _MODEL_PILL_INACTIVE_CLS;
+      if (btnVariant) btnVariant.className = currentModelGroupMode === 'variant' ? _MODEL_PILL_ACTIVE_CLS : _MODEL_PILL_INACTIVE_CLS;
+      renderModelsChart();
+    };
+
+    window.setModelLegacyMode = function(mode) {
+      currentModelLegacyMode = mode === 'all' ? 'all' : 'active';
+      const btnActive = document.getElementById('btnModelActive');
+      const btnAll = document.getElementById('btnModelAll');
+      if (btnActive) btnActive.className = currentModelLegacyMode === 'active' ? _MODEL_PILL_ACTIVE_CLS : _MODEL_PILL_INACTIVE_CLS;
+      if (btnAll) btnAll.className = currentModelLegacyMode === 'all' ? _MODEL_PILL_ACTIVE_CLS : _MODEL_PILL_INACTIVE_CLS;
+      renderModelsChart();
+    };
+
     const PROJECT_PALETTE = [
       '#6366f1', '#a855f7', '#06b6d4', '#10b981', '#f59e0b',
       '#ec4899', '#3b82f6', '#14b8a6', '#f43f5e', '#8b5cf6'
     ];
+    const OTHER_SLATE_COLOR = '#475569';
+
+    function getDistinctPaletteColor(index, palette = PROJECT_PALETTE) {
+      const pal = Array.isArray(palette) && palette.length > 0 ? palette : PROJECT_PALETTE;
+      const idx = Math.max(0, Math.floor(Number(index) || 0));
+      if (idx < pal.length) {
+        return pal[idx];
+      }
+      return `hsl(${((idx * 137.508) % 360).toFixed(1)}, 68%, 58%)`;
+    }
 
     function getProjectColor(projectName, index) {
       if (!projectName || projectName === '(unassigned)') {
         return '#64748b';
       }
-      return PROJECT_PALETTE[index % PROJECT_PALETTE.length];
+      return getDistinctPaletteColor(index, PROJECT_PALETTE);
+    }
+
+    function colorWithAlpha(color, alpha = 0.8) {
+      if (typeof color !== 'string') return color;
+      if (color.startsWith('#') && color.length === 7) {
+        const hexAlpha = Math.round(alpha * 255).toString(16).padStart(2, '0');
+        return color + hexAlpha;
+      }
+      if (color.startsWith('hsl(')) {
+        return color.replace(/^hsl\((.+)\)$/, `hsla($1, ${alpha})`);
+      }
+      return color;
+    }
+
+    const _MODEL_TIER_SUFFIX_RE = /\s*\((?:high|medium|low|xhigh|tiered|thinking|reasoning)\)\s*$/i;
+    const _LEGACY_GEMINI_VERSION_RE = /\bgemini[- ]?(?:1(?:\.\d+)?|2(?:\.\d+)?|3\.[0-7])\b/i;
+
+    function getModelFamilyJs(modelName, apiFamily) {
+      if (typeof apiFamily === 'string' && apiFamily.trim()) {
+        return apiFamily.trim();
+      }
+      const raw = String(modelName || '').trim();
+      if (!raw) return 'Gemini';
+      const collapsed = raw.replace(/\s+/g, ' ').trim();
+      const lower = collapsed.toLowerCase();
+      if (lower.includes('orchestrator') && (lower.includes('carbon') || lower === 'orchestrator')) {
+        return 'Gemini 4 Carbon';
+      }
+      const family = collapsed.replace(_MODEL_TIER_SUFFIX_RE, '').replace(/\s+/g, ' ').trim();
+      return family || 'Gemini';
+    }
+
+    function isLegacyModelJs(modelName, apiLegacy) {
+      if (typeof apiLegacy === 'boolean') {
+        return apiLegacy;
+      }
+      const raw = String(modelName || '').trim();
+      if (!raw) return false;
+      const m = raw.toLowerCase().replace(/\s+/g, ' ').trim();
+      if (
+        m.includes('orchestrator') ||
+        m.includes('gemini 4') ||
+        m.includes('gemini-4') ||
+        m.includes('3.8') ||
+        m === 'gemini flash'
+      ) {
+        return false;
+      }
+      if (_LEGACY_GEMINI_VERSION_RE.test(m)) {
+        return true;
+      }
+      if ((m.includes('gemini pro') || m.includes('gemini-pro')) && !m.includes('4')) {
+        return true;
+      }
+      return false;
+    }
+
+    function rollupTopNWithOther(items, opts = {}) {
+      const list = Array.isArray(items) ? items : [];
+      const maxItems = Math.max(0, Math.floor(Number(opts.maxItems ?? 5)));
+      const minSharePct = Number(opts.minSharePct ?? 0) || 0;
+      const getValue = typeof opts.getValue === 'function' ? opts.getValue : (x => Number(x?.value ?? 0));
+      const keepItem = typeof opts.keepItem === 'function' ? opts.keepItem : null;
+      const buildOther = typeof opts.buildOther === 'function' ? opts.buildOther : null;
+
+      const valOf = (item) => {
+        const v = Number(getValue(item));
+        return Number.isFinite(v) && v > 0 ? v : 0;
+      };
+
+      const sorted = list.slice().sort((a, b) => valOf(b) - valOf(a));
+      const totalValue = sorted.reduce((acc, item) => acc + valOf(item), 0);
+
+      if (totalValue <= 0) {
+        return {
+          items: sorted.slice(0, maxItems),
+          otherCount: 0,
+          otherValue: 0,
+          totalValue: 0
+        };
+      }
+
+      const primary = [];
+      const tail = [];
+      let primaryNonPinnedCount = 0;
+
+      for (const item of sorted) {
+        const val = valOf(item);
+        const sharePct = (val / totalValue) * 100;
+        const isPinned = keepItem ? Boolean(keepItem(item)) : false;
+        if (isPinned) {
+          primary.push(item);
+        } else if (primaryNonPinnedCount < maxItems && sharePct >= minSharePct) {
+          primary.push(item);
+          primaryNonPinnedCount += 1;
+        } else {
+          tail.push(item);
+        }
+      }
+
+      if (
+        tail.length === 1 &&
+        primaryNonPinnedCount === maxItems &&
+        ((valOf(tail[0]) / totalValue) * 100) >= minSharePct
+      ) {
+        primary.push(tail.pop());
+      }
+
+      const otherCount = tail.length;
+      const otherValue = tail.reduce((acc, item) => acc + valOf(item), 0);
+      const resultItems = primary.slice();
+
+      if (otherCount > 0) {
+        const otherItem = buildOther
+          ? buildOther(tail, otherValue, totalValue)
+          : { label: `Other (${otherCount})`, value: otherValue, isOther: true };
+        if (otherItem && typeof otherItem === 'object' && otherItem.isOther === undefined) {
+          otherItem.isOther = true;
+        }
+        resultItems.push(otherItem);
+      }
+
+      return {
+        items: resultItems,
+        otherCount,
+        otherValue,
+        totalValue
+      };
     }
 
     const COLOR_PALETTE = {
@@ -343,8 +522,14 @@
 
     function getModelTierClass(modelStr) {
       const m = String(modelStr || '').toLowerCase();
+      if (m.includes('carbon') || m.includes('orchestrator')) {
+        return 'bg-emerald-950/70 text-emerald-300 border-emerald-500/40';
+      }
       if (m.includes('argon') || m.includes('reasoning') || m.includes('thinking')) {
         return 'bg-cyan-950/70 text-cyan-300 border-cyan-500/40';
+      }
+      if (m.includes('hydrogen')) {
+        return 'bg-sky-950/70 text-sky-300 border-sky-500/40';
       }
       if (m.includes('pro') || m.includes('opus')) {
         return 'bg-indigo-950/70 text-indigo-300 border-indigo-500/40';
@@ -2164,12 +2349,91 @@
       window.velocityChart = timelineChart;
     }
 
+    const MODEL_CHART_PALETTE = ['#6366f1', '#06b6d4', '#a855f7', '#10b981', '#f59e0b'];
+
+    function escapeModelText(str) {
+      return String(str ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+    }
+
     function renderModelsChart(models) {
+      if (models !== undefined) {
+        lastModelsData = Array.isArray(models) ? models : [];
+      }
+      const rawModels = Array.isArray(lastModelsData) ? lastModelsData : [];
       const canvas = document.getElementById('modelsChart');
-      if (!canvas || !models) return;
-      const labels = models.map(m => m.model_name);
-      const data = models.map(m => m.tokens);
-      const colors = ['#6366f1', '#a855f7', '#ec4899', '#3b82f6', '#10b981', '#f59e0b'];
+      const legendEl = document.getElementById('modelsLegend');
+      const footerEl = document.getElementById('modelsFooterNote');
+      if (!canvas) return;
+
+      const activeModels = [];
+      const legacyModels = [];
+      for (const m of rawModels) {
+        if (isLegacyModelJs(m?.model_name, m?.is_legacy)) {
+          legacyModels.push(m);
+        } else {
+          activeModels.push(m);
+        }
+      }
+
+      let filteredModels = rawModels;
+      let hiddenLegacyCount = 0;
+      let hiddenLegacyTokens = 0;
+      let usedLegacyFallback = false;
+
+      if (currentModelLegacyMode === 'active') {
+        if (activeModels.length > 0) {
+          filteredModels = activeModels;
+          hiddenLegacyCount = legacyModels.length;
+          hiddenLegacyTokens = legacyModels.reduce((acc, m) => acc + (Number(m?.tokens) || 0), 0);
+        } else if (rawModels.length > 0) {
+          filteredModels = rawModels;
+          usedLegacyFallback = true;
+        } else {
+          filteredModels = [];
+        }
+      }
+
+      const groupedMap = new Map();
+      for (const m of filteredModels) {
+        const label = currentModelGroupMode === 'family'
+          ? getModelFamilyJs(m?.model_name, m?.model_family)
+          : String(m?.model_name || 'Unknown');
+        const tok = Number(m?.tokens) || 0;
+        const stp = Number(m?.steps) || 0;
+        const existing = groupedMap.get(label);
+        if (existing) {
+          existing.tokens += tok;
+          existing.steps += stp;
+        } else {
+          groupedMap.set(label, { label, tokens: tok, steps: stp, isOther: false });
+        }
+      }
+      const grouped = Array.from(groupedMap.values());
+
+      const rolled = rollupTopNWithOther(grouped, {
+        maxItems: 5,
+        minSharePct: 1.5,
+        getValue: (m) => m.tokens,
+        buildOther: (tail, sum) => ({
+          label: 'Other (' + tail.length + ')',
+          tokens: sum,
+          steps: tail.reduce((a, b) => a + (b.steps || 0), 0),
+          isOther: true
+        })
+      });
+
+      const slices = rolled.items;
+      const totalTokens = rolled.totalValue;
+      const labels = slices.map((item) => item.label);
+      const data = slices.map((item) => item.tokens);
+      const colors = slices.map((item, idx) =>
+        item.isOther ? OTHER_SLATE_COLOR : getDistinctPaletteColor(idx, MODEL_CHART_PALETTE)
+      );
 
       modelsChart = upsertChart(modelsChart, canvas, {
         type: 'doughnut',
@@ -2177,7 +2441,7 @@
           labels: labels,
           datasets: [{
             data: data,
-            backgroundColor: colors.slice(0, labels.length),
+            backgroundColor: colors,
             borderColor: '#111827',
             borderWidth: 2
           }]
@@ -2185,21 +2449,74 @@
         options: {
           responsive: true,
           maintainAspectRatio: false,
+          animation: false,
+          animations: false,
+          cutout: '65%',
           plugins: {
-            legend: { position: 'bottom', labels: { color: '#9ca3af', boxWidth: 12, font: { size: 10 } } },
+            legend: { display: false },
             tooltip: {
               callbacks: {
-                label: (ctx) => ` ${ctx.label}: ${formatTokens(ctx.raw)} API tokens`
+                label: (ctx) => {
+                  const val = Number(ctx.raw) || 0;
+                  const pct = totalTokens > 0 ? ((val / totalTokens) * 100).toFixed(1) : '0.0';
+                  return ` ${ctx.label}: ${pct}% (${formatTokens(val)} tokens)`;
+                }
               }
             }
-          },
-          cutout: '65%'
+          }
         }
       });
+
+      if (legendEl) {
+        if (slices.length === 0) {
+          legendEl.innerHTML = '<div class="text-xs text-gray-500">No model token data recorded</div>';
+        } else {
+          legendEl.innerHTML = slices.map((item, idx) => {
+            const pct = totalTokens > 0 ? ((item.tokens / totalTokens) * 100).toFixed(1) : '0.0';
+            const safeLabel = escapeModelText(item.label);
+            return `
+              <div class="flex items-center justify-between gap-2 text-xs leading-tight">
+                <div class="flex items-center gap-2 min-w-0">
+                  <span class="w-2.5 h-2.5 rounded-full shrink-0" style="background-color: ${colors[idx]}"></span>
+                  <span class="text-gray-200 truncate" title="${safeLabel}">${safeLabel}</span>
+                </div>
+                <div class="flex items-center gap-2 shrink-0 font-mono text-[11px]">
+                  <span class="text-gray-300 font-medium">${pct}%</span>
+                  <span class="text-gray-400">${formatTokens(item.tokens)}</span>
+                </div>
+              </div>
+            `;
+          }).join('');
+        }
+      }
+
+      if (footerEl) {
+        if (usedLegacyFallback) {
+          footerEl.innerHTML = '<span>Showing legacy models (no active models recorded)</span>';
+        } else if (hiddenLegacyCount > 0) {
+          const totalAllTokens = rawModels.reduce((acc, m) => acc + (Number(m?.tokens) || 0), 0);
+          const hiddenPct = totalAllTokens > 0 ? ((hiddenLegacyTokens / totalAllTokens) * 100).toFixed(1) : '0.0';
+          footerEl.innerHTML = `
+            <span>Hiding ${hiddenLegacyCount} legacy model${hiddenLegacyCount === 1 ? '' : 's'} (${hiddenPct}% tokens)</span>
+            <button onclick="window.setModelLegacyMode('all')" class="text-brand-400 hover:text-brand-300 font-medium transition whitespace-nowrap">Show all</button>
+          `;
+        } else if (currentModelLegacyMode === 'all' && legacyModels.length > 0) {
+          footerEl.innerHTML = `
+            <span>Showing all ${rawModels.length} models (${legacyModels.length} legacy)</span>
+            <button onclick="window.setModelLegacyMode('active')" class="text-brand-400 hover:text-brand-300 font-medium transition whitespace-nowrap">Active only</button>
+          `;
+        } else if (rawModels.length > 0) {
+          const unit = currentModelGroupMode === 'family' ? 'families' : 'variants';
+          footerEl.innerHTML = `<span>Showing ${grouped.length} active ${unit}</span>`;
+        } else {
+          footerEl.innerHTML = '<span>No model usage recorded</span>';
+        }
+      }
     }
 
     function renderProjectCostSection(costData, currentProject) {
       if (!costData) return;
+      allProjectCostData = costData;
       const projects = costData.projects || [];
       const totalCost = costData.total_cost || 0;
 
@@ -2249,25 +2566,68 @@
         elCountBadge.textContent = `${projects.length} project${projects.length === 1 ? '' : 's'}`;
       }
 
+      const isCost = (currentProjectMetric === 'cost');
+
       // 1. Chart.js Horizontal Bar Chart
       const chartCanvas = document.getElementById('projectCostChart');
       if (chartCanvas && typeof chartCanvas.getContext === 'function') {
-        const ctx = chartCanvas.getContext('2d');
-        const labels = projects.map(p => p.project);
-        const isCost = (currentProjectMetric === 'cost');
-        const dataValues = isCost ? projects.map(p => p.cost) : projects.map(p => p.tokens);
+        const sortedProjects = projects.slice().sort((a, b) => {
+          const va = isCost ? (a.cost || 0) : (a.tokens || 0);
+          const vb = isCost ? (b.cost || 0) : (b.tokens || 0);
+          return vb - va;
+        });
+
+        const collapsedRollup = rollupTopNWithOther(sortedProjects, {
+          maxItems: 8,
+          minSharePct: 1.5,
+          getValue: p => isCost ? (p.cost || 0) : (p.tokens || 0),
+          keepItem: p => isFiltered && p.project === currentProject,
+          buildOther: (tail) => {
+            const tailCost = tail.reduce((a, b) => a + (b.cost || 0), 0);
+            return {
+              project: 'Other (' + tail.length + ' projects)',
+              cost: tailCost,
+              tokens: tail.reduce((a, b) => a + (b.tokens || 0), 0),
+              sessions: tail.reduce((a, b) => a + (b.sessions || 0), 0),
+              percentage: totalCost > 0 ? Number((tailCost / totalCost * 100).toFixed(1)) : 0,
+              isOther: true,
+              _otherCount: tail.length
+            };
+          }
+        });
+
+        const hasTail = collapsedRollup.otherCount > 0;
+        const displayProjects = showAllProjects ? sortedProjects : collapsedRollup.items;
+
+        const showAllBtn = document.getElementById('projectShowAllBtn');
+        if (showAllBtn) {
+          if (hasTail || (showAllProjects && sortedProjects.length > 8)) {
+            showAllBtn.classList.remove('hidden');
+            showAllBtn.textContent = showAllProjects ? 'Top 8 + Other' : `Show all (${sortedProjects.length})`;
+          } else {
+            showAllBtn.classList.add('hidden');
+          }
+        }
+
+        const chartInner = document.getElementById('projectCostChartInner');
+        if (chartInner) {
+          chartInner.style.height = Math.max(260, displayProjects.length * 28) + 'px';
+        }
+
+        const labels = displayProjects.map(p => p.project);
+        const dataValues = isCost ? displayProjects.map(p => p.cost) : displayProjects.map(p => p.tokens);
 
         const backgroundColors = [];
         const borderColors = [];
         const borderWidths = [];
 
-        projects.forEach((p, idx) => {
-          const baseColor = getProjectColor(p.project, idx);
-          const isSelected = isFiltered && (p.project === currentProject);
+        displayProjects.forEach((p, idx) => {
+          const baseColor = p.isOther ? OTHER_SLATE_COLOR : getProjectColor(p.project, idx);
+          const isSelected = isFiltered && !p.isOther && (p.project === currentProject);
 
           if (!isFiltered) {
             // Normal state: all projects vibrant
-            backgroundColors.push(baseColor + 'cc');
+            backgroundColors.push(colorWithAlpha(baseColor, 0.8));
             borderColors.push(baseColor);
             borderWidths.push(1);
           } else if (isSelected) {
@@ -2306,7 +2666,8 @@
               tooltip: {
                 callbacks: {
                   label: (ctx) => {
-                    const p = projects[ctx.dataIndex];
+                    const p = displayProjects[ctx.dataIndex];
+                    if (!p) return '';
                     if (isCost) {
                       const costStr = '$' + ctx.raw.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
                       return ` ${costStr} (${p.percentage}% share • ${p.sessions} sessions • ${formatTokens(p.tokens)} API tokens)`;
@@ -2321,6 +2682,11 @@
             onClick: (evt, elements) => {
               if (elements && elements.length > 0) {
                 const idx = elements[0].index;
+                const clickedItem = displayProjects[idx];
+                if (clickedItem && clickedItem.isOther) {
+                  window.toggleProjectShowAll(true);
+                  return;
+                }
                 const clickedProject = labels[idx];
                 if (currentProject === clickedProject) {
                   window.handleProjectChange('all');
@@ -2343,13 +2709,16 @@
                 grid: { display: false },
                 ticks: {
                   color: (ctx) => {
+                    const item = displayProjects[ctx.index];
                     const label = labels[ctx.index];
+                    if (item && item.isOther) return '#94a3b8';
                     if (!isFiltered) return '#e5e7eb';
                     return label === currentProject ? '#ffffff' : '#6b7280';
                   },
                   font: (ctx) => {
+                    const item = displayProjects[ctx.index];
                     const label = labels[ctx.index];
-                    const isSelected = isFiltered && label === currentProject;
+                    const isSelected = isFiltered && !(item && item.isOther) && label === currentProject;
                     return {
                       size: 11,
                       weight: isSelected ? 'bold' : 'normal'
@@ -2490,13 +2859,49 @@
     }
 
     function renderMcpSection(mcpData) {
-      allMcpData = mcpData || [];
+      allMcpData = Array.isArray(mcpData) ? mcpData : [];
       const canvas = document.getElementById('mcpServerChart');
-      if (!canvas || !allMcpData || allMcpData.length === 0) return;
+      const showAllBtn = document.getElementById('mcpShowAllBtn');
+      if (!canvas || allMcpData.length === 0) {
+        if (showAllBtn) showAllBtn.classList.add('hidden');
+        return;
+      }
 
-      const labels = allMcpData.map(s => s.server);
-      const data = allMcpData.map(s => s.calls);
-      const colors = ['#06b6d4', '#3b82f6', '#10b981', '#f59e0b', '#ec4899', '#8b5cf6', '#a855f7', '#64748b'];
+      const MCP_PALETTE = ['#06b6d4', '#3b82f6', '#10b981', '#f59e0b', '#ec4899', '#8b5cf6', '#a855f7', '#64748b'];
+      const sortedServers = allMcpData.slice().sort((a, b) => (b.calls || 0) - (a.calls || 0));
+      const collapsedRollup = rollupTopNWithOther(sortedServers, {
+        maxItems: 6,
+        minSharePct: 1.5,
+        getValue: s => s.calls || 0,
+        buildOther: (tail, sumCalls) => ({
+          server: 'Other (' + tail.length + ' servers)',
+          calls: sumCalls,
+          isOther: true
+        })
+      });
+
+      const hasTail = collapsedRollup.otherCount > 0;
+      const displayServers = showAllMcpServers ? sortedServers : collapsedRollup.items;
+
+      if (showAllBtn) {
+        if (hasTail || showAllMcpServers) {
+          showAllBtn.classList.remove('hidden');
+          showAllBtn.textContent = showAllMcpServers ? 'Top 6 + Other' : `Show all (${allMcpData.length})`;
+        } else {
+          showAllBtn.classList.add('hidden');
+        }
+      }
+
+      const chartInner = document.getElementById('mcpServerChartInner');
+      if (chartInner) {
+        chartInner.style.height = Math.max(200, displayServers.length * 28) + 'px';
+      }
+
+      const labels = displayServers.map(s => s.server);
+      const data = displayServers.map(s => s.calls);
+      const itemColors = displayServers.map((s, idx) =>
+        s.isOther ? OTHER_SLATE_COLOR : getDistinctPaletteColor(idx, MCP_PALETTE)
+      );
 
       mcpServerChart = upsertChart(mcpServerChart, canvas, {
         type: 'bar',
@@ -2504,8 +2909,8 @@
           labels: labels,
           datasets: [{
             data: data,
-            backgroundColor: colors.slice(0, labels.length).map(c => c + 'cc'),
-            borderColor: colors.slice(0, labels.length),
+            backgroundColor: itemColors.map(c => colorWithAlpha(c, 0.8)),
+            borderColor: itemColors,
             borderWidth: 1
           }]
         },
@@ -2513,6 +2918,8 @@
           indexAxis: 'y',
           responsive: true,
           maintainAspectRatio: false,
+          animation: false,
+          animations: false,
           plugins: {
             legend: { display: false },
             tooltip: {
@@ -2538,15 +2945,15 @@
       const leg = document.getElementById('mcpServerLegend');
       if (leg) {
         leg.innerHTML = '';
-        const total = data.reduce((a, b) => a + b, 0) || 1;
-        allMcpData.forEach((s, idx) => {
-          const pct = ((s.calls / total) * 100).toFixed(1);
-          const color = colors[idx % colors.length];
+        const totalCalls = allMcpData.reduce((a, b) => a + (b.calls || 0), 0) || 1;
+        displayServers.forEach((s, idx) => {
+          const pct = (((s.calls || 0) / totalCalls) * 100).toFixed(1);
+          const color = itemColors[idx];
           leg.innerHTML += `
-            <div class="flex items-center space-x-1.5">
+            <div class="flex items-center space-x-1.5 min-w-0">
               <div class="w-2.5 h-2.5 rounded-full shrink-0" style="background-color: ${color}"></div>
-              <span class="text-gray-300 font-medium truncate max-w-[90px]" title="${s.server}">${s.server}</span>
-              <span class="text-gray-400 ml-auto font-mono text-[11px]">${pct}%</span>
+              <span class="text-gray-300 font-medium min-w-0 flex-1 truncate" title="${s.server}">${s.server}</span>
+              <span class="text-gray-400 ml-auto shrink-0 font-mono text-[11px]">${pct}%</span>
             </div>
           `;
         });
@@ -2554,10 +2961,14 @@
 
       const select = document.getElementById('mcpServerSelect');
       if (select) {
+        const prevVal = select.value || 'all';
         select.innerHTML = '<option value="all">All Servers</option>';
         allMcpData.forEach(s => {
           select.innerHTML += `<option value="${s.server}">${s.server} (${s.calls})</option>`;
         });
+        if (prevVal !== 'all' && allMcpData.some(s => s.server === prevVal)) {
+          select.value = prevVal;
+        }
       }
 
       filterMcpToolsTable();

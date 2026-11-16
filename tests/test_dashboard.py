@@ -1299,6 +1299,9 @@ def test_model_badge_formatting():
 
     const singleFlash = api.formatModelBadgeHtml('Gemini 3.8 Flash (High)');
     const singleArgon = api.formatModelBadgeHtml('Gemini 4 Argon (Medium)');
+    const singleCarbon = api.formatModelBadgeHtml('Gemini 4 Carbon (Medium)');
+    const singleHydrogen = api.formatModelBadgeHtml('Gemini 4 Hydrogen (High)');
+    const singleOrchestrator = api.formatModelBadgeHtml('Orchestrator (Carbon)');
     const singlePro = api.formatModelBadgeHtml('Gemini 3.8 Pro (High)');
     const singleClaude = api.formatModelBadgeHtml('Claude 3.7 Sonnet');
     const singleInherit = api.formatModelBadgeHtml('inherit');
@@ -1308,6 +1311,9 @@ def test_model_badge_formatting():
     console.log(JSON.stringify({
       singleFlash,
       singleArgon,
+      singleCarbon,
+      singleHydrogen,
+      singleOrchestrator,
       singlePro,
       singleClaude,
       singleInherit,
@@ -1330,6 +1336,15 @@ def test_model_badge_formatting():
     assert ">4 Argon (Med)<" in data["singleArgon"]
     assert 'title="Gemini 4 Argon (Medium)"' in data["singleArgon"]
     assert "cyan" in data["singleArgon"]
+
+    assert ">4 Carbon (Med)<" in data["singleCarbon"]
+    assert "emerald" in data["singleCarbon"]
+
+    assert ">4 Hydrogen (High)<" in data["singleHydrogen"]
+    assert "sky" in data["singleHydrogen"]
+
+    assert ">Orchestrator (Carbon)<" in data["singleOrchestrator"]
+    assert "emerald" in data["singleOrchestrator"]
 
     assert "3.8 Pro (High)" in data["singlePro"]
     assert "indigo" in data["singlePro"]
@@ -5200,5 +5215,726 @@ def test_dashboard_token_velocity_api_and_frontend_rendering(test_db: Path):
     data_node = json.loads(res.stdout.strip().splitlines()[-1])
     assert data_node["status"] == "ok"
     assert data_node["cases"] == 7
+
+
+def test_chart_rollup_and_color_helpers():
+    """Verifies shared chart rollup, distinct palette, and JS model classification helpers."""
+    node_script = """
+    const fs = require('fs');
+    const code = fs.readFileSync('src/context_monitor/dashboard/static/script.js', 'utf8');
+
+    function createMockElement() {
+      let _html = '';
+      return {
+        className: '',
+        textContent: '',
+        get innerHTML() { return _html; },
+        set innerHTML(val) {
+          _html = val;
+          if (val === '') this.children = [];
+        },
+        style: {},
+        children: [],
+        appendChild(child) { this.children.push(child); },
+        classList: {
+          add(cls) { if (!this.className.includes(cls)) this.className += ' ' + cls; },
+          remove(cls) { this.className = this.className.replace(cls, '').trim(); }
+        }
+      };
+    }
+
+    const mockDocument = {
+      getElementById: () => createMockElement(),
+      createElement: () => createMockElement(),
+      querySelectorAll: () => [],
+      addEventListener: () => {}
+    };
+
+    const mockWindow = {
+      location: { search: '' },
+      addEventListener: () => {},
+      history: { pushState: () => {} }
+    };
+
+    const fn = new Function('window', 'document', 'Chart', 'lucide', `
+      ${code}
+      return {
+        OTHER_SLATE_COLOR,
+        PROJECT_PALETTE,
+        getDistinctPaletteColor,
+        getProjectColor,
+        getModelFamilyJs,
+        isLegacyModelJs,
+        rollupTopNWithOther
+      };
+    `);
+
+    const api = fn(
+      mockWindow,
+      mockDocument,
+      { defaults: { font: {}, elements: {}, plugins: {} }, register: () => {} },
+      { createIcons: () => {} }
+    );
+
+    const assert = (cond, msg) => {
+      if (!cond) throw new Error(msg);
+    };
+
+    // 1. rollupTopNWithOther keeps >= minSharePct up to maxItems and folds remaining tail into buildOther
+    const items7 = [
+      { name: 'A', val: 40 },
+      { name: 'B', val: 25 },
+      { name: 'C', val: 15 },
+      { name: 'D', val: 10 },
+      { name: 'E', val: 5 },
+      { name: 'F', val: 3 },
+      { name: 'G', val: 2 }
+    ];
+    // Pass unsorted to also verify shallow copy descending sort
+    const unsorted7 = [items7[4], items7[0], items7[6], items7[2], items7[1], items7[5], items7[3]];
+    const r1 = api.rollupTopNWithOther(unsorted7, {
+      maxItems: 5,
+      minSharePct: 1.5,
+      getValue: (x) => x.val,
+      buildOther: (tail, otherValue) => ({ name: `Other (${tail.length})`, val: otherValue, isOther: true })
+    });
+    assert(r1.totalValue === 100, `Expected totalValue 100, got ${r1.totalValue}`);
+    assert(r1.otherCount === 2, `Expected otherCount 2, got ${r1.otherCount}`);
+    assert(r1.otherValue === 5, `Expected otherValue 5, got ${r1.otherValue}`);
+    assert(r1.items.length === 6, `Expected 6 items, got ${r1.items.length}`);
+    assert(r1.items[0].name === 'A' && r1.items[4].name === 'E', 'Expected top 5 sorted descending');
+    assert(r1.items[5].name === 'Other (2)' && r1.items[5].isOther === true, 'Expected Other (2) item');
+    assert(unsorted7[0].name === 'E', 'Input array must not be mutated');
+
+    // Items below minSharePct within maxItems are also folded into Other
+    const itemsWithTiny = [
+      { name: 'A', val: 60 },
+      { name: 'B', val: 38 },
+      { name: 'C', val: 1 },
+      { name: 'D', val: 1 }
+    ];
+    const rTiny = api.rollupTopNWithOther(itemsWithTiny, {
+      maxItems: 5,
+      minSharePct: 1.5,
+      getValue: (x) => x.val,
+      buildOther: (tail, otherValue) => ({ name: `Other (${tail.length})`, val: otherValue })
+    });
+    assert(rTiny.items.length === 3, `Expected 2 primary + 1 Other, got ${rTiny.items.length}`);
+    assert(rTiny.otherCount === 2 && rTiny.otherValue === 2, 'Expected both 1% items in Other');
+    assert(rTiny.items[2].isOther === true, 'Expected isOther: true defaulted when buildOther omits it');
+
+    // 2. keepItem pins selected item outside Top N without folding into Other
+    const items12 = Array.from({ length: 12 }, (_, i) => ({ name: `proj-${i + 1}`, val: 100 - i * 8 }));
+    const rPinned = api.rollupTopNWithOther(items12, {
+      maxItems: 8,
+      minSharePct: 1.5,
+      getValue: (x) => x.val,
+      keepItem: (x) => x.name === 'proj-11',
+      buildOther: (tail, otherValue) => ({ name: `Other (${tail.length})`, val: otherValue, isOther: true })
+    });
+    assert(rPinned.items.some((x) => x.name === 'proj-11'), 'Pinned proj-11 must remain visible');
+    assert(rPinned.otherCount === 3, `Expected 3 tail items excluding pinned proj-11, got ${rPinned.otherCount}`);
+    assert(!rPinned.items.find((x) => x.isOther && x.val === 0), 'Other must have positive value');
+
+    // 3. Single tail item above minSharePct when total items == maxItems + 1 is kept directly (no "Other (1)")
+    const items6Healthy = [
+      { name: 'M1', val: 30 },
+      { name: 'M2', val: 25 },
+      { name: 'M3', val: 20 },
+      { name: 'M4', val: 12 },
+      { name: 'M5', val: 8 },
+      { name: 'M6', val: 5 }
+    ];
+    const r6 = api.rollupTopNWithOther(items6Healthy, {
+      maxItems: 5,
+      minSharePct: 1.5,
+      getValue: (x) => x.val,
+      buildOther: (tail, otherValue) => ({ name: `Other (${tail.length})`, val: otherValue, isOther: true })
+    });
+    assert(r6.items.length === 6, `Expected 6 direct items (no Other (1)), got ${r6.items.length}`);
+    assert(r6.otherCount === 0 && r6.otherValue === 0, 'Expected zero otherCount/otherValue for healthy #6');
+    assert(!r6.items.some((x) => x.isOther), 'Expected no isOther item');
+
+    // Single tail item BELOW minSharePct IS still folded into Other (1)
+    const items6Tiny = [
+      { name: 'M1', val: 40 },
+      { name: 'M2', val: 25 },
+      { name: 'M3', val: 20 },
+      { name: 'M4', val: 10 },
+      { name: 'M5', val: 4 },
+      { name: 'M6', val: 1 }
+    ];
+    const r6Tiny = api.rollupTopNWithOther(items6Tiny, {
+      maxItems: 5,
+      minSharePct: 1.5,
+      getValue: (x) => x.val,
+      buildOther: (tail, otherValue) => ({ name: `Other (${tail.length})`, val: otherValue, isOther: true })
+    });
+    assert(r6Tiny.items.length === 6 && r6Tiny.otherCount === 1 && r6Tiny.items[5].isOther === true, 'Tiny 1% #6 should fold into Other (1)');
+
+    // 4. Zero-total dataset produces 0 totalValue without NaN or Other
+    const itemsZero = [{ name: 'Z1', val: 0 }, { name: 'Z2', val: 0 }, { name: 'Z3', val: 0 }];
+    const rZero = api.rollupTopNWithOther(itemsZero, {
+      maxItems: 2,
+      minSharePct: 1.5,
+      getValue: (x) => x.val,
+      buildOther: (tail, otherValue) => ({ name: `Other (${tail.length})`, val: otherValue, isOther: true })
+    });
+    assert(rZero.totalValue === 0 && rZero.otherCount === 0 && rZero.otherValue === 0, 'Zero total must not produce NaN or Other');
+    assert(rZero.items.length === 2, `Zero total must slice to maxItems=2, got ${rZero.items.length}`);
+
+    // 5. OTHER_SLATE_COLOR and getDistinctPaletteColor / getProjectColor
+    assert(api.OTHER_SLATE_COLOR === '#475569', `Expected #475569, got ${api.OTHER_SLATE_COLOR}`);
+    assert(api.getDistinctPaletteColor(0) === api.PROJECT_PALETTE[0], 'Index 0 should use palette[0]');
+    const c15 = api.getDistinctPaletteColor(15);
+    assert(typeof c15 === 'string' && c15.startsWith('hsl('), `Expected hsl(...) for index 15, got ${c15}`);
+    assert(c15 !== api.getDistinctPaletteColor(16), 'Overflow colors should be distinct');
+    assert(api.getProjectColor('proj-15', 15) === c15, 'getProjectColor must delegate to getDistinctPaletteColor');
+    assert(api.getProjectColor('(unassigned)', 0) === '#64748b', 'Unassigned project keeps slate gray');
+
+    // 6. getModelFamilyJs & isLegacyModelJs match pricing.py rules and respect API overrides
+    assert(api.getModelFamilyJs('Gemini 4 Hydrogen (High)') === 'Gemini 4 Hydrogen', 'Hydrogen High -> Gemini 4 Hydrogen');
+    assert(api.getModelFamilyJs('Gemini 4 Hydrogen (Medium)') === 'Gemini 4 Hydrogen', 'Hydrogen Medium -> Gemini 4 Hydrogen');
+    assert(api.getModelFamilyJs('Gemini 3.8 Flash (Tiered)') === 'Gemini 3.8 Flash', '3.8 Flash Tiered -> Gemini 3.8 Flash');
+    assert(api.getModelFamilyJs('Gemini 4 Argon (Reasoning)') === 'Gemini 4 Argon', 'Argon Reasoning -> Gemini 4 Argon');
+    assert(api.getModelFamilyJs('Gemini 4 Carbon (Thinking)') === 'Gemini 4 Carbon', 'Carbon Thinking -> Gemini 4 Carbon');
+    assert(api.getModelFamilyJs('Orchestrator (Carbon)') === 'Gemini 4 Carbon', 'Orchestrator (Carbon) -> Gemini 4 Carbon');
+    assert(api.getModelFamilyJs('  Gemini   3.1   Pro  (High) ') === 'Gemini 3.1 Pro', 'Collapses whitespace');
+    assert(api.getModelFamilyJs('Gemini 4 Hydrogen (High)', 'Override Family') === 'Override Family', 'Prefers non-empty apiFamily');
+    assert(api.getModelFamilyJs('Orchestrator (Carbon)', '') === 'Gemini 4 Carbon', 'Empty apiFamily falls back');
+
+    assert(api.isLegacyModelJs('Gemini 4 Hydrogen (High)') === false, 'Gemini 4 Hydrogen active');
+    assert(api.isLegacyModelJs('Gemini 4 Carbon (Medium)') === false, 'Gemini 4 Carbon active');
+    assert(api.isLegacyModelJs('Orchestrator (Carbon)') === false, 'Orchestrator active');
+    assert(api.isLegacyModelJs('Gemini 3.8 Flash (High)') === false, 'Gemini 3.8 Flash active');
+    assert(api.isLegacyModelJs('Gemini Flash') === false, 'Gemini Flash active');
+    assert(api.isLegacyModelJs('Claude 3.7 Sonnet') === false, 'Claude 3P active');
+    assert(api.isLegacyModelJs('Gemini 3.1 Pro (High)') === true, 'Gemini 3.1 Pro legacy');
+    assert(api.isLegacyModelJs('Gemini 3.6 Flash (High)') === true, 'Gemini 3.6 Flash legacy');
+    assert(api.isLegacyModelJs('Gemini 3.7 Flash') === true, 'Gemini 3.7 Flash legacy');
+    assert(api.isLegacyModelJs('Gemini 2.5 Pro') === true, 'Gemini 2.5 Pro legacy');
+    assert(api.isLegacyModelJs('Gemini 1.5 Pro') === true, 'Gemini 1.5 Pro legacy');
+    assert(api.isLegacyModelJs('Gemini Pro') === true, 'Bare Gemini Pro legacy');
+    assert(api.isLegacyModelJs('Gemini 4 Hydrogen (High)', true) === true, 'Prefers boolean apiLegacy=true');
+    assert(api.isLegacyModelJs('Gemini 3.1 Pro (High)', false) === false, 'Prefers boolean apiLegacy=false');
+
+    console.log(JSON.stringify({ status: 'ok', checks: 6 }));
+    """
+
+    res = subprocess.run(
+        ["node", "-e", node_script], capture_output=True, text=True, cwd=Path.cwd()
+    )
+    assert res.returncode == 0, f"Node script failed: {res.stderr}"
+    data = json.loads(res.stdout.strip().splitlines()[-1])
+    assert data["status"] == "ok"
+    assert data["checks"] == 6
+
+
+def test_models_chart_top5_family_and_legacy_filter():
+    """Verifies redesigned Model Utilization & Share card HTML, family/variant rollup, legacy filter, and auto-fallback."""
+    dashboard_dir = (
+        Path(__file__).resolve().parent.parent / "src" / "context_monitor" / "dashboard"
+    )
+    html_content = (dashboard_dir / "templates" / "index.html").read_text(
+        encoding="utf-8"
+    )
+
+    for required_token in (
+        'id="btnModelFamily"',
+        'id="btnModelVariant"',
+        'id="btnModelActive"',
+        'id="btnModelAll"',
+        "window.setModelGroupMode('family')",
+        "window.setModelGroupMode('variant')",
+        "window.setModelLegacyMode('active')",
+        "window.setModelLegacyMode('all')",
+        'id="modelsChart"',
+        'id="modelsLegend"',
+        'id="modelsFooterNote"',
+        "w-40 h-40 sm:w-44 sm:h-44 shrink-0 relative",
+        "flex flex-col sm:flex-row items-center gap-4 flex-1",
+    ):
+        assert required_token in html_content, (
+            f"Missing expected HTML token in index.html: {required_token}"
+        )
+
+    node_script = """
+    const fs = require('fs');
+    const code = fs.readFileSync('src/context_monitor/dashboard/static/script.js', 'utf8');
+
+    function createMockElement(id = '') {
+      let _html = '';
+      return {
+        id,
+        className: '',
+        textContent: '',
+        get innerHTML() { return _html; },
+        set innerHTML(val) {
+          _html = String(val);
+          if (_html === '') this.children = [];
+        },
+        style: {},
+        children: [],
+        getContext: () => ({}),
+        addEventListener: () => {},
+        appendChild(child) { this.children.push(child); },
+        classList: {
+          add(cls) { if (!this.className.includes(cls)) this.className += ' ' + cls; },
+          remove(cls) { this.className = this.className.replace(cls, '').trim(); }
+        }
+      };
+    }
+
+    const elements = {
+      modelsChart: createMockElement('modelsChart'),
+      modelsLegend: createMockElement('modelsLegend'),
+      modelsFooterNote: createMockElement('modelsFooterNote'),
+      btnModelFamily: createMockElement('btnModelFamily'),
+      btnModelVariant: createMockElement('btnModelVariant'),
+      btnModelActive: createMockElement('btnModelActive'),
+      btnModelAll: createMockElement('btnModelAll')
+    };
+
+    const mockDocument = {
+      getElementById: (id) => {
+        if (!elements[id]) elements[id] = createMockElement(id);
+        return elements[id];
+      },
+      createElement: () => createMockElement(),
+      querySelectorAll: () => [],
+      addEventListener: () => {}
+    };
+
+    const mockWindow = {
+      location: { search: '' },
+      addEventListener: () => {},
+      history: { pushState: () => {} }
+    };
+
+    const fetchCalls = [];
+    const mockFetch = async (...args) => {
+      fetchCalls.push(args[0]);
+      return { json: async () => ({}) };
+    };
+
+    let lastChartConfig = null;
+    const modCode = code.replace(
+      'function upsertChart(existingChart, canvas, config) {',
+      'function upsertChart(existingChart, canvas, config) { if (canvas && canvas.id === "modelsChart") lastChartConfig = config; return { config, data: config.data, options: config.options, update: () => {} };'
+    );
+
+    const fn = new Function('window', 'document', 'Chart', 'lucide', 'fetch', `
+      ${modCode}
+      return {
+        renderModelsChart,
+        setModelGroupMode: window.setModelGroupMode,
+        setModelLegacyMode: window.setModelLegacyMode,
+        getLastConfig: () => lastChartConfig,
+        getModes: () => ({ group: currentModelGroupMode, legacy: currentModelLegacyMode })
+      };
+    `);
+
+    const api = fn(
+      mockWindow,
+      mockDocument,
+      { defaults: { font: {}, elements: {}, plugins: {} }, register: () => {} },
+      { createIcons: () => {} },
+      mockFetch
+    );
+
+    const assert = (cond, msg) => {
+      if (!cond) throw new Error(msg);
+    };
+
+    assert(typeof api.setModelGroupMode === 'function', 'window.setModelGroupMode must be defined');
+    assert(typeof api.setModelLegacyMode === 'function', 'window.setModelLegacyMode must be defined');
+
+    const dataset = [
+      { model_name: 'Gemini 3.8 Flash (High)', tokens: 350000, steps: 20 },
+      { model_name: 'Gemini 3.8 Flash (Medium)', tokens: 150000, steps: 10 },
+      { model_name: 'Gemini 3.8 Flash (Tiered)', tokens: 50000, steps: 5 },
+      { model_name: 'Gemini 4 Hydrogen (High)', tokens: 200000, steps: 12 },
+      { model_name: 'Gemini 4 Hydrogen (Medium)', tokens: 100000, steps: 8 },
+      { model_name: 'Gemini 4 Argon (High)', tokens: 120000, steps: 6 },
+      { model_name: 'Gemini 4 Argon (Medium)', tokens: 30000, steps: 4 },
+      { model_name: 'Gemini 4 Carbon (Medium)', tokens: 60000, steps: 4 },
+      { model_name: 'Gemini 4 Carbon (Low)', tokens: 20000, steps: 2 },
+      { model_name: 'Orchestrator (Carbon)', tokens: 40000, steps: 3 },
+      { model_name: 'Claude 4 Sonnet', tokens: 50000, steps: 3 },
+      { model_name: 'Claude 4 Opus', tokens: 20000, steps: 2 },
+      { model_name: 'GPT-4o', tokens: 10000, steps: 1 },
+      { model_name: 'Gemini 3.1 Pro (High)', tokens: 100000, steps: 5 },
+      { model_name: 'Gemini 3.6 Flash (High)', tokens: 80000, steps: 4 },
+      { model_name: 'Gemini 3.7 Flash', tokens: 70000, steps: 4 },
+      { model_name: 'Gemini 2.5 Pro', tokens: 50000, steps: 2 }
+    ];
+
+    // 1. Default mode: family + active
+    api.renderModelsChart(dataset);
+    let cfg = api.getLastConfig();
+    assert(cfg && cfg.type === 'doughnut', 'Expected doughnut chart config');
+    assert(cfg.options.animation === false && cfg.options.animations === false, 'Static chart animations must be false');
+    assert(cfg.options.cutout === '65%', `Expected cutout 65%, got ${cfg.options.cutout}`);
+    assert(cfg.options.plugins.legend.display === false, 'Built-in Chart.js legend must be hidden');
+
+    let labels = cfg.data.labels;
+    let values = cfg.data.datasets[0].data;
+    let colors = cfg.data.datasets[0].backgroundColor;
+    assert(labels.length <= 6, `Expected <= 6 slices (Top 5 + Other), got ${labels.length}: ${labels}`);
+    assert(labels[0] === 'Gemini 3.8 Flash' && values[0] === 550000, `Expected merged Gemini 3.8 Flash = 550000, got ${labels[0]}=${values[0]}`);
+    assert(labels[1] === 'Gemini 4 Hydrogen' && values[1] === 300000, `Expected merged Gemini 4 Hydrogen = 300000, got ${labels[1]}=${values[1]}`);
+    assert(labels.includes('Gemini 4 Carbon'), 'Expected Orchestrator (Carbon) merged into Gemini 4 Carbon');
+    const carbonIdx = labels.indexOf('Gemini 4 Carbon');
+    assert(values[carbonIdx] === 120000, `Expected Gemini 4 Carbon = 120000, got ${values[carbonIdx]}`);
+    assert(labels[labels.length - 1] === 'Other (2)' && values[values.length - 1] === 30000, `Expected Other (2) = 30000, got ${labels}`);
+    assert(!labels.some((l) => l.includes('3.1') || l.includes('3.6') || l.includes('3.7') || l.includes('2.5')), 'Legacy models must be excluded in active mode');
+    assert(colors.length === labels.length && colors.every((c) => typeof c === 'string' && c.length > 0), 'Every slice must have a defined color');
+    assert(colors[colors.length - 1] === '#475569', `Expected Other slice color #475569, got ${colors[colors.length - 1]}`);
+    assert(new Set(colors).size === colors.length, 'Slice colors must not repeat');
+
+    // Tooltip formats % share + formatTokens
+    const tipStr = cfg.options.plugins.tooltip.callbacks.label({ label: labels[0], raw: values[0] });
+    assert(tipStr.includes('45.8%') && tipStr.includes('550.0k'), `Unexpected tooltip string: ${tipStr}`);
+
+    // Legend & Footer populated
+    assert(elements.modelsLegend.innerHTML.includes('Gemini 3.8 Flash') && elements.modelsLegend.innerHTML.includes('45.8%'), 'Legend must show family label and % share');
+    assert(elements.modelsFooterNote.innerHTML.includes('Hiding 4 legacy models') && elements.modelsFooterNote.innerHTML.includes('20.0%'), `Unexpected footer note: ${elements.modelsFooterNote.innerHTML}`);
+    assert(elements.modelsFooterNote.innerHTML.includes("window.setModelLegacyMode('all')"), 'Footer note must include clickable Show all button');
+
+    // 2. Switch to variant mode (instantaneous, 0 fetch calls)
+    api.setModelGroupMode('variant');
+    assert(fetchCalls.length === 0, 'Toggle must not trigger network fetch');
+    assert(elements.btnModelVariant.className.includes('bg-brand-600'), 'btnModelVariant must be highlighted active');
+    assert(!elements.btnModelFamily.className.includes('bg-brand-600'), 'btnModelFamily must be inactive');
+    cfg = api.getLastConfig();
+    labels = cfg.data.labels;
+    values = cfg.data.datasets[0].data;
+    assert(labels.length === 6, `Expected 6 slices in variant mode, got ${labels.length}`);
+    assert(labels[0] === 'Gemini 3.8 Flash (High)' && values[0] === 350000, 'Variant mode must separate variants');
+    assert(labels[2] === 'Gemini 3.8 Flash (Medium)' && values[2] === 150000, 'Variant mode must include Medium separately');
+    assert(labels[5] === 'Other (8)' && values[5] === 280000, `Expected Other (8) = 280000, got ${labels[5]}=${values[5]}`);
+
+    // 3. Switch to all models (includes legacy)
+    api.setModelLegacyMode('all');
+    assert(fetchCalls.length === 0, 'Legacy toggle must not trigger network fetch');
+    assert(elements.btnModelAll.className.includes('bg-brand-600'), 'btnModelAll must be highlighted active');
+    cfg = api.getLastConfig();
+    const totalAllVariant = cfg.data.datasets[0].data.reduce((a, b) => a + b, 0);
+    assert(totalAllVariant === 1500000, `Expected total 1500000 with legacy models, got ${totalAllVariant}`);
+    assert(!elements.modelsFooterNote.innerHTML.includes('Hiding'), 'Footer must not say Hiding when all models are shown');
+
+    // Switch back to family while keeping 'all'
+    api.setModelGroupMode('family');
+    cfg = api.getLastConfig();
+    const totalAllFamily = cfg.data.datasets[0].data.reduce((a, b) => a + b, 0);
+    assert(totalAllFamily === 1500000, `Expected total 1500000 in family+all mode, got ${totalAllFamily}`);
+
+    // SSE refresh preserves toggle selections
+    api.setModelGroupMode('variant');
+    api.renderModelsChart(dataset);
+    assert(api.getModes().group === 'variant' && api.getModes().legacy === 'all', 'Modes must persist across renderModelsChart SSE refresh');
+
+    // 4. All-legacy dataset in 'active' mode auto-falls back
+    api.setModelLegacyMode('active');
+    api.renderModelsChart([
+      { model_name: 'Gemini 3.1 Pro (High)', tokens: 120000, steps: 6 },
+      { model_name: 'Gemini 2.5 Pro', tokens: 80000, steps: 4 }
+    ]);
+    cfg = api.getLastConfig();
+    assert(cfg.data.labels.length === 2, `Expected 2 fallback slices, got ${cfg.data.labels.length}`);
+    assert(cfg.data.datasets[0].data.reduce((a, b) => a + b, 0) === 200000, 'Fallback must render legacy token totals');
+    assert(elements.modelsFooterNote.innerHTML.includes('Showing legacy models (no active models recorded)'), `Expected fallback note, got ${elements.modelsFooterNote.innerHTML}`);
+
+    console.log(JSON.stringify({ status: 'ok', checks: 4 }));
+    """
+
+    res = subprocess.run(
+        ["node", "-e", node_script], capture_output=True, text=True, cwd=Path.cwd()
+    )
+    assert res.returncode == 0, f"Node script failed: {res.stderr}"
+    data = json.loads(res.stdout.strip().splitlines()[-1])
+    assert data["status"] == "ok"
+    assert data["checks"] == 4
+
+
+def test_project_cost_and_mcp_chart_top_n_and_show_all():
+    """Verifies Top-N rollup, Show all toggles, pinned active project, and scrollable height for projectCostChart & mcpServerChart."""
+    dashboard_dir = (
+        Path(__file__).resolve().parent.parent / "src" / "context_monitor" / "dashboard"
+    )
+    html_content = (dashboard_dir / "templates" / "index.html").read_text(
+        encoding="utf-8"
+    )
+
+    for required_token in (
+        'id="projectCostChartWrap"',
+        'id="projectCostChartInner"',
+        'id="projectShowAllBtn"',
+        "window.toggleProjectShowAll()",
+        "max-h-[340px] overflow-y-auto",
+        'id="mcpServerChartWrap"',
+        'id="mcpServerChartInner"',
+        'id="mcpShowAllBtn"',
+        "window.toggleMcpShowAll()",
+        "max-h-[280px] overflow-y-auto",
+    ):
+        assert required_token in html_content, (
+            f"Missing expected HTML token in index.html: {required_token}"
+        )
+
+    node_script = """
+    const fs = require('fs');
+    const code = fs.readFileSync('src/context_monitor/dashboard/static/script.js', 'utf8');
+
+    function createMockElement(id = '') {
+      let _html = '';
+      const classes = new Set(['hidden']);
+      if (id !== 'projectShowAllBtn' && id !== 'mcpShowAllBtn') {
+        classes.delete('hidden');
+      }
+      return {
+        id,
+        className: '',
+        textContent: '',
+        value: 'all',
+        get innerHTML() { return _html; },
+        set innerHTML(val) {
+          _html = String(val);
+          if (_html === '') this.children = [];
+        },
+        style: {},
+        children: [],
+        getContext: () => ({}),
+        addEventListener: () => {},
+        appendChild(child) { this.children.push(child); },
+        classList: {
+          add(cls) { classes.add(cls); },
+          remove(cls) { classes.delete(cls); },
+          contains(cls) { return classes.has(cls); }
+        }
+      };
+    }
+
+    const elements = {
+      projectCostChart: createMockElement('projectCostChart'),
+      projectCostChartWrap: createMockElement('projectCostChartWrap'),
+      projectCostChartInner: createMockElement('projectCostChartInner'),
+      projectShowAllBtn: createMockElement('projectShowAllBtn'),
+      projectCountBadge: createMockElement('projectCountBadge'),
+      projectCostHeaderValue: createMockElement('projectCostHeaderValue'),
+      projectCostHeaderLabel: createMockElement('projectCostHeaderLabel'),
+      costProjectSub: createMockElement('costProjectSub'),
+      topCostDriversSub: createMockElement('topCostDriversSub'),
+      topCostScopeBadge: createMockElement('topCostScopeBadge'),
+      topCostDriversBody: createMockElement('topCostDriversBody'),
+      mcpServerChart: createMockElement('mcpServerChart'),
+      mcpServerChartWrap: createMockElement('mcpServerChartWrap'),
+      mcpServerChartInner: createMockElement('mcpServerChartInner'),
+      mcpShowAllBtn: createMockElement('mcpShowAllBtn'),
+      mcpServerLegend: createMockElement('mcpServerLegend'),
+      mcpServerSelect: createMockElement('mcpServerSelect'),
+      mcpToolsTableBody: createMockElement('mcpToolsTableBody')
+    };
+
+    const mockDocument = {
+      getElementById: (id) => {
+        if (!elements[id]) elements[id] = createMockElement(id);
+        return elements[id];
+      },
+      createElement: () => createMockElement(),
+      querySelectorAll: () => [],
+      addEventListener: () => {}
+    };
+
+    const mockWindow = {
+      location: { search: '' },
+      addEventListener: () => {},
+      history: { pushState: () => {} }
+    };
+
+    const chartConfigs = {};
+    const modCode = code.replace(
+      'function upsertChart(existingChart, canvas, config) {',
+      'function upsertChart(existingChart, canvas, config) { if (canvas && canvas.id) chartConfigs[canvas.id] = config; return { config, data: config.data, options: config.options, update: () => {} };'
+    );
+
+    const fn = new Function('window', 'document', 'Chart', 'lucide', 'fetch', `
+      const chartConfigs = {};
+      ${modCode}
+      return {
+        renderProjectCostSection,
+        renderMcpSection,
+        toggleProjectShowAll: window.toggleProjectShowAll,
+        toggleMcpShowAll: window.toggleMcpShowAll,
+        getChartConfig: (id) => chartConfigs[id],
+        getShowAllProjects: () => showAllProjects,
+        getShowAllMcpServers: () => showAllMcpServers
+      };
+    `);
+
+    const api = fn(
+      mockWindow,
+      mockDocument,
+      { defaults: { font: {}, elements: {}, plugins: {} }, register: () => {} },
+      { createIcons: () => {} },
+      async () => ({ json: async () => ({}) })
+    );
+
+    const assert = (cond, msg) => {
+      if (!cond) throw new Error(msg);
+    };
+
+    assert(typeof api.toggleProjectShowAll === 'function', 'window.toggleProjectShowAll must be defined');
+    assert(typeof api.toggleMcpShowAll === 'function', 'window.toggleMcpShowAll must be defined');
+
+    let projectChangeCalls = [];
+    mockWindow.handleProjectChange = (proj) => { projectChangeCalls.push(proj); };
+
+    // 1. Project Cost Chart: 15 projects (Top 8 >= 1.5%, proj-09..15 < 1.5%)
+    const projects15 = [];
+    for (let i = 1; i <= 8; i++) {
+      projects15.push({
+        project: `proj-${String(i).padStart(2, '0')}`,
+        cost: (17 - i) * 10,
+        tokens: (17 - i) * 10000,
+        sessions: i,
+        percentage: 10
+      });
+    }
+    for (let i = 9; i <= 15; i++) {
+      projects15.push({
+        project: `proj-${String(i).padStart(2, '0')}`,
+        cost: 2.0 - (i - 9) * 0.1,
+        tokens: 2000 - (i - 9) * 100,
+        sessions: 1,
+        percentage: 0.2
+      });
+    }
+    const totalCost15 = projects15.reduce((a, b) => a + b.cost, 0);
+    const projectPayload = { total_cost: totalCost15, projects: projects15, top_sessions: [] };
+
+    // 1a. Default collapsed view (all)
+    api.renderProjectCostSection(projectPayload, 'all');
+    let pCfg = api.getChartConfig('projectCostChart');
+    assert(pCfg, 'projectCostChart must be rendered');
+    assert(pCfg.options.animation === false && pCfg.options.animations === false, 'Static chart animations must be false');
+    let pLabels = pCfg.data.labels;
+    assert(pLabels.length === 9, `Expected 9 bars (Top 8 + Other), got ${pLabels.length}: ${pLabels}`);
+    assert(pLabels[8] === 'Other (7 projects)', `Expected 'Other (7 projects)', got ${pLabels[8]}`);
+    assert(pCfg.data.datasets[0].borderColor[8] === '#475569', `Expected Other slate color #475569, got ${pCfg.data.datasets[0].borderColor[8]}`);
+    assert(!elements.projectShowAllBtn.classList.contains('hidden'), '#projectShowAllBtn must be visible');
+    assert(elements.projectShowAllBtn.textContent === 'Show all (15)', `Expected 'Show all (15)', got ${elements.projectShowAllBtn.textContent}`);
+    assert(elements.projectCostChartInner.style.height === '260px', `Expected 260px height, got ${elements.projectCostChartInner.style.height}`);
+
+    // Tooltip on Other bar uses rolled-up displayProjects entry, not raw projects[8]
+    const otherRaw = pCfg.data.datasets[0].data[8];
+    const tipOther = pCfg.options.plugins.tooltip.callbacks.label({ dataIndex: 8, raw: otherRaw });
+    assert(tipOther.includes('7 sessions'), `Expected rolled-up 7 sessions in Other tooltip, got: ${tipOther}`);
+
+    // 1b. Active project proj-14 is pinned in collapsed view
+    api.renderProjectCostSection(projectPayload, 'proj-14');
+    pCfg = api.getChartConfig('projectCostChart');
+    pLabels = pCfg.data.labels;
+    assert(pLabels.includes('proj-14'), 'Pinned active project proj-14 must appear in collapsed labels');
+    assert(pLabels[pLabels.length - 1] === 'Other (6 projects)', `Expected 'Other (6 projects)' when proj-14 pinned, got ${pLabels[pLabels.length - 1]}`);
+    const pinnedIdx = pLabels.indexOf('proj-14');
+    assert(pCfg.data.datasets[0].borderColor[pinnedIdx] === '#ffffff', 'Pinned project must be highlighted');
+
+    // 1c. Clicking Other bar calls toggleProjectShowAll(true) instead of handleProjectChange
+    projectChangeCalls = [];
+    pCfg.options.onClick(null, [{ index: pLabels.length - 1 }]);
+    assert(projectChangeCalls.length === 0, `Clicking Other must NOT call handleProjectChange, got ${projectChangeCalls}`);
+    assert(api.getShowAllProjects() === true, 'Clicking Other must set showAllProjects = true');
+
+    // Expanded view checks (15 projects)
+    pCfg = api.getChartConfig('projectCostChart');
+    pLabels = pCfg.data.labels;
+    assert(pLabels.length === 15, `Expected 15 projects when expanded, got ${pLabels.length}`);
+    assert(elements.projectCostChartInner.style.height === '420px', `Expected 420px height for 15 projects, got ${elements.projectCostChartInner.style.height}`);
+    assert(elements.projectShowAllBtn.textContent === 'Top 8 + Other', `Expected 'Top 8 + Other', got ${elements.projectShowAllBtn.textContent}`);
+
+    // Re-render unfiltered to verify 15 distinct valid colors
+    api.renderProjectCostSection(projectPayload, 'all');
+    assert(api.getShowAllProjects() === true, 'SSE refresh must preserve showAllProjects = true');
+    pCfg = api.getChartConfig('projectCostChart');
+    const pBg = pCfg.data.datasets[0].backgroundColor;
+    const pBorder = pCfg.data.datasets[0].borderColor;
+    assert(pBg.length === 15 && pBorder.length === 15, 'Expected 15 colors');
+    assert(pBg.every(c => typeof c === 'string' && !c.includes('undefined') && !c.endsWith(')cc')), `Invalid backgroundColor in ${JSON.stringify(pBg)}`);
+    assert(new Set(pBorder).size === 15, `Expected 15 distinct borderColors, got ${new Set(pBorder).size}`);
+    assert(new Set(pBg).size === 15, `Expected 15 distinct backgroundColors, got ${new Set(pBg).size}`);
+
+    // Toggle back to collapsed
+    api.toggleProjectShowAll();
+    assert(api.getShowAllProjects() === false, 'toggleProjectShowAll() must collapse back to false');
+    assert(api.getChartConfig('projectCostChart').data.labels.length === 9, 'Collapsed view must return to 9 bars');
+
+    // 2. MCP Server Ecosystem: 12 servers (Top 6 >= 1.5%, server-07..12 < 1.5%)
+    const mcp12 = [
+      { server: 'very-long-mcp-server-ecosystem-name', calls: 300, tools: [{ tool: 't1', calls: 300, sessions: 5, error_rate: 0 }] },
+      { server: 'srv-02', calls: 200, tools: [] },
+      { server: 'srv-03', calls: 150, tools: [] },
+      { server: 'srv-04', calls: 100, tools: [] },
+      { server: 'srv-05', calls: 80, tools: [] },
+      { server: 'srv-06', calls: 50, tools: [] },
+      { server: 'srv-07', calls: 5, tools: [] },
+      { server: 'srv-08', calls: 4, tools: [] },
+      { server: 'srv-09', calls: 3, tools: [] },
+      { server: 'srv-10', calls: 3, tools: [] },
+      { server: 'srv-11', calls: 2, tools: [] },
+      { server: 'srv-12', calls: 2, tools: [] }
+    ];
+
+    api.renderMcpSection(mcp12);
+    let mCfg = api.getChartConfig('mcpServerChart');
+    assert(mCfg, 'mcpServerChart must be rendered');
+    assert(mCfg.options.animation === false && mCfg.options.animations === false, 'MCP chart animations must be false');
+    let mLabels = mCfg.data.labels;
+    assert(mLabels.length === 7, `Expected 7 bars (Top 6 + Other), got ${mLabels.length}: ${mLabels}`);
+    assert(mLabels[6] === 'Other (6 servers)', `Expected 'Other (6 servers)', got ${mLabels[6]}`);
+    assert(mCfg.data.datasets[0].borderColor[6] === '#475569', `Expected Other slate color #475569, got ${mCfg.data.datasets[0].borderColor[6]}`);
+    assert(!elements.mcpShowAllBtn.classList.contains('hidden'), '#mcpShowAllBtn must be visible');
+    assert(elements.mcpShowAllBtn.textContent === 'Show all (12)', `Expected 'Show all (12)', got ${elements.mcpShowAllBtn.textContent}`);
+    assert(elements.mcpServerChartInner.style.height === '200px', `Expected 200px height, got ${elements.mcpServerChartInner.style.height}`);
+    assert(!elements.mcpServerLegend.innerHTML.includes('max-w-[90px]'), '#mcpServerLegend must not clip at max-w-[90px]');
+    assert(elements.mcpServerLegend.innerHTML.includes('min-w-0 flex-1 truncate'), '#mcpServerLegend must use min-w-0 flex-1 truncate');
+    assert(elements.mcpServerLegend.innerHTML.includes('very-long-mcp-server-ecosystem-name'), 'Legend must contain full server name');
+    assert(elements.mcpServerSelect.innerHTML.includes('srv-12'), '#mcpServerSelect must still include all 12 servers');
+
+    // Expand MCP servers
+    api.toggleMcpShowAll();
+    assert(api.getShowAllMcpServers() === true, 'toggleMcpShowAll() must set showAllMcpServers = true');
+    mCfg = api.getChartConfig('mcpServerChart');
+    mLabels = mCfg.data.labels;
+    assert(mLabels.length === 12, `Expected 12 servers when expanded, got ${mLabels.length}`);
+    assert(elements.mcpServerChartInner.style.height === '336px', `Expected 336px height for 12 servers, got ${elements.mcpServerChartInner.style.height}`);
+    assert(elements.mcpShowAllBtn.textContent === 'Top 6 + Other', `Expected 'Top 6 + Other', got ${elements.mcpShowAllBtn.textContent}`);
+
+    const mBg = mCfg.data.datasets[0].backgroundColor;
+    const mBorder = mCfg.data.datasets[0].borderColor;
+    assert(mBg.length === 12 && mBorder.length === 12, 'Expected 12 MCP colors');
+    assert(mBg.every(c => typeof c === 'string' && !c.includes('undefined') && !c.endsWith(')cc')), `Invalid MCP backgroundColor in ${JSON.stringify(mBg)}`);
+    assert(mBorder.every(c => typeof c === 'string' && !c.includes('undefined')), `Invalid MCP borderColor in ${JSON.stringify(mBorder)}`);
+    assert(new Set(mBorder).size === 12, `Expected 12 distinct MCP borderColors, got ${new Set(mBorder).size}`);
+    assert(new Set(mBg).size === 12, `Expected 12 distinct MCP backgroundColors, got ${new Set(mBg).size}`);
+
+    // SSE refresh preserves showAllMcpServers = true
+    api.renderMcpSection(mcp12);
+    assert(api.getShowAllMcpServers() === true, 'SSE refresh must preserve showAllMcpServers = true');
+    assert(api.getChartConfig('mcpServerChart').data.labels.length === 12, 'Expanded MCP count must persist across SSE refresh');
+
+    console.log(JSON.stringify({ status: 'ok', checks: 2 }));
+    """
+
+    res = subprocess.run(
+        ["node", "-e", node_script], capture_output=True, text=True, cwd=Path.cwd()
+    )
+    assert res.returncode == 0, f"Node script failed: {res.stderr}"
+    data = json.loads(res.stdout.strip().splitlines()[-1])
+    assert data["status"] == "ok"
+    assert data["checks"] == 2
+
+
+
 
 

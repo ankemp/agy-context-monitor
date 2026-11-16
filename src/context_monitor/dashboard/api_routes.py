@@ -9,7 +9,12 @@ from typing import Any, NamedTuple
 from zoneinfo import ZoneInfo
 
 from context_monitor.db import get_quota_state, ensure_rollups_synced
-from context_monitor.pricing import get_pricing_key, get_model_context_limit
+from context_monitor.pricing import (
+    get_model_context_limit,
+    get_model_family,
+    get_pricing_key,
+    is_legacy_model,
+)
 from context_monitor.quota import (
     _get_default_capacity,
     _to_utc_datetime,
@@ -559,6 +564,9 @@ def query_summary_data(conn, tz=None, project=None):
             }
 
     models = sorted(model_data.values(), key=lambda x: x["tokens"], reverse=True)
+    for m in models:
+        m["model_family"] = get_model_family(m["model_name"])
+        m["is_legacy"] = is_legacy_model(m["model_name"])
 
     category_rows = cur.execute(
         f"SELECT category, SUM(est_tokens) as tokens FROM steps WHERE category IS NOT NULL {where_step_and} GROUP BY category",

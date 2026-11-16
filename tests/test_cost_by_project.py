@@ -488,3 +488,52 @@ def test_query_cost_by_project_all_zero_cost_and_tokens(tmp_path):
     assert top["tokens"] == 0
     assert top["subagent_count"] == 1
 
+
+def test_model_family_and_legacy_classification():
+    from context_monitor.pricing import get_model_family, is_legacy_model
+
+    assert get_model_family("Gemini 4 Hydrogen (High)") == "Gemini 4 Hydrogen"
+    assert get_model_family("Gemini 4 Hydrogen (Medium)") == "Gemini 4 Hydrogen"
+    assert get_model_family("Gemini 3.8 Flash (Tiered)") == "Gemini 3.8 Flash"
+    assert get_model_family("Orchestrator (Carbon)") == "Gemini 4 Carbon"
+    assert get_model_family("Gemini 3.1 Pro (High)") == "Gemini 3.1 Pro"
+
+    assert is_legacy_model("Gemini 4 Hydrogen (High)") is False
+    assert is_legacy_model("Gemini 4 Carbon (Medium)") is False
+    assert is_legacy_model("Gemini 3.8 Flash (High)") is False
+    assert is_legacy_model("Gemini Flash") is False
+    assert is_legacy_model("Gemini 3.1 Pro (High)") is True
+    assert is_legacy_model("Gemini 3.6 Flash (High)") is True
+    assert is_legacy_model("Gemini 3.7 Flash") is True
+    assert is_legacy_model("Gemini 2.5 Pro") is True
+    assert is_legacy_model("Gemini Pro") is True
+
+
+def test_query_summary_data_includes_model_metadata(tmp_path):
+    db_file = tmp_path / "test_model_meta.db"
+    init_db(db_file)
+    conn = get_db_connection(db_file)
+    conn.execute(
+        "INSERT INTO conversations (id, title, project, model_name, created_at) "
+        "VALUES ('c1', 'T1', 'p1', 'Gemini 4 Hydrogen (High)', '2026-11-01T10:00:00Z')"
+    )
+    conn.execute(
+        "INSERT INTO steps (conversation_id, step_index, model_name, billed_input_tokens, billed_output_tokens) "
+        "VALUES ('c1', 0, 'Gemini 4 Hydrogen (High)', 1000, 500)"
+    )
+    conn.execute(
+        "INSERT INTO steps (conversation_id, step_index, model_name, billed_input_tokens, billed_output_tokens) "
+        "VALUES ('c1', 1, 'Gemini 3.1 Pro (High)', 200, 100)"
+    )
+    conn.commit()
+
+    summary = query_summary_data(conn)
+    conn.close()
+
+    by_name = {m["model_name"]: m for m in summary["models"]}
+    assert by_name["Gemini 4 Hydrogen (High)"]["model_family"] == "Gemini 4 Hydrogen"
+    assert by_name["Gemini 4 Hydrogen (High)"]["is_legacy"] is False
+    assert by_name["Gemini 3.1 Pro (High)"]["model_family"] == "Gemini 3.1 Pro"
+    assert by_name["Gemini 3.1 Pro (High)"]["is_legacy"] is True
+
+
