@@ -206,7 +206,7 @@
         <div class="absolute -right-3 -bottom-3 w-14 h-14 bg-emerald-500/5 rounded-full blur-xl"></div>
       </div>
 
-      <div class="card p-4 flex flex-col justify-between relative overflow-hidden cursor-help" title="Calculated as the multi-turn cumulative context cost (with implicit KV cache-read discounts on Gemini 4) across Gemini 4 Carbon/Argon ($2-$4/M in, $10-$20/M out), Hydrogen ($1.50/M in, $7.50/M out), Pro ($1.25-$2.50/M), Flash ($0.075-$0.15/M), and 3P models.">
+      <div class="card p-4 flex flex-col justify-between relative overflow-hidden cursor-help" title="Calculated as the multi-turn cumulative context cost (with implicit KV cache-read discounts on Gemini 4) across Gemini 4 Carbon/Argon ($2-$4/M in, $10-$20/M out), Neon ($3/M in, $15/M out), Hydrogen ($1.50/M in, $7.50/M out), Pro ($1.25-$2.50/M), Flash ($0.075-$0.15/M), and 3P models.">
         <div class="flex justify-between items-start text-gray-400">
           <span class="text-xs font-medium uppercase tracking-wider">Est. API Value</span>
           <i data-lucide="calculator" class="w-4 h-4 text-rose-400"></i>
@@ -442,11 +442,11 @@
             </div>
           </div>
         </div>
-        <div class="flex flex-col sm:flex-row items-center gap-4 flex-1">
-          <div class="w-40 h-40 sm:w-44 sm:h-44 shrink-0 relative">
+        <div class="flex flex-col items-center gap-4 flex-1 justify-center">
+          <div class="w-40 h-40 shrink-0 relative">
             <canvas id="modelsChart"></canvas>
           </div>
-          <div id="modelsLegend" class="flex-1 min-w-0 space-y-1.5 w-full"></div>
+          <div id="modelsLegend" class="w-full min-w-0 space-y-1.5"></div>
         </div>
         <div id="modelsFooterNote" class="mt-3 pt-2.5 border-t border-dark-700/60 flex items-center justify-between text-[11px] text-gray-400"></div>
       </div>
@@ -928,15 +928,16 @@
     {% if not IS_STATIC_EXPORT or INCLUDE_CONVERSATIONS %}
     <!-- 6. Searchable Conversation Explorer (SECTION_CONVERSATION_EXPLORER) -->
     <div id="convExplorerSection" class="card p-5">
-      <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-4">
+      <div class="flex flex-col lg:flex-row lg:items-center justify-between gap-3 mb-4">
         <div>
           <h2 class="text-sm font-semibold text-white flex items-center space-x-2">
             <i data-lucide="folder-search" class="w-4 h-4 text-indigo-400"></i>
             <span>Conversation Explorer</span>
+            <span id="convFilterCount" class="hidden text-[11px] font-mono font-normal text-indigo-300 bg-indigo-950/50 border border-indigo-500/30 px-2 py-0.5 rounded"></span>
           </h2>
           <p class="text-xs text-gray-400">Browse and inspect step-by-step waterfalls for any session</p>
         </div>
-        <div class="flex items-center space-x-2 max-w-md w-full justify-end">
+        <div class="flex flex-wrap items-center gap-2 lg:max-w-2xl w-full justify-end">
           <div class="flex items-center space-x-1 bg-dark-900 border border-dark-700 rounded-lg p-1 text-xs shrink-0">
             <button onclick="setConvViewMode('hierarchy')" id="btnConvHierarchy" class="px-2.5 py-1 rounded-md bg-brand-600 text-white font-medium shadow transition whitespace-nowrap inline-flex items-center space-x-1.5 shrink-0">
               <i data-lucide="layers" class="w-3.5 h-3.5 shrink-0"></i>
@@ -947,9 +948,12 @@
               <span>All Sessions</span>
             </button>
           </div>
-          <div class="relative flex-1">
+          <select id="convModelFilter" onchange="filterConversations()" aria-label="Filter conversations by model" class="bg-dark-800 border border-dark-700 rounded-md px-2.5 py-1.5 text-xs text-gray-200 focus:outline-none focus:border-brand-500 transition shrink-0 max-w-[190px] cursor-pointer">
+            <option value="">All Models</option>
+          </select>
+          <div class="relative flex-1 min-w-[180px]">
             <i data-lucide="search" class="w-4 h-4 text-gray-400 absolute left-3 top-2.5"></i>
-            <input type="text" id="convSearch" oninput="filterConversations()" placeholder="Search title / ID..." class="w-full pl-9 pr-3 py-1.5 bg-dark-800 border border-dark-700 rounded-md text-xs text-gray-200 placeholder-gray-500 focus:outline-none focus:border-brand-500 transition">
+            <input type="text" id="convSearch" oninput="filterConversations()" placeholder="Search title / ID / model..." class="w-full pl-9 pr-3 py-1.5 bg-dark-800 border border-dark-700 rounded-md text-xs text-gray-200 placeholder-gray-500 focus:outline-none focus:border-brand-500 transition">
           </div>
         </div>
       </div>

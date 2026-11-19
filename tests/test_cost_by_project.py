@@ -494,12 +494,21 @@ def test_model_family_and_legacy_classification():
 
     assert get_model_family("Gemini 4 Hydrogen (High)") == "Gemini 4 Hydrogen"
     assert get_model_family("Gemini 4 Hydrogen (Medium)") == "Gemini 4 Hydrogen"
+    assert get_model_family("Gemini 4 Neon (High)") == "Gemini 4 Neon"
     assert get_model_family("Gemini 3.8 Flash (Tiered)") == "Gemini 3.8 Flash"
     assert get_model_family("Orchestrator (Carbon)") == "Gemini 4 Carbon"
+    assert get_model_family("Orchestrator (Neon)") == "Gemini 4 Neon"
+    assert get_model_family("gemini-pro-orchestrator-neon") == "Gemini 4 Neon"
+    assert get_model_family("Orchestrator (Argon)") == "Gemini 4 Argon"
+    assert get_model_family("Gemini 4 Hydrogen (Orchestrator)") == "Gemini 4 Hydrogen"
     assert get_model_family("Gemini 3.1 Pro (High)") == "Gemini 3.1 Pro"
 
     assert is_legacy_model("Gemini 4 Hydrogen (High)") is False
+    assert is_legacy_model("Gemini 4 Neon (High)") is False
     assert is_legacy_model("Gemini 4 Carbon (Medium)") is False
+    assert is_legacy_model("Orchestrator (Neon)") is False
+    assert is_legacy_model("Orchestrator (Argon)") is False
+    assert is_legacy_model("Gemini 4 Hydrogen (Orchestrator)") is False
     assert is_legacy_model("Gemini 3.8 Flash (High)") is False
     assert is_legacy_model("Gemini Flash") is False
     assert is_legacy_model("Gemini 3.1 Pro (High)") is True

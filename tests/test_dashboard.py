@@ -1301,6 +1301,7 @@ def test_model_badge_formatting():
     const singleArgon = api.formatModelBadgeHtml('Gemini 4 Argon (Medium)');
     const singleCarbon = api.formatModelBadgeHtml('Gemini 4 Carbon (Medium)');
     const singleHydrogen = api.formatModelBadgeHtml('Gemini 4 Hydrogen (High)');
+    const singleNeon = api.formatModelBadgeHtml('Gemini 4 Neon (High)');
     const singleOrchestrator = api.formatModelBadgeHtml('Orchestrator (Carbon)');
     const singlePro = api.formatModelBadgeHtml('Gemini 3.8 Pro (High)');
     const singleClaude = api.formatModelBadgeHtml('Claude 3.7 Sonnet');
@@ -1313,6 +1314,7 @@ def test_model_badge_formatting():
       singleArgon,
       singleCarbon,
       singleHydrogen,
+      singleNeon,
       singleOrchestrator,
       singlePro,
       singleClaude,
@@ -1342,6 +1344,9 @@ def test_model_badge_formatting():
 
     assert ">4 Hydrogen (High)<" in data["singleHydrogen"]
     assert "sky" in data["singleHydrogen"]
+
+    assert ">4 Neon (High)<" in data["singleNeon"]
+    assert "fuchsia" in data["singleNeon"]
 
     assert ">Orchestrator (Carbon)<" in data["singleOrchestrator"]
     assert "emerald" in data["singleOrchestrator"]
@@ -5451,12 +5456,16 @@ def test_models_chart_top5_family_and_legacy_filter():
         'id="modelsChart"',
         'id="modelsLegend"',
         'id="modelsFooterNote"',
-        "w-40 h-40 sm:w-44 sm:h-44 shrink-0 relative",
-        "flex flex-col sm:flex-row items-center gap-4 flex-1",
+        "w-40 h-40 shrink-0 relative",
+        "flex flex-col items-center gap-4 flex-1 justify-center",
+        "w-full min-w-0 space-y-1.5",
     ):
         assert required_token in html_content, (
             f"Missing expected HTML token in index.html: {required_token}"
         )
+    assert "sm:flex-row" not in html_content.split('id="modelsChart"')[0].split("Model Utilization & Share")[-1], (
+        "Model Utilization & Share widget must use stacked layout rather than side-by-side"
+    )
 
     node_script = """
     const fs = require('fs');
@@ -5527,6 +5536,7 @@ def test_models_chart_top5_family_and_legacy_filter():
       ${modCode}
       return {
         renderModelsChart,
+        formatModelChartLabel,
         setModelGroupMode: window.setModelGroupMode,
         setModelLegacyMode: window.setModelLegacyMode,
         getLastConfig: () => lastChartConfig,
@@ -5569,6 +5579,17 @@ def test_models_chart_top5_family_and_legacy_filter():
       { model_name: 'Gemini 2.5 Pro', tokens: 50000, steps: 2 }
     ];
 
+    assert(api.formatModelChartLabel('Gemini 4 Hydrogen (High)') === '4 Hydrogen (High)', 'Strips Gemini prefix');
+    assert(api.formatModelChartLabel('gemini-3.8-flash') === '3.8-flash', 'Strips hyphenated gemini prefix');
+    assert(api.formatModelChartLabel('Claude 4 Sonnet') === '4 Sonnet', 'Strips Claude prefix');
+    assert(api.formatModelChartLabel('claude-3-5-sonnet') === '3-5-sonnet', 'Strips hyphenated claude prefix');
+    assert(api.formatModelChartLabel('Google Gemini 4 Argon') === '4 Argon', 'Strips Google + Gemini prefixes');
+    assert(api.formatModelChartLabel('Anthropic Claude 4 Opus') === '4 Opus', 'Strips Anthropic + Claude prefixes');
+    assert(api.formatModelChartLabel('OpenAI GPT-4o') === 'GPT-4o', 'Strips OpenAI prefix');
+    assert(api.formatModelChartLabel('Gemini') === 'Gemini', 'Keeps bare Gemini intact');
+    assert(api.formatModelChartLabel('Claude') === 'Claude', 'Keeps bare Claude intact');
+    assert(api.formatModelChartLabel('GPT-4o') === 'GPT-4o', 'Keeps GPT-4o intact');
+
     // 1. Default mode: family + active
     api.renderModelsChart(dataset);
     let cfg = api.getLastConfig();
@@ -5581,11 +5602,11 @@ def test_models_chart_top5_family_and_legacy_filter():
     let values = cfg.data.datasets[0].data;
     let colors = cfg.data.datasets[0].backgroundColor;
     assert(labels.length <= 6, `Expected <= 6 slices (Top 5 + Other), got ${labels.length}: ${labels}`);
-    assert(labels[0] === 'Gemini 3.8 Flash' && values[0] === 550000, `Expected merged Gemini 3.8 Flash = 550000, got ${labels[0]}=${values[0]}`);
-    assert(labels[1] === 'Gemini 4 Hydrogen' && values[1] === 300000, `Expected merged Gemini 4 Hydrogen = 300000, got ${labels[1]}=${values[1]}`);
-    assert(labels.includes('Gemini 4 Carbon'), 'Expected Orchestrator (Carbon) merged into Gemini 4 Carbon');
-    const carbonIdx = labels.indexOf('Gemini 4 Carbon');
-    assert(values[carbonIdx] === 120000, `Expected Gemini 4 Carbon = 120000, got ${values[carbonIdx]}`);
+    assert(labels[0] === '3.8 Flash' && values[0] === 550000, `Expected merged 3.8 Flash = 550000, got ${labels[0]}=${values[0]}`);
+    assert(labels[1] === '4 Hydrogen' && values[1] === 300000, `Expected merged 4 Hydrogen = 300000, got ${labels[1]}=${values[1]}`);
+    assert(labels.includes('4 Carbon'), 'Expected Orchestrator (Carbon) merged into 4 Carbon');
+    const carbonIdx = labels.indexOf('4 Carbon');
+    assert(values[carbonIdx] === 120000, `Expected 4 Carbon = 120000, got ${values[carbonIdx]}`);
     assert(labels[labels.length - 1] === 'Other (2)' && values[values.length - 1] === 30000, `Expected Other (2) = 30000, got ${labels}`);
     assert(!labels.some((l) => l.includes('3.1') || l.includes('3.6') || l.includes('3.7') || l.includes('2.5')), 'Legacy models must be excluded in active mode');
     assert(colors.length === labels.length && colors.every((c) => typeof c === 'string' && c.length > 0), 'Every slice must have a defined color');
@@ -5594,10 +5615,12 @@ def test_models_chart_top5_family_and_legacy_filter():
 
     // Tooltip formats % share + formatTokens
     const tipStr = cfg.options.plugins.tooltip.callbacks.label({ label: labels[0], raw: values[0] });
-    assert(tipStr.includes('45.8%') && tipStr.includes('550.0k'), `Unexpected tooltip string: ${tipStr}`);
+    assert(tipStr.includes('3.8 Flash: 45.8%') && tipStr.includes('550.0k'), `Unexpected tooltip string: ${tipStr}`);
 
-    // Legend & Footer populated
-    assert(elements.modelsLegend.innerHTML.includes('Gemini 3.8 Flash') && elements.modelsLegend.innerHTML.includes('45.8%'), 'Legend must show family label and % share');
+    // Legend & Footer populated (shortened label in text, canonical full name in title)
+    assert(elements.modelsLegend.innerHTML.includes('>3.8 Flash<') && elements.modelsLegend.innerHTML.includes('45.8%'), 'Legend must show stripped family label and % share');
+    assert(elements.modelsLegend.innerHTML.includes('title="Gemini 3.8 Flash"'), 'Legend must preserve canonical full name in title attribute');
+    assert(elements.modelsLegend.innerHTML.includes('title="4 Opus, GPT-4o"'), 'Other legend row title must list rolled-up labels');
     assert(elements.modelsFooterNote.innerHTML.includes('Hiding 4 legacy models') && elements.modelsFooterNote.innerHTML.includes('20.0%'), `Unexpected footer note: ${elements.modelsFooterNote.innerHTML}`);
     assert(elements.modelsFooterNote.innerHTML.includes("window.setModelLegacyMode('all')"), 'Footer note must include clickable Show all button');
 
@@ -5610,8 +5633,8 @@ def test_models_chart_top5_family_and_legacy_filter():
     labels = cfg.data.labels;
     values = cfg.data.datasets[0].data;
     assert(labels.length === 6, `Expected 6 slices in variant mode, got ${labels.length}`);
-    assert(labels[0] === 'Gemini 3.8 Flash (High)' && values[0] === 350000, 'Variant mode must separate variants');
-    assert(labels[2] === 'Gemini 3.8 Flash (Medium)' && values[2] === 150000, 'Variant mode must include Medium separately');
+    assert(labels[0] === '3.8 Flash (High)' && values[0] === 350000, 'Variant mode must separate variants');
+    assert(labels[2] === '3.8 Flash (Medium)' && values[2] === 150000, 'Variant mode must include Medium separately');
     assert(labels[5] === 'Other (8)' && values[5] === 280000, `Expected Other (8) = 280000, got ${labels[5]}=${values[5]}`);
 
     // 3. Switch to all models (includes legacy)
@@ -5933,6 +5956,463 @@ def test_project_cost_and_mcp_chart_top_n_and_show_all():
     data = json.loads(res.stdout.strip().splitlines()[-1])
     assert data["status"] == "ok"
     assert data["checks"] == 2
+
+
+def test_orchestrator_model_badges_and_family_js():
+    """Verifies JS getModelTierClass precedence, getModelFamilyJs parity with pricing.py, and formatModelBadgeHtml ellipsis/XSS escaping."""
+    from context_monitor.pricing import RAW_MODEL_DISPLAY_MAP, get_model_family
+
+    parity_samples = [
+        "",
+        "Orchestrator",
+        "Orchestrator (Neon)",
+        "Orchestrator (Argon)",
+        "Orchestrator (Carbon)",
+        "Gemini 4 Hydrogen (Orchestrator)",
+        "Claude 3.7 Sonnet (Thinking)",
+        "Gemini 4 Argon (Reasoning)",
+        "Gemini 3.8 Flash (Tiered)",
+        "  Gemini   3.1   Pro  (High) ",
+        *RAW_MODEL_DISPLAY_MAP.keys(),
+        *RAW_MODEL_DISPLAY_MAP.values(),
+    ]
+    expected_families_json = json.dumps(
+        {sample: get_model_family(sample) for sample in parity_samples}
+    )
+
+    node_script = """
+    const fs = require('fs');
+    const code = fs.readFileSync('src/context_monitor/dashboard/static/script.js', 'utf8');
+    const expectedFamilies = __EXPECTED_FAMILIES__;
+
+    const fn = new Function('window', 'document', 'Chart', 'lucide', `
+      ${code}
+      return {
+        getModelTierClass,
+        getModelFamilyJs,
+        formatModelBadgeHtml
+      };
+    `);
+
+    const mockWindow = {
+      location: { search: '' },
+      addEventListener: () => {},
+      history: { pushState: () => {} }
+    };
+    const mockDocument = {
+      getElementById: () => null,
+      querySelectorAll: () => [],
+      addEventListener: () => {}
+    };
+
+    const api = fn(
+      mockWindow,
+      mockDocument,
+      { defaults: { font: {}, elements: {}, plugins: {} }, register: () => {} },
+      { createIcons: () => {} }
+    );
+
+    const assert = (cond, msg) => {
+      if (!cond) throw new Error(msg);
+    };
+
+    // 1. Tier class precedence
+    assert(api.getModelTierClass('Orchestrator (Neon)').includes('fuchsia'), 'Orchestrator (Neon) must be fuchsia');
+    assert(!api.getModelTierClass('Orchestrator (Neon)').includes('emerald'), 'Orchestrator (Neon) must not fall back to emerald');
+    assert(api.getModelTierClass('Orchestrator (Argon)').includes('cyan'), 'Orchestrator (Argon) must be cyan');
+    assert(!api.getModelTierClass('Orchestrator (Argon)').includes('emerald'), 'Orchestrator (Argon) must not fall back to emerald');
+    assert(api.getModelTierClass('Gemini 4 Hydrogen (Orchestrator)').includes('sky'), 'Gemini 4 Hydrogen (Orchestrator) must be sky');
+    assert(!api.getModelTierClass('Gemini 4 Hydrogen (Orchestrator)').includes('emerald'), 'Hydrogen Orchestrator must not fall back to emerald');
+    assert(api.getModelTierClass('Orchestrator (Carbon)').includes('emerald'), 'Orchestrator (Carbon) must be emerald');
+    assert(api.getModelTierClass('Orchestrator').includes('emerald'), 'Bare Orchestrator must be emerald');
+    assert(api.getModelTierClass('Claude 3.7 Sonnet (Thinking)').includes('amber'), 'Claude 3.7 Sonnet (Thinking) must be amber');
+    assert(!api.getModelTierClass('Claude 3.7 Sonnet (Thinking)').includes('cyan'), 'Claude 3.7 Sonnet (Thinking) must not be cyan');
+    assert(api.getModelTierClass('Claude 4 Opus').includes('indigo'), 'Claude 4 Opus must be indigo');
+    assert(api.getModelTierClass('Claude 3.5 Haiku').includes('purple'), 'Claude 3.5 Haiku must be purple');
+    assert(api.getModelTierClass('GPT-4o').includes('amber'), 'GPT-4o must be amber');
+    assert(api.getModelTierClass('DeepSeek Reasoning').includes('cyan'), 'DeepSeek Reasoning must be cyan');
+    assert(api.getModelTierClass('inherit').includes('zinc'), 'inherit fallback must be zinc');
+
+    // 2. getModelFamilyJs parity with pricing.py get_model_family
+    for (const [sample, expected] of Object.entries(expectedFamilies)) {
+      const actual = api.getModelFamilyJs(sample);
+      assert(actual === expected, `Parity mismatch for "${sample}": JS=${actual} vs Python=${expected}`);
+    }
+    assert(api.getModelFamilyJs('Orchestrator (Neon)') === 'Gemini 4 Neon', `Neon orch family: ${api.getModelFamilyJs('Orchestrator (Neon)')}`);
+    assert(api.getModelFamilyJs('Orchestrator (Argon)') === 'Gemini 4 Argon', `Argon orch family: ${api.getModelFamilyJs('Orchestrator (Argon)')}`);
+    assert(api.getModelFamilyJs('Orchestrator (Carbon)') === 'Gemini 4 Carbon', `Carbon orch family: ${api.getModelFamilyJs('Orchestrator (Carbon)')}`);
+    assert(api.getModelFamilyJs('Orchestrator') === 'Gemini 4 Carbon', `Bare orch family: ${api.getModelFamilyJs('Orchestrator')}`);
+    assert(api.getModelFamilyJs('Gemini 4 Hydrogen (Orchestrator)') === 'Gemini 4 Hydrogen', `Hydrogen orch family: ${api.getModelFamilyJs('Gemini 4 Hydrogen (Orchestrator)')}`);
+    assert(api.getModelFamilyJs('gemini-pro-orchestrator-neon') === 'Gemini 4 Neon', 'Raw neon orch ID');
+    assert(api.getModelFamilyJs('gemini-pro-orchestrator-argon') === 'Gemini 4 Argon', 'Raw argon orch ID');
+    assert(api.getModelFamilyJs('gemini-pro-orchestrator') === 'Gemini 4 Carbon', 'Raw carbon orch ID');
+    assert(api.getModelFamilyJs('model_placeholder_m537') === 'Gemini 4 Neon', 'Placeholder m537');
+    assert(api.getModelFamilyJs('model_placeholder_m533') === 'Gemini 4 Neon', 'Placeholder m533');
+
+    // 3. formatModelBadgeHtml ellipsis rendering & XSS escaping
+    const truncatedHtml = api.formatModelBadgeHtml(
+      'Orchestrator (Neon) → ... → Gemini 4 Hydrogen (Orchestrator)',
+      'Orchestrator (Neon), Gemini 4 Argon (Medium), Gemini 4 Hydrogen (Orchestrator)'
+    );
+    assert(truncatedHtml.includes('fuchsia'), 'Truncated chain must style Neon badge fuchsia');
+    assert(truncatedHtml.includes('sky'), 'Truncated chain must style Hydrogen badge sky');
+    assert(!truncatedHtml.includes('border shrink-0" title="...">...'), 'Ellipsis must not be rendered as a bordered badge');
+    assert(
+      truncatedHtml.includes('<span class="text-slate-500 text-[10px] px-0.5" title="Orchestrator (Neon), Gemini 4 Argon (Medium), Gemini 4 Hydrogen (Orchestrator)">…</span>'),
+      `Unexpected ellipsis markup: ${truncatedHtml}`
+    );
+
+    const xssHtml = api.formatModelBadgeHtml(
+      '<script>alert(1)</script> → ... → <img src=x onerror=alert(1)>',
+      '<script>evil()</script>'
+    );
+    assert(!xssHtml.includes('<script>'), 'Must HTML-escape <script> in model badge');
+    assert(!xssHtml.includes('<img '), 'Must HTML-escape <img in model badge');
+    assert(xssHtml.includes('&lt;script&gt;alert(1)&lt;/script&gt;'), 'Escaped model payload missing');
+    assert(xssHtml.includes('title="&lt;script&gt;evil()&lt;/script&gt;"'), 'Escaped modelsUsed title missing');
+
+    console.log(JSON.stringify({ status: 'ok', checks: 3 }));
+    """.replace("__EXPECTED_FAMILIES__", expected_families_json)
+
+    res = subprocess.run(
+        ["node", "-e", node_script], capture_output=True, text=True, cwd=Path.cwd()
+    )
+    assert res.returncode == 0, f"Node script failed: {res.stderr}"
+    data = json.loads(res.stdout.strip().splitlines()[-1])
+    assert data["status"] == "ok"
+    assert data["checks"] == 3
+
+
+def test_conversation_explorer_model_search_filter_and_subagent_tracking():
+    """Verifies Conversation Explorer #convModelFilter, subagent-aware search/auto-expand, parent-aware subagent tooltips, Top Cost Drivers badges, and Session Inspector transitions."""
+    dashboard_dir = (
+        Path(__file__).resolve().parent.parent / "src" / "context_monitor" / "dashboard"
+    )
+    html_content = (dashboard_dir / "templates" / "index.html").read_text(
+        encoding="utf-8"
+    )
+    for required_token in (
+        'id="convModelFilter"',
+        'onchange="filterConversations()"',
+        '<option value="">All Models</option>',
+        'id="convFilterCount"',
+    ):
+        assert required_token in html_content, (
+            f"Missing expected HTML token in index.html: {required_token}"
+        )
+
+    node_script = """
+    const fs = require('fs');
+    const code = fs.readFileSync('src/context_monitor/dashboard/static/script.js', 'utf8');
+
+    function createMockElement(id = '') {
+      let _html = '';
+      const classes = new Set();
+      if (id === 'convFilterCount') classes.add('hidden');
+      return {
+        id,
+        className: '',
+        textContent: '',
+        title: '',
+        value: '',
+        style: {},
+        children: [],
+        get innerHTML() { return _html; },
+        set innerHTML(val) {
+          _html = String(val);
+          if (_html === '') this.children = [];
+        },
+        appendChild(child) { this.children.push(child); },
+        addEventListener: () => {},
+        classList: {
+          add(cls) { classes.add(cls); },
+          remove(cls) { classes.delete(cls); },
+          contains(cls) { return classes.has(cls); },
+          toggle(cls, force) {
+            if (force === undefined) {
+              if (classes.has(cls)) classes.delete(cls); else classes.add(cls);
+            } else if (force) {
+              classes.add(cls);
+            } else {
+              classes.delete(cls);
+            }
+          }
+        }
+      };
+    }
+
+    const elements = {
+      convSearch: createMockElement('convSearch'),
+      convModelFilter: createMockElement('convModelFilter'),
+      convFilterCount: createMockElement('convFilterCount'),
+      convTableBody: createMockElement('convTableBody'),
+      topCostDriversBody: createMockElement('topCostDriversBody'),
+      topCostDriversSub: createMockElement('topCostDriversSub'),
+      topCostScopeBadge: createMockElement('topCostScopeBadge'),
+      topCostCountBadge: createMockElement('topCostCountBadge'),
+      modalTitle: createMockElement('modalTitle'),
+      modalSub: createMockElement('modalSub'),
+      modalModel: createMockElement('modalModel'),
+      modalTopConsumers: createMockElement('modalTopConsumers'),
+      modalStepList: createMockElement('modalStepList')
+    };
+
+    const mockDocument = {
+      getElementById: (id) => elements[id] || null,
+      createElement: () => createMockElement(),
+      querySelectorAll: () => [],
+      addEventListener: () => {}
+    };
+
+    let sessionPayloads = {
+      'sess-multi': {
+        conversation: {
+          id: 'sess-multi',
+          title: 'Multi-switch Session',
+          created_at: '2026-11-18 10:00',
+          model_name: 'Orchestrator (Neon) → ... → Orchestrator (Neon)',
+          models_used: 'Orchestrator (Neon), Gemini 4 Hydrogen (Orchestrator)'
+        },
+        steps: [
+          { step_index: 1, activity: 'User Input', tool_or_source: 'Human', est_tokens: 100, model_name: null },
+          { step_index: 2, activity: 'Planner', tool_or_source: 'Planner', est_tokens: 500, model_name: 'Orchestrator (Neon)' },
+          { step_index: 3, activity: 'Planner', tool_or_source: 'Planner', est_tokens: 600, model_name: 'Gemini 4 Hydrogen (Orchestrator)' },
+          { step_index: 4, activity: 'Planner', tool_or_source: 'Planner', est_tokens: 700, model_name: 'Orchestrator (Neon)' }
+        ],
+        top_consumers: []
+      },
+      'sess-single': {
+        conversation: {
+          id: 'sess-single',
+          title: 'Single Step Model Session',
+          created_at: '2026-11-18 11:00',
+          model_name: 'Gemini Flash',
+          models_used: 'Orchestrator (Neon)'
+        },
+        steps: [
+          { step_index: 1, activity: 'Planner', tool_or_source: 'Planner', est_tokens: 300, model_name: 'Orchestrator (Neon)' }
+        ],
+        top_consumers: []
+      }
+    };
+
+    const mockFetch = async (url) => {
+      const id = String(url).split('/api/session/')[1].split('?')[0];
+      return { json: async () => sessionPayloads[id] };
+    };
+    global.fetch = mockFetch;
+
+    const mockWindow = {
+      location: { search: '' },
+      addEventListener: () => {},
+      history: { pushState: () => {} },
+      fetch: mockFetch
+    };
+
+    const fn = new Function('window', 'document', 'Chart', 'lucide', 'fetch', `
+      ${code}
+      return {
+        renderConversations,
+        populateConvModelFilter,
+        filterConversations,
+        toggleSubagents: window.toggleSubagents,
+        renderProjectCostSection,
+        inspectSession,
+        getExpandedConvs: () => Array.from(expandedConvs)
+      };
+    `);
+
+    const api = fn(
+      mockWindow,
+      mockDocument,
+      { defaults: { font: {}, elements: {}, plugins: {} }, register: () => {} },
+      { createIcons: () => {} },
+      mockFetch
+    );
+
+    const assert = (cond, msg) => {
+      if (!cond) throw new Error(msg);
+    };
+
+    (async () => {
+      const sampleConversations = [
+        {
+          id: 'root-a',
+          title: 'Execute Implementation Plan File',
+          created_at: '2026-11-18 10:00',
+          updated_at: '2026-11-18 10:30',
+          model_name: 'Orchestrator (Neon) → Gemini 4 Hydrogen (Orchestrator)',
+          models_used: 'Orchestrator (Neon), Gemini 4 Hydrogen (Orchestrator)',
+          model_families: ['Gemini 4 Neon', 'Gemini 4 Hydrogen'],
+          total_steps: 20,
+          fleet_steps: 30,
+          tokens: 50000,
+          fleet_tokens: 75000,
+          billed_cost: 1.25,
+          fleet_cost: 2.00,
+          subagent_count: 1,
+          subagents: [
+            {
+              id: 'sub-1',
+              title: 'DTO Migrator',
+              subagent_role: 'Worker',
+              depth: 1,
+              model_name: 'Gemini 4 Hydrogen (Orchestrator)',
+              models_used: 'Gemini 4 Hydrogen (Orchestrator)',
+              model_families: ['Gemini 4 Hydrogen'],
+              total_steps: 10,
+              tokens: 25000,
+              billed_cost: 0.75
+            }
+          ]
+        },
+        {
+          id: 'root-b',
+          title: 'Carbon Standalone',
+          created_at: '2026-11-18 09:00',
+          updated_at: '2026-11-18 09:15',
+          model_name: 'Gemini 4 Carbon (Medium)',
+          models_used: 'Gemini 4 Carbon (Medium)',
+          model_families: ['Gemini 4 Carbon'],
+          total_steps: 5,
+          tokens: 10000,
+          billed_cost: 0.25,
+          subagent_count: 0,
+          subagents: []
+        },
+        {
+          id: 'root-c',
+          title: 'Argon Campaign',
+          created_at: '2026-11-18 08:00',
+          updated_at: '2026-11-18 08:30',
+          model_name: 'Orchestrator (Argon)',
+          models_used: 'Orchestrator (Argon)',
+          model_families: ['Gemini 4 Argon'],
+          total_steps: 8,
+          fleet_steps: 12,
+          tokens: 12000,
+          fleet_tokens: 18000,
+          billed_cost: 0.40,
+          fleet_cost: 0.60,
+          subagent_count: 1,
+          subagents: [
+            {
+              id: 'sub-2',
+              title: 'Inherited Worker',
+              subagent_role: 'Research',
+              depth: 1,
+              model_name: null,
+              models_used: '',
+              total_steps: 4,
+              tokens: 6000,
+              billed_cost: 0.20
+            }
+          ]
+        }
+      ];
+
+      api.renderConversations(sampleConversations);
+
+      // 1. #convModelFilter populated with unique models across roots + subagents
+      const optHtml = elements.convModelFilter.innerHTML;
+      assert(optHtml.includes('value="Orchestrator (Neon)"'), `Missing Orchestrator (Neon) option: ${optHtml}`);
+      assert(optHtml.includes('value="Gemini 4 Hydrogen (Orchestrator)"'), `Missing Hydrogen option: ${optHtml}`);
+      assert(optHtml.includes('value="Gemini 4 Carbon (Medium)"'), `Missing Carbon option: ${optHtml}`);
+      assert(optHtml.includes('value="Orchestrator (Argon)"'), `Missing Argon option: ${optHtml}`);
+      assert(!optHtml.includes('value="inherit"'), 'Must not include inherit in model filter options');
+      assert(elements.convTableBody.children.length === 3, `Expected 3 root rows unfiltered, got ${elements.convTableBody.children.length}`);
+      assert(elements.convFilterCount.classList.contains('hidden'), 'Filter count should be hidden when unfiltered <= 50');
+
+      // 2. Selecting Gemini 4 Hydrogen (Orchestrator) matches Root A and renders fuchsia + sky badges and auto-expands sub-1
+      elements.convModelFilter.value = 'Gemini 4 Hydrogen (Orchestrator)';
+      api.filterConversations();
+      assert(elements.convTableBody.children.length === 2, `Expected Root A + auto-expanded sub-1, got ${elements.convTableBody.children.length}`);
+      const rootAHtml = elements.convTableBody.children[0].innerHTML;
+      assert(rootAHtml.includes('Execute Implementation Plan File'), 'Matched row must be Root A');
+      assert(rootAHtml.includes('fuchsia') && rootAHtml.includes('Orchestrator (Neon)'), 'Root A must render fuchsia Orchestrator (Neon) badge');
+      assert(rootAHtml.includes('sky') && rootAHtml.includes('4 Hydrogen (Orchestrator)'), 'Root A must render sky 4 Hydrogen (Orchestrator) badge');
+      assert(elements.convTableBody.children[1].innerHTML.includes('DTO Migrator'), 'Auto-expanded child row must show sub-1');
+      assert(elements.convFilterCount.textContent.includes('Showing 1 of 3'), `Unexpected filter count: ${elements.convFilterCount.textContent}`);
+      assert(!elements.convFilterCount.classList.contains('hidden'), 'Filter count must be visible when filter active');
+
+      // Clearing filter restores collapsed state (expandedConvs not permanently mutated)
+      elements.convModelFilter.value = '';
+      api.filterConversations();
+      assert(api.getExpandedConvs().length === 0, 'Auto-expand must not permanently mutate expandedConvs');
+      assert(elements.convTableBody.children.length === 3, 'Clearing filter must collapse back to 3 root rows');
+
+      // 3. Searching 'Hydrogen' matches Root A and auto-expands sub-1
+      elements.convSearch.value = 'Hydrogen';
+      api.filterConversations();
+      assert(elements.convTableBody.children.length === 2, `Expected 2 rows on Hydrogen search, got ${elements.convTableBody.children.length}`);
+      assert(elements.convTableBody.children[1].innerHTML.includes('DTO Migrator'), 'Sub-1 must be visible when searching Hydrogen');
+
+      // 4. Searching 'DTO Migrator' matches Root A via its child subagent
+      elements.convSearch.value = 'DTO Migrator';
+      api.filterConversations();
+      assert(elements.convTableBody.children.length === 2, `Expected 2 rows on DTO Migrator search, got ${elements.convTableBody.children.length}`);
+      assert(elements.convTableBody.children[0].innerHTML.includes('Execute Implementation Plan File'), 'Parent Root A must match child title search');
+      elements.convSearch.value = '';
+
+      // 5. Missing/inherit subagent model resolves against parent with parent-aware tooltip
+      api.toggleSubagents('root-c');
+      const rootCRowIdx = elements.convTableBody.children.findIndex(tr => tr.innerHTML.includes('Argon Campaign'));
+      assert(rootCRowIdx >= 0, 'Root C must be rendered');
+      const inheritedSubHtml = elements.convTableBody.children[rootCRowIdx + 1].innerHTML;
+      assert(inheritedSubHtml.includes('Inherited from Orchestrator (Argon)'), `Expected parent-aware tooltip on inherited subagent: ${inheritedSubHtml}`);
+      assert(inheritedSubHtml.includes('cyan') && inheritedSubHtml.includes('Orchestrator (Argon)'), `Expected resolved parent badge on inherited subagent: ${inheritedSubHtml}`);
+
+      // 6. Top Cost Drivers renders formatModelBadgeHtml instead of raw model_name
+      api.renderProjectCostSection({
+        total_cost: 5.0,
+        projects: [],
+        top_sessions: [
+          {
+            id: 'root-a',
+            title: 'Plan Session',
+            project: 'agy',
+            model_name: 'Orchestrator (Neon) → ... → Gemini 4 Hydrogen (Orchestrator)',
+            models_used: 'Orchestrator (Neon), Gemini 4 Argon (Medium), Gemini 4 Hydrogen (Orchestrator)',
+            billed_cost: 5.0,
+            local_cost: 5.0,
+            subagent_count: 0,
+            total_tokens: 10000
+          }
+        ]
+      }, 'all');
+      const driverHtml = elements.topCostDriversBody.children[0].innerHTML;
+      assert(driverHtml.includes('fuchsia') && driverHtml.includes('sky'), `Top Cost Drivers must render tier-colored badges: ${driverHtml}`);
+      assert(driverHtml.includes('title="Orchestrator (Neon), Gemini 4 Argon (Medium), Gemini 4 Hydrogen (Orchestrator)"'), `Top Cost Drivers ellipsis tooltip missing: ${driverHtml}`);
+
+      // 7. inspectSession preserves sequential non-consecutive transitions & renders initial + switch banners
+      await api.inspectSession('sess-multi');
+      const modalModelHtml = elements.modalModel.innerHTML;
+      assert((modalModelHtml.match(/Orchestrator \\(Neon\\)/g) || []).length >= 2, `Expected sequential Neon -> Hydrogen -> Neon in modalModel: ${modalModelHtml}`);
+      assert((modalModelHtml.match(/→/g) || []).length === 2, `Expected 2 transition arrows in modalModel: ${modalModelHtml}`);
+      const stepHtmls = elements.modalStepList.children.map(tr => tr.innerHTML);
+      assert(stepHtmls.some(h => h.includes('Initial Model:') && h.includes('fuchsia')), `Expected initial model banner on first model-bearing step: ${JSON.stringify(stepHtmls)}`);
+      assert(stepHtmls.some(h => h.includes('Model Switched to:') && h.includes('sky') && h.includes('4 Hydrogen (Orchestrator)')), `Expected badge-formatted switch banner to Hydrogen: ${JSON.stringify(stepHtmls)}`);
+
+      // Single step model overrides stale conv.model_name
+      await api.inspectSession('sess-single');
+      assert(elements.modalModel.innerHTML.includes('Orchestrator (Neon)'), `Expected step model Orchestrator (Neon) in modalModel: ${elements.modalModel.innerHTML}`);
+      assert(!elements.modalModel.innerHTML.includes('Gemini Flash'), `Stale conv.model_name must not override step model: ${elements.modalModel.innerHTML}`);
+
+      console.log(JSON.stringify({ status: 'ok', checks: 7 }));
+    })().catch(err => {
+      console.error(err);
+      process.exit(1);
+    });
+    """
+
+    res = subprocess.run(
+        ["node", "-e", node_script], capture_output=True, text=True, cwd=Path.cwd()
+    )
+    assert res.returncode == 0, f"Node script failed: {res.stderr}"
+    data = json.loads(res.stdout.strip().splitlines()[-1])
+    assert data["status"] == "ok"
+    assert data["checks"] == 7
+
 
 
 

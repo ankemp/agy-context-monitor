@@ -2362,6 +2362,163 @@ class TestSubagentHierarchy(unittest.TestCase):
             self.assertIn("sub-valid-1", conv_ids)
 
 
+def test_backfill_preserves_multimodel_steps_on_explicit_conversation(tmp_path: Path):
+    """Verify backfill preserves per-step models and Neon/Hydrogen billing on multi-model explicit conversations."""
+    import sqlite3
+    import pytest
+    import scripts.backfill_analytics as backfill
+
+    brain_dir = tmp_path / "brain"
+    brain_dir.mkdir(parents=True)
+    conversations_dir = tmp_path / "conversations"
+    conversations_dir.mkdir(parents=True)
+    db_file = tmp_path / "test_analytics.db"
+
+    parent_cid = "orch-multimodel-parent"
+    sub_cid = "orch-multimodel-child"
+
+    parent_logs = brain_dir / parent_cid / ".system_generated" / "logs"
+    parent_logs.mkdir(parents=True)
+    parent_tx = [
+        {
+            "step_index": 1,
+            "type": "PLANNER_RESPONSE",
+            "source": "MODEL",
+            "content": "Initial Neon orchestrator planning",
+            "est_tokens": 1000,
+            "created_at": "2026-11-18T10:00:00Z",
+        },
+        {
+            "step_index": 2,
+            "type": "PLANNER_RESPONSE",
+            "source": "MODEL",
+            "content": "Switched to Hydrogen orchestrator and spawning subagent",
+            "est_tokens": 1000,
+            "tool_calls": [
+                {
+                    "name": "invoke_subagent",
+                    "args": {
+                        "Role": "Hydrogen Worker",
+                        "TypeName": "self",
+                        "Model": "inherit",
+                        "Prompt": "Execute task",
+                    },
+                }
+            ],
+            "created_at": "2026-11-18T10:00:10Z",
+        },
+        {
+            "step_index": 3,
+            "type": "GENERIC",
+            "source": "SYSTEM",
+            "content": f'Created the following subagent:\n{{\n  "conversationId": "{sub_cid}"\n}}',
+            "est_tokens": 0,
+            "created_at": "2026-11-18T10:00:11Z",
+        },
+    ]
+    with open(parent_logs / "transcript.jsonl", "w", encoding="utf-8") as f:
+        for entry in parent_tx:
+            f.write(json.dumps(entry) + "\n")
+
+    sub_logs = brain_dir / sub_cid / ".system_generated" / "logs"
+    sub_logs.mkdir(parents=True)
+    sub_tx = [
+        {
+            "step_index": 1,
+            "type": "SYSTEM_MESSAGE",
+            "source": "SYSTEM",
+            "content": f"[Message] timestamp=2026-11-18T10:00:11Z sender={parent_cid} recipient={sub_cid}\nExecute task",
+            "est_tokens": 0,
+            "created_at": "2026-11-18T10:00:12Z",
+        },
+        {
+            "step_index": 2,
+            "type": "PLANNER_RESPONSE",
+            "source": "MODEL",
+            "content": "Subagent completed task",
+            "est_tokens": 1000,
+            "created_at": "2026-11-18T10:00:20Z",
+        },
+    ]
+    with open(sub_logs / "transcript.jsonl", "w", encoding="utf-8") as f:
+        for entry in sub_tx:
+            f.write(json.dumps(entry) + "\n")
+
+    # Native gen_metadata for parent: step 1 = Orchestrator (Neon), step 2 = Gemini 4 Hydrogen (Orchestrator)
+    parent_native_db = conversations_dir / f"{parent_cid}.db"
+    pconn = sqlite3.connect(parent_native_db)
+    pconn.execute(
+        "CREATE TABLE gen_metadata (idx integer, data blob, size integer NOT NULL DEFAULT 0, PRIMARY KEY (idx))"
+    )
+    row0 = _encode_ld(2, _encode_varint(1)) + _encode_ld(
+        1,
+        _encode_ld(19, b"gemini-pro-orchestrator-neon")
+        + _encode_ld(21, b"Orchestrator (Neon)"),
+    )
+    row1 = _encode_ld(2, _encode_varint(2)) + _encode_ld(
+        1,
+        _encode_ld(19, b"gemini-flash-worker-agy")
+        + _encode_ld(21, b"Gemini 4 Hydrogen (Orchestrator)"),
+    )
+    pconn.execute(
+        "INSERT INTO gen_metadata (idx, data, size) VALUES (0, ?, ?)",
+        (row0, len(row0)),
+    )
+    pconn.execute(
+        "INSERT INTO gen_metadata (idx, data, size) VALUES (1, ?, ?)",
+        (row1, len(row1)),
+    )
+    pconn.commit()
+    pconn.close()
+
+    backfill.run_backfill(
+        brain_dir=brain_dir,
+        db_path=db_file,
+        conversations_dir=conversations_dir,
+        force=True,
+    )
+
+    conn = get_db_connection(db_file)
+    p_conv = conn.execute(
+        "SELECT model_name, models_used, billed_cost FROM conversations WHERE id = ?",
+        (parent_cid,),
+    ).fetchone()
+    p_steps = conn.execute(
+        "SELECT step_index, model_name, billed_cost FROM steps WHERE conversation_id = ? ORDER BY step_index",
+        (parent_cid,),
+    ).fetchall()
+    s_conv = conn.execute(
+        "SELECT model_name, models_used, billed_cost FROM conversations WHERE id = ?",
+        (sub_cid,),
+    ).fetchone()
+    s_steps = conn.execute(
+        "SELECT step_index, model_name, billed_cost FROM steps WHERE conversation_id = ? ORDER BY step_index",
+        (sub_cid,),
+    ).fetchall()
+    conn.close()
+
+    assert (
+        p_conv["model_name"]
+        == "Orchestrator (Neon) → Gemini 4 Hydrogen (Orchestrator)"
+    )
+    assert (
+        p_conv["models_used"]
+        == "Orchestrator (Neon), Gemini 4 Hydrogen (Orchestrator)"
+    )
+    assert p_steps[0]["model_name"] == "Orchestrator (Neon)"
+    assert p_steps[1]["model_name"] == "Gemini 4 Hydrogen (Orchestrator)"
+    # Step 1 (Neon): 1000 out * $15/M = $0.015
+    assert p_steps[0]["billed_cost"] == pytest.approx(0.015)
+    # Step 2 (Hydrogen, uncached across Neon -> Hydrogen): 1000 in * $1.50/M + 1000 out * $7.50/M = $0.009
+    assert p_steps[1]["billed_cost"] == pytest.approx(0.009)
+    assert p_conv["billed_cost"] == pytest.approx(0.024)
+
+    # Subagent inherits terminal model (Gemini 4 Hydrogen (Orchestrator)), not the arrow chain
+    assert s_conv["model_name"] == "Gemini 4 Hydrogen (Orchestrator)"
+    assert s_steps[1]["model_name"] == "Gemini 4 Hydrogen (Orchestrator)"
+    assert s_conv["billed_cost"] == pytest.approx(0.0075)
+
+
 if __name__ == "__main__":
     unittest.main()
 

@@ -891,6 +891,162 @@ def test_carbon_hydrogen_pricing_and_context_limits():
     assert resolve_subagent_model("carbon", "Gemini 4 Hydrogen (High)") == "Gemini 4 Carbon (Medium)"
 
 
+def test_neon_pricing_and_context_limits():
+    from context_monitor.pricing import (
+        CACHED_INPUT_PRICING,
+        PRICING,
+        calculate_step_cost,
+        get_model_context_limit,
+        get_pricing_key,
+        normalize_native_model_name,
+        recompute_step_costs,
+        resolve_subagent_model,
+    )
+
+    assert PRICING["neon"] == (3.00, 3.00, 15.00)
+    assert CACHED_INPUT_PRICING["neon"] == pytest.approx(0.15)
+
+    for name in [
+        "Gemini 4 Neon (High)",
+        "Gemini 4 Neon (Medium)",
+        "Gemini 4 Neon (Low)",
+        "Gemini 4 Neon (XHigh)",
+        "gemini-4-neon",
+    ]:
+        assert get_pricing_key(name) == "neon"
+        assert get_model_context_limit(name) == 1_000_000
+
+    # Neon: 100k uncached + 200k cached + 10k output (flat across 1M context)
+    # 100k * 3.00/M (0.30) + 200k * 0.15/M (0.03) + 10k * 15.00/M (0.15) = 0.48
+    cost_n, in_n, out_n = calculate_step_cost(
+        300_000,
+        0,
+        10_000,
+        "Gemini 4 Neon (High)",
+        cached_tokens=200_000,
+        created_at="2026-12-15T10:00:00Z",
+    )
+    assert cost_n == pytest.approx(0.48)
+    assert in_n == 300_000
+    assert out_n == 10_000
+
+    assert normalize_native_model_name("gemini-4-neon", "", "") == "Gemini 4 Neon (High)"
+    assert (
+        normalize_native_model_name("gemini-4-neon", "Gemini 4 Neon (Medium)", "")
+        == "Gemini 4 Neon (Medium)"
+    )
+    assert resolve_subagent_model("neon", "Gemini 4 Carbon (Medium)") == "Gemini 4 Neon (High)"
+
+    steps = [
+        {"step_type": "USER_INPUT", "est_tokens": 10_000, "created_at": "2026-11-18T15:00:00Z"},
+        {
+            "step_type": "PLANNER_RESPONSE",
+            "est_tokens": 1_000,
+            "model_name": "Gemini 4 Neon (High)",
+            "created_at": "2026-11-18T15:00:10Z",
+        },
+        {"step_type": "GENERIC", "est_tokens": 2_000, "created_at": "2026-11-18T15:00:20Z"},
+        {
+            "step_type": "PLANNER_RESPONSE",
+            "est_tokens": 1_000,
+            "model_name": "Gemini 4 Neon (High)",
+            "created_at": "2026-11-18T15:01:00Z",  # 50s later -> cache warm (11k cached, 2k uncached)
+        },
+    ]
+    recompute_step_costs(steps, "Gemini 4 Neon (High)")
+    # Step 1: 10k * 3.00/M (0.03) + 1k * 15.00/M (0.015) = 0.045
+    assert steps[1]["billed_cost"] == pytest.approx(0.045)
+    # Step 3 (warm): 11k * 0.15/M (0.00165) + 2k * 3.00/M (0.006) + 1k * 15.00/M (0.015) = 0.02265
+    assert steps[3]["billed_cost"] == pytest.approx(0.02265)
+
+
+def test_orchestrator_neon_and_hydrogen_pricing_and_cache_boundary():
+    from context_monitor.pricing import (
+        get_pricing_key,
+        normalize_native_model_name,
+        recompute_step_costs,
+    )
+
+    assert get_pricing_key("Orchestrator (Neon)") == "neon"
+    assert get_pricing_key("gemini-pro-orchestrator-neon") == "neon"
+    assert get_pricing_key("Orchestrator (Argon)") == "argon"
+    assert get_pricing_key("gemini-pro-orchestrator-argon") == "argon"
+    assert get_pricing_key("Gemini 4 Hydrogen (Orchestrator)") == "hydrogen"
+    assert get_pricing_key("Orchestrator (Carbon)") == "carbon"
+    assert get_pricing_key("gemini-pro-orchestrator") == "carbon"
+    assert get_pricing_key("Orchestrator") == "carbon"
+
+    assert (
+        normalize_native_model_name("gemini-pro-orchestrator-neon", "", "MODEL_PLACEHOLDER_M537")
+        == "Orchestrator (Neon)"
+    )
+    assert (
+        normalize_native_model_name("gemini-4-neon", "", "MODEL_PLACEHOLDER_M533")
+        == "Gemini 4 Neon (Medium)"
+    )
+    assert (
+        normalize_native_model_name("gemini-pro-orchestrator-argon", "", "")
+        == "Orchestrator (Argon)"
+    )
+    assert (
+        normalize_native_model_name(
+            "gemini-flash-worker-agy",
+            "Gemini 4 Hydrogen (Orchestrator)",
+            "MODEL_PLACEHOLDER_M669",
+        )
+        == "Gemini 4 Hydrogen (Orchestrator)"
+    )
+    assert (
+        normalize_native_model_name("gemini-flash-worker-agy", "", "MODEL_PLACEHOLDER_M669")
+        == "Gemini Flash"
+    )
+
+    # Fallback (non-native token) Neon -> Hydrogen switch within 300s must NOT apply cached discount across models
+    steps = [
+        {"step_type": "USER_INPUT", "est_tokens": 100_000, "created_at": "2026-11-18T17:00:00Z"},
+        {
+            "step_type": "PLANNER_RESPONSE",
+            "est_tokens": 1_000,
+            "model_name": "Orchestrator (Neon)",
+            "created_at": "2026-11-18T17:00:10Z",
+        },
+        {
+            "step_type": "PLANNER_RESPONSE",
+            "est_tokens": 1_000,
+            "model_name": "Gemini 4 Hydrogen (Orchestrator)",
+            "created_at": "2026-11-18T17:00:20Z",
+        },
+    ]
+    res = recompute_step_costs(steps, "Orchestrator (Neon)")
+    # Step 1 (Neon): 100k * $3/M ($0.30) + 1k * $15/M ($0.015) = $0.315
+    # Step 2 (Hydrogen, uncached because pkey switched neon -> hydrogen): 101k * $1.50/M ($0.1515) + 1k * $7.50/M ($0.0075) = $0.159
+    assert steps[1]["billed_cost"] == pytest.approx(0.315)
+    assert steps[2]["billed_cost"] == pytest.approx(0.159)
+    assert res["billed_cost"] == pytest.approx(0.474)
+
+    # Empty/None step model_name must fall back to active_model rather than resolving to flash
+    fallback_steps = [
+        {"step_type": "USER_INPUT", "est_tokens": 100_000, "created_at": "2026-11-18T17:00:00Z"},
+        {
+            "step_type": "PLANNER_RESPONSE",
+            "est_tokens": 1_000,
+            "model_name": None,
+            "created_at": "2026-11-18T17:00:10Z",
+        },
+        {
+            "step_type": "PLANNER_RESPONSE",
+            "est_tokens": 1_000,
+            "model_name": "",
+            "created_at": "2026-11-18T17:00:20Z",
+        },
+    ]
+    fallback_res = recompute_step_costs(fallback_steps, "Orchestrator (Neon)")
+    assert fallback_steps[1]["billed_cost"] == pytest.approx(0.315)
+    # Step 2 (warm cache on Neon): 101k * $0.15/M ($0.01515) + 1k * $15/M ($0.015) = $0.03015
+    assert fallback_steps[2]["billed_cost"] == pytest.approx(0.03015)
+    assert fallback_res["billed_cost"] == pytest.approx(0.34515)
+
+
 def test_recompute_step_costs_native_tokens_and_implicit_cache_ttl():
     from context_monitor.pricing import recompute_step_costs
 

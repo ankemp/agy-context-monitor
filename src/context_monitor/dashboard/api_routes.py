@@ -501,67 +501,55 @@ def query_summary_data(conn, tz=None, project=None):
         """
         model_params = ()
 
+    def _merge_model_bucket(model_name: str, steps_cnt: int, tok_cnt: int) -> None:
+        if model_name in model_data:
+            model_data[model_name]["steps"] += steps_cnt
+            model_data[model_name]["tokens"] += tok_cnt
+        else:
+            model_data[model_name] = {
+                "model_name": model_name,
+                "steps": steps_cnt,
+                "tokens": tok_cnt,
+            }
+
     model_rows = cur.execute(model_sql, model_params).fetchall()
-    has_resolved_project_nulls = False
+    has_resolved_nulls = False
     for r in model_rows:
         name = r["mname"]
         if not name:
-            if project:
-                if not has_resolved_project_nulls:
-                    has_resolved_project_nulls = True
-                    if project == "(unassigned)":
-                        null_sql = """
-                            SELECT COALESCE(c.model_name, 'Gemini Flash') as cname,
-                                   COUNT(*) as steps,
-                                   SUM(COALESCE(s.billed_input_tokens, 0) + COALESCE(s.billed_output_tokens, 0)) as tokens
-                            FROM steps s
-                            JOIN conversations c ON s.conversation_id = c.id
-                            WHERE (s.model_name IS NULL OR s.model_name = '')
-                              AND (c.project IS NULL OR c.project = '')
-                            GROUP BY cname
-                        """
-                        null_params = ()
-                    else:
-                        null_sql = """
-                            SELECT COALESCE(c.model_name, 'Gemini Flash') as cname,
-                                   COUNT(*) as steps,
-                                   SUM(COALESCE(s.billed_input_tokens, 0) + COALESCE(s.billed_output_tokens, 0)) as tokens
-                            FROM steps s
-                            JOIN conversations c ON s.conversation_id = c.id
-                            WHERE (s.model_name IS NULL OR s.model_name = '')
-                              AND c.project = ?
-                            GROUP BY cname
-                        """
-                        null_params = (project,)
-                    null_rows = cur.execute(null_sql, null_params).fetchall()
-                    for null_row in null_rows:
-                        cname = null_row["cname"] or "Gemini Flash"
-                        c_steps = null_row["steps"] or 0
-                        c_tokens = null_row["tokens"] or 0
-                        if cname in model_data:
-                            model_data[cname]["steps"] += c_steps
-                            model_data[cname]["tokens"] += c_tokens
-                        else:
-                            model_data[cname] = {
-                                "model_name": cname,
-                                "steps": c_steps,
-                                "tokens": c_tokens,
-                            }
-                continue
-            else:
-                name = "Gemini Flash"
+            if not has_resolved_nulls:
+                has_resolved_nulls = True
+                join_clause = (
+                    "JOIN conversations c ON s.conversation_id = c.id"
+                    if project
+                    else "LEFT JOIN conversations c ON s.conversation_id = c.id"
+                )
+                null_where_extra = ""
+                null_params: tuple[Any, ...] = ()
+                if project == "(unassigned)":
+                    null_where_extra = " AND (c.project IS NULL OR c.project = '')"
+                elif project:
+                    null_where_extra = " AND c.project = ?"
+                    null_params = (project,)
 
-        tokens = r["tokens"] or 0
-        steps = r["steps"] or 0
-        if name in model_data:
-            model_data[name]["steps"] += steps
-            model_data[name]["tokens"] += tokens
-        else:
-            model_data[name] = {
-                "model_name": name,
-                "steps": steps,
-                "tokens": tokens,
-            }
+                null_sql = f"""
+                    SELECT COALESCE(NULLIF(TRIM(c.model_name), ''), 'Gemini Flash') as cname,
+                           COUNT(*) as steps,
+                           SUM(COALESCE(s.billed_input_tokens, 0) + COALESCE(s.billed_output_tokens, 0)) as tokens
+                    FROM steps s
+                    {join_clause}
+                    WHERE (s.model_name IS NULL OR s.model_name = ''){null_where_extra}
+                    GROUP BY cname
+                """
+                null_rows = cur.execute(null_sql, null_params).fetchall()
+                for null_row in null_rows:
+                    cname = null_row["cname"] or "Gemini Flash"
+                    _merge_model_bucket(
+                        cname, null_row["steps"] or 0, null_row["tokens"] or 0
+                    )
+            continue
+
+        _merge_model_bucket(name, r["steps"] or 0, r["tokens"] or 0)
 
     models = sorted(model_data.values(), key=lambda x: x["tokens"], reverse=True)
     for m in models:
@@ -1615,6 +1603,38 @@ def query_activity_matrix(conn, tz=None, project=None):
     }
 
 
+_MODEL_SPLIT_RE = re.compile(r",|→|➔|->")
+
+
+def _extract_model_families(
+    models_used: str | None, model_name: str | None
+) -> list[str]:
+    """Extracts ordered, deduplicated canonical model families from models_used or model_name."""
+
+    def _split_clean(val: str | None) -> list[str]:
+        raw = (val or "").strip()
+        if not raw:
+            return []
+        return [
+            p.strip()
+            for p in _MODEL_SPLIT_RE.split(raw)
+            if p.strip() and p.strip() not in ("...", "…")
+        ]
+
+    parts = _split_clean(models_used)
+    if not parts:
+        parts = _split_clean(model_name)
+
+    families: list[str] = []
+    seen: set[str] = set()
+    for part in parts:
+        fam = get_model_family(part)
+        if fam and fam not in seen:
+            seen.add(fam)
+            families.append(fam)
+    return families
+
+
 def query_conversations_list(
     conn, limit=200, tz=None, project=None, view_mode="hierarchy"
 ):
@@ -1735,6 +1755,9 @@ def query_conversations_list(
                     "project": dr["project"] or "(unassigned)",
                     "model_name": dr["model_name"] or "Gemini",
                     "models_used": dr_m_used,
+                    "model_families": _extract_model_families(
+                        dr_m_used, dr["model_name"] or "Gemini"
+                    ),
                     "created_at": d_dt.strftime("%Y-%m-%d %H:%M")
                     if d_dt
                     else dr["created_at"],
@@ -1849,6 +1872,9 @@ def query_conversations_list(
                 "project": r["project"] or "(unassigned)",
                 "model_name": r["model_name"] or "Gemini",
                 "models_used": r_m_used,
+                "model_families": _extract_model_families(
+                    r_m_used, r["model_name"] or "Gemini"
+                ),
                 "created_at": dt.strftime("%Y-%m-%d %H:%M") if dt else r["created_at"],
                 "updated_at": udt.strftime("%Y-%m-%d %H:%M")
                 if udt

@@ -363,8 +363,46 @@
       return color;
     }
 
-    const _MODEL_TIER_SUFFIX_RE = /\s*\((?:high|medium|low|xhigh|tiered|thinking|reasoning)\)\s*$/i;
+    const _RAW_MODEL_DISPLAY_MAP = {
+      'gemini-3.8-flash-tiered': 'Gemini 3.8 Flash (Tiered)',
+      'gemini-3.8-flash': 'Gemini 3.8 Flash (High)',
+      'gemini-4-argon': 'Gemini 4 Argon (Medium)',
+      'gemini-4-argon-b': 'Gemini 4 Argon (High)',
+      'gemini-4-carbon': 'Gemini 4 Carbon (Medium)',
+      'gemini-4-hydrogen': 'Gemini 4 Hydrogen (High)',
+      'gemini-4-neon': 'Gemini 4 Neon (High)',
+      'gemini-pro-orchestrator': 'Orchestrator (Carbon)',
+      'gemini-pro-orchestrator-neon': 'Orchestrator (Neon)',
+      'gemini-pro-orchestrator-argon': 'Orchestrator (Argon)',
+      'gemini-flash-worker-agy': 'Gemini Flash',
+      'model_placeholder_m322': 'Gemini 3.8 Flash (Tiered)',
+      'model_placeholder_m318': 'Gemini 3.8 Flash (High)',
+      'model_placeholder_m319': 'Gemini 3.8 Flash (Medium)',
+      'model_placeholder_m417': 'Gemini 4 Argon (High)',
+      'model_placeholder_m418': 'Gemini 4 Argon (Medium)',
+      'model_placeholder_m419': 'Gemini 4 Argon (Low)',
+      'model_placeholder_m437': 'Gemini 4 Carbon (Medium)',
+      'model_placeholder_m438': 'Gemini 4 Carbon (Low)',
+      'model_placeholder_m525': 'Gemini 4 Hydrogen (High)',
+      'model_placeholder_m526': 'Gemini 4 Hydrogen (Medium)',
+      'model_placeholder_m528': 'Gemini 4 Hydrogen (XHigh)',
+      'model_placeholder_m533': 'Gemini 4 Neon (Medium)',
+      'model_placeholder_m537': 'Orchestrator (Neon)',
+      'model_placeholder_m667': 'Orchestrator (Carbon)',
+      'model_placeholder_m669': 'Gemini Flash'
+    };
+    const _MODEL_TIER_SUFFIX_RE = /\s*\((?:high|medium|low|xhigh|tiered|thinking|reasoning|orchestrator)\)\s*$/i;
     const _LEGACY_GEMINI_VERSION_RE = /\bgemini[- ]?(?:1(?:\.\d+)?|2(?:\.\d+)?|3\.[0-7])\b/i;
+    const _MODEL_VENDOR_PREFIX_RE = /^(?:google|anthropic|openai)[ -]+(?=\S)/i;
+    const _MODEL_FAMILY_PREFIX_RE = /^(?:gemini|claude)[ -]+(?=\S)/i;
+
+    function formatModelChartLabel(name) {
+      const raw = String(name || '').replace(/\s+/g, ' ').trim();
+      if (!raw) return 'Unknown';
+      let clean = raw.replace(_MODEL_VENDOR_PREFIX_RE, '').trim();
+      clean = clean.replace(_MODEL_FAMILY_PREFIX_RE, '').trim();
+      return clean || raw;
+    }
 
     function getModelFamilyJs(modelName, apiFamily) {
       if (typeof apiFamily === 'string' && apiFamily.trim()) {
@@ -372,10 +410,14 @@
       }
       const raw = String(modelName || '').trim();
       if (!raw) return 'Gemini';
-      const collapsed = raw.replace(/\s+/g, ' ').trim();
+      const resolved = _RAW_MODEL_DISPLAY_MAP[raw.toLowerCase()] || raw;
+      const collapsed = resolved.replace(/\s+/g, ' ').trim();
       const lower = collapsed.toLowerCase();
-      if (lower.includes('orchestrator') && (lower.includes('carbon') || lower === 'orchestrator')) {
-        return 'Gemini 4 Carbon';
+      if (lower.includes('orchestrator')) {
+        if (lower.includes('neon')) return 'Gemini 4 Neon';
+        if (lower.includes('hydrogen')) return 'Gemini 4 Hydrogen';
+        if (lower.includes('argon') || lower.includes('argo')) return 'Gemini 4 Argon';
+        if (lower.includes('carbon') || lower === 'orchestrator') return 'Gemini 4 Carbon';
       }
       const family = collapsed.replace(_MODEL_TIER_SUFFIX_RE, '').replace(/\s+/g, ' ').trim();
       return family || 'Gemini';
@@ -387,11 +429,13 @@
       }
       const raw = String(modelName || '').trim();
       if (!raw) return false;
-      const m = raw.toLowerCase().replace(/\s+/g, ' ').trim();
+      const resolved = _RAW_MODEL_DISPLAY_MAP[raw.toLowerCase()] || raw;
+      const m = resolved.toLowerCase().replace(/\s+/g, ' ').trim();
       if (
         m.includes('orchestrator') ||
         m.includes('gemini 4') ||
         m.includes('gemini-4') ||
+        m.includes('neon') ||
         m.includes('3.8') ||
         m === 'gemini flash'
       ) {
@@ -522,43 +566,63 @@
 
     function getModelTierClass(modelStr) {
       const m = String(modelStr || '').toLowerCase();
-      if (m.includes('carbon') || m.includes('orchestrator')) {
-        return 'bg-emerald-950/70 text-emerald-300 border-emerald-500/40';
-      }
-      if (m.includes('argon') || m.includes('reasoning') || m.includes('thinking')) {
-        return 'bg-cyan-950/70 text-cyan-300 border-cyan-500/40';
+      if (m.includes('neon')) {
+        return 'bg-fuchsia-950/70 text-fuchsia-300 border-fuchsia-500/40';
       }
       if (m.includes('hydrogen')) {
         return 'bg-sky-950/70 text-sky-300 border-sky-500/40';
       }
-      if (m.includes('pro') || m.includes('opus')) {
+      if (m.includes('argon')) {
+        return 'bg-cyan-950/70 text-cyan-300 border-cyan-500/40';
+      }
+      if (m.includes('carbon') || m.includes('orchestrator')) {
+        return 'bg-emerald-950/70 text-emerald-300 border-emerald-500/40';
+      }
+      if (m.includes('opus')) {
         return 'bg-indigo-950/70 text-indigo-300 border-indigo-500/40';
       }
-      if (m.includes('flash') || m.includes('haiku') || (m.includes('mini') && !m.includes('gemini'))) {
+      if (m.includes('haiku')) {
         return 'bg-purple-950/70 text-purple-300 border-purple-500/40';
       }
       if (m.includes('claude') || m.includes('sonnet') || m.includes('gpt')) {
         return 'bg-amber-950/70 text-amber-300 border-amber-500/40';
       }
+      if (m.includes('pro')) {
+        return 'bg-indigo-950/70 text-indigo-300 border-indigo-500/40';
+      }
+      if (m.includes('flash') || (m.includes('mini') && !m.includes('gemini'))) {
+        return 'bg-purple-950/70 text-purple-300 border-purple-500/40';
+      }
+      if (m.includes('reasoning') || m.includes('thinking')) {
+        return 'bg-cyan-950/70 text-cyan-300 border-cyan-500/40';
+      }
       return 'bg-zinc-800/80 text-gray-400 border-zinc-700/50';
     }
 
-    function formatModelBadgeHtml(modelStr) {
+    function formatModelBadgeHtml(modelStr, modelsUsed = '', customTitle = '') {
       if (!modelStr) {
-        return `<span class="px-1.5 py-0.5 rounded text-[10px] font-mono font-medium bg-zinc-800/80 text-gray-400 border border-zinc-700/50 shrink-0" title="Unknown">Gemini</span>`;
+        const fallbackTitle = escapeModelText(customTitle || 'Unknown');
+        return `<span class="px-1.5 py-0.5 rounded text-[10px] font-mono font-medium bg-zinc-800/80 text-gray-400 border border-zinc-700/50 shrink-0" title="${fallbackTitle}">Gemini</span>`;
       }
 
       const str = String(modelStr).trim();
       const parts = str.split(/\s*(?:→|➔|->)\s*/).filter(Boolean);
 
       if (parts.length === 0) {
-        return `<span class="px-1.5 py-0.5 rounded text-[10px] font-mono font-medium bg-zinc-800/80 text-gray-400 border border-zinc-700/50 shrink-0" title="${str}">${str}</span>`;
+        const safeStr = escapeModelText(str);
+        const safeTitle = escapeModelText(customTitle || str || 'Unknown');
+        return `<span class="px-1.5 py-0.5 rounded text-[10px] font-mono font-medium bg-zinc-800/80 text-gray-400 border border-zinc-700/50 shrink-0" title="${safeTitle}">${safeStr || 'Gemini'}</span>`;
       }
 
+      const escapedModelsUsed = escapeModelText(modelsUsed || customTitle || str);
       const badgesHtml = parts.map(part => {
-        const short = shortenModelName(part);
+        if (part === '...' || part === '…') {
+          return `<span class="text-slate-500 text-[10px] px-0.5" title="${escapedModelsUsed}">…</span>`;
+        }
+        const short = escapeModelText(shortenModelName(part));
+        const safePartTitle = escapeModelText(customTitle || part);
         const tierClass = getModelTierClass(part);
-        return `<span class="px-1.5 py-0.5 rounded text-[10px] font-mono font-medium ${tierClass} border shrink-0" title="${part}">${short}</span>`;
+        return `<span class="px-1.5 py-0.5 rounded text-[10px] font-mono font-medium ${tierClass} border shrink-0" title="${safePartTitle}">${short}</span>`;
       });
 
       if (parts.length === 1) {
@@ -2400,9 +2464,10 @@
 
       const groupedMap = new Map();
       for (const m of filteredModels) {
-        const label = currentModelGroupMode === 'family'
+        const rawLabel = currentModelGroupMode === 'family'
           ? getModelFamilyJs(m?.model_name, m?.model_family)
           : String(m?.model_name || 'Unknown');
+        const label = formatModelChartLabel(rawLabel);
         const tok = Number(m?.tokens) || 0;
         const stp = Number(m?.steps) || 0;
         const existing = groupedMap.get(label);
@@ -2410,7 +2475,7 @@
           existing.tokens += tok;
           existing.steps += stp;
         } else {
-          groupedMap.set(label, { label, tokens: tok, steps: stp, isOther: false });
+          groupedMap.set(label, { label, rawLabel, tokens: tok, steps: stp, isOther: false });
         }
       }
       const grouped = Array.from(groupedMap.values());
@@ -2421,6 +2486,7 @@
         getValue: (m) => m.tokens,
         buildOther: (tail, sum) => ({
           label: 'Other (' + tail.length + ')',
+          rawLabel: tail.map((t) => t.label).join(', '),
           tokens: sum,
           steps: tail.reduce((a, b) => a + (b.steps || 0), 0),
           isOther: true
@@ -2474,15 +2540,16 @@
           legendEl.innerHTML = slices.map((item, idx) => {
             const pct = totalTokens > 0 ? ((item.tokens / totalTokens) * 100).toFixed(1) : '0.0';
             const safeLabel = escapeModelText(item.label);
+            const safeTitle = escapeModelText(item.rawLabel || item.label);
             return `
               <div class="flex items-center justify-between gap-2 text-xs leading-tight">
                 <div class="flex items-center gap-2 min-w-0">
                   <span class="w-2.5 h-2.5 rounded-full shrink-0" style="background-color: ${colors[idx]}"></span>
-                  <span class="text-gray-200 truncate" title="${safeLabel}">${safeLabel}</span>
+                  <span class="text-gray-200 truncate" title="${safeTitle}">${safeLabel}</span>
                 </div>
-                <div class="flex items-center gap-2 shrink-0 font-mono text-[11px]">
-                  <span class="text-gray-300 font-medium">${pct}%</span>
-                  <span class="text-gray-400">${formatTokens(item.tokens)}</span>
+                <div class="flex items-center gap-3 shrink-0 font-mono text-[11px] tabular-nums">
+                  <span class="text-gray-300 font-medium w-12 text-right">${pct}%</span>
+                  <span class="text-gray-400 w-16 text-right">${formatTokens(item.tokens)}</span>
                 </div>
               </div>
             `;
@@ -2787,7 +2854,7 @@
                 </div>
               </td>
               <td class="py-2 px-2 whitespace-nowrap"><span class="px-1.5 py-0.5 rounded text-[10px] font-mono bg-dark-900 border border-dark-700 text-gray-300">${s.project}</span></td>
-              <td class="py-2 px-2 text-purple-300 whitespace-nowrap text-[11px]">${s.model_name}</td>
+              <td class="py-2 px-2 align-middle">${formatModelBadgeHtml(s.model_name, s.models_used)}</td>
               <td class="py-2 px-2 text-right font-semibold text-indigo-400 font-mono text-[11px]" title="${formatTokens(s.disk_tokens || 0)} disk footprint">${formatTokens(s.tokens || s.total_tokens)}</td>
               <td class="py-2 px-2 text-right font-mono font-bold text-rose-400 text-[11px]" title="${costTooltip}">$${s.billed_cost.toFixed(2)}</td>
               <td class="py-2 px-2 text-center">
@@ -3213,27 +3280,148 @@
       }
     }
 
+    function _extractItemModelList(item) {
+      if (!item || typeof item !== 'object') return [];
+      const seen = new Set();
+      const result = [];
+      const addParts = (raw) => {
+        if (!raw) return;
+        const arr = Array.isArray(raw) ? raw : String(raw).split(',');
+        for (const chunk of arr) {
+          const subParts = String(chunk).split(/\s*(?:→|➔|->)\s*/);
+          for (const p of subParts) {
+            const clean = p.trim();
+            if (!clean || clean === '...' || clean === '…') continue;
+            if (!seen.has(clean)) {
+              seen.add(clean);
+              result.push(clean);
+            }
+          }
+        }
+      };
+      addParts(item.models_used);
+      addParts(item.model_name);
+      return result;
+    }
+
+    function populateConvModelFilter(conversations) {
+      const selectEl = document.getElementById('convModelFilter');
+      if (!selectEl) return;
+      const prevVal = String(selectEl.value || '');
+      const modelSet = new Set();
+      const list = Array.isArray(conversations) ? conversations : [];
+      for (const c of list) {
+        for (const m of _extractItemModelList(c)) {
+          if (m.toLowerCase() !== 'inherit' && m.toLowerCase() !== 'default') {
+            modelSet.add(m);
+          }
+        }
+        if (Array.isArray(c?.subagents)) {
+          for (const sub of c.subagents) {
+            for (const m of _extractItemModelList(sub)) {
+              if (m.toLowerCase() !== 'inherit' && m.toLowerCase() !== 'default') {
+                modelSet.add(m);
+              }
+            }
+          }
+        }
+      }
+      const sortedModels = Array.from(modelSet).sort((a, b) => a.localeCompare(b));
+      const optionsHtml = ['<option value="">All Models</option>'];
+      for (const m of sortedModels) {
+        const escaped = escapeModelText(m);
+        optionsHtml.push(`<option value="${escaped}">${escaped}</option>`);
+      }
+      selectEl.innerHTML = optionsHtml.join('');
+      selectEl.value = (prevVal && modelSet.has(prevVal)) ? prevVal : '';
+    }
+
+    function _convItemMatchesQuery(item, q) {
+      if (!q) return true;
+      if (!item || typeof item !== 'object') return false;
+      const familiesStr = Array.isArray(item.model_families)
+        ? item.model_families.join(' ')
+        : String(item.model_families || '');
+      return (
+        String(item.title || '').toLowerCase().includes(q) ||
+        String(item.id || '').toLowerCase().includes(q) ||
+        String(item.created_at || '').toLowerCase().includes(q) ||
+        String(item.updated_at || '').toLowerCase().includes(q) ||
+        String(item.subagent_role || '').toLowerCase().includes(q) ||
+        String(item.model_name || '').toLowerCase().includes(q) ||
+        String(item.models_used || '').toLowerCase().includes(q) ||
+        familiesStr.toLowerCase().includes(q)
+      );
+    }
+
+    function _convItemMatchesModel(item, selectedModel) {
+      if (!selectedModel) return true;
+      const target = selectedModel.toLowerCase();
+      return _extractItemModelList(item).some(m => m.toLowerCase() === target);
+    }
+
+    function _resolveParentEffectiveModel(conv) {
+      const candidates = _extractItemModelList({ model_name: conv?.model_name });
+      if (candidates.length > 0) {
+        return candidates[candidates.length - 1];
+      }
+      const fromUsed = _extractItemModelList({ models_used: conv?.models_used });
+      return fromUsed.length > 0 ? fromUsed[fromUsed.length - 1] : '';
+    }
+
     function renderConversations(convs) {
-      allConversations = convs;
+      allConversations = Array.isArray(convs) ? convs : [];
+      populateConvModelFilter(allConversations);
       filterConversations();
     }
 
     function filterConversations() {
-      const el = document.getElementById('convSearch');
-      if (!el) return;
-      const q = el.value.toLowerCase();
+      const searchEl = document.getElementById('convSearch');
+      const modelFilterEl = document.getElementById('convModelFilter');
+      const countEl = document.getElementById('convFilterCount');
       const tbody = document.getElementById('convTableBody');
       if (!tbody) return;
+      const q = String(searchEl?.value || '').trim().toLowerCase();
+      const selectedModel = String(modelFilterEl?.value || '').trim();
+      const hasActiveFilter = Boolean(q || selectedModel);
       tbody.innerHTML = '';
 
-      const filtered = allConversations.filter(c => 
-        (c.title || '').toLowerCase().includes(q) || 
-        (c.id || '').toLowerCase().includes(q) || 
-        (c.created_at && c.created_at.includes(q)) ||
-        (c.updated_at && c.updated_at.includes(q))
-      );
+      const convList = Array.isArray(allConversations) ? allConversations : [];
+      const autoExpandIds = new Set();
+      const filtered = convList.filter(c => {
+        const subs = Array.isArray(c?.subagents) ? c.subagents : [];
+        const rootMatchesQuery = _convItemMatchesQuery(c, q);
+        const subMatchesQuery = Boolean(q) && subs.some(sub => _convItemMatchesQuery(sub, q));
+        const rootMatchesModel = _convItemMatchesModel(c, selectedModel);
+        const subMatchesModel = Boolean(selectedModel) && subs.some(sub => _convItemMatchesModel(sub, selectedModel));
 
-      for (const c of filtered.slice(0, 50)) {
+        const matchesQuery = !q || rootMatchesQuery || subMatchesQuery;
+        const matchesModel = !selectedModel || rootMatchesModel || subMatchesModel;
+        if (!matchesQuery || !matchesModel) {
+          return false;
+        }
+        if (hasActiveFilter && (subMatchesQuery || subMatchesModel)) {
+          autoExpandIds.add(c.id);
+        }
+        return true;
+      });
+
+      const displayed = filtered.slice(0, 50);
+      if (countEl) {
+        if (hasActiveFilter || filtered.length > 50) {
+          if (hasActiveFilter && filtered.length > 50) {
+            countEl.textContent = `Showing ${displayed.length} of ${filtered.length} matched (${convList.length} total)`;
+          } else {
+            countEl.textContent = `Showing ${displayed.length} of ${convList.length}`;
+          }
+          countEl.classList?.remove('hidden');
+        } else {
+          countEl.textContent = '';
+          countEl.classList?.add('hidden');
+        }
+      }
+
+      for (const c of displayed) {
         const tr = document.createElement('tr');
         tr.className = 'hover:bg-dark-800/60 transition';
         
@@ -3245,7 +3433,7 @@
         const wallSec = c.duration_seconds || 0;
         const hasFleetDiff = fleetAgentSec > agentSec;
         const timeTitle = `Agent Work: ${formatDuration(agentSec)}${hasFleetDiff ? ` (Fleet: ${formatDuration(fleetAgentSec)})` : ''} | Human Pairing: ${formatDuration(pairingSec)} | Total Span: ${formatDuration(wallSec)}`;
-        const isExpanded = expandedConvs.has(c.id);
+        const isExpanded = expandedConvs.has(c.id) || autoExpandIds.has(c.id);
 
         let titleHtml = '';
         let stepsHtml = '';
@@ -3307,7 +3495,7 @@
             <span class="text-[10px] text-gray-500 block font-mono">Started ${startedStr}</span>
           </td>
           <td class="py-2.5 px-3">${titleHtml}</td>
-          <td class="py-2.5 px-3 max-w-[220px] align-middle">${formatModelBadgeHtml(c.model_name)}</td>
+          <td class="py-2.5 px-3 max-w-[220px] align-middle">${formatModelBadgeHtml(c.model_name, c.models_used)}</td>
           <td class="py-2.5 px-3 text-right">${stepsHtml}</td>
           <td class="py-2.5 px-3 text-right">${costHtml}</td>
           <td class="py-2.5 px-3 text-right">${tokensHtml}</td>
@@ -3352,6 +3540,12 @@
               ? `<span class="text-[9px] text-cyan-400 font-mono block" title="Active Context: ${subActTpm.toLocaleString()} TPM | Pairing Billed: ${subBldTph.toLocaleString()} TPH">${formatTokens(subActTpm)} TPM · ${formatTokens(subBldTph)} TPH</span>`
               : '';
 
+            const parentResolvedModel = _resolveParentEffectiveModel(c);
+            const rawSubModel = String(sub.model_name || '').trim();
+            const isInheritedSubModel = !rawSubModel || rawSubModel.toLowerCase() === 'inherit' || rawSubModel.toLowerCase() === 'default' || (rawSubModel === 'Gemini' && parentResolvedModel && parentResolvedModel !== 'Gemini');
+            const effectiveSubModel = (isInheritedSubModel && parentResolvedModel) ? parentResolvedModel : (rawSubModel || 'inherit');
+            const subBadgeTitle = isInheritedSubModel ? (parentResolvedModel ? `Inherited from ${parentResolvedModel}` : 'Inherited from parent') : '';
+
             childTr.innerHTML = `
               <td class="py-2 px-3 text-gray-400 whitespace-nowrap font-mono text-[10px] pl-6" title="Started: ${childStartedStr}">
                 <span class="text-emerald-400/80">${childLastActiveStr}</span>
@@ -3365,7 +3559,7 @@
                   ${subCompactionBadge}
                 </div>
               </td>
-              <td class="py-2 px-3 max-w-[220px] align-middle">${formatModelBadgeHtml(sub.model_name || 'inherit')}</td>
+              <td class="py-2 px-3 max-w-[220px] align-middle">${formatModelBadgeHtml(effectiveSubModel, sub.models_used || '', subBadgeTitle)}</td>
               <td class="py-2 px-3 text-right text-gray-400 font-mono text-xs">${sub.total_steps}</td>
               <td class="py-2 px-3 text-right font-mono font-medium text-rose-400/80 text-xs">$${(sub.billed_cost || 0).toFixed(2)}${sub.weekly_quota_pct != null ? ` <span class="text-[10px] text-cyan-300 font-mono">(${sub.weekly_quota_pct.toFixed(2)}% wk)</span>` : ''}</td>
               <td class="py-2 px-3 text-right font-mono font-medium text-indigo-400/80 text-xs">${formatTokens(sub.tokens || sub.total_tokens)}${subVelHtml}</td>
@@ -3393,13 +3587,25 @@
         const data = await res.json();
         if (!data) return;
 
-        const conv = data.conversation;
-        document.getElementById('modalTitle').textContent = conv.title || `Session ${conv.id.substring(0, 8)}`;
-        document.getElementById('modalSub').textContent = `ID: ${conv.id} • Started: ${conv.created_at || '--'}`;
-        
-        const distinctModels = [...new Set(data.steps.map(s => s.model_name).filter(Boolean))];
-        const modelLabel = distinctModels.length > 1 ? distinctModels.join(' ➔ ') : (conv.model_name || 'Gemini');
-        document.getElementById('modalModel').innerHTML = formatModelBadgeHtml(modelLabel);
+        const conv = data.conversation || {};
+        const modalTitleEl = document.getElementById('modalTitle');
+        if (modalTitleEl) modalTitleEl.textContent = conv.title || `Session ${(conv.id || '').substring(0, 8)}`;
+        const modalSubEl = document.getElementById('modalSub');
+        if (modalSubEl) modalSubEl.textContent = `ID: ${conv.id || '--'} • Started: ${conv.created_at || '--'}`;
+
+        const stepsList = Array.isArray(data.steps) ? data.steps : [];
+        const stepTransitions = [];
+        for (const s of stepsList) {
+          const m = s?.model_name ? String(s.model_name).trim() : '';
+          if (m && (stepTransitions.length === 0 || stepTransitions[stepTransitions.length - 1] !== m)) {
+            stepTransitions.push(m);
+          }
+        }
+        const modelLabel = stepTransitions.length > 0 ? stepTransitions.join(' → ') : (conv.model_name || 'Gemini');
+        const modalModelEl = document.getElementById('modalModel');
+        if (modalModelEl) {
+          modalModelEl.innerHTML = formatModelBadgeHtml(modelLabel, conv.models_used || '');
+        }
         
         const convAgentSec = conv.active_agent_seconds || 0;
         const convPairingSec = conv.active_pairing_seconds || 0;
@@ -3541,66 +3747,89 @@
         }
 
         const tcBody = document.getElementById('modalTopConsumers');
-        tcBody.innerHTML = '';
-        for (const s of data.top_consumers) {
-          const costStr = (s.billed_cost != null && s.billed_cost > 0)
-            ? `$${s.billed_cost.toFixed(4)}${s.weekly_quota_pct != null ? ` <span class="text-[10px] text-cyan-300 font-mono">(${s.weekly_quota_pct.toFixed(2)}% wk)</span>` : ''}`
-            : '$0.00';
-          const tr = document.createElement('tr');
-          tr.innerHTML = `
-            <td class="py-2 px-2.5 text-gray-400 font-mono">#${s.step_index}</td>
-            <td class="py-2 px-2.5 font-medium text-white">${s.activity}</td>
-            <td class="py-2 px-2.5">${formatToolBadge(s.tool_or_source, s.activity)}</td>
-            <td class="py-2 px-2.5 text-right font-semibold text-white">${formatTokens(s.est_tokens)}</td>
-            <td class="py-2 px-2.5 text-right font-mono text-gray-300 whitespace-nowrap">${costStr}</td>
-            <td class="py-2 px-2.5 text-gray-400 max-w-xs truncate" title="${s.detail || ''}">${s.detail || '--'}</td>
-          `;
-          tcBody.appendChild(tr);
+        if (tcBody) {
+          tcBody.innerHTML = '';
+          for (const s of (Array.isArray(data.top_consumers) ? data.top_consumers : [])) {
+            const costStr = (s.billed_cost != null && s.billed_cost > 0)
+              ? `$${s.billed_cost.toFixed(4)}${s.weekly_quota_pct != null ? ` <span class="text-[10px] text-cyan-300 font-mono">(${s.weekly_quota_pct.toFixed(2)}% wk)</span>` : ''}`
+              : '$0.00';
+            const tr = document.createElement('tr');
+            tr.innerHTML = `
+              <td class="py-2 px-2.5 text-gray-400 font-mono">#${s.step_index}</td>
+              <td class="py-2 px-2.5 font-medium text-white">${s.activity}</td>
+              <td class="py-2 px-2.5">${formatToolBadge(s.tool_or_source, s.activity)}</td>
+              <td class="py-2 px-2.5 text-right font-semibold text-white">${formatTokens(s.est_tokens)}</td>
+              <td class="py-2 px-2.5 text-right font-mono text-gray-300 whitespace-nowrap">${costStr}</td>
+              <td class="py-2 px-2.5 text-gray-400 max-w-xs truncate" title="${s.detail || ''}">${s.detail || '--'}</td>
+            `;
+            tcBody.appendChild(tr);
+          }
         }
 
         const sBody = document.getElementById('modalStepList');
-        sBody.innerHTML = '';
-        let lastModel = null;
-        for (const s of data.steps) {
-          const isModelSwitch = lastModel && s.model_name && s.model_name !== lastModel;
-          lastModel = s.model_name || lastModel;
+        if (sBody) {
+          sBody.innerHTML = '';
+          let lastModel = null;
+          for (const s of stepsList) {
+            const stepModel = s?.model_name ? String(s.model_name).trim() : '';
+            const isInitialModel = !lastModel && Boolean(stepModel);
+            const isModelSwitch = Boolean(lastModel && stepModel && stepModel !== lastModel);
+            if (stepModel) {
+              lastModel = stepModel;
+            }
 
-          if (isModelSwitch) {
-            const switchTr = document.createElement('tr');
-            switchTr.className = 'bg-brand-950/60 border-y border-brand-500/30';
-            switchTr.innerHTML = `
-              <td colspan="6" class="py-1 px-2.5 text-center text-xs font-semibold text-brand-300">
-                🔄 Model Switched to: <span class="text-white">${s.model_name}</span>
-              </td>
+            if (isInitialModel) {
+              const initTr = document.createElement('tr');
+              initTr.className = 'bg-dark-800/70 border-y border-dark-700';
+              initTr.innerHTML = `
+                <td colspan="6" class="py-1 px-2.5 text-center text-xs font-medium text-gray-300">
+                  <div class="inline-flex items-center justify-center gap-1.5 flex-wrap">
+                    <span>Initial Model:</span>
+                    ${formatModelBadgeHtml(stepModel)}
+                  </div>
+                </td>
+              `;
+              sBody.appendChild(initTr);
+            } else if (isModelSwitch) {
+              const switchTr = document.createElement('tr');
+              switchTr.className = 'bg-brand-950/60 border-y border-brand-500/30';
+              switchTr.innerHTML = `
+                <td colspan="6" class="py-1 px-2.5 text-center text-xs font-semibold text-brand-300">
+                  <div class="inline-flex items-center justify-center gap-1.5 flex-wrap">
+                    <span>🔄 Model Switched to:</span>
+                    ${formatModelBadgeHtml(stepModel)}
+                  </div>
+                </td>
+              `;
+              sBody.appendChild(switchTr);
+            }
+
+            const sType = s.step_type || s.activity || '';
+            if (sType === 'CHECKPOINT' || sType === 'CONVERSATION_HISTORY' || sType.includes('Compaction')) {
+              const compTr = document.createElement('tr');
+              compTr.className = 'bg-amber-950/60 border-y border-amber-500/50';
+              compTr.innerHTML = `
+                <td colspan="6" class="py-1.5 px-2.5 text-center text-xs font-semibold text-amber-300">
+                  ⚡ Memory Compaction Checkpoint #${s.step_index}: Context window was truncated/compacted at this step
+                </td>
+              `;
+              sBody.appendChild(compTr);
+            }
+
+            const stepCostStr = (s.billed_cost != null && s.billed_cost > 0)
+              ? `$${s.billed_cost.toFixed(4)}${s.weekly_quota_pct != null ? ` <span class="text-[10px] text-cyan-300 font-mono">(${s.weekly_quota_pct.toFixed(2)}% wk)</span>` : ''}`
+              : '$0.00';
+            const tr = document.createElement('tr');
+            tr.innerHTML = `
+              <td class="py-1.5 px-2.5 text-gray-400 font-mono">#${s.step_index}</td>
+              <td class="py-1.5 px-2.5 text-gray-300">${s.activity}</td>
+              <td class="py-1.5 px-2.5">${formatToolBadge(s.tool_or_source, s.activity)}</td>
+              <td class="py-1.5 px-2.5 text-right text-gray-400">${formatTokens(s.est_tokens)}</td>
+              <td class="py-1.5 px-2.5 text-right font-mono text-gray-300 whitespace-nowrap">${stepCostStr}</td>
+              <td class="py-1.5 px-2.5 text-gray-400 max-w-md truncate" title="${s.detail || ''}">${s.detail || '--'}</td>
             `;
-            sBody.appendChild(switchTr);
+            sBody.appendChild(tr);
           }
-
-          const sType = s.step_type || s.activity || '';
-          if (sType === 'CHECKPOINT' || sType === 'CONVERSATION_HISTORY' || sType.includes('Compaction')) {
-            const compTr = document.createElement('tr');
-            compTr.className = 'bg-amber-950/60 border-y border-amber-500/50';
-            compTr.innerHTML = `
-              <td colspan="6" class="py-1.5 px-2.5 text-center text-xs font-semibold text-amber-300">
-                ⚡ Memory Compaction Checkpoint #${s.step_index}: Context window was truncated/compacted at this step
-              </td>
-            `;
-            sBody.appendChild(compTr);
-          }
-
-          const stepCostStr = (s.billed_cost != null && s.billed_cost > 0)
-            ? `$${s.billed_cost.toFixed(4)}${s.weekly_quota_pct != null ? ` <span class="text-[10px] text-cyan-300 font-mono">(${s.weekly_quota_pct.toFixed(2)}% wk)</span>` : ''}`
-            : '$0.00';
-          const tr = document.createElement('tr');
-          tr.innerHTML = `
-            <td class="py-1.5 px-2.5 text-gray-400 font-mono">#${s.step_index}</td>
-            <td class="py-1.5 px-2.5 text-gray-300">${s.activity}</td>
-            <td class="py-1.5 px-2.5">${formatToolBadge(s.tool_or_source, s.activity)}</td>
-            <td class="py-1.5 px-2.5 text-right text-gray-400">${formatTokens(s.est_tokens)}</td>
-            <td class="py-1.5 px-2.5 text-right font-mono text-gray-300 whitespace-nowrap">${stepCostStr}</td>
-            <td class="py-1.5 px-2.5 text-gray-400 max-w-md truncate" title="${s.detail || ''}">${s.detail || '--'}</td>
-          `;
-          sBody.appendChild(tr);
         }
 
         currentSessionData = data;
@@ -3672,8 +3901,8 @@
       const activeClass = 'px-2.5 py-1 rounded-md bg-brand-600 text-white font-medium shadow transition whitespace-nowrap';
       const inactiveClass = 'px-2.5 py-1 rounded-md text-gray-400 hover:text-white transition whitespace-nowrap';
 
-      btnTable.className = mode === 'table' ? activeClass : inactiveClass;
-      btnFlow.className = mode === 'flow' ? activeClass : inactiveClass;
+      if (btnTable) btnTable.className = mode === 'table' ? activeClass : inactiveClass;
+      if (btnFlow) btnFlow.className = mode === 'flow' ? activeClass : inactiveClass;
       if (btnDiff) {
         btnDiff.className = (mode === 'diff' ? activeClass : inactiveClass) + ' flex items-center space-x-1';
       }
@@ -3681,8 +3910,8 @@
         btnSwarm.className = (mode === 'swarm' ? activeClass : inactiveClass) + ' flex items-center space-x-1';
       }
 
-      tableContainer.classList.toggle('hidden', mode !== 'table');
-      flowContainer.classList.toggle('hidden', mode !== 'flow');
+      if (tableContainer) tableContainer.classList.toggle('hidden', mode !== 'table');
+      if (flowContainer) flowContainer.classList.toggle('hidden', mode !== 'flow');
       if (diffContainer) {
         diffContainer.classList.toggle('hidden', mode !== 'diff');
       }
@@ -3813,7 +4042,7 @@
               <span class="font-medium text-white text-xs truncate max-w-xs" title="${node.title}">
                 ${node.title}
               </span>
-              ${formatModelBadgeHtml(node.model_name || 'Gemini')}
+              ${formatModelBadgeHtml(node.model_name || 'Gemini', node.models_used || '')}
               ${compactionBadge}
               ${isCurrent ? `<span class="px-1.5 py-0.2 rounded text-[10px] bg-emerald-500/20 text-emerald-300 font-mono border border-emerald-500/40">Active</span>` : ''}
             </div>
@@ -4305,6 +4534,7 @@
 
     function renderFlowSequence(steps) {
       const container = document.getElementById('modalFlowSequence');
+      if (!container) return;
       container.innerHTML = '';
 
       if (!steps || steps.length === 0) {

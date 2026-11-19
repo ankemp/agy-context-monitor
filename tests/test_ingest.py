@@ -1490,3 +1490,191 @@ def test_backfill_analytics_parity_active_context_tokens_and_subagent(tmp_path: 
             "SELECT active_pairing_seconds FROM conversations WHERE id = 'sub-bf'"
         ).fetchone()
         assert row["active_pairing_seconds"] == 0.0
+
+
+def _encode_pb_varint(v: int) -> bytes:
+    buf = bytearray()
+    while v >= 0x80:
+        buf.append((v & 0x7F) | 0x80)
+        v >>= 7
+    buf.append(v & 0x7F)
+    return bytes(buf)
+
+
+def _encode_pb_ld(field_num: int, data: bytes) -> bytes:
+    return _encode_pb_varint((field_num << 3) | 2) + _encode_pb_varint(len(data)) + data
+
+
+def test_sync_to_sqlite_invalidates_append_only_on_retroactive_model_change(
+    tmp_path: Path,
+):
+    """Verifies sync_to_sqlite invalidates is_append_only when retroactive gen_metadata changes earlier step models."""
+    import sqlite3
+    from context_monitor.pricing import DEFAULT_MODEL
+
+    db_file = tmp_path / "test_retroactive_model.db"
+    init_db(db_file)
+    convs_dir = tmp_path / "conversations"
+    convs_dir.mkdir(parents=True)
+    cid = "retro-model-cid"
+
+    t_file = tmp_path / "transcript.jsonl"
+    t_file.write_text(
+        json.dumps(
+            {
+                "step_index": 1,
+                "type": "USER_INPUT",
+                "content": "Plan the implementation",
+                "est_tokens": 100,
+                "created_at": "2026-11-18T10:00:00Z",
+            }
+        )
+        + "\n"
+        + json.dumps(
+            {
+                "step_index": 2,
+                "type": "PLANNER_RESPONSE",
+                "content": "Here is the plan",
+                "est_tokens": 200,
+                "created_at": "2026-11-18T10:00:10Z",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    # Initial sync before native <cid>.db exists -> steps default to DEFAULT_MODEL
+    res1 = analyze_transcript(t_file, cid=cid, conversations_dir=convs_dir)
+    assert res1["has_explicit_model"] is False
+    assert res1["latest_model"] == DEFAULT_MODEL
+    sync_to_sqlite(
+        cid, res1["latest_model"], res1, db_path=db_file, conversations_dir=convs_dir
+    )
+
+    with get_db_connection(db_file) as conn:
+        rows1 = conn.execute(
+            "SELECT step_index, model_name FROM steps WHERE conversation_id = ? ORDER BY step_index",
+            (cid,),
+        ).fetchall()
+        assert [(r["step_index"], r["model_name"]) for r in rows1] == [
+            (1, DEFAULT_MODEL),
+            (2, DEFAULT_MODEL),
+        ]
+
+    # Retroactively create native <cid>.db mapping step 1 to Orchestrator (Neon) without touching transcript
+    native_db = convs_dir / f"{cid}.db"
+    nconn = sqlite3.connect(native_db)
+    nconn.execute(
+        "CREATE TABLE gen_metadata (idx integer, data blob, size integer NOT NULL DEFAULT 0, PRIMARY KEY (idx))"
+    )
+    payload = _encode_pb_ld(2, _encode_pb_varint(1)) + _encode_pb_ld(
+        1,
+        _encode_pb_ld(19, b"gemini-pro-orchestrator-neon")
+        + _encode_pb_ld(21, b"Orchestrator (Neon)"),
+    )
+    nconn.execute(
+        "INSERT INTO gen_metadata (idx, data, size) VALUES (0, ?, ?)",
+        (payload, len(payload)),
+    )
+    nconn.commit()
+    nconn.close()
+
+    res2 = analyze_transcript(t_file, cid=cid, conversations_dir=convs_dir)
+    assert res2["has_explicit_model"] is True
+    assert res2["steps"][0]["model_name"] == "Orchestrator (Neon)"
+    sync_to_sqlite(
+        cid, res2["latest_model"], res2, db_path=db_file, conversations_dir=convs_dir
+    )
+
+    with get_db_connection(db_file) as conn:
+        conv_row = conn.execute(
+            "SELECT model_name FROM conversations WHERE id = ?", (cid,)
+        ).fetchone()
+        rows2 = conn.execute(
+            "SELECT step_index, model_name, billed_cost FROM steps WHERE conversation_id = ? ORDER BY step_index",
+            (cid,),
+        ).fetchall()
+
+    assert conv_row["model_name"] == "Orchestrator (Neon)"
+    assert [(r["step_index"], r["model_name"]) for r in rows2] == [
+        (1, "Orchestrator (Neon)"),
+        (2, "Orchestrator (Neon)"),
+    ]
+    assert rows2[1]["billed_cost"] == pytest.approx(0.0033)
+
+
+def test_sync_to_sqlite_existing_multimodel_fallback_does_not_write_arrow_to_steps(
+    tmp_path: Path,
+):
+    """Verifies existing multi-model fallback resolves terminal model for steps rather than writing 'A → B'."""
+    db_file = tmp_path / "test_multimodel_fallback.db"
+    init_db(db_file)
+    convs_dir = tmp_path / "conversations"
+    convs_dir.mkdir(parents=True)
+    cid = "multimodel-fallback-cid"
+
+    with get_db_connection(db_file) as conn:
+        conn.execute(
+            """
+            INSERT INTO conversations (id, title, model_name, models_used, total_steps)
+            VALUES (?, 'Orchestrator Conv', 'Orchestrator (Neon) → Gemini 4 Hydrogen (Orchestrator)', 'Orchestrator (Neon), Gemini 4 Hydrogen (Orchestrator)', 2)
+            """,
+            (cid,),
+        )
+        conn.commit()
+
+    t_file = tmp_path / "transcript.jsonl"
+    t_file.write_text(
+        json.dumps(
+            {
+                "step_index": 1,
+                "type": "USER_INPUT",
+                "content": "Continue work",
+                "est_tokens": 1000,
+                "created_at": "2026-11-18T10:00:00Z",
+            }
+        )
+        + "\n"
+        + json.dumps(
+            {
+                "step_index": 2,
+                "type": "PLANNER_RESPONSE",
+                "content": "Continuing",
+                "est_tokens": 1000,
+                "created_at": "2026-11-18T10:00:10Z",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    res = analyze_transcript(t_file, cid=cid, conversations_dir=convs_dir)
+    assert res["has_explicit_model"] is False
+    sync_to_sqlite(
+        cid, res["latest_model"], res, db_path=db_file, conversations_dir=convs_dir
+    )
+
+    with get_db_connection(db_file) as conn:
+        conv_row = conn.execute(
+            "SELECT model_name, models_used FROM conversations WHERE id = ?", (cid,)
+        ).fetchone()
+        step_rows = conn.execute(
+            "SELECT step_index, model_name, billed_cost FROM steps WHERE conversation_id = ? ORDER BY step_index",
+            (cid,),
+        ).fetchall()
+
+    assert (
+        conv_row["model_name"]
+        == "Orchestrator (Neon) → Gemini 4 Hydrogen (Orchestrator)"
+    )
+    assert (
+        conv_row["models_used"]
+        == "Orchestrator (Neon), Gemini 4 Hydrogen (Orchestrator)"
+    )
+    assert len(step_rows) == 2
+    for row in step_rows:
+        assert row["model_name"] == "Gemini 4 Hydrogen (Orchestrator)"
+        assert "→" not in row["model_name"]
+    # Step 2 billed at Hydrogen rates ($1.50/M in + $7.50/M out = $0.009)
+    assert step_rows[1]["billed_cost"] == pytest.approx(0.009)
+

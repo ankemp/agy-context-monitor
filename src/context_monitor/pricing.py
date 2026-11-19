@@ -42,7 +42,10 @@ RAW_MODEL_DISPLAY_MAP: dict[str, str] = {
     "gemini-4-argon-b": "Gemini 4 Argon (High)",
     "gemini-4-carbon": "Gemini 4 Carbon (Medium)",
     "gemini-4-hydrogen": "Gemini 4 Hydrogen (High)",
+    "gemini-4-neon": "Gemini 4 Neon (High)",
     "gemini-pro-orchestrator": "Orchestrator (Carbon)",
+    "gemini-pro-orchestrator-neon": "Orchestrator (Neon)",
+    "gemini-pro-orchestrator-argon": "Orchestrator (Argon)",
     "gemini-flash-worker-agy": "Gemini Flash",
     "model_placeholder_m322": "Gemini 3.8 Flash (Tiered)",
     "model_placeholder_m318": "Gemini 3.8 Flash (High)",
@@ -55,6 +58,8 @@ RAW_MODEL_DISPLAY_MAP: dict[str, str] = {
     "model_placeholder_m525": "Gemini 4 Hydrogen (High)",
     "model_placeholder_m526": "Gemini 4 Hydrogen (Medium)",
     "model_placeholder_m528": "Gemini 4 Hydrogen (XHigh)",
+    "model_placeholder_m533": "Gemini 4 Neon (Medium)",
+    "model_placeholder_m537": "Orchestrator (Neon)",
     "model_placeholder_m667": "Orchestrator (Carbon)",
     "model_placeholder_m669": "Gemini Flash",
 }
@@ -67,12 +72,14 @@ SUBAGENT_MODEL_TIER_MAP: dict[str, str] = {
     "carbon": "Gemini 4 Carbon (Medium)",
     "argon": "Gemini 4 Argon (Medium)",
     "hydrogen": "Gemini 4 Hydrogen (High)",
+    "neon": "Gemini 4 Neon (High)",
 }
 
 # Rates per 1,000,000 tokens: (input_rate_low, input_rate_high_tier_over_128k, output_rate)
 PRICING: dict[str, tuple[float, float, float]] = {
     "carbon": (2.00, 2.00, 10.00),   # Gemini 4 Carbon intro ($2.00/M in, $10.00/M out flat; $4/$20 starting 2026-12-01)
     "argon": (2.00, 2.00, 10.00),    # Gemini 4 Argon intro ($2.00/M in, $10.00/M out flat; $4/$20 starting 2026-12-01)
+    "neon": (3.00, 3.00, 15.00),     # Gemini 4 Neon ($3.00/M in, $15.00/M out flat)
     "hydrogen": (1.50, 1.50, 7.50),  # Gemini 4 Hydrogen ($1.50/M in, $7.50/M out flat)
     "pro": (1.25, 2.50, 10.00),      # Gemini Pro / 3.1 Pro / 2.5 Pro
     "flash": (0.075, 0.15, 0.60),    # Gemini Flash / 3.6 / 3.7 / 3.8 Flash
@@ -84,6 +91,7 @@ PRICING: dict[str, tuple[float, float, float]] = {
 CACHED_INPUT_PRICING: dict[str, float] = {
     "carbon": 0.10,
     "argon": 0.10,
+    "neon": 0.15,
     "hydrogen": 0.075,
 }
 
@@ -104,6 +112,7 @@ CACHE_TTL_SECONDS: int = 300
 MODEL_CONTEXT_LIMITS: dict[str, int] = {
     "carbon": 1_000_000,
     "argon": 1_000_000,
+    "neon": 1_000_000,
     "hydrogen": 1_000_000,
     "flash": 1_000_000,
     "pro": 2_000_000,
@@ -115,12 +124,14 @@ MODEL_CONTEXT_LIMITS: dict[str, int] = {
 def get_pricing_key(model_name: str) -> str:
     """Resolves a model name string to its canonical pricing key."""
     m = (model_name or "").lower()
-    if "carbon" in m or "orchestrator" in m:
-        return "carbon"
+    if "neon" in m:
+        return "neon"
     if "hydrogen" in m:
         return "hydrogen"
     if "argon" in m or "argo" in m:
         return "argon"
+    if "carbon" in m or "orchestrator" in m:
+        return "carbon"
     if "claude" in m or "sonnet" in m or "opus" in m:
         return "claude"
     if "gpt" in m or "o1" in m or "o3" in m:
@@ -165,7 +176,7 @@ def get_model_context_limit(model_name: str) -> int:
 
 
 _TIER_SUFFIX_RE = re.compile(
-    r"\s*\((?:high|medium|low|xhigh|tiered|thinking|reasoning)\)\s*$",
+    r"\s*\((?:high|medium|low|xhigh|tiered|thinking|reasoning|orchestrator)\)\s*$",
     re.IGNORECASE,
 )
 _LEGACY_GEMINI_VERSION_RE = re.compile(
@@ -183,8 +194,15 @@ def get_model_family(model_name: str) -> str:
     resolved = RAW_MODEL_DISPLAY_MAP.get(raw.lower(), raw)
     collapsed = re.sub(r"\s+", " ", resolved).strip()
     lower = collapsed.lower()
-    if "orchestrator" in lower and ("carbon" in lower or lower == "orchestrator"):
-        return "Gemini 4 Carbon"
+    if "orchestrator" in lower:
+        if "neon" in lower:
+            return "Gemini 4 Neon"
+        if "hydrogen" in lower:
+            return "Gemini 4 Hydrogen"
+        if "argon" in lower or "argo" in lower:
+            return "Gemini 4 Argon"
+        if "carbon" in lower or lower == "orchestrator":
+            return "Gemini 4 Carbon"
 
     family = _TIER_SUFFIX_RE.sub("", collapsed).strip()
     family = re.sub(r"\s+", " ", family).strip()
@@ -204,6 +222,7 @@ def is_legacy_model(model_name: str) -> bool:
         "orchestrator" in m
         or "gemini 4" in m
         or "gemini-4" in m
+        or "neon" in m
         or "3.8" in m
         or m == "gemini flash"
     ):
@@ -411,7 +430,7 @@ def recompute_step_costs(
     prev_planner_dt: datetime | None = None
 
     for s in steps:
-        m_name = s.get("model_name", active_model)
+        m_name = s.get("model_name") or active_model
         s_type = s.get("step_type")
         tokens = s.get("est_tokens", 0)
         created_at = s.get("created_at")

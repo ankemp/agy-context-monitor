@@ -959,11 +959,11 @@ def sync_to_sqlite(
                         ).fetchone()
 
                         last_step_row = cur.execute(
-                            "SELECT step_index, est_tokens FROM steps WHERE conversation_id = ? AND step_index = ?",
+                            "SELECT step_index, est_tokens, model_name FROM steps WHERE conversation_id = ? AND step_index = ?",
                             (cid, prev_max_step),
                         ).fetchone()
                         first_step_row = cur.execute(
-                            "SELECT step_index, est_tokens FROM steps WHERE conversation_id = ? ORDER BY step_index ASC LIMIT 1",
+                            "SELECT step_index, est_tokens, model_name FROM steps WHERE conversation_id = ? ORDER BY step_index ASC LIMIT 1",
                             (cid,),
                         ).fetchone()
 
@@ -981,16 +981,47 @@ def sync_to_sqlite(
                             if curr_blocks_le:
                                 blocks_match = False
 
+                        fallback_step_model = (
+                            analysis.get("latest_model", model_name) or ""
+                        )
                         steps_match = True
                         if (
                             not last_step_row
                             or curr_steps_le[-1]["step_index"] != last_step_row[0]
                             or curr_steps_le[-1]["est_tokens"] != last_step_row[1]
+                            or (
+                                curr_steps_le[-1].get(
+                                    "model_name", fallback_step_model
+                                )
+                                or ""
+                            )
+                            != (last_step_row[2] or "")
                             or not first_step_row
                             or curr_steps_le[0]["step_index"] != first_step_row[0]
                             or curr_steps_le[0]["est_tokens"] != first_step_row[1]
+                            or (
+                                curr_steps_le[0].get(
+                                    "model_name", fallback_step_model
+                                )
+                                or ""
+                            )
+                            != (first_step_row[2] or "")
                         ):
                             steps_match = False
+                        elif len(curr_steps_le) > 2:
+                            existing_step_models = cur.execute(
+                                "SELECT step_index, model_name FROM steps WHERE conversation_id = ? ORDER BY step_index ASC",
+                                (cid,),
+                            ).fetchall()
+                            if len(existing_step_models) != len(curr_steps_le) or any(
+                                s["step_index"] != r[0]
+                                or (
+                                    s.get("model_name", fallback_step_model) or ""
+                                )
+                                != (r[1] or "")
+                                for s, r in zip(curr_steps_le, existing_step_models)
+                            ):
+                                steps_match = False
 
                         if blocks_match and steps_match:
                             is_append_only = True
@@ -1113,6 +1144,7 @@ def sync_to_sqlite(
                             root_id = parent_id
                             depth = 1
 
+                preserved_conv_model_name = None
                 if not analysis.get("has_explicit_model"):
                     native_step_models = extract_native_step_models(
                         cid, conversations_dir=conversations_dir
@@ -1138,9 +1170,11 @@ def sync_to_sqlite(
                         is_append_only = False
                     else:
                         existing_model = None
+                        existing_models_used = None
                         if existing:
                             try:
                                 existing_model = existing["model_name"]
+                                existing_models_used = existing["models_used"]
                             except (IndexError, KeyError):
                                 pass
 
@@ -1151,17 +1185,48 @@ def sync_to_sqlite(
                             except (IndexError, KeyError):
                                 pass
 
+                        has_existing_chain = bool(
+                            existing_model
+                            and ("→" in existing_model or "->" in existing_model)
+                        )
                         inherited_m = None
                         if existing_model:
-                            inherited_m = existing_model
+                            inherited_m = resolve_subagent_model(
+                                "inherit", existing_model
+                            )
                         elif p_model:
                             inherited_m = resolve_subagent_model("inherit", p_model)
+
+                        if has_existing_chain:
+                            preserved_conv_model_name = existing_model
+                            chain_parts = [
+                                p.strip()
+                                for p in existing_model.replace("->", "→").split("→")
+                                if p.strip()
+                            ]
+                            if existing_models_used:
+                                used_parts = [
+                                    m.strip()
+                                    for m in existing_models_used.split(",")
+                                    if m.strip()
+                                ]
+                            else:
+                                used_parts = list(
+                                    dict.fromkeys(
+                                        p for p in chain_parts if p != "..."
+                                    )
+                                )
+                            if used_parts:
+                                analysis["models_used"] = used_parts
+                            if chain_parts:
+                                analysis["model_transitions"] = chain_parts
 
                         if inherited_m and inherited_m != active_model:
                             active_model = inherited_m
                             analysis["latest_model"] = active_model
-                            analysis["models_used"] = [active_model]
-                            analysis["model_transitions"] = [active_model]
+                            if not has_existing_chain:
+                                analysis["models_used"] = [active_model]
+                                analysis["model_transitions"] = [active_model]
                             analysis["latest_max_tokens"] = get_model_context_limit(active_model)
 
                             for s in analysis.get("steps", []):
@@ -1244,7 +1309,14 @@ def sync_to_sqlite(
                 if not model_transitions:
                     model_transitions = models_used_list
 
-                if len(model_transitions) > 1:
+                if preserved_conv_model_name:
+                    conv_model_name = preserved_conv_model_name
+                    models_used_str = (
+                        ", ".join(models_used_list)
+                        if models_used_list
+                        else active_model
+                    )
+                elif len(model_transitions) > 1:
                     if len(model_transitions) <= 3:
                         conv_model_name = " → ".join(model_transitions)
                     else:

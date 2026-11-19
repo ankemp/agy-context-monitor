@@ -1075,7 +1075,10 @@ def run_backfill(
                 c_id = c_conv["id"]
                 c_steps = data["steps"]
                 resolved_m = _resolve_conv_model(c_id)
-                if resolved_m != c_conv["model_name"]:
+                if (
+                    resolved_m != c_conv["model_name"]
+                    and not c_conv.get("has_explicit_model")
+                ):
                     c_conv["model_name"] = resolved_m
                     c_conv["models_used"] = resolved_m
                     for s in c_steps:
