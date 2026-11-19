@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
 const MODEL_LIMIT_RULES = [
-  { match: ['carbon', 'argon', 'hydrogen', 'orchestrator', 'flash', 'gemini-4'], limit: 1000000 },
+  { match: ['carbon', 'argon', 'hydrogen', 'neon', 'orchestrator', 'flash', 'gemini-4'], limit: 1000000 },
   { match: ['pro'], limit: 2000000 },
   { match: ['gemini'], limit: 1000000 },
   { match: ['claude', 'sonnet', 'opus'], limit: 200000 },

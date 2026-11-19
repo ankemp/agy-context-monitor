@@ -470,6 +470,8 @@ def test_sidecar_model_detection_and_naive_utc_countdown():
     const carbonPrefix = getModelQuotaPrefix('Gemini 4 Carbon (Medium)');
     const hydrogenLimit = getModelContextLimit('Gemini 4 Hydrogen (High)');
     const hydrogenPrefix = getModelQuotaPrefix('Gemini 4 Hydrogen (High)');
+    const neonLimit = getModelContextLimit('Gemini 4 Neon (High)');
+    const neonPrefix = getModelQuotaPrefix('Gemini 4 Neon (High)');
     const orchLimit = getModelContextLimit('gemini-pro-orchestrator');
     const orchPrefix = getModelQuotaPrefix('Orchestrator (Carbon)');
 
@@ -479,8 +481,8 @@ def test_sidecar_model_detection_and_naive_utc_countdown():
 
     console.log(JSON.stringify({
       sonnetLimit, sonnetPrefix, opusLimit, opusPrefix, argonLimit, argonPrefix,
-      carbonLimit, carbonPrefix, hydrogenLimit, hydrogenPrefix, orchLimit, orchPrefix,
-      utcZ, naive
+      carbonLimit, carbonPrefix, hydrogenLimit, hydrogenPrefix, neonLimit, neonPrefix,
+      orchLimit, orchPrefix, utcZ, naive
     }));
     """
 
@@ -502,6 +504,8 @@ def test_sidecar_model_detection_and_naive_utc_countdown():
     assert data["carbonPrefix"] == "gemini"
     assert data["hydrogenLimit"] == 1000000
     assert data["hydrogenPrefix"] == "gemini"
+    assert data["neonLimit"] == 1000000
+    assert data["neonPrefix"] == "gemini"
     assert data["orchLimit"] == 1000000
     assert data["orchPrefix"] == "gemini"
     assert data["utcZ"] == "2h 0m"
