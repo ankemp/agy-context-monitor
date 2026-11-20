@@ -20,6 +20,88 @@ let inspectedCid = null;
 let activeFleet = null;
 let activeSessionImpact = null;
 
+function syncScheme() {
+  if (
+    typeof document === 'undefined' ||
+    !document.documentElement ||
+    typeof document.createElement !== 'function'
+  ) {
+    return;
+  }
+  const getComputedStyleFn =
+    (typeof window !== 'undefined' && typeof window.getComputedStyle === 'function' && window.getComputedStyle.bind(window)) ||
+    (typeof getComputedStyle === 'function' ? getComputedStyle : null);
+  if (!getComputedStyleFn) return;
+
+  const probe = document.createElement('span');
+  if (probe.style) {
+    probe.style.cssText = 'position:absolute;visibility:hidden;color:var(--background, #f7f7f8)';
+  }
+  if (typeof document.documentElement.appendChild === 'function') {
+    document.documentElement.appendChild(probe);
+  }
+  const computed = getComputedStyleFn(probe);
+  if (typeof probe.remove === 'function') {
+    probe.remove();
+  } else if (typeof document.documentElement.removeChild === 'function') {
+    document.documentElement.removeChild(probe);
+  }
+
+  const c = computed && typeof computed.color === 'string' ? computed.color.trim() : '';
+  if (!c) return;
+  const body = c.startsWith('color(') ? c.replace(/^color\(\s*[a-z0-9-]+\s+/i, '') : c;
+  const nums = (body.match(/[-+]?(?:\d*\.\d+|\d+)/g) || []).map(Number);
+  if (nums.length < 3 || nums.slice(0, 3).some(Number.isNaN)) return;
+
+  // "rgb(r, g, b)" is 0–255; "color(srgb r g b)" is 0–1.
+  const scale = c.startsWith('color(') ? 1 : 255;
+  const [r, g, b] = nums.slice(0, 3).map((v) => v / scale);
+  const lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+  const theme = lum < 0.5 ? 'dark' : 'light';
+
+  if (document.documentElement.dataset) {
+    if (document.documentElement.dataset.theme !== theme) {
+      document.documentElement.dataset.theme = theme;
+    }
+  } else if (typeof document.documentElement.setAttribute === 'function') {
+    document.documentElement.setAttribute('data-theme', theme);
+  }
+}
+
+if (typeof window !== 'undefined') {
+  window.syncScheme = syncScheme;
+}
+
+function hideLoadingSkeleton() {
+  const skel = $('loading-skeleton');
+  if (!skel) return;
+  skel.hidden = true;
+  if (typeof skel.setAttribute === 'function') {
+    skel.setAttribute('aria-busy', 'false');
+  }
+}
+
+function setLiveStatusState(state) {
+  const liveEl = $('live-status');
+  if (!liveEl) return;
+  if (liveEl.classList && typeof liveEl.classList.toggle === 'function') {
+    liveEl.classList.toggle('stale', state === 'stale');
+    liveEl.classList.toggle('error', state === 'error');
+  } else if (
+    liveEl.classList &&
+    typeof liveEl.classList.add === 'function' &&
+    typeof liveEl.classList.remove === 'function'
+  ) {
+    liveEl.classList.remove('stale');
+    liveEl.classList.remove('error');
+    if (state === 'stale') liveEl.classList.add('stale');
+    if (state === 'error') liveEl.classList.add('error');
+  } else {
+    const suffix = state === 'stale' ? ' stale' : (state === 'error' ? ' error' : '');
+    liveEl.className = `live${suffix}`;
+  }
+}
+
 function formatTokens(n) {
   const num = Number(n) || 0;
   if (num >= 1000000) return (num / 1000000).toFixed(2) + 'M';
@@ -115,6 +197,29 @@ function getCategoryColor(category) {
   return { cssClass: 'other', color: '#9aa0a6' };
 }
 
+function getCurrentConversationId() {
+  const activeSidecar = (typeof window !== 'undefined' && window.sidecar) || sidecar;
+  const fromBridge =
+    activeSidecar && activeSidecar.conversationId
+      ? String(activeSidecar.conversationId).trim()
+      : '';
+  if (fromBridge) return fromBridge;
+  if (
+    typeof window !== 'undefined' &&
+    window.location &&
+    window.location.search &&
+    typeof URLSearchParams !== 'undefined'
+  ) {
+    const fromUrl = new URLSearchParams(window.location.search).get('conversationId');
+    if (fromUrl && fromUrl.trim()) return fromUrl.trim();
+  }
+  return null;
+}
+
+if (typeof window !== 'undefined') {
+  window.getCurrentConversationId = getCurrentConversationId;
+}
+
 async function callApi(path) {
   const fetchFn = (sidecar && typeof sidecar.fetch === 'function')
     ? sidecar.fetch.bind(sidecar)
@@ -175,13 +280,16 @@ function renderQuota(quotaData, sessionImpactPct, fleet = null) {
 
   const tabGemini = $('quota-tab-gemini');
   const tab3p = $('quota-tab-3p');
+  const isGemini = activeQuotaFamily === 'gemini';
   if (tabGemini) {
-    tabGemini.classList.toggle('active', activeQuotaFamily === 'gemini');
-    tabGemini.setAttribute('aria-selected', String(activeQuotaFamily === 'gemini'));
+    tabGemini.classList.toggle('active', isGemini);
+    tabGemini.setAttribute('aria-selected', String(isGemini));
+    tabGemini.setAttribute('tabindex', isGemini ? '0' : '-1');
   }
   if (tab3p) {
-    tab3p.classList.toggle('active', activeQuotaFamily === '3p');
-    tab3p.setAttribute('aria-selected', String(activeQuotaFamily === '3p'));
+    tab3p.classList.toggle('active', !isGemini);
+    tab3p.setAttribute('aria-selected', String(!isGemini));
+    tab3p.setAttribute('tabindex', !isGemini ? '0' : '-1');
   }
 
   const weeklyBucket = quotaData.buckets ? quotaData.buckets[`${activeQuotaFamily}-weekly`] : null;
@@ -229,10 +337,15 @@ function renderQuota(quotaData, sessionImpactPct, fleet = null) {
   if (wkSubEl) {
     wkSubEl.textContent = `Calibrated capacity: $${Number(capWk).toFixed(2)}`;
   }
+  const wkClamped = Math.min(100, Math.max(0, remWk));
   const wkBarEl = $('quota-weekly-bar');
   if (wkBarEl) {
-    wkBarEl.style.width = `${Math.min(100, Math.max(0, remWk))}%`;
+    wkBarEl.style.width = `${wkClamped}%`;
     wkBarEl.className = `quota-bar ${remWk <= 10 ? 'error' : remWk <= 25 ? 'warning' : 'ok'}`;
+  }
+  const wkTrackEl = $('quota-weekly-track');
+  if (wkTrackEl && typeof wkTrackEl.setAttribute === 'function') {
+    wkTrackEl.setAttribute('aria-valuenow', String(Math.round(wkClamped)));
   }
 
   // 5-Hour bucket
@@ -249,10 +362,15 @@ function renderQuota(quotaData, sessionImpactPct, fleet = null) {
   if (fhSubEl) {
     fhSubEl.textContent = `Calibrated capacity: $${Number(cap5h).toFixed(2)}`;
   }
+  const fhClamped = Math.min(100, Math.max(0, rem5h));
   const fhBarEl = $('quota-5h-bar');
   if (fhBarEl) {
-    fhBarEl.style.width = `${Math.min(100, Math.max(0, rem5h))}%`;
+    fhBarEl.style.width = `${fhClamped}%`;
     fhBarEl.className = `quota-bar ${rem5h <= 10 ? 'error' : rem5h <= 25 ? 'warning' : 'ok'}`;
+  }
+  const fhTrackEl = $('quota-5h-track');
+  if (fhTrackEl && typeof fhTrackEl.setAttribute === 'function') {
+    fhTrackEl.setAttribute('aria-valuenow', String(Math.round(fhClamped)));
   }
 }
 
@@ -318,6 +436,7 @@ function renderGlobal(globalData) {
     statusBadge.textContent = 'Live';
     statusBadge.className = 'badge ok';
   }
+  setLiveStatusState('ok');
   const modelBadge = $('model-badge');
   if (modelBadge) modelBadge.textContent = 'Global Overview';
   updateCostHeaderBadge(globalData.total_cost, null, true);
@@ -360,6 +479,7 @@ function renderGlobal(globalData) {
   if (globalData.quota) {
     renderQuota(globalData.quota, globalData.weekly_quota_pct, null);
   }
+  hideLoadingSkeleton();
 }
 
 function renderFleetCard(fleet) {
@@ -410,7 +530,7 @@ function renderFleetCard(fleet) {
   if (!list) return;
   list.innerHTML = '';
 
-  const cid = (sidecar && sidecar.conversationId) || null;
+  const cid = getCurrentConversationId();
   const currentInspectedId = inspectedCid || cid;
 
   const nodes = fleet.nodes || [];
@@ -453,7 +573,7 @@ function renderFleetCard(fleet) {
         <span class="fleet-node-cost">${costText}</span>
       </div>
       <div class="fleet-node-bar-row">
-        <div class="fleet-mini-track">
+        <div class="fleet-mini-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${Math.round(pct)}" aria-label="${escapeHtml(roleName)} context capacity">
           <div class="fleet-mini-bar ${pctClass}" style="width: ${pct}%;"></div>
         </div>
         <span class="fleet-node-tokens muted small">${tokenLabel}</span>
@@ -487,7 +607,7 @@ function closeEventStream() {
 function connectEventStream() {
   if (typeof document !== 'undefined' && document.hidden) return;
 
-  const cid = (sidecar && sidecar.conversationId) || null;
+  const cid = getCurrentConversationId();
   const currentKey = `${cid || ''}::${inspectedCid || ''}`;
 
   if (eventSource && streamKey === currentKey) {
@@ -508,7 +628,12 @@ function connectEventStream() {
   if (cid) params.set('cid', cid);
   if (inspectedCid) params.set('inspect_cid', inspectedCid);
 
-  if (typeof window !== 'undefined' && window.location && window.location.search) {
+  if (
+    typeof window !== 'undefined' &&
+    window.location &&
+    window.location.search &&
+    typeof URLSearchParams !== 'undefined'
+  ) {
     const urlParams = new URLSearchParams(window.location.search);
     const token = urlParams.get('token');
     if (token) params.set('token', token);
@@ -530,6 +655,12 @@ function connectEventStream() {
     es.addEventListener('message', handleIncomingUpdate);
     es.onerror = () => {
       // EventSource automatically reconnects per SSE specification
+      const statusBadge = $('status-badge');
+      if (statusBadge) {
+        statusBadge.textContent = 'Reconnecting';
+        statusBadge.className = 'badge warning';
+      }
+      setLiveStatusState('stale');
     };
   } catch (err) {
     console.warn('[app.js] Failed to connect EventSource:', err);
@@ -537,7 +668,7 @@ function connectEventStream() {
 }
 
 function selectFleetNode(nodeId) {
-  const activeCid = (sidecar && sidecar.conversationId) || lastCid;
+  const activeCid = getCurrentConversationId() || lastCid;
   inspectedCid = (nodeId === activeCid ? null : nodeId);
   connectEventStream();
   refreshTelemetry();
@@ -573,7 +704,7 @@ async function refreshTelemetry() {
   const quotaCard = $('quota-card');
 
   try {
-    const cid = sidecar ? sidecar.conversationId : null;
+    const cid = getCurrentConversationId();
     if (lastCid !== cid) {
       lastCid = cid;
       userSelectedQuotaFamily = false;
@@ -612,6 +743,7 @@ async function refreshTelemetry() {
       statusBadge.textContent = 'Live';
       statusBadge.className = 'badge ok';
     }
+    setLiveStatusState('ok');
     const modelBadge = $('model-badge');
     if (modelBadge) modelBadge.textContent = sessionData.model_name || 'Gemini 3.7 Flash';
     updateCostHeaderBadge(sessionData.billed_cost, sessionData.fleet, false);
@@ -625,6 +757,11 @@ async function refreshTelemetry() {
 
     // Multi-segment capacity bar
     renderMultiSegmentBar($('capacity-bar'), sessionData.categories, sessionData.max_tokens, sessionData.pct);
+    const capPctClamped = Math.min(100, Math.max(0, Number(sessionData.pct) || 0));
+    const capTrackEl = $('capacity-track');
+    if (capTrackEl && typeof capTrackEl.setAttribute === 'function') {
+      capTrackEl.setAttribute('aria-valuenow', String(Math.round(capPctClamped)));
+    }
 
     // Subscription Quota rendering
     if (sessionData.quota) {
@@ -654,12 +791,15 @@ async function refreshTelemetry() {
 
     // Top steps
     renderTopSteps($('top-steps-list'), sessionData.top_steps, $('steps-range'), sessionData.min_step, sessionData.max_step);
+    hideLoadingSkeleton();
 
   } catch (err) {
     if (statusBadge) {
       statusBadge.textContent = 'Offline';
       statusBadge.className = 'badge error';
     }
+    setLiveStatusState('error');
+    hideLoadingSkeleton();
     console.error('Context Monitor refresh failed:', err);
   } finally {
     isRefreshing = false;
@@ -681,12 +821,14 @@ function escapeHtml(str) {
 }
 
 async function sendPrompt(promptText, actionName) {
-  if (!sidecar || !sidecar.agent || !sidecar.conversationId) {
+  const activeSidecar = (typeof window !== 'undefined' && window.sidecar) || sidecar;
+  const cid = getCurrentConversationId();
+  if (!activeSidecar || !activeSidecar.agent || typeof activeSidecar.agent.sendMessage !== 'function' || !cid) {
     toast('No active conversation connected', true);
     return;
   }
   try {
-    await sidecar.agent.sendMessage(promptText);
+    await activeSidecar.agent.sendMessage(promptText, cid);
     toast(`${actionName} sent to agent`);
   } catch (err) {
     toast(`Failed to send prompt: ${err.message}`, true);
@@ -696,6 +838,39 @@ async function sendPrompt(promptText, actionName) {
 function init() {
   if (isInitialized) return;
   isInitialized = true;
+
+  syncScheme();
+
+  if (typeof document !== 'undefined' && document.documentElement) {
+    const MutationObserverCtor =
+      (typeof window !== 'undefined' && typeof window.MutationObserver === 'function' && window.MutationObserver) ||
+      (typeof MutationObserver === 'function' ? MutationObserver : null);
+    if (MutationObserverCtor) {
+      const themeObserver = new MutationObserverCtor(() => syncScheme());
+      themeObserver.observe(document.documentElement, {
+        attributes: true,
+        attributeFilter: ['style'],
+      });
+    }
+  }
+
+  const headerEl = $('panel-header');
+  if (headerEl && typeof document !== 'undefined' && document.documentElement) {
+    const updateHeaderHeight = () => {
+      if (document.documentElement.style && typeof document.documentElement.style.setProperty === 'function') {
+        const height = headerEl.offsetHeight || 0;
+        document.documentElement.style.setProperty('--header-h', `${height}px`);
+      }
+    };
+    updateHeaderHeight();
+    const ResizeObserverCtor =
+      (typeof window !== 'undefined' && typeof window.ResizeObserver === 'function' && window.ResizeObserver) ||
+      (typeof ResizeObserver === 'function' ? ResizeObserver : null);
+    if (ResizeObserverCtor) {
+      const headerObserver = new ResizeObserverCtor(updateHeaderHeight);
+      headerObserver.observe(headerEl);
+    }
+  }
 
   const btnAudit = $('btn-audit');
   if (btnAudit) {
@@ -728,26 +903,77 @@ function init() {
   }
 
   const tabGemini = $('quota-tab-gemini');
-  if (tabGemini) {
-    tabGemini.addEventListener('click', () => {
-      userSelectedQuotaFamily = true;
-      activeQuotaFamily = 'gemini';
-      if (activeQuota) renderQuota(activeQuota, activeSessionImpact, activeFleet);
-    });
-  }
-
   const tab3p = $('quota-tab-3p');
-  if (tab3p) {
-    tab3p.addEventListener('click', () => {
-      userSelectedQuotaFamily = true;
-      activeQuotaFamily = '3p';
-      if (activeQuota) renderQuota(activeQuota, activeSessionImpact, activeFleet);
+  const quotaTabs = [
+    { el: tabGemini, family: 'gemini' },
+    { el: tab3p, family: '3p' },
+  ].filter((t) => t.el);
+
+  const selectQuotaFamily = (family, shouldFocus = false) => {
+    userSelectedQuotaFamily = true;
+    activeQuotaFamily = family;
+    if (activeQuota) {
+      renderQuota(activeQuota, activeSessionImpact, activeFleet);
+    } else {
+      const isGemini = family === 'gemini';
+      if (tabGemini) {
+        tabGemini.classList.toggle('active', isGemini);
+        tabGemini.setAttribute('aria-selected', String(isGemini));
+        tabGemini.setAttribute('tabindex', isGemini ? '0' : '-1');
+      }
+      if (tab3p) {
+        tab3p.classList.toggle('active', !isGemini);
+        tab3p.setAttribute('aria-selected', String(!isGemini));
+        tab3p.setAttribute('tabindex', !isGemini ? '0' : '-1');
+      }
+    }
+    if (shouldFocus) {
+      const targetTab = family === 'gemini' ? tabGemini : tab3p;
+      if (targetTab && typeof targetTab.focus === 'function') {
+        targetTab.focus();
+      }
+    }
+  };
+
+  quotaTabs.forEach((tab, idx) => {
+    tab.el.addEventListener('click', () => {
+      selectQuotaFamily(tab.family, false);
     });
-  }
+    tab.el.addEventListener('keydown', (e) => {
+      if (!e) return;
+      let nextIdx = null;
+      if (e.key === 'ArrowRight') {
+        nextIdx = (idx + 1) % quotaTabs.length;
+      } else if (e.key === 'ArrowLeft') {
+        nextIdx = (idx - 1 + quotaTabs.length) % quotaTabs.length;
+      } else if (e.key === 'Home') {
+        nextIdx = 0;
+      } else if (e.key === 'End') {
+        nextIdx = quotaTabs.length - 1;
+      }
+      if (nextIdx === null) return;
+      if (typeof e.preventDefault === 'function') {
+        e.preventDefault();
+      }
+      selectQuotaFamily(quotaTabs[nextIdx].family, true);
+    });
+  });
 
   const btnResetInspect = $('btn-reset-inspect');
   if (btnResetInspect) {
     btnResetInspect.addEventListener('click', resetInspectedNode);
+  }
+
+  const activeSidecar = (typeof window !== 'undefined' && window.sidecar) || sidecar;
+  if (activeSidecar && typeof activeSidecar.onWorkspaceChange === 'function') {
+    activeSidecar.onWorkspaceChange(() => {
+      lastCid = undefined;
+      inspectedCid = null;
+      userSelectedQuotaFamily = false;
+      closeEventStream();
+      connectEventStream();
+      refreshTelemetry();
+    });
   }
 
   // Handle visibility changes: close event stream when hidden, reconnect and refresh when visible

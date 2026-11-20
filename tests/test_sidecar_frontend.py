@@ -1630,4 +1630,1023 @@ def test_sidecar_frontend_sse_subscription_and_no_polling():
     assert "inspect_cid=subagent-worker-1" in data["resumedUrl"]
 
 
+def test_sidecar_host_tokens_and_typography():
+    """Verifies agy-sidecar-ui host theme tokens, Hub typography, dark mode, and base ergonomics."""
+    import re
+
+    html = Path("sidecars/panel/index.html").read_text(encoding="utf-8")
+    css = Path("sidecars/panel/styles.css").read_text(encoding="utf-8")
+
+    # Script / stylesheet ordering and non-blocking Hub font loading
+    assert html.index('src="/preload.js"') < html.index('href="/styles.css"')
+    assert 'rel="preconnect" href="https://fonts.googleapis.com"' in html
+    assert 'rel="preconnect" href="https://fonts.gstatic.com"' in html
+    assert "Google+Sans+Flex" in html
+    assert "Google+Sans+Code" in html
+    assert 'media="print"' in html
+    assert 'onload="this.media=\'all\'"' in html
+
+    # All 20 host tokens consumed
+    host_tokens = [
+        "var(--background",
+        "var(--card",
+        "var(--secondary",
+        "var(--muted",
+        "var(--foreground",
+        "var(--card-foreground",
+        "var(--secondary-foreground",
+        "var(--muted-foreground",
+        "var(--placeholder",
+        "var(--code-foreground",
+        "var(--border",
+        "var(--card-border",
+        "var(--primary",
+        "var(--primary-foreground",
+        "var(--accent",
+        "var(--accent-foreground",
+        "var(--error",
+        "var(--ring",
+        "var(--font-family",
+        "var(--editor-font-family",
+    ]
+    for token in host_tokens:
+        assert token in css, f"Expected host token {token} in styles.css"
+
+    # Semantic --ui-* tokens, type scale, and radii produced
+    produced_tokens = [
+        "--ui-bg:",
+        "--ui-card:",
+        "--ui-secondary:",
+        "--ui-muted:",
+        "--ui-fg:",
+        "--ui-fg-2:",
+        "--ui-fg-muted:",
+        "--ui-fg-faint:",
+        "--ui-border:",
+        "--ui-card-border:",
+        "--ui-primary:",
+        "--ui-primary-fg:",
+        "--ui-error:",
+        "--ui-success:",
+        "--ui-warning:",
+        "--ui-hover:",
+        "--ui-press:",
+        "--ui-ring:",
+        "--ui-line:",
+        "--ui-fill:",
+        "--ui-field:",
+        "--ui-font:",
+        "--ui-mono:",
+        "--text-2xs:",
+        "--text-xs:",
+        "--text-sm:",
+        "--text-base:",
+        "--r-sm:",
+        "--r-md:",
+        "--r-lg:",
+    ]
+    for token in produced_tokens:
+        assert token in css, f"Expected semantic token {token} in styles.css"
+
+    # Dark theme overrides & standalone prefers-color-scheme fallback
+    assert ':root[data-theme="dark"]' in css
+    assert "@media (prefers-color-scheme: dark)" in css
+    assert ':root:not([data-theme="light"])' in css
+
+    # Hub typography & preload.js inline font override + tabular numerals
+    assert "font-family: var(--ui-font) !important" in css
+    assert "font-variant-ligatures: no-contextual" in css
+    assert "font-variation-settings:" in css
+    assert "font-variant-numeric: tabular-nums" in css
+
+    # Base ergonomics & invariants
+    assert ":focus-visible" in css
+    assert "scrollbar-width: thin" in css
+    assert "@media (prefers-reduced-motion: reduce)" in css
+    assert "transition: none !important" in css
+    assert "animation: none !important" in css
+
+    # No hardcoded legacy light-mode status hexes anywhere in status rules
+    css_lower = css.lower()
+    for legacy_hex in ("#1e8e3e", "#e37400", "#d93025", "#0284c7"):
+        assert legacy_hex not in css_lower, (
+            f"Legacy hardcoded status color {legacy_hex} must use --ui-* semantic tokens"
+        )
+
+    for selector_pattern in (
+        r"\.quota-val\.ok\s*\{[^}]*var\(--ui-success\)",
+        r"\.quota-val\.warning\s*\{[^}]*var\(--ui-warning\)",
+        r"\.quota-val\.error\s*\{[^}]*var\(--ui-error\)",
+        r"\.quota-bar\.ok\s*\{[^}]*var\(--ui-success\)",
+        r"\.quota-bar\.warning\s*\{[^}]*var\(--ui-warning\)",
+        r"\.quota-bar\.error\s*\{[^}]*var\(--ui-error\)",
+        r"\.fleet-mini-bar\.ok\s*\{[^}]*var\(--ui-success\)",
+        r"\.fleet-mini-bar\.warning\s*\{[^}]*var\(--ui-warning\)",
+        r"\.fleet-mini-bar\.error\s*\{[^}]*var\(--ui-error\)",
+        r"\.toast\.error\s*\{[^}]*var\(--ui-error\)",
+    ):
+        assert re.search(selector_pattern, css, re.DOTALL), (
+            f"Rule matching {selector_pattern} must consume --ui-* status token"
+        )
+
+
+def test_sidecar_sync_scheme_luminance_and_observer():
+    """Verifies syncScheme() luminance detection for rgb() and color(srgb ...) plus MutationObserver registration."""
+    import json
+    import subprocess
+
+    node_script = """
+    const fs = require('fs');
+    const code = fs.readFileSync('sidecars/panel/app.js', 'utf8');
+
+    const elements = {};
+    function makeEl(id) {
+      return {
+        id,
+        textContent: '',
+        className: '',
+        style: {},
+        hidden: false,
+        attributes: {},
+        listeners: {},
+        children: [],
+        appendChild(c) { this.children.push(c); },
+        removeChild(c) { this.children = this.children.filter(x => x !== c); },
+        setAttribute(k, v) { this.attributes[k] = v; },
+        getAttribute(k) { return this.attributes[k]; },
+        classList: {
+          classes: new Set(),
+          add(c) { this.classes.add(c); },
+          remove(c) { this.classes.delete(c); },
+          toggle(c, force) {
+            if (force === undefined) {
+              if (this.classes.has(c)) this.classes.delete(c);
+              else this.classes.add(c);
+            } else if (force) {
+              this.classes.add(c);
+            } else {
+              this.classes.delete(c);
+            }
+          },
+          contains(c) { return this.classes.has(c); }
+        },
+        addEventListener(evt, fn) { this.listeners[evt] = fn; }
+      };
+    }
+
+    const docEl = {
+      dataset: {},
+      style: { setProperty() {} },
+      children: [],
+      appendChild(c) { this.children.push(c); },
+      removeChild(c) { this.children = this.children.filter(x => x !== c); }
+    };
+
+    let currentColor = 'rgb(24, 24, 27)';
+    const getComputedStyle = () => ({ color: currentColor });
+
+    const observerCalls = [];
+    let observerCallback = null;
+    class MockMutationObserver {
+      constructor(cb) {
+        observerCallback = cb;
+      }
+      observe(target, options) {
+        observerCalls.push({ targetIsDocEl: target === docEl, options });
+      }
+    }
+
+    const mockDocument = {
+      documentElement: docEl,
+      getElementById: (id) => elements[id],
+      createElement: (tag) => makeEl(tag),
+      addEventListener: () => {},
+      readyState: 'complete',
+      hidden: false
+    };
+
+    const mockWindow = {
+      getComputedStyle,
+      MutationObserver: MockMutationObserver,
+      sidecar: {
+        conversationId: null,
+        fetch: async () => ({ ok: true, json: async () => ({ total_conversations: 0, total_tokens: 0, total_cost: 0, total_compactions: 0, total_pruned_tokens: 0 }) })
+      }
+    };
+
+    const fn = new Function('window', 'document', 'getComputedStyle', 'MutationObserver', 'fetch', code);
+    fn(mockWindow, mockDocument, getComputedStyle, MockMutationObserver, mockWindow.sidecar.fetch);
+
+    const results = {
+      hasWindowSyncScheme: typeof mockWindow.syncScheme === 'function',
+      initialDarkRgb: docEl.dataset.theme,
+      observerCalls
+    };
+
+    currentColor = 'rgb(247, 247, 248)';
+    if (observerCallback) observerCallback();
+    results.lightRgbViaObserver = docEl.dataset.theme;
+
+    currentColor = 'color(srgb 0.1 0.1 0.1)';
+    if (typeof mockWindow.syncScheme === 'function') mockWindow.syncScheme();
+    results.darkSrgb = docEl.dataset.theme;
+
+    currentColor = 'color(srgb 0.95 0.95 0.95)';
+    if (typeof mockWindow.syncScheme === 'function') mockWindow.syncScheme();
+    results.lightSrgb = docEl.dataset.theme;
+
+    console.log(JSON.stringify(results));
+    """
+
+    res = subprocess.run(
+        ["node", "-e", node_script], capture_output=True, text=True, cwd=Path.cwd()
+    )
+    assert res.returncode == 0, f"Node script failed: {res.stderr}"
+    data = json.loads(res.stdout)
+
+    assert data["hasWindowSyncScheme"] is True
+    assert data["initialDarkRgb"] == "dark"
+    assert data["lightRgbViaObserver"] == "light"
+    assert data["darkSrgb"] == "dark"
+    assert data["lightSrgb"] == "light"
+    assert len(data["observerCalls"]) >= 1
+    assert data["observerCalls"][0]["targetIsDocEl"] is True
+    assert data["observerCalls"][0]["options"] == {
+        "attributes": True,
+        "attributeFilter": ["style"],
+    }
+
+
+def test_sidecar_layout_and_skeleton_lifecycle():
+    """Verifies sticky responsive layout CSS, HTML shell elements, ResizeObserver --header-h, and loading skeleton lifecycle."""
+    import json
+    import re
+    import subprocess
+
+    html = Path("sidecars/panel/index.html").read_text(encoding="utf-8")
+    css = Path("sidecars/panel/styles.css").read_text(encoding="utf-8")
+
+    # CSS layout, skeleton, empty-card, overflow protection, monochrome primary discipline
+    assert "--col: 760px" in css
+    assert "--inline:" in css
+    assert "@media (max-width: 420px)" in css
+    assert "position: sticky" in css
+    assert ".skel" in css
+    assert ".empty-card" in css
+    assert ".live-dot" in css
+    assert "min-width: 0" in css
+    assert "left: 50%" in css
+    assert "transform: translateX(-50%)" in css
+    assert "max-width: min(92vw, 520px)" in css
+
+    for selector_pattern in (
+        r"\.capacity-val\s*\{[^}]*color:\s*var\(--ui-fg\)",
+        r"\.step-source\s*\{[^}]*color:\s*var\(--ui-fg\)",
+        r"\.tab-btn\.active\s*\{[^}]*color:\s*var\(--ui-fg\)",
+    ):
+        assert re.search(selector_pattern, css, re.DOTALL), (
+            f"Rule matching {selector_pattern} must enforce monochrome --ui-fg"
+        )
+
+    # HTML shell elements
+    assert 'id="loading-skeleton"' in html
+    assert "live-dot" in html
+    assert 'id="panel-header"' in html
+    assert 'id="live-status"' in html
+
+    # Execute app.js in Node across global, session, and error paths
+    node_script = """
+    const fs = require('fs');
+    const code = fs.readFileSync('sidecars/panel/app.js', 'utf8');
+
+    function runScenario(mode) {
+      return new Promise((resolve) => {
+        const elements = {};
+        function makeEl(id) {
+          return {
+            id,
+            textContent: '',
+            className: '',
+            style: {},
+            offsetHeight: 68,
+            hidden: false,
+            attributes: {},
+            listeners: {},
+            children: [],
+            appendChild(c) { this.children.push(c); },
+            removeChild(c) { this.children = this.children.filter(x => x !== c); },
+            setAttribute(k, v) { this.attributes[k] = v; },
+            getAttribute(k) { return this.attributes[k]; },
+            classList: {
+              classes: new Set(),
+              add(c) { this.classes.add(c); },
+              remove(c) { this.classes.delete(c); },
+              toggle(c, force) {
+                if (force === undefined) {
+                  if (this.classes.has(c)) this.classes.delete(c);
+                  else this.classes.add(c);
+                } else if (force) {
+                  this.classes.add(c);
+                } else {
+                  this.classes.delete(c);
+                }
+              },
+              contains(c) { return this.classes.has(c); }
+            },
+            addEventListener(evt, fn) { this.listeners[evt] = fn; }
+          };
+        }
+
+        const ids = [
+          'panel-header', 'live-status', 'status-dot', 'status-badge', 'model-badge', 'cost-badge', 'quota-badge',
+          'loading-skeleton', 'inspect-banner', 'inspect-banner-label', 'btn-reset-inspect',
+          'fleet-card', 'fleet-title', 'fleet-count-badge', 'fleet-summary-strip', 'fleet-total-cost', 'fleet-total-tokens', 'fleet-shielding', 'fleet-node-list',
+          'global-card', 'global-convs', 'global-tokens', 'global-cost', 'global-quota', 'global-compactions', 'global-pruned',
+          'compaction-banner', 'compaction-count', 'compaction-pruned', 'compaction-window',
+          'quota-card', 'quota-title', 'quota-session-impact', 'quota-tab-gemini', 'quota-tab-3p',
+          'quota-weekly-pct', 'quota-weekly-reset', 'quota-weekly-bar', 'quota-weekly-sub',
+          'quota-5h-pct', 'quota-5h-reset', 'quota-5h-bar', 'quota-5h-sub',
+          'capacity-card', 'capacity-pct', 'capacity-sub', 'capacity-bar', 'category-list',
+          'top-steps-card', 'top-steps-list', 'steps-range',
+          'actions-card', 'btn-audit', 'btn-plan', 'btn-compact', 'toast'
+        ];
+        for (const id of ids) elements[id] = makeEl(id);
+
+        const cssVars = {};
+        const docEl = {
+          dataset: {},
+          style: { setProperty(k, v) { cssVars[k] = v; } },
+          appendChild() {},
+          removeChild() {}
+        };
+
+        const resizeObserved = [];
+        class MockResizeObserver {
+          constructor(cb) { this.cb = cb; }
+          observe(target) {
+            resizeObserved.push(target.id);
+            this.cb();
+          }
+        }
+
+        const mockDocument = {
+          documentElement: docEl,
+          getElementById: (id) => elements[id],
+          createElement: (tag) => makeEl(tag),
+          addEventListener: () => {},
+          readyState: 'complete',
+          hidden: false
+        };
+
+        const mockFetch = async () => {
+          if (mode === 'error') {
+            return { ok: false, status: 500 };
+          }
+          if (mode === 'global') {
+            return {
+              ok: true,
+              json: async () => ({
+                total_conversations: 1,
+                total_tokens: 1000,
+                total_cost: 0.1,
+                weekly_quota_pct: 0.05,
+                total_compactions: 0,
+                total_pruned_tokens: 0
+              })
+            };
+          }
+          return {
+            ok: true,
+            json: async () => ({
+              cid: 'conv-1',
+              model_name: 'Gemini 3.7 Flash',
+              billed_cost: 0.25,
+              pct: 12.0,
+              active_tokens: 120000,
+              max_tokens: 1000000,
+              weekly_quota_pct: 0.1,
+              categories: [],
+              top_steps: [],
+              min_step: 1,
+              max_step: 2
+            })
+          };
+        };
+
+        const mockWindow = {
+          getComputedStyle: () => ({ color: 'rgb(247, 247, 248)' }),
+          ResizeObserver: MockResizeObserver,
+          sidecar: {
+            conversationId: mode === 'global' ? null : 'conv-1',
+            fetch: mockFetch
+          }
+        };
+
+        const initialSkelHidden = elements['loading-skeleton'].hidden;
+        const fn = new Function('window', 'document', 'getComputedStyle', 'ResizeObserver', 'fetch', code);
+        fn(mockWindow, mockDocument, mockWindow.getComputedStyle, MockResizeObserver, mockFetch);
+
+        setTimeout(() => {
+          resolve({
+            initialSkelHidden,
+            finalSkelHidden: elements['loading-skeleton'].hidden,
+            skelAriaBusy: elements['loading-skeleton'].getAttribute('aria-busy'),
+            statusText: elements['status-badge'].textContent,
+            liveStatusHasError: elements['live-status'].classList.contains('error'),
+            headerH: cssVars['--header-h'] || null,
+            resizeObserved
+          });
+        }, 40);
+      });
+    }
+
+    Promise.all([
+      runScenario('global'),
+      runScenario('session'),
+      runScenario('error')
+    ]).then(([globalRes, sessionRes, errorRes]) => {
+      console.log(JSON.stringify({ globalRes, sessionRes, errorRes }));
+    });
+    """
+
+    res = subprocess.run(
+        ["node", "-e", node_script], capture_output=True, text=True, cwd=Path.cwd()
+    )
+    assert res.returncode == 0, f"Node script failed: {res.stderr}"
+    data = json.loads(res.stdout)
+
+    for key in ("globalRes", "sessionRes", "errorRes"):
+        assert data[key]["initialSkelHidden"] is False
+        assert data[key]["finalSkelHidden"] is True
+        assert data[key]["skelAriaBusy"] == "false"
+        assert data[key]["headerH"] == "68px"
+        assert "panel-header" in data[key]["resizeObserved"]
+
+    assert data["globalRes"]["statusText"] == "Live"
+    assert data["globalRes"]["liveStatusHasError"] is False
+    assert data["sessionRes"]["statusText"] == "Live"
+    assert data["sessionRes"]["liveStatusHasError"] is False
+    assert data["errorRes"]["statusText"] == "Offline"
+    assert data["errorRes"]["liveStatusHasError"] is True
+
+
+def test_sidecar_quota_tabs_keyboard_and_aria_progressbars():
+    """Verifies roving-tabindex keyboard nav on quota tabs and ARIA progressbar attributes."""
+    import json
+    import re
+    import subprocess
+
+    html = Path("sidecars/panel/index.html").read_text(encoding="utf-8")
+
+    assert 'role="progressbar"' in html
+    assert 'aria-valuemin="0"' in html
+    assert 'aria-valuemax="100"' in html
+    assert 'aria-controls="quota-buckets"' in html
+    assert re.search(
+        r'<div[^>]*id="quota-buckets"[^>]*role="tabpanel"|<div[^>]*role="tabpanel"[^>]*id="quota-buckets"',
+        html,
+    ), "index.html must wrap quota buckets in #quota-buckets with role=tabpanel"
+    assert re.search(
+        r'<button[^>]*id="quota-tab-gemini"[^>]*tabindex="0"',
+        html,
+    ), "#quota-tab-gemini must start with tabindex='0'"
+    assert re.search(
+        r'<button[^>]*id="quota-tab-3p"[^>]*tabindex="-1"',
+        html,
+    ), "#quota-tab-3p must start with tabindex='-1'"
+    for track_id in ("quota-weekly-track", "quota-5h-track", "capacity-track"):
+        assert re.search(
+            rf'<div[^>]*id="{track_id}"[^>]*role="progressbar"[^>]*aria-valuemin="0"[^>]*aria-valuemax="100"',
+            html,
+        ), f"#{track_id} must declare role='progressbar' with aria-valuemin='0' and aria-valuemax='100'"
+
+    node_script = """
+    import fs from 'node:fs';
+
+    const code = fs.readFileSync('sidecars/panel/app.js', 'utf8');
+    const elements = {};
+    const focusCalls = [];
+
+    function makeEl(id) {
+      let _html = '';
+      return {
+        id,
+        textContent: '',
+        className: '',
+        style: {},
+        hidden: false,
+        attributes: {},
+        listeners: {},
+        children: [],
+        get innerHTML() { return _html; },
+        set innerHTML(val) {
+          _html = val;
+          if (val === '') this.children = [];
+        },
+        appendChild(c) { this.children.push(c); },
+        removeChild(c) { this.children = this.children.filter(x => x !== c); },
+        setAttribute(k, v) { this.attributes[k] = String(v); },
+        getAttribute(k) { return this.attributes[k]; },
+        focus() { focusCalls.push(id); },
+        classList: {
+          classes: new Set(),
+          add(c) { this.classes.add(c); },
+          remove(c) { this.classes.delete(c); },
+          toggle(c, force) {
+            if (force === undefined) {
+              if (this.classes.has(c)) this.classes.delete(c);
+              else this.classes.add(c);
+            } else if (force) {
+              this.classes.add(c);
+            } else {
+              this.classes.delete(c);
+            }
+          },
+          contains(c) { return this.classes.has(c); }
+        },
+        addEventListener(evt, fn) {
+          if (!this.listeners[evt]) this.listeners[evt] = [];
+          this.listeners[evt].push(fn);
+        },
+        dispatchEvent(evt, eventObj = {}) {
+          for (const fn of (this.listeners[evt] || [])) fn(eventObj);
+        }
+      };
+    }
+
+    const ids = [
+      'panel-header', 'live-status', 'status-dot', 'status-badge', 'model-badge', 'cost-badge', 'quota-badge',
+      'loading-skeleton', 'inspect-banner', 'inspect-banner-label', 'btn-reset-inspect',
+      'fleet-card', 'fleet-title', 'fleet-count-badge', 'fleet-summary-strip', 'fleet-total-cost', 'fleet-total-tokens', 'fleet-shielding', 'fleet-node-list',
+      'global-card', 'global-convs', 'global-tokens', 'global-cost', 'global-quota', 'global-compactions', 'global-pruned',
+      'compaction-banner', 'compaction-count', 'compaction-pruned', 'compaction-window',
+      'quota-card', 'quota-title', 'quota-session-impact', 'quota-tab-gemini', 'quota-tab-3p',
+      'quota-weekly-pct', 'quota-weekly-reset', 'quota-weekly-track', 'quota-weekly-bar', 'quota-weekly-sub',
+      'quota-5h-pct', 'quota-5h-reset', 'quota-5h-track', 'quota-5h-bar', 'quota-5h-sub',
+      'capacity-card', 'capacity-pct', 'capacity-sub', 'capacity-track', 'capacity-bar', 'category-list',
+      'top-steps-card', 'top-steps-list', 'steps-range',
+      'actions-card', 'btn-audit', 'btn-plan', 'btn-compact', 'toast'
+    ];
+    for (const id of ids) elements[id] = makeEl(id);
+
+    const mockDocument = {
+      getElementById: (id) => elements[id],
+      createElement: (tag) => makeEl(tag),
+      addEventListener: () => {},
+      readyState: 'complete',
+      hidden: false
+    };
+
+    const mockWindow = {
+      sidecar: {
+        conversationId: 'conv-aria-1',
+        fetch: async () => ({
+          ok: true,
+          json: async () => ({
+            cid: 'conv-aria-1',
+            model_name: 'Gemini 3.7 Flash',
+            billed_cost: 2.50,
+            pct: 15.6,
+            active_tokens: 156000,
+            max_tokens: 1000000,
+            weekly_quota_pct: 0.5,
+            categories: [],
+            top_steps: [],
+            quota: {
+              prefix: 'gemini',
+              weekly_remaining_pct: 84.6,
+              five_hour_remaining_pct: 90.4,
+              session_weekly_pct: 0.5,
+              buckets: {
+                'gemini-weekly': { remaining_pct: 84.6, session_impact_pct: 0.5, calibrated_capacity: 672.0 },
+                'gemini-5h': { remaining_pct: 90.4, session_impact_pct: 1.2, calibrated_capacity: 236.7 },
+                '3p-weekly': { remaining_pct: 61.2, session_impact_pct: 0.1, calibrated_capacity: 200.0 },
+                '3p-5h': { remaining_pct: 77.8, session_impact_pct: 0.2, calibrated_capacity: 70.0 }
+              }
+            },
+            fleet: {
+              is_swarm: true,
+              agent_count: 1,
+              total_cost: 2.50,
+              total_tokens: 156000,
+              shielding_ratio: 1.0,
+              nodes: [
+                {
+                  id: 'conv-aria-1',
+                  model_name: 'Gemini 3.7 Flash',
+                  billed_cost: 2.50,
+                  active_tokens: 156000,
+                  max_tokens: 1000000,
+                  context_pct: 44.7,
+                  weekly_quota_pct: 0.5,
+                  role: 'Root Coordinator',
+                  is_root: true
+                }
+              ]
+            }
+          })
+        })
+      }
+    };
+
+    const fn = new Function('window', 'document', 'fetch', code);
+    fn(mockWindow, mockDocument, mockWindow.sidecar.fetch);
+
+    await new Promise((r) => setTimeout(r, 60));
+
+    const initial = {
+      weeklyValuenow: elements['quota-weekly-track'].getAttribute('aria-valuenow'),
+      fiveHValuenow: elements['quota-5h-track'].getAttribute('aria-valuenow'),
+      capacityValuenow: elements['capacity-track'].getAttribute('aria-valuenow'),
+      geminiTabindex: elements['quota-tab-gemini'].getAttribute('tabindex'),
+      threepTabindex: elements['quota-tab-3p'].getAttribute('tabindex'),
+      fleetNodeHtml: elements['fleet-node-list'].children[0]?.innerHTML || ''
+    };
+
+    let prevented = 0;
+    const mkKey = (key) => ({ key, preventDefault: () => { prevented++; } });
+
+    // ArrowRight on gemini -> switches to 3p and focuses 3p
+    elements['quota-tab-gemini'].dispatchEvent('keydown', mkKey('ArrowRight'));
+    const afterRight = {
+      geminiSelected: elements['quota-tab-gemini'].getAttribute('aria-selected'),
+      geminiTabindex: elements['quota-tab-gemini'].getAttribute('tabindex'),
+      threepSelected: elements['quota-tab-3p'].getAttribute('aria-selected'),
+      threepTabindex: elements['quota-tab-3p'].getAttribute('tabindex'),
+      weeklyValuenow: elements['quota-weekly-track'].getAttribute('aria-valuenow'),
+      fiveHValuenow: elements['quota-5h-track'].getAttribute('aria-valuenow'),
+      lastFocused: focusCalls[focusCalls.length - 1]
+    };
+
+    // ArrowLeft on 3p -> switches back to gemini and focuses gemini
+    elements['quota-tab-3p'].dispatchEvent('keydown', mkKey('ArrowLeft'));
+    const afterLeft = {
+      geminiSelected: elements['quota-tab-gemini'].getAttribute('aria-selected'),
+      geminiTabindex: elements['quota-tab-gemini'].getAttribute('tabindex'),
+      threepSelected: elements['quota-tab-3p'].getAttribute('aria-selected'),
+      threepTabindex: elements['quota-tab-3p'].getAttribute('tabindex'),
+      lastFocused: focusCalls[focusCalls.length - 1]
+    };
+
+    // End -> switches to 3p and focuses 3p
+    elements['quota-tab-gemini'].dispatchEvent('keydown', mkKey('End'));
+    const afterEnd = {
+      threepSelected: elements['quota-tab-3p'].getAttribute('aria-selected'),
+      threepTabindex: elements['quota-tab-3p'].getAttribute('tabindex'),
+      lastFocused: focusCalls[focusCalls.length - 1]
+    };
+
+    // Home -> switches to gemini and focuses gemini
+    elements['quota-tab-3p'].dispatchEvent('keydown', mkKey('Home'));
+    const afterHome = {
+      geminiSelected: elements['quota-tab-gemini'].getAttribute('aria-selected'),
+      geminiTabindex: elements['quota-tab-gemini'].getAttribute('tabindex'),
+      lastFocused: focusCalls[focusCalls.length - 1],
+      prevented
+    };
+
+    console.log(JSON.stringify({ initial, afterRight, afterLeft, afterEnd, afterHome }));
+    """
+
+    res = subprocess.run(
+        ["node", "--input-type=module", "-e", node_script],
+        capture_output=True,
+        text=True,
+        cwd=Path.cwd(),
+    )
+    assert res.returncode == 0, f"Node script failed: {res.stderr}"
+    data = json.loads(res.stdout)
+
+    initial = data["initial"]
+    assert initial["weeklyValuenow"] == "85"
+    assert initial["fiveHValuenow"] == "90"
+    assert initial["capacityValuenow"] == "16"
+    assert initial["geminiTabindex"] == "0"
+    assert initial["threepTabindex"] == "-1"
+    assert 'role="progressbar"' in initial["fleetNodeHtml"]
+    assert 'aria-valuemin="0"' in initial["fleetNodeHtml"]
+    assert 'aria-valuemax="100"' in initial["fleetNodeHtml"]
+    assert 'aria-valuenow="45"' in initial["fleetNodeHtml"]
+
+    after_right = data["afterRight"]
+    assert after_right["geminiSelected"] == "false"
+    assert after_right["geminiTabindex"] == "-1"
+    assert after_right["threepSelected"] == "true"
+    assert after_right["threepTabindex"] == "0"
+    assert after_right["weeklyValuenow"] == "61"
+    assert after_right["fiveHValuenow"] == "78"
+    assert after_right["lastFocused"] == "quota-tab-3p"
+
+    after_left = data["afterLeft"]
+    assert after_left["geminiSelected"] == "true"
+    assert after_left["geminiTabindex"] == "0"
+    assert after_left["threepSelected"] == "false"
+    assert after_left["threepTabindex"] == "-1"
+    assert after_left["lastFocused"] == "quota-tab-gemini"
+
+    assert data["afterEnd"]["threepSelected"] == "true"
+    assert data["afterEnd"]["threepTabindex"] == "0"
+    assert data["afterEnd"]["lastFocused"] == "quota-tab-3p"
+
+    assert data["afterHome"]["geminiSelected"] == "true"
+    assert data["afterHome"]["geminiTabindex"] == "0"
+    assert data["afterHome"]["lastFocused"] == "quota-tab-gemini"
+    assert data["afterHome"]["prevented"] == 4
+
+
+def test_sidecar_bridge_url_fallback_workspace_change_and_sse_reconnect():
+    """Verifies URL conversationId fallback, onWorkspaceChange reset, and SSE onerror Reconnecting badge."""
+    import json
+    import subprocess
+
+    node_script = """
+    import fs from 'node:fs';
+
+    const code = fs.readFileSync('sidecars/panel/app.js', 'utf8');
+
+    class MockEventSource {
+      static instances = [];
+      constructor(url) {
+        this.url = url;
+        this.listeners = {};
+        this.closed = false;
+        this.onerror = null;
+        MockEventSource.instances.push(this);
+      }
+      addEventListener(event, fn) {
+        if (!this.listeners[event]) this.listeners[event] = [];
+        this.listeners[event].push(fn);
+      }
+      close() {
+        this.closed = true;
+      }
+      emit(event, data = {}) {
+        for (const fn of (this.listeners[event] || [])) {
+          fn({ data: JSON.stringify(data) });
+        }
+      }
+    }
+
+    const elements = {};
+    function makeEl(id) {
+      let _html = '';
+      return {
+        id,
+        textContent: '',
+        className: '',
+        style: {},
+        hidden: false,
+        attributes: {},
+        listeners: {},
+        children: [],
+        get innerHTML() { return _html; },
+        set innerHTML(val) {
+          _html = val;
+          if (val === '') this.children = [];
+        },
+        appendChild(c) { this.children.push(c); },
+        removeChild(c) { this.children = this.children.filter(x => x !== c); },
+        setAttribute(k, v) { this.attributes[k] = String(v); },
+        getAttribute(k) { return this.attributes[k]; },
+        classList: {
+          classes: new Set(),
+          add(c) { this.classes.add(c); },
+          remove(c) { this.classes.delete(c); },
+          toggle(c, force) {
+            if (force === undefined) {
+              if (this.classes.has(c)) this.classes.delete(c);
+              else this.classes.add(c);
+            } else if (force) {
+              this.classes.add(c);
+            } else {
+              this.classes.delete(c);
+            }
+          },
+          contains(c) { return this.classes.has(c); }
+        },
+        addEventListener(evt, fn) {
+          if (!this.listeners[evt]) this.listeners[evt] = [];
+          this.listeners[evt].push(fn);
+        },
+        dispatchEvent(evt, eventObj = {}) {
+          for (const fn of (this.listeners[evt] || [])) fn(eventObj);
+        }
+      };
+    }
+
+    const ids = [
+      'panel-header', 'live-status', 'status-dot', 'status-badge', 'model-badge', 'cost-badge', 'quota-badge',
+      'loading-skeleton', 'inspect-banner', 'inspect-banner-label', 'btn-reset-inspect',
+      'fleet-card', 'fleet-title', 'fleet-count-badge', 'fleet-summary-strip', 'fleet-total-cost', 'fleet-total-tokens', 'fleet-shielding', 'fleet-node-list',
+      'global-card', 'global-convs', 'global-tokens', 'global-cost', 'global-quota', 'global-compactions', 'global-pruned',
+      'compaction-banner', 'compaction-count', 'compaction-pruned', 'compaction-window',
+      'quota-card', 'quota-title', 'quota-session-impact', 'quota-tab-gemini', 'quota-tab-3p',
+      'quota-weekly-pct', 'quota-weekly-reset', 'quota-weekly-track', 'quota-weekly-bar', 'quota-weekly-sub',
+      'quota-5h-pct', 'quota-5h-reset', 'quota-5h-track', 'quota-5h-bar', 'quota-5h-sub',
+      'capacity-card', 'capacity-pct', 'capacity-sub', 'capacity-track', 'capacity-bar', 'category-list',
+      'top-steps-card', 'top-steps-list', 'steps-range',
+      'actions-card', 'btn-audit', 'btn-plan', 'btn-compact', 'toast'
+    ];
+    for (const id of ids) elements[id] = makeEl(id);
+
+    const mockDocument = {
+      getElementById: (id) => elements[id],
+      createElement: (tag) => makeEl(tag),
+      addEventListener: () => {},
+      readyState: 'complete',
+      hidden: false
+    };
+
+    const fetchCalls = [];
+    const sentMessages = [];
+    let workspaceChangeCb = null;
+
+    const mockWindow = {
+      EventSource: MockEventSource,
+      location: { search: '?conversationId=conv-url-1&token=tok9' },
+      sidecar: {
+        // conversationId intentionally omitted (undefined) to test URL fallback
+        onWorkspaceChange: (cb) => {
+          workspaceChangeCb = cb;
+          return () => {};
+        },
+        agent: {
+          sendMessage: async (msg, cid) => {
+            sentMessages.push({ msg, cid });
+          }
+        },
+        fetch: async (url) => {
+          fetchCalls.push(url);
+          const isInspectingWorker = url.includes('inspect_cid=subagent-worker-1');
+          return {
+            ok: true,
+            json: async () => ({
+              cid: 'conv-url-1',
+              model_name: isInspectingWorker ? 'Claude 3.7 Sonnet' : 'Gemini 3.7 Flash',
+              billed_cost: 1.25,
+              pct: 20.0,
+              active_tokens: 200000,
+              max_tokens: 1000000,
+              weekly_quota_pct: 0.4,
+              categories: [],
+              top_steps: [],
+              quota: {
+                prefix: 'gemini',
+                weekly_remaining_pct: 85.0,
+                five_hour_remaining_pct: 90.0,
+                session_weekly_pct: 0.4,
+                buckets: {
+                  'gemini-weekly': { remaining_pct: 85.0, session_impact_pct: 0.4, calibrated_capacity: 672.0 },
+                  'gemini-5h': { remaining_pct: 90.0, session_impact_pct: 1.0, calibrated_capacity: 236.7 },
+                  '3p-weekly': { remaining_pct: 95.0, session_impact_pct: 0.0, calibrated_capacity: 200.0 },
+                  '3p-5h': { remaining_pct: 98.0, session_impact_pct: 0.0, calibrated_capacity: 70.0 }
+                }
+              },
+              fleet: {
+                is_swarm: true,
+                root_id: 'conv-url-1',
+                active_cid: 'conv-url-1',
+                inspected_cid: isInspectingWorker ? 'subagent-worker-1' : 'conv-url-1',
+                is_inspecting_other: isInspectingWorker,
+                inspected_role: isInspectingWorker ? 'Worker' : 'Root Coordinator',
+                agent_count: 2,
+                total_cost: 2.50,
+                total_tokens: 300000,
+                weekly_quota_pct: 0.8,
+                shielding_ratio: 1.5,
+                nodes: [
+                  {
+                    id: 'subagent-worker-1',
+                    model_name: 'Claude 3.7 Sonnet',
+                    billed_cost: 1.25,
+                    active_tokens: 100000,
+                    max_tokens: 200000,
+                    context_pct: 50.0,
+                    weekly_quota_pct: 0.4,
+                    role: 'Worker',
+                    is_root: false
+                  },
+                  {
+                    id: 'conv-url-1',
+                    model_name: 'Gemini 3.7 Flash',
+                    billed_cost: 1.25,
+                    active_tokens: 200000,
+                    max_tokens: 1000000,
+                    context_pct: 20.0,
+                    weekly_quota_pct: 0.4,
+                    role: 'Root Coordinator',
+                    is_root: true
+                  }
+                ]
+              }
+            })
+          };
+        }
+      }
+    };
+
+    const fn = new Function('window', 'document', 'EventSource', 'fetch', code);
+    fn(mockWindow, mockDocument, MockEventSource, mockWindow.sidecar.fetch);
+
+    await new Promise((r) => setTimeout(r, 60));
+
+    // Case A: URL fallback for conversationId + prompt dispatch
+    const caseA = {
+      resolvedCid: typeof mockWindow.getCurrentConversationId === 'function' ? mockWindow.getCurrentConversationId() : null,
+      initialFetch: fetchCalls[0] || null,
+      initialSseUrl: MockEventSource.instances[0]?.url || null
+    };
+    elements['btn-audit'].dispatchEvent('click');
+    await new Promise((r) => setTimeout(r, 30));
+    caseA.sentMessages = [...sentMessages];
+
+    // Case B: Inspect subagent + toggle 3P tab, then trigger onWorkspaceChange
+    mockWindow.selectFleetNode('subagent-worker-1');
+    await new Promise((r) => setTimeout(r, 60));
+    elements['quota-tab-3p'].dispatchEvent('click');
+    const beforeWsReset = {
+      inspectBannerHidden: elements['inspect-banner'].hidden,
+      threepSelected: elements['quota-tab-3p'].getAttribute('aria-selected'),
+      fetchBeforeReset: fetchCalls[fetchCalls.length - 1]
+    };
+
+    const fetchCountBeforeWs = fetchCalls.length;
+    if (typeof workspaceChangeCb === 'function') {
+      workspaceChangeCb();
+    }
+    await new Promise((r) => setTimeout(r, 60));
+
+    const activeES = MockEventSource.instances[MockEventSource.instances.length - 1];
+    const caseB = {
+      hasWorkspaceCallback: typeof workspaceChangeCb === 'function',
+      beforeWsReset,
+      newFetchesAfterReset: fetchCalls.slice(fetchCountBeforeWs),
+      inspectBannerHiddenAfterReset: elements['inspect-banner'].hidden,
+      geminiSelectedAfterReset: elements['quota-tab-gemini'].getAttribute('aria-selected'),
+      threepSelectedAfterReset: elements['quota-tab-3p'].getAttribute('aria-selected'),
+      activeSseUrlAfterReset: activeES?.url || null
+    };
+
+    // Case C: SSE onerror -> Reconnecting / badge warning / stale, then 'update' restores Live / badge ok
+    if (activeES && typeof activeES.onerror === 'function') {
+      activeES.onerror();
+    }
+    const duringError = {
+      statusText: elements['status-badge'].textContent,
+      statusClass: elements['status-badge'].className,
+      liveStale: elements['live-status'].classList.contains('stale')
+    };
+
+    activeES.emit('update', { cid: 'conv-url-1' });
+    await new Promise((r) => setTimeout(r, 60));
+    const afterRecover = {
+      statusText: elements['status-badge'].textContent,
+      statusClass: elements['status-badge'].className,
+      liveStale: elements['live-status'].classList.contains('stale')
+    };
+
+    console.log(JSON.stringify({ caseA, caseB, caseC: { duringError, afterRecover } }));
+    """
+
+    res = subprocess.run(
+        ["node", "--input-type=module", "-e", node_script],
+        capture_output=True,
+        text=True,
+        cwd=Path.cwd(),
+    )
+    assert res.returncode == 0, f"Node script failed: {res.stderr}"
+    data = json.loads(res.stdout)
+
+    case_a = data["caseA"]
+    assert case_a["resolvedCid"] == "conv-url-1"
+    assert case_a["initialFetch"] == "/api/session?cid=conv-url-1"
+    assert "cid=conv-url-1" in case_a["initialSseUrl"]
+    assert "token=tok9" in case_a["initialSseUrl"]
+    assert len(case_a["sentMessages"]) == 1
+    assert case_a["sentMessages"][0]["cid"] == "conv-url-1"
+
+    case_b = data["caseB"]
+    assert case_b["hasWorkspaceCallback"] is True
+    assert case_b["beforeWsReset"]["inspectBannerHidden"] is False
+    assert case_b["beforeWsReset"]["threepSelected"] == "true"
+    assert "inspect_cid=subagent-worker-1" in case_b["beforeWsReset"]["fetchBeforeReset"]
+    assert len(case_b["newFetchesAfterReset"]) >= 1
+    assert all("inspect_cid" not in u for u in case_b["newFetchesAfterReset"])
+    assert case_b["inspectBannerHiddenAfterReset"] is True
+    assert case_b["geminiSelectedAfterReset"] == "true"
+    assert case_b["threepSelectedAfterReset"] == "false"
+    assert "inspect_cid" not in case_b["activeSseUrlAfterReset"]
+
+    case_c = data["caseC"]
+    assert case_c["duringError"]["statusText"] == "Reconnecting"
+    assert case_c["duringError"]["statusClass"] == "badge warning"
+    assert case_c["duringError"]["liveStale"] is True
+    assert case_c["afterRecover"]["statusText"] == "Live"
+    assert case_c["afterRecover"]["statusClass"] == "badge ok"
+    assert case_c["afterRecover"]["liveStale"] is False
+
+
+
+
+
 

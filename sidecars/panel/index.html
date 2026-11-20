@@ -4,16 +4,23 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Context Monitor</title>
-  <link rel="stylesheet" href="/styles.css">
   <!-- Host bridge: synchronizes theme tokens and defines window.sidecar -->
   <script src="/preload.js"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" media="print" onload="this.media='all'"
+    href="https://fonts.googleapis.com/css2?family=Google+Sans+Flex:ROND,opsz,slnt,wdth,wght@0..100,6..144,-10..0,92..100,100..1000&family=Google+Sans+Code:ital,wght@0,300..800;1,300..800&display=swap">
+  <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
   <main class="panel">
-    <header class="panel-header">
+    <header class="panel-header" id="panel-header">
       <div class="header-main">
         <h1>Context Monitor</h1>
-        <span id="status-badge" class="badge ok">Live</span>
+        <span id="live-status" class="live">
+          <span id="status-dot" class="live-dot" aria-hidden="true"></span>
+          <span id="status-badge" class="badge ok">Live</span>
+        </span>
       </div>
       <div class="header-meta">
         <span id="model-badge" class="badge secondary">Detecting...</span>
@@ -24,14 +31,36 @@
       </div>
     </header>
 
-    <!-- Inspect Banner (visible when viewing an inspected subagent node) -->
-    <section id="inspect-banner" class="inspect-banner" hidden>
-      <span id="inspect-banner-label">Viewing: Sub-Agent</span>
-      <button id="btn-reset-inspect" type="button" class="reset-inspect-btn">Back to Active Session</button>
-    </section>
+    <div class="panel-body">
+      <!-- Inspect Banner (visible when viewing an inspected subagent node) -->
+      <section id="inspect-banner" class="inspect-banner" hidden>
+        <span id="inspect-banner-label">Viewing: Sub-Agent</span>
+        <button id="btn-reset-inspect" type="button" class="reset-inspect-btn">Back to Active Session</button>
+      </section>
 
-    <!-- Global Aggregate View (visible when no conversation is active) -->
-    <section id="global-card" class="card" aria-labelledby="global-title" hidden>
+      <!-- Loading Skeleton (visible on initial load until first telemetry or error resolves) -->
+      <section id="loading-skeleton" class="loading" aria-busy="true" aria-label="Loading telemetry">
+        <div class="card skel-card">
+          <div class="card-header">
+            <span class="skel" style="width: 132px; height: 14px;"></span>
+            <span class="skel" style="width: 84px; height: 18px; border-radius: 999px;"></span>
+          </div>
+          <span class="skel" style="width: 100%; height: 10px; border-radius: 5px;"></span>
+          <span class="skel" style="width: 68%; height: 12px;"></span>
+        </div>
+        <div class="card skel-card">
+          <div class="card-header">
+            <span class="skel" style="width: 112px; height: 14px;"></span>
+            <span class="skel" style="width: 48px; height: 14px;"></span>
+          </div>
+          <span class="skel" style="width: 100%; height: 10px; border-radius: 5px;"></span>
+          <span class="skel" style="width: 82%; height: 12px;"></span>
+          <span class="skel" style="width: 54%; height: 12px;"></span>
+        </div>
+      </section>
+
+      <!-- Global Aggregate View (visible when no conversation is active) -->
+      <section id="global-card" class="card empty-card" aria-labelledby="global-title" hidden>
       <div class="card-header">
         <h2 id="global-title">Global Fleet Telemetry</h2>
         <span id="global-convs" class="badge">0 Sessions</span>
@@ -74,42 +103,44 @@
           <span id="quota-session-impact" class="badge ok">0.00% session share</span>
         </div>
         <div class="quota-tabs" role="tablist" aria-label="Model Family Quota">
-          <button type="button" id="quota-tab-gemini" class="tab-btn active" role="tab" aria-selected="true">Gemini</button>
-          <button type="button" id="quota-tab-3p" class="tab-btn" role="tab" aria-selected="false">Claude / 3P</button>
+          <button type="button" id="quota-tab-gemini" class="tab-btn active" role="tab" aria-selected="true" aria-controls="quota-buckets" tabindex="0">Gemini</button>
+          <button type="button" id="quota-tab-3p" class="tab-btn" role="tab" aria-selected="false" aria-controls="quota-buckets" tabindex="-1">Claude / 3P</button>
         </div>
       </div>
 
-      <!-- Weekly Quota Bucket -->
-      <div class="quota-bucket" id="quota-weekly-bucket">
-        <div class="quota-row">
-          <span class="quota-name">Weekly Quota</span>
-          <div class="quota-meta">
-            <span id="quota-weekly-pct" class="quota-val">100.0% remaining</span>
-            <span id="quota-weekly-reset" class="quota-reset muted small">resets in --</span>
+      <div id="quota-buckets" role="tabpanel">
+        <!-- Weekly Quota Bucket -->
+        <div class="quota-bucket" id="quota-weekly-bucket">
+          <div class="quota-row">
+            <span class="quota-name">Weekly Quota</span>
+            <div class="quota-meta">
+              <span id="quota-weekly-pct" class="quota-val">100.0% remaining</span>
+              <span id="quota-weekly-reset" class="quota-reset muted small">resets in --</span>
+            </div>
+          </div>
+          <div class="progress-track" id="quota-weekly-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="100" aria-label="Weekly quota remaining">
+            <div class="quota-bar ok" id="quota-weekly-bar" style="width: 100%;"></div>
+          </div>
+          <div class="quota-sub muted small" id="quota-weekly-sub">
+            Calibrated capacity: $672.00
           </div>
         </div>
-        <div class="progress-track" id="quota-weekly-track">
-          <div class="quota-bar ok" id="quota-weekly-bar" style="width: 100%;"></div>
-        </div>
-        <div class="quota-sub muted small" id="quota-weekly-sub">
-          Calibrated capacity: $672.00
-        </div>
-      </div>
 
-      <!-- 5-Hour Quota Bucket -->
-      <div class="quota-bucket" id="quota-5h-bucket">
-        <div class="quota-row">
-          <span class="quota-name">5-Hour Limit</span>
-          <div class="quota-meta">
-            <span id="quota-5h-pct" class="quota-val">100.0% remaining</span>
-            <span id="quota-5h-reset" class="quota-reset muted small">resets in --</span>
+        <!-- 5-Hour Quota Bucket -->
+        <div class="quota-bucket" id="quota-5h-bucket">
+          <div class="quota-row">
+            <span class="quota-name">5-Hour Limit</span>
+            <div class="quota-meta">
+              <span id="quota-5h-pct" class="quota-val">100.0% remaining</span>
+              <span id="quota-5h-reset" class="quota-reset muted small">resets in --</span>
+            </div>
           </div>
-        </div>
-        <div class="progress-track" id="quota-5h-track">
-          <div class="quota-bar ok" id="quota-5h-bar" style="width: 100%;"></div>
-        </div>
-        <div class="quota-sub muted small" id="quota-5h-sub">
-          Calibrated capacity: $236.70
+          <div class="progress-track" id="quota-5h-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="100" aria-label="5-hour quota remaining">
+            <div class="quota-bar ok" id="quota-5h-bar" style="width: 100%;"></div>
+          </div>
+          <div class="quota-sub muted small" id="quota-5h-sub">
+            Calibrated capacity: $236.70
+          </div>
         </div>
       </div>
     </section>
@@ -125,7 +156,7 @@
       </div>
 
       <!-- Multi-segment capacity bar -->
-      <div class="progress-track" id="capacity-track">
+      <div class="progress-track" id="capacity-track" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-label="Active context capacity">
         <div class="segment-container" id="capacity-bar"></div>
       </div>
 
@@ -176,10 +207,11 @@
       </div>
       <div class="actions">
         <button id="btn-audit" type="button" class="action-btn">Audit Redundant Reads</button>
-        <button id="btn-plan" type="button" class="action-btn">Plan Context Cleanup</button>
+        <button id="btn-plan" type="button" class="action-btn secondary">Plan Context Cleanup</button>
         <button id="btn-compact" type="button" class="action-btn secondary">Review Compaction</button>
       </div>
     </section>
+    </div>
 
     <p id="toast" class="toast" role="status" aria-live="polite" hidden></p>
   </main>
