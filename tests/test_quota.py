@@ -203,13 +203,20 @@ def test_calibration_from_db_and_concurrency_isolation(tmp_path: Path):
     db_file = tmp_path / "test_cal.db"
     init_db(db_file)
     conn = get_db_connection(db_file)
+    now_utc = datetime.now(timezone.utc).replace(microsecond=0)
+    step_ts = (now_utc - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    reset_weekly = (now_utc + timedelta(days=6, hours=16)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    reset_5h = (now_utc + timedelta(hours=3)).strftime("%Y-%m-%dT%H:%M:%SZ")
     conn.execute(
         "INSERT INTO conversations (id, title, model_name) VALUES ('c1', 'T1', 'Gemini 3.8 Flash (High)')"
     )
-    conn.execute("""
+    conn.execute(
+        """
         INSERT INTO steps (conversation_id, step_index, created_at, step_type, model_name, billed_cost)
-        VALUES ('c1', 1, '2026-10-14T10:00:00Z', 'PLANNER_RESPONSE', 'Gemini 3.8 Flash (High)', 43.8064)
-    """)
+        VALUES ('c1', 1, ?, 'PLANNER_RESPONSE', 'Gemini 3.8 Flash (High)', 43.8064)
+        """,
+        (step_ts,),
+    )
     conn.commit()
 
     mock_ls_payload = {
@@ -223,14 +230,14 @@ def test_calibration_from_db_and_concurrency_isolation(tmp_path: Path):
                             "displayName": "Weekly Limit Remaining",
                             "window": "weekly",
                             "remainingFraction": 0.93481183,
-                            "resetTime": "2026-10-21T02:27:22Z",
+                            "resetTime": reset_weekly,
                         },
                         {
                             "bucketId": "gemini-5h",
                             "displayName": "Five Hour Limit Remaining",
                             "window": "5h",
                             "remainingFraction": 0.95912546,
-                            "resetTime": "2026-10-14T14:00:00Z",
+                            "resetTime": reset_5h,
                         },
                     ],
                 }
@@ -353,17 +360,30 @@ def test_calibration_5h_window_boundary(tmp_path: Path):
         "INSERT INTO conversations (id, title, model_name) VALUES ('c1', 'T1', 'Gemini 3.8 Flash')"
     )
 
-    # reset_time is 2026-10-14T15:00:00Z -> 5h window starts at 2026-10-14T10:00:00Z
-    # Step 1: 09:30:00Z (outside 5h window, cost $10.00)
-    # Step 2: 11:00:00Z (inside 5h window, cost $11.835)
-    conn.execute("""
+    now_utc = datetime.now(timezone.utc).replace(microsecond=0)
+    reset_5h = (now_utc + timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    step_outside = (now_utc - timedelta(hours=3, minutes=30)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    step_inside = (now_utc - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    # reset_time is +2h -> 5h window starts at -3h
+    # Step 1: -3h30m (outside 5h window, cost $10.00)
+    # Step 2: -1h (inside 5h window, cost $11.835)
+    conn.execute(
+        """
         INSERT INTO steps (conversation_id, step_index, created_at, step_type, model_name, billed_cost)
-        VALUES ('c1', 1, '2026-10-14T09:30:00Z', 'USER_MESSAGE', 'Gemini 3.8 Flash', 10.00)
-    """)
-    conn.execute("""
+        VALUES ('c1', 1, ?, 'USER_MESSAGE', 'Gemini 3.8 Flash', 10.00)
+        """,
+        (step_outside,),
+    )
+    conn.execute(
+        """
         INSERT INTO steps (conversation_id, step_index, created_at, step_type, model_name, billed_cost)
-        VALUES ('c1', 2, '2026-10-14T11:00:00Z', 'USER_MESSAGE', 'Gemini 3.8 Flash', 11.835)
-    """)
+        VALUES ('c1', 2, ?, 'USER_MESSAGE', 'Gemini 3.8 Flash', 11.835)
+        """,
+        (step_inside,),
+    )
     conn.commit()
 
     # remaining_fraction = 0.95 -> used_fraction = 0.05
@@ -372,7 +392,7 @@ def test_calibration_5h_window_boundary(tmp_path: Path):
         conn=conn,
         bucket_id="gemini-5h",
         remaining_fraction=0.95,
-        reset_time="2026-10-14T15:00:00Z",
+        reset_time=reset_5h,
         fallback_capacity=236.7,
     )
     assert abs(cap - 236.70) < 0.01
@@ -388,16 +408,27 @@ def test_model_family_filtering(tmp_path: Path):
         "INSERT INTO conversations (id, title, model_name) VALUES ('c1', 'T1', 'Mixed')"
     )
 
+    now_utc = datetime.now(timezone.utc).replace(microsecond=0)
+    step_gem = (now_utc - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    step_3p = (now_utc - timedelta(hours=1, minutes=55)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    reset_weekly = (now_utc + timedelta(days=6)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
     # Gemini cost = $33.60
-    conn.execute("""
+    conn.execute(
+        """
         INSERT INTO steps (conversation_id, step_index, created_at, step_type, model_name, billed_cost)
-        VALUES ('c1', 1, '2026-10-14T10:00:00Z', 'USER_MESSAGE', 'Gemini 3.8 Pro', 33.60)
-    """)
+        VALUES ('c1', 1, ?, 'USER_MESSAGE', 'Gemini 3.8 Pro', 33.60)
+        """,
+        (step_gem,),
+    )
     # Claude cost = $10.00
-    conn.execute("""
+    conn.execute(
+        """
         INSERT INTO steps (conversation_id, step_index, created_at, step_type, model_name, billed_cost)
-        VALUES ('c1', 2, '2026-10-14T10:05:00Z', 'USER_MESSAGE', 'Claude 3.7 Sonnet', 10.00)
-    """)
+        VALUES ('c1', 2, ?, 'USER_MESSAGE', 'Claude 3.7 Sonnet', 10.00)
+        """,
+        (step_3p,),
+    )
     conn.commit()
 
     # Gemini weekly: remaining = 0.95 -> used = 0.05. 33.60 / 0.05 = 672.0
@@ -405,7 +436,7 @@ def test_model_family_filtering(tmp_path: Path):
         conn=conn,
         bucket_id="gemini-weekly",
         remaining_fraction=0.95,
-        reset_time="2026-10-21T10:00:00Z",
+        reset_time=reset_weekly,
         fallback_capacity=DEFAULT_GEMINI_WEEKLY_CAPACITY,
     )
     assert abs(cap_gemini - 672.0) < 0.01
@@ -415,7 +446,7 @@ def test_model_family_filtering(tmp_path: Path):
         conn=conn,
         bucket_id="3p-weekly",
         remaining_fraction=0.95,
-        reset_time="2026-10-21T10:00:00Z",
+        reset_time=reset_weekly,
         fallback_capacity=DEFAULT_3P_WEEKLY_CAPACITY,
     )
     assert abs(cap_3p - 200.0) < 0.01
@@ -735,24 +766,32 @@ def test_calibrate_capacity_edge_cases(tmp_path: Path):
     assert cap3 == 672.0
 
     # Timezone offset string is converted to UTC to match steps
+    now_utc = datetime.now(timezone.utc).replace(microsecond=0)
+    reset_utc = now_utc + timedelta(days=5)
+    window_start_utc = reset_utc - timedelta(days=7)
+    before_window_iso = (window_start_utc - timedelta(minutes=30)).strftime(
+        "%Y-%m-%dT%H:%M:%SZ"
+    )
+    reset_offset_iso = reset_utc.astimezone(timezone(timedelta(hours=-5))).isoformat()
+
     conn.execute(
         "INSERT INTO conversations (id, title, model_name) VALUES ('c_tz', 'TZ', 'Gemini 3.8 Flash')"
     )
-    # Step at 2026-10-14T07:30:00Z
-    conn.execute("""
+    conn.execute(
+        """
         INSERT INTO steps (conversation_id, step_index, created_at, step_type, model_name, billed_cost)
-        VALUES ('c_tz', 1, '2026-10-14T07:30:00Z', 'USER_MESSAGE', 'Gemini 3.8 Flash', 33.60)
-    """)
+        VALUES ('c_tz', 1, ?, 'USER_MESSAGE', 'Gemini 3.8 Flash', 33.60)
+        """,
+        (before_window_iso,),
+    )
     conn.commit()
 
-    # reset_time at 2026-10-21T03:00:00-05:00 -> in UTC: 2026-10-21T08:00:00Z
-    # 7 days earlier: 2026-10-14T08:00:00Z
-    # Step at 07:30:00Z is BEFORE the 7d window start -> should not be counted!
+    # Step is 30m BEFORE the 7d window start -> should not be counted!
     cap4 = calibrate_capacity(
         conn,
         "gemini-weekly",
         0.95,
-        "2026-10-21T03:00:00-05:00",
+        reset_offset_iso,
         672.0,
     )
     # Outside window -> billed cost = 0 < 0.50 -> fallback 672.0
@@ -1071,6 +1110,10 @@ def test_calibration_ema_smoothing(tmp_path: Path):
     db_file = tmp_path / "test_ema.db"
     init_db(db_file)
     conn = get_db_connection(db_file)
+    now_utc = datetime.now(timezone.utc).replace(microsecond=0)
+    step_ts = (now_utc - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    reset_ts = (now_utc + timedelta(days=6, hours=22)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
     conn.execute(
         "INSERT INTO conversations (id, title, model_name) VALUES ('c1', 'T1', 'Gemini 3.8 Flash')"
     )
@@ -1083,17 +1126,20 @@ def test_calibration_ema_smoothing(tmp_path: Path):
                 "group_name": "Gemini Models",
                 "window": "weekly",
                 "remaining_fraction": 0.50,
-                "reset_time": "2026-10-21T10:00:00Z",
+                "reset_time": reset_ts,
                 "calibrated_capacity": 600.0,
-                "fetched_at": "2026-10-14T10:00:00Z",
+                "fetched_at": step_ts,
             }
         ],
     )
     # Add step cost: $80.00 billed cost within window
-    conn.execute("""
+    conn.execute(
+        """
         INSERT INTO steps (conversation_id, step_index, created_at, step_type, model_name, billed_cost)
-        VALUES ('c1', 1, '2026-10-14T10:00:00Z', 'USER_MESSAGE', 'Gemini 3.8 Flash', 80.0)
-    """)
+        VALUES ('c1', 1, ?, 'USER_MESSAGE', 'Gemini 3.8 Flash', 80.0)
+        """,
+        (step_ts,),
+    )
     conn.commit()
 
     # remaining_fraction = 0.90 -> used_fraction = 0.10
@@ -1104,7 +1150,7 @@ def test_calibration_ema_smoothing(tmp_path: Path):
         conn=conn,
         bucket_id="gemini-weekly",
         remaining_fraction=0.90,
-        reset_time="2026-10-21T10:00:00Z",
+        reset_time=reset_ts,
         fallback_capacity=672.0,
     )
     assert cap == 640.0
@@ -1115,16 +1161,19 @@ def test_calibration_ema_smoothing(tmp_path: Path):
     conn2.execute(
         "INSERT INTO conversations (id, title, model_name) VALUES ('c1', 'T1', 'Gemini 3.8 Flash')"
     )
-    conn2.execute("""
+    conn2.execute(
+        """
         INSERT INTO steps (conversation_id, step_index, created_at, step_type, model_name, billed_cost)
-        VALUES ('c1', 1, '2026-10-14T10:00:00Z', 'USER_MESSAGE', 'Gemini 3.8 Flash', 80.0)
-    """)
+        VALUES ('c1', 1, ?, 'USER_MESSAGE', 'Gemini 3.8 Flash', 80.0)
+        """,
+        (step_ts,),
+    )
     conn2.commit()
     cap_initial = calibrate_capacity(
         conn=conn2,
         bucket_id="gemini-weekly",
         remaining_fraction=0.90,
-        reset_time="2026-10-21T10:00:00Z",
+        reset_time=reset_ts,
         fallback_capacity=672.0,
     )
     # raw is 800.0, which is within [350.0, 1000.0]
@@ -1144,7 +1193,7 @@ def test_calibration_ema_smoothing(tmp_path: Path):
         conn=conn2,
         bucket_id="gemini-weekly",
         remaining_fraction=0.90,
-        reset_time="2026-10-21T10:00:00Z",
+        reset_time=reset_ts,
         fallback_capacity=672.0,
     )
     assert cap_zero_prior == 800.0
@@ -1164,7 +1213,7 @@ def test_calibration_ema_smoothing(tmp_path: Path):
         conn=conn2,
         bucket_id="gemini-weekly",
         remaining_fraction=0.90,
-        reset_time="2026-10-21T10:00:00Z",
+        reset_time=reset_ts,
         fallback_capacity=672.0,
     )
     assert cap_legacy_prior == 960.0
@@ -1183,19 +1232,27 @@ def test_calibration_clamping(tmp_path: Path):
     db_file = tmp_path / "test_clamp.db"
     init_db(db_file)
     conn = get_db_connection(db_file)
+    now_utc = datetime.now(timezone.utc).replace(microsecond=0)
+    step_ts = (now_utc - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    reset_weekly = (now_utc + timedelta(days=6)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    reset_5h = (now_utc + timedelta(hours=3)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
     conn.execute(
         "INSERT INTO conversations (id, title, model_name) VALUES ('c_gemini', 'G', 'Gemini 3.8 Flash'), ('c_3p', '3P', 'Claude 3.7 Sonnet')"
     )
 
     # 1. Gemini Weekly: bounds [350.0, 1000.0]
     # Lower clamp: cost $10.0 / 0.05 used = $200.0 -> clamped to 350.0
-    conn.execute("""
+    conn.execute(
+        """
         INSERT INTO steps (conversation_id, step_index, created_at, step_type, model_name, billed_cost)
-        VALUES ('c_gemini', 1, '2026-10-14T10:00:00Z', 'USER_MESSAGE', 'Gemini 3.8 Flash', 10.0)
-    """)
+        VALUES ('c_gemini', 1, ?, 'USER_MESSAGE', 'Gemini 3.8 Flash', 10.0)
+        """,
+        (step_ts,),
+    )
     conn.commit()
     cap_gw_low = calibrate_capacity(
-        conn, "gemini-weekly", 0.95, "2026-10-21T10:00:00Z", 672.0
+        conn, "gemini-weekly", 0.95, reset_weekly, 672.0
     )
     assert cap_gw_low == 350.0
 
@@ -1205,7 +1262,7 @@ def test_calibration_clamping(tmp_path: Path):
     )
     conn.commit()
     cap_gw_high = calibrate_capacity(
-        conn, "gemini-weekly", 0.95, "2026-10-21T10:00:00Z", 672.0
+        conn, "gemini-weekly", 0.95, reset_weekly, 672.0
     )
     assert cap_gw_high == 1000.0
 
@@ -1216,7 +1273,7 @@ def test_calibration_clamping(tmp_path: Path):
     )
     conn.commit()
     cap_g5_low = calibrate_capacity(
-        conn, "gemini-5h", 0.95, "2026-10-14T15:00:00Z", 236.7
+        conn, "gemini-5h", 0.95, reset_5h, 236.7
     )
     assert cap_g5_low == 100.0
 
@@ -1226,19 +1283,22 @@ def test_calibration_clamping(tmp_path: Path):
     )
     conn.commit()
     cap_g5_high = calibrate_capacity(
-        conn, "gemini-5h", 0.95, "2026-10-14T15:00:00Z", 236.7
+        conn, "gemini-5h", 0.95, reset_5h, 236.7
     )
     assert cap_g5_high == 400.0
 
     # 3. 3P Weekly: bounds [100.0, 500.0]
     # Lower clamp: cost $2.50 / 0.05 = $50.0 -> clamped to 100.0
-    conn.execute("""
+    conn.execute(
+        """
         INSERT INTO steps (conversation_id, step_index, created_at, step_type, model_name, billed_cost)
-        VALUES ('c_3p', 1, '2026-10-14T10:00:00Z', 'USER_MESSAGE', 'Claude 3.7 Sonnet', 2.50)
-    """)
+        VALUES ('c_3p', 1, ?, 'USER_MESSAGE', 'Claude 3.7 Sonnet', 2.50)
+        """,
+        (step_ts,),
+    )
     conn.commit()
     cap_3pw_low = calibrate_capacity(
-        conn, "3p-weekly", 0.95, "2026-10-21T10:00:00Z", 200.0
+        conn, "3p-weekly", 0.95, reset_weekly, 200.0
     )
     assert cap_3pw_low == 100.0
 
@@ -1248,7 +1308,7 @@ def test_calibration_clamping(tmp_path: Path):
     )
     conn.commit()
     cap_3pw_high = calibrate_capacity(
-        conn, "3p-weekly", 0.95, "2026-10-21T10:00:00Z", 200.0
+        conn, "3p-weekly", 0.95, reset_weekly, 200.0
     )
     assert cap_3pw_high == 500.0
 
@@ -1258,7 +1318,7 @@ def test_calibration_clamping(tmp_path: Path):
         "UPDATE steps SET billed_cost = 1.0 WHERE conversation_id = 'c_3p' AND step_index = 1"
     )
     conn.commit()
-    cap_3p5_low = calibrate_capacity(conn, "3p-5h", 0.95, "2026-10-14T15:00:00Z", 70.0)
+    cap_3p5_low = calibrate_capacity(conn, "3p-5h", 0.95, reset_5h, 70.0)
     assert cap_3p5_low == 35.0
 
     # Upper clamp: cost $15.0 / 0.05 = $300.0 -> clamped to 150.0
@@ -1266,7 +1326,7 @@ def test_calibration_clamping(tmp_path: Path):
         "UPDATE steps SET billed_cost = 15.0 WHERE conversation_id = 'c_3p' AND step_index = 1"
     )
     conn.commit()
-    cap_3p5_high = calibrate_capacity(conn, "3p-5h", 0.95, "2026-10-14T15:00:00Z", 70.0)
+    cap_3p5_high = calibrate_capacity(conn, "3p-5h", 0.95, reset_5h, 70.0)
     assert cap_3p5_high == 150.0
 
     # 5. Combined EMA + Clamping:
@@ -1288,7 +1348,7 @@ def test_calibration_clamping(tmp_path: Path):
     conn.commit()
     # cost 75.0 / 0.05 = 1500.0 raw
     cap_combined = calibrate_capacity(
-        conn, "gemini-weekly", 0.95, "2026-10-21T10:00:00Z", 672.0
+        conn, "gemini-weekly", 0.95, reset_weekly, 672.0
     )
     assert cap_combined == 1000.0
 
@@ -1305,7 +1365,7 @@ def test_calibration_clamping(tmp_path: Path):
         ],
     )
     cap_clamped_fallback = calibrate_capacity(
-        conn, "gemini-weekly", 0.999, "2026-10-21T10:00:00Z", 672.0
+        conn, "gemini-weekly", 0.999, reset_weekly, 672.0
     )
     assert cap_clamped_fallback == 350.0
 
@@ -1328,6 +1388,11 @@ def test_calibration_bucket_variants_and_model_isolation(tmp_path: Path):
     db_file = tmp_path / "test_variants.db"
     init_db(db_file)
     conn = get_db_connection(db_file)
+    now_utc = datetime.now(timezone.utc).replace(microsecond=0)
+    step_ts_1 = (now_utc - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    step_ts_2 = (now_utc - timedelta(hours=1, minutes=55)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    reset_weekly = (now_utc + timedelta(days=6)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
     conn.execute(
         "INSERT INTO conversations (id, title, model_name) VALUES ('c_mix', 'Mixed', 'Claude 3.7 Sonnet')"
     )
@@ -1345,20 +1410,26 @@ def test_calibration_bucket_variants_and_model_isolation(tmp_path: Path):
     assert get_capacity_bounds("gemini_5h") == (100.0, 400.0)
 
     # Add Claude step cost $15.00 and Gemini step cost $40.00
-    conn.execute("""
+    conn.execute(
+        """
         INSERT INTO steps (conversation_id, step_index, created_at, step_type, model_name, billed_cost)
-        VALUES ('c_mix', 1, '2026-10-14T10:00:00Z', 'USER_MESSAGE', 'Claude 3.7 Sonnet', 15.0)
-    """)
-    conn.execute("""
+        VALUES ('c_mix', 1, ?, 'USER_MESSAGE', 'Claude 3.7 Sonnet', 15.0)
+        """,
+        (step_ts_1,),
+    )
+    conn.execute(
+        """
         INSERT INTO steps (conversation_id, step_index, created_at, step_type, model_name, billed_cost)
-        VALUES ('c_mix', 2, '2026-10-14T10:05:00Z', 'USER_MESSAGE', 'Gemini 3.8 Pro', 40.0)
-    """)
+        VALUES ('c_mix', 2, ?, 'USER_MESSAGE', 'Gemini 3.8 Pro', 40.0)
+        """,
+        (step_ts_2,),
+    )
     conn.commit()
 
     # claude-weekly bucket: used_fraction = 0.05.
     # Should ONLY count Claude steps ($15.00 / 0.05 = $300.00), NOT Gemini ($55.00 / 0.05 = $1100.00)
     cap_claude = calibrate_capacity(
-        conn, "claude-weekly", 0.95, "2026-10-21T10:00:00Z", 200.0
+        conn, "claude-weekly", 0.95, reset_weekly, 200.0
     )
     assert cap_claude == 300.0
 
@@ -1370,24 +1441,31 @@ def test_calibration_nan_and_corrupt_inputs(tmp_path: Path):
     db_file = tmp_path / "test_corrupt.db"
     init_db(db_file)
     conn = get_db_connection(db_file)
+    now_utc = datetime.now(timezone.utc).replace(microsecond=0)
+    step_ts = (now_utc - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    reset_weekly = (now_utc + timedelta(days=6)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
     conn.execute(
         "INSERT INTO conversations (id, title, model_name) VALUES ('c1', 'T1', 'Gemini 3.8 Flash')"
     )
-    conn.execute("""
+    conn.execute(
+        """
         INSERT INTO steps (conversation_id, step_index, created_at, step_type, model_name, billed_cost)
-        VALUES ('c1', 1, '2026-10-14T10:00:00Z', 'USER_MESSAGE', 'Gemini 3.8 Flash', 10.0)
-    """)
+        VALUES ('c1', 1, ?, 'USER_MESSAGE', 'Gemini 3.8 Flash', 10.0)
+        """,
+        (step_ts,),
+    )
     conn.commit()
 
     # NaN remaining_fraction should fall back safely to fallback_val (672.0)
     cap_nan = calibrate_capacity(
-        conn, "gemini-weekly", float("nan"), "2026-10-21T10:00:00Z", 672.0
+        conn, "gemini-weekly", float("nan"), reset_weekly, 672.0
     )
     assert cap_nan == 672.0
 
     # Inf remaining_fraction should fall back safely
     cap_inf = calibrate_capacity(
-        conn, "gemini-weekly", float("inf"), "2026-10-21T10:00:00Z", 672.0
+        conn, "gemini-weekly", float("inf"), reset_weekly, 672.0
     )
     assert cap_inf == 672.0
 
@@ -1403,7 +1481,7 @@ def test_calibration_nan_and_corrupt_inputs(tmp_path: Path):
     )
     # With sanitized persisted capacity, initial calibration runs raw: 10.0 / 0.05 = 200.0 -> clamped to 350.0
     cap_nan_prior = calibrate_capacity(
-        conn, "gemini-weekly", 0.95, "2026-10-21T10:00:00Z", 672.0
+        conn, "gemini-weekly", 0.95, reset_weekly, 672.0
     )
     assert cap_nan_prior == 350.0
 
@@ -2332,3 +2410,255 @@ def test_calculate_quota_pacing_boundary_z_timestamp_inclusion(tmp_path: Path):
     # 100,000 billed tokens / 20.0 hrs = 5,000.0
     assert res["billed_tph"] == 5_000.0
     assert res["est_tph"] == 500.0
+
+
+def test_calibrate_capacity_clamps_stale_reset_time_and_upper_bound(tmp_path: Path):
+    """Verifies calibrate_capacity bounds SQL queries with created_at <= ? and clamps stale reset_time."""
+    db_file = tmp_path / "test_stale_cal.db"
+    init_db(db_file)
+    conn = get_db_connection(db_file)
+
+    now_utc = datetime.now(timezone.utc).replace(microsecond=0)
+    old_30d_iso = (now_utc - timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    stale_25d_iso = (now_utc - timedelta(days=25)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    recent_2d_iso = (now_utc - timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    future_1d_iso = (now_utc + timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    stale_reset_iso = (now_utc - timedelta(days=20)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    conn.execute(
+        "INSERT INTO conversations (id, title, model_name) VALUES ('c1', 'T1', 'Gemini 3.8 Flash')"
+    )
+    conn.executemany(
+        """
+        INSERT INTO steps (conversation_id, step_index, created_at, step_type, model_name, billed_cost)
+        VALUES (?, ?, ?, 'USER_MESSAGE', 'Gemini 3.8 Flash', ?)
+        """,
+        [
+            ("c1", 1, old_30d_iso, 200.0),
+            ("c1", 2, stale_25d_iso, 200.0),
+            ("c1", 3, recent_2d_iso, 250.0),
+            ("c1", 4, future_1d_iso, 200.0),
+        ],
+    )
+    conn.commit()
+
+    executed_queries: list[tuple[str, tuple]] = []
+
+    class SpyConn:
+        def __init__(self, real_conn: sqlite3.Connection):
+            self._real = real_conn
+
+        def execute(self, sql: str, params=()):
+            executed_queries.append((sql, tuple(params)))
+            return self._real.execute(sql, params)
+
+        def __getattr__(self, name: str):
+            return getattr(self._real, name)
+
+    spy_conn = SpyConn(conn)
+    cap = calibrate_capacity(
+        conn=spy_conn,  # type: ignore[arg-type]
+        bucket_id="gemini-weekly",
+        remaining_fraction=0.5,
+        reset_time=stale_reset_iso,
+        fallback_capacity=672.0,
+    )
+
+    step_queries = [
+        (sql, params)
+        for sql, params in executed_queries
+        if "FROM steps" in sql and "billed_cost" in sql
+    ]
+    assert step_queries, "Expected steps calibration query to execute"
+    cal_sql, cal_params = step_queries[0]
+    assert "created_at >=" in cal_sql
+    assert "created_at <=" in cal_sql
+    assert len(cal_params) == 2
+
+    eqp = conn.execute(f"EXPLAIN QUERY PLAN {cal_sql}", cal_params).fetchall()
+    eqp_str = " ".join(str(tuple(r)) for r in eqp)
+    assert "idx_steps_created_cost" in eqp_str
+    assert "SCAN steps" not in eqp_str
+
+    # Only recent_2d_iso ($250) falls in [now - 7d, now]: 250.0 / 0.5 = 500.0
+    assert cap == 500.0
+
+    # Also verify a recent past reset_time (3 days ago) excludes steps after reset_time (recent_2d_iso)
+    recent_past_reset = (now_utc - timedelta(days=3)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    cap_before_reset = calibrate_capacity(
+        conn=conn,
+        bucket_id="gemini-weekly",
+        remaining_fraction=0.5,
+        reset_time=recent_past_reset,
+        fallback_capacity=672.0,
+    )
+    assert cap_before_reset == 672.0
+    conn.close()
+
+
+def test_sync_and_get_quota_state_negative_cache_backoff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Verifies 30s negative-cache backoff in discover_language_server_credentials and sync_and_get_quota_state."""
+    import context_monitor.quota as quota_mod
+
+    monkeypatch.setattr(quota_mod, "_CACHED_LS_CREDS", (None, None, 0.0))
+    monkeypatch.setattr(quota_mod, "_LAST_QUOTA_SYNC_TIMES", {})
+
+    discovery_calls = 0
+
+    def fake_discover_token():
+        nonlocal discovery_calls
+        discovery_calls += 1
+        return None
+
+    monkeypatch.setattr(quota_mod, "_discover_csrf_token", fake_discover_token)
+    monkeypatch.setattr(quota_mod, "_discover_http_port", lambda log_path=None: 60090)
+
+    # 1. Direct discover_language_server_credentials negative cache
+    p1, t1 = discover_language_server_credentials()
+    assert (p1, t1) == (60090, None)
+    assert discovery_calls == 1
+
+    p2, t2 = discover_language_server_credentials()
+    assert (p2, t2) == (60090, None)
+    assert discovery_calls == 1
+
+    p3, t3 = discover_language_server_credentials(force_refresh=True)
+    assert (p3, t3) == (60090, None)
+    assert discovery_calls == 2
+
+    # 2. sync_and_get_quota_state 30s negative-cache backoff on stale DB rows
+    monkeypatch.setattr(quota_mod, "_CACHED_LS_CREDS", (None, None, 0.0))
+    monkeypatch.setattr(quota_mod, "_LAST_QUOTA_SYNC_TIMES", {})
+    discovery_calls = 0
+
+    db_file = tmp_path / "test_neg_backoff.db"
+    init_db(db_file)
+    conn = get_db_connection(db_file)
+    stale_fetched_at = (datetime.now(timezone.utc) - timedelta(seconds=120)).isoformat()
+    upsert_quota_state(
+        conn,
+        [
+            {
+                "bucket_id": "gemini-weekly",
+                "group_name": "Gemini Models",
+                "window": "weekly",
+                "remaining_fraction": 0.42,
+                "reset_time": (datetime.now(timezone.utc) + timedelta(days=5)).isoformat(),
+                "calibrated_capacity": 672.0,
+                "fetched_at": stale_fetched_at,
+            }
+        ],
+    )
+
+    for _ in range(3):
+        state = sync_and_get_quota_state(conn, force_refresh=False, ttl_seconds=60)
+        assert state["gemini-weekly"]["remaining_fraction"] == 0.42
+
+    assert discovery_calls == 1
+
+    state_forced = sync_and_get_quota_state(conn, force_refresh=True, ttl_seconds=60)
+    assert state_forced["gemini-weekly"]["remaining_fraction"] == 0.42
+    assert discovery_calls == 2
+
+    # After 30s negative-cache window expires, non-forced sync retries discovery
+    t_base = 10000.0
+    monkeypatch.setattr(quota_mod, "_CACHED_LS_CREDS", (None, None, 0.0))
+    monkeypatch.setattr(quota_mod, "_LAST_QUOTA_SYNC_TIMES", {})
+    discovery_calls = 0
+
+    current_time = [t_base]
+    monkeypatch.setattr(quota_mod.time, "monotonic", lambda: current_time[0])
+
+    sync_and_get_quota_state(conn, force_refresh=False, ttl_seconds=60)
+    assert discovery_calls == 1
+
+    current_time[0] = t_base + 15.0
+    sync_and_get_quota_state(conn, force_refresh=False, ttl_seconds=60)
+    assert discovery_calls == 1
+
+    current_time[0] = t_base + 31.0
+    sync_and_get_quota_state(conn, force_refresh=False, ttl_seconds=60)
+    assert discovery_calls == 2
+
+    # Also verify HTTP fetch failure (token present, fetch_raw_quota_summary returns None) backs off for 30s
+    monkeypatch.setattr(quota_mod, "_CACHED_LS_CREDS", (None, None, 0.0))
+    monkeypatch.setattr(quota_mod, "_LAST_QUOTA_SYNC_TIMES", {})
+    fetch_calls = 0
+
+    def fake_fetch(port, token, timeout=None):
+        nonlocal fetch_calls
+        fetch_calls += 1
+        return None
+
+    monkeypatch.setattr(quota_mod, "_discover_csrf_token", lambda: "valid-token")
+    monkeypatch.setattr(quota_mod, "fetch_raw_quota_summary", fake_fetch)
+
+    current_time[0] = t_base + 100.0
+    sync_and_get_quota_state(conn, force_refresh=False, ttl_seconds=60)
+    sync_and_get_quota_state(conn, force_refresh=False, ttl_seconds=60)
+    assert fetch_calls == 1
+    conn.close()
+
+
+def test_calculate_quota_pacing_query_tokens_sargable_and_clamped(tmp_path: Path):
+    """Verifies _query_tokens uses idx_steps_created with sargable bounds and clamps stale reset_time."""
+    db_file = tmp_path / "test_pacing_sargable.db"
+    init_db(db_file)
+    conn = get_db_connection(db_file)
+
+    now = datetime(2026, 11, 20, 12, 0, 0, tzinfo=timezone.utc)
+    stale_reset = "2026-10-21T00:00:00Z"  # 30 days in the past
+
+    conn.execute("INSERT INTO conversations (id, title) VALUES ('c1', 'Conv')")
+    conn.executemany(
+        """
+        INSERT INTO steps (conversation_id, step_index, created_at, est_tokens, billed_input_tokens, billed_output_tokens, model_name)
+        VALUES ('c1', ?, ?, ?, ?, 0, 'Gemini 3.8 Flash')
+        """,
+        [
+            (1, "2026-10-18T10:00:00Z", 50_000, 100_000),
+            (2, "2026-11-19T12:00:00Z", 8_400, 168_000),
+        ],
+    )
+    conn.commit()
+
+    executed_queries: list[tuple[str, tuple]] = []
+
+    class SpyConn:
+        def __init__(self, real_conn: sqlite3.Connection):
+            self._real = real_conn
+
+        def execute(self, sql: str, params=()):
+            executed_queries.append((sql, tuple(params)))
+            return self._real.execute(sql, params)
+
+        def __getattr__(self, name: str):
+            return getattr(self._real, name)
+
+    res = calculate_quota_pacing(
+        0.88,
+        stale_reset,
+        window_hours=168.0,
+        calibrated_capacity=672.0,
+        now=now,
+        conn=SpyConn(conn),  # type: ignore[arg-type]
+    )
+
+    step_queries = [(s, p) for s, p in executed_queries if "FROM steps" in s]
+    assert step_queries
+    q_sql, q_params = step_queries[0]
+    assert "created_at >=" in q_sql
+    assert "created_at <=" in q_sql
+    assert len(q_params) == 4
+
+    eqp = conn.execute(f"EXPLAIN QUERY PLAN {q_sql}", q_params).fetchall()
+    eqp_str = " ".join(str(tuple(r)) for r in eqp)
+    assert "idx_steps_created" in eqp_str
+    assert "SCAN steps" not in eqp_str
+
+    # Only the recent step (168,000 billed / 168h = 1,000 tph; 8,400 est / 168h = 50 tph) counts
+    assert res["billed_tph"] == 1_000.0
+    assert res["est_tph"] == 50.0
+    conn.close()

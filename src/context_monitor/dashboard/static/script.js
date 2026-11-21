@@ -68,6 +68,7 @@
     }
 
     function upsertChart(existingChart, canvas, config) {
+      if (typeof Chart === 'undefined') return null;
       if (!canvas || typeof canvas.getContext !== 'function') return null;
       trackCanvasPointer(canvas);
 
@@ -634,13 +635,40 @@
     }
 
     let dashboardAbortController = null;
+    let isDashboardFetchInFlight = false;
+    let pendingSseRefresh = false;
+    let activeDashboardFetchId = 0;
+    let summaryFetchFailed = false;
 
-    async function fetchDashboardData() {
+    async function fetchJson(url, fetchOpts) {
+      const res = await fetch(url, fetchOpts);
+      if (res && res.ok === false) {
+        throw new Error(`${url}: HTTP ${res.status || 'error'}`);
+      }
+      if (!res || typeof res.json !== 'function') {
+        throw new Error(`${url}: invalid response`);
+      }
+      return res.json();
+    }
+
+    async function fetchDashboardData(options = {}) {
+      const isSse = Boolean(options && options.source === 'sse');
+      if (isSse && isDashboardFetchInFlight) {
+        pendingSseRefresh = true;
+        return;
+      }
+
       if (dashboardAbortController) {
         dashboardAbortController.abort();
       }
+      if (!isSse) {
+        pendingSseRefresh = false;
+      }
+
       dashboardAbortController = typeof AbortController !== 'undefined' ? new AbortController() : null;
       const signal = dashboardAbortController ? dashboardAbortController.signal : undefined;
+      const fetchId = ++activeDashboardFetchId;
+      isDashboardFetchInFlight = true;
 
       if (dbUpdateDebounceTimer) {
         clearTimeout(dbUpdateDebounceTimer);
@@ -663,54 +691,121 @@
         const isCycleActive = (typeof currentTimelineDays === 'string' && currentTimelineDays.toLowerCase().trim() === 'cycle');
         const activeTimelineUrl = isCycleActive ? `/api/timeline${cycleQueryStr}` : `/api/timeline${queryStr}`;
 
-        const [summaryRes, timelineActiveRes, costProjRes, toolsRes, mcpRes, hotFilesRes, matrixRes, convsRes] = await Promise.all([
-          fetch(`/api/summary${queryStr}`, fetchOpts).then(r => r.json()),
-          fetch(activeTimelineUrl, fetchOpts).then(r => r.json()),
-          fetch(`/api/cost-by-project${queryStr}`, fetchOpts).then(r => r.json()),
-          fetch(`/api/tools${queryStr}`, fetchOpts).then(r => r.json()),
-          fetch(`/api/mcp${queryStr}`, fetchOpts).then(r => r.json()),
-          fetch(`/api/hot-files${queryStr}`, fetchOpts).then(r => r.json()),
-          fetch(`/api/activity-matrix${queryStr}`, fetchOpts).then(r => r.json()),
-          fetch(`/api/conversations${convQueryStr}`, fetchOpts).then(r => r.json())
+        const endpointNames = [
+          '/api/summary',
+          activeTimelineUrl,
+          '/api/cost-by-project',
+          '/api/tools',
+          '/api/mcp',
+          '/api/hot-files',
+          '/api/activity-matrix',
+          '/api/conversations'
+        ];
+        const settled = await Promise.allSettled([
+          fetchJson(`/api/summary${queryStr}`, fetchOpts),
+          fetchJson(activeTimelineUrl, fetchOpts),
+          fetchJson(`/api/cost-by-project${queryStr}`, fetchOpts),
+          fetchJson(`/api/tools${queryStr}`, fetchOpts),
+          fetchJson(`/api/mcp${queryStr}`, fetchOpts),
+          fetchJson(`/api/hot-files${queryStr}`, fetchOpts),
+          fetchJson(`/api/activity-matrix${queryStr}`, fetchOpts),
+          fetchJson(`/api/conversations${convQueryStr}`, fetchOpts)
         ]);
 
         if (signal && signal.aborted) return;
 
-        if (isCycleActive) {
-          cycleTimelineData = Array.isArray(timelineActiveRes) ? timelineActiveRes : [];
-          cachedCycleProject = currentProject;
-        } else {
-          allTimelineData = Array.isArray(timelineActiveRes) ? timelineActiveRes : [];
-        }
-        allProjectCostData = costProjRes || { total_cost: 0, projects: [] };
-        allToolsData = Array.isArray(toolsRes) ? toolsRes : [];
-        allMcpData = Array.isArray(mcpRes) ? mcpRes : [];
-        cachedActivityMatrix = matrixRes || {};
+        const isAbortErr = (err) => Boolean(err && (err.name === 'AbortError' || err.code === 20));
+        settled.forEach((res, idx) => {
+          if (res.status === 'rejected' && !isAbortErr(res.reason)) {
+            console.error(`Failed to load ${endpointNames[idx]}`, res.reason);
+          }
+        });
 
-        if (summaryRes.timezone_label) {
-          document.getElementById('tzLabel').textContent = summaryRes.timezone_label;
-        } else if (matrixRes.timezone_abbr) {
-          document.getElementById('tzLabel').textContent = matrixRes.timezone_abbr;
+        const [
+          summarySettled,
+          timelineSettled,
+          costProjSettled,
+          toolsSettled,
+          mcpSettled,
+          hotFilesSettled,
+          matrixSettled,
+          convsSettled
+        ] = settled;
+
+        const summaryRes = summarySettled.status === 'fulfilled' ? summarySettled.value : null;
+        const matrixRes = matrixSettled.status === 'fulfilled' ? matrixSettled.value : null;
+
+        const tzEl = document.getElementById('tzLabel');
+        if (tzEl) {
+          if (summaryRes && summaryRes.timezone_label) {
+            tzEl.textContent = summaryRes.timezone_label;
+          } else if (matrixRes && matrixRes.timezone_abbr) {
+            tzEl.textContent = matrixRes.timezone_abbr;
+          }
         }
-        if (matrixRes.timezone_abbr) {
+        if (matrixRes && matrixRes.timezone_abbr) {
           localTimezoneAbbr = matrixRes.timezone_abbr;
         }
 
-        renderKPIs(summaryRes);
-        if (summaryRes.quota || summaryRes.quota_summary) {
-          renderQuotaSection(summaryRes.quota || summaryRes.quota_summary);
+        const syncTextEl = document.getElementById('syncText');
+        if (summarySettled.status === 'fulfilled' && summaryRes) {
+          if (summaryFetchFailed) {
+            summaryFetchFailed = false;
+            if (syncTextEl) {
+              syncTextEl.textContent = 'Live Sync: SSE Active';
+            }
+          }
+          renderKPIs(summaryRes);
+          if (summaryRes.quota || summaryRes.quota_summary) {
+            renderQuotaSection(summaryRes.quota || summaryRes.quota_summary);
+          }
+          renderModelsChart(summaryRes.models);
+          renderCategoryChart(summaryRes.categories);
+          renderPhaseChart(summaryRes.phases);
+        } else if (summarySettled.status === 'rejected' && !isAbortErr(summarySettled.reason)) {
+          summaryFetchFailed = true;
+          if (syncTextEl) {
+            syncTextEl.textContent = 'Live Sync: Summary unavailable (partial view)';
+          }
         }
-        setTimelineRange(currentTimelineDays);
-        renderModelsChart(summaryRes.models);
-        renderProjectCostSection(allProjectCostData, currentProject);
-        renderToolsChart(allToolsData);
-        renderMcpSection(allMcpData);
-        renderCategoryChart(summaryRes.categories);
-        renderPhaseChart(summaryRes.phases);
-        renderHeatmapAllViews(matrixRes);
-        renderHotFiles(hotFilesRes);
-        if (convsRes) {
-          renderConversations(convsRes);
+
+        if (timelineSettled.status === 'fulfilled') {
+          const timelineActiveRes = timelineSettled.value;
+          if (isCycleActive) {
+            cycleTimelineData = Array.isArray(timelineActiveRes) ? timelineActiveRes : [];
+            cachedCycleProject = currentProject;
+          } else {
+            allTimelineData = Array.isArray(timelineActiveRes) ? timelineActiveRes : [];
+          }
+          setTimelineRange(currentTimelineDays);
+        }
+
+        if (costProjSettled.status === 'fulfilled') {
+          allProjectCostData = costProjSettled.value || { total_cost: 0, projects: [] };
+          renderProjectCostSection(allProjectCostData, currentProject);
+        }
+
+        if (toolsSettled.status === 'fulfilled') {
+          allToolsData = Array.isArray(toolsSettled.value) ? toolsSettled.value : [];
+          renderToolsChart(allToolsData);
+        }
+
+        if (mcpSettled.status === 'fulfilled') {
+          allMcpData = Array.isArray(mcpSettled.value) ? mcpSettled.value : [];
+          renderMcpSection(allMcpData);
+        }
+
+        if (matrixSettled.status === 'fulfilled' && matrixRes) {
+          cachedActivityMatrix = matrixRes;
+          renderHeatmapAllViews(matrixRes);
+        }
+
+        if (hotFilesSettled.status === 'fulfilled') {
+          renderHotFiles(hotFilesSettled.value);
+        }
+
+        if (convsSettled.status === 'fulfilled' && convsSettled.value) {
+          renderConversations(convsSettled.value);
         }
       } catch (err) {
         if (err && (err.name === 'AbortError' || err.code === 20 || (signal && signal.aborted))) {
@@ -718,8 +813,15 @@
         }
         console.error("Failed to load dashboard data", err);
       } finally {
-        if (dashboardAbortController && dashboardAbortController.signal === signal) {
-          dashboardAbortController = null;
+        if (fetchId === activeDashboardFetchId) {
+          isDashboardFetchInFlight = false;
+          if (dashboardAbortController && dashboardAbortController.signal === signal) {
+            dashboardAbortController = null;
+          }
+          if (pendingSseRefresh && !(signal && signal.aborted)) {
+            pendingSseRefresh = false;
+            fetchDashboardData({ source: 'sse' });
+          }
         }
       }
     }
@@ -4803,7 +4905,7 @@
         if (!document.hidden && pendingDashboardRefresh) {
           console.log("⚡ Tab became visible with pending SQLite update. Refreshing UI...");
           pendingDashboardRefresh = false;
-          fetchDashboardData();
+          fetchDashboardData({ source: 'sse' });
         }
       });
     }
@@ -4818,7 +4920,7 @@
           const badge = document.getElementById('liveSyncBadge');
           const text = document.getElementById('syncText');
           if (badge) badge.className = 'px-3 py-1.5 rounded-md bg-emerald-950/60 border border-emerald-500/30 text-emerald-300 text-xs font-medium flex items-center space-x-1.5 transition select-none';
-          if (text) text.textContent = 'Live Sync: SSE Active';
+          if (text && !summaryFetchFailed) text.textContent = 'Live Sync: SSE Active';
           try {
             if (event.data) {
               const d = JSON.parse(event.data);
@@ -4847,8 +4949,8 @@
           // 2000ms SSE debounce window (previously 300ms) to coalesce rapid sub-agent writes
           const sseDebounceMs = 2000;
           dbUpdateDebounceTimer = setTimeout(() => {
-            fetchDashboardData();
             dbUpdateDebounceTimer = null;
+            fetchDashboardData({ source: 'sse' });
           }, sseDebounceMs);
         });
 
@@ -4880,7 +4982,7 @@
       updateProjectFilterUI(currentProject);
 
       try {
-        const projects = await fetch('/api/projects').then(r => r.json());
+        const projects = await fetchJson('/api/projects');
         const filterSelect = document.getElementById('projectFilter');
         if (filterSelect && Array.isArray(projects) && projects.length > 0) {
           projects.forEach(p => {
@@ -4900,6 +5002,9 @@
       if (typeof lucide !== 'undefined' && lucide.createIcons) {
         lucide.createIcons();
       }
-      fetchDashboardData();
-      if (typeof IS_STATIC_EXPORT === "undefined" || !IS_STATIC_EXPORT) { initLiveSyncSSE(); }
+      fetchDashboardData().finally(() => {
+        if (typeof IS_STATIC_EXPORT === "undefined" || !IS_STATIC_EXPORT) {
+          initLiveSyncSSE();
+        }
+      });
     });

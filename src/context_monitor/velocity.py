@@ -206,7 +206,7 @@ def query_rolling_velocity(
         scope_rollups_params.extend(fleet_ids)
     elif project and project != "all":
         try:
-            if project == "unassigned":
+            if project in ("unassigned", "(unassigned)"):
                 cur_proj = conn.execute(
                     "SELECT id FROM conversations WHERE project IS NULL OR project = ''"
                 )
@@ -234,6 +234,10 @@ def query_rolling_velocity(
     rolling_60m_billed = 0
 
     try:
+        # Broad sargable bounds allow SQLite to use idx_steps_created while keeping
+        # space-separated (' ' < 'T') and sub-second/offset ('Z'/'.'/'+' < 'z') rows.
+        idx_start = iso_60m[:10]
+        idx_end = iso_now + "z"
         rolling_sql = f"""
             SELECT
                 COALESCE(SUM(CASE WHEN substr(replace(created_at, ' ', 'T'), 1, 19) >= ? THEN est_tokens ELSE 0 END), 0) AS c_5m,
@@ -242,11 +246,12 @@ def query_rolling_velocity(
                 COALESCE(SUM(COALESCE(billed_input_tokens, 0) + COALESCE(billed_output_tokens, 0)), 0) AS b_60m
             FROM steps
             WHERE created_at IS NOT NULL AND created_at != ''
+              AND created_at >= ? AND created_at <= ?
               AND substr(replace(created_at, ' ', 'T'), 1, 19) >= ?
               AND substr(replace(created_at, ' ', 'T'), 1, 19) <= ?
               {scope_steps_sql}
         """
-        params = [iso_5m, iso_5m, iso_60m, iso_now] + scope_steps_params
+        params = [iso_5m, iso_5m, idx_start, idx_end, iso_60m, iso_now] + scope_steps_params
         cur = conn.execute(rolling_sql, params)
         row = cur.fetchone()
         if row:

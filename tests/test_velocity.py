@@ -408,3 +408,91 @@ def test_query_rolling_velocity_hourly_series_future_exclusion_and_fallback(tmp_
 
     hour_keys = [h["hour_key"] for h in res["hourly_series"]]
     assert "2026-10-23T15" not in hour_keys
+
+
+def test_query_rolling_velocity_uses_created_at_index_and_unassigned_project(tmp_path: Path):
+    """Verifies rolling velocity uses idx_steps_created index bounds and matches '(unassigned)' project."""
+    db_file = tmp_path / "index_unassigned.db"
+    init_db(db_file)
+
+    now = datetime(2026, 10, 23, 14, 0, 0, tzinfo=timezone.utc)
+
+    with get_db_connection(db_file) as conn:
+        # Ensure idx_steps_created exists on steps(created_at)
+        idx_row = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_steps_created'"
+        ).fetchone()
+        assert idx_row is not None
+
+        conn.execute(
+            "INSERT INTO conversations (id, title, project) VALUES ('unassigned-1', 'Unassigned Conv', NULL)"
+        )
+        conn.execute(
+            "INSERT INTO conversations (id, title, project) VALUES ('assigned-1', 'Assigned Conv', 'my-project')"
+        )
+
+        # Unassigned step 1: 2 mins ago (inside 5m and 60m)
+        conn.execute(
+            """
+            INSERT INTO steps (conversation_id, step_index, created_at, est_tokens, billed_input_tokens, billed_output_tokens)
+            VALUES ('unassigned-1', 1, '2026-10-23T13:58:00Z', 1000, 4000, 1000)
+            """
+        )
+        # Unassigned step 2: 3 mins ago with space separator (inside 5m and 60m)
+        conn.execute(
+            """
+            INSERT INTO steps (conversation_id, step_index, created_at, est_tokens, billed_input_tokens, billed_output_tokens)
+            VALUES ('unassigned-1', 2, '2026-10-23 13:57:00', 500, 2000, 500)
+            """
+        )
+        # Unassigned step 3: 30 mins ago (outside 5m, inside 60m)
+        conn.execute(
+            """
+            INSERT INTO steps (conversation_id, step_index, created_at, est_tokens, billed_input_tokens, billed_output_tokens)
+            VALUES ('unassigned-1', 3, '2026-10-23T13:30:00Z', 2000, 8000, 2000)
+            """
+        )
+        # Unassigned step 4: 90 mins ago (outside 60m)
+        conn.execute(
+            """
+            INSERT INTO steps (conversation_id, step_index, created_at, est_tokens, billed_input_tokens, billed_output_tokens)
+            VALUES ('unassigned-1', 4, '2026-10-23T12:30:00Z', 9000, 40000, 5000)
+            """
+        )
+        # Assigned conversation step: 1 min ago (must be excluded from unassigned scope)
+        conn.execute(
+            """
+            INSERT INTO steps (conversation_id, step_index, created_at, est_tokens, billed_input_tokens, billed_output_tokens)
+            VALUES ('assigned-1', 1, '2026-10-23T13:59:00Z', 50000, 100000, 50000)
+            """
+        )
+        conn.commit()
+
+        # Capture the actual rolling 5m/60m SQL executed by query_rolling_velocity
+        traced_queries: list[str] = []
+        conn.set_trace_callback(traced_queries.append)
+        try:
+            _ = query_rolling_velocity(conn, now=now)
+        finally:
+            conn.set_trace_callback(None)
+
+        rolling_queries = [
+            q for q in traced_queries if "COALESCE(SUM(CASE WHEN" in q and "FROM steps" in q
+        ]
+        assert len(rolling_queries) == 1
+
+        plan_rows = conn.execute(f"EXPLAIN QUERY PLAN {rolling_queries[0]}").fetchall()
+        plan_text = " | ".join(str(r[-1]) for r in plan_rows)
+        assert "SEARCH steps USING INDEX idx_steps_created" in plan_text
+        assert "SCAN steps" not in plan_text
+
+        res_paren = query_rolling_velocity(conn, project="(unassigned)", now=now)
+        res_plain = query_rolling_velocity(conn, project="unassigned", now=now)
+
+    # 5m est = 1000 + 500 = 1500 -> 300.0 TPM
+    # 60m billed = (4000+1000) + (2000+500) + (8000+2000) = 17500 -> 17500.0 TPH
+    assert res_paren["rolling_5m_context_tpm"] == 300.0
+    assert res_paren["rolling_60m_billed_tph"] == 17500.0
+    assert res_paren["rolling_5m_context_tpm"] == res_plain["rolling_5m_context_tpm"]
+    assert res_paren["rolling_60m_billed_tph"] == res_plain["rolling_60m_billed_tph"]
+

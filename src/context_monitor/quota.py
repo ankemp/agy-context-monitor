@@ -68,6 +68,7 @@ _LS_CREDS_LOCK = threading.Lock()
 _QUOTA_SYNC_LOCK = threading.Lock()
 _LAST_QUOTA_SYNC_TIMES: dict[str, float] = {}
 LS_CREDS_CACHE_TTL = 60.0
+_LS_NEGATIVE_CACHE_TTL_SECONDS = 30.0
 
 
 class QuotaStateList(list):
@@ -201,13 +202,24 @@ def discover_language_server_credentials(
             port, token, ts = _CACHED_LS_CREDS
             if port is not None and token is not None and (now - ts) < LS_CREDS_CACHE_TTL:
                 return port, token
+            if (
+                ts > 0.0
+                and (port is None or token is None)
+                and (now - ts) < _LS_NEGATIVE_CACHE_TTL_SECONDS
+            ):
+                return port, token
 
     token = _discover_csrf_token()
     port = _discover_http_port(log_path)
 
-    if log_path is None and port is not None and token is not None:
+    if log_path is None:
         with _LS_CREDS_LOCK:
-            _CACHED_LS_CREDS = (port, token, time.monotonic())
+            if port is not None and token is not None:
+                _CACHED_LS_CREDS = (port, token, time.monotonic())
+            elif not token:
+                _CACHED_LS_CREDS = (port, None, time.monotonic())
+            else:
+                _CACHED_LS_CREDS = (None, token, time.monotonic())
 
     return port, token
 
@@ -446,12 +458,13 @@ def calibrate_capacity(
     if reset_dt is None:
         return fallback_val
 
-    if is_5h:
-        start_dt = reset_dt - timedelta(hours=5)
-    else:
-        start_dt = reset_dt - timedelta(days=7)
+    now_utc = datetime.now(timezone.utc)
+    window_delta = timedelta(hours=5) if is_5h else timedelta(days=7)
+    start_dt = max(reset_dt - window_delta, now_utc - window_delta)
+    end_dt = min(reset_dt, now_utc) if reset_dt > start_dt else now_utc
     # Prefix format in UTC matches steps.created_at ISO format
     window_start_prefix = start_dt.strftime("%Y-%m-%dT%H:%M:%S")
+    window_end_prefix = end_dt.strftime("%Y-%m-%dT%H:%M:%S") + "z"
 
     try:
         rem_val = float(remaining_fraction) if remaining_fraction is not None else 1.0
@@ -470,13 +483,13 @@ def calibrate_capacity(
     try:
         try:
             cur = conn.execute(
-                "SELECT model_name, SUM(billed_cost) FROM steps INDEXED BY idx_steps_created_cost WHERE created_at >= ? GROUP BY model_name",
-                (window_start_prefix,),
+                "SELECT model_name, SUM(billed_cost) FROM steps INDEXED BY idx_steps_created_cost WHERE created_at >= ? AND created_at <= ? GROUP BY model_name",
+                (window_start_prefix, window_end_prefix),
             )
         except sqlite3.OperationalError:
             cur = conn.execute(
-                "SELECT model_name, SUM(billed_cost) FROM steps WHERE created_at >= ? GROUP BY model_name",
-                (window_start_prefix,),
+                "SELECT model_name, SUM(billed_cost) FROM steps WHERE created_at >= ? AND created_at <= ? GROUP BY model_name",
+                (window_start_prefix, window_end_prefix),
             )
 
         for r in cur.fetchall():
@@ -543,8 +556,8 @@ def sync_and_get_quota_state(
         if not rows:
             return False
         if ls_fetcher is None:
-            last_sync = _LAST_QUOTA_SYNC_TIMES.get(cache_key, 0.0)
-            if (time.monotonic() - last_sync) < ttl_seconds:
+            last_sync = _LAST_QUOTA_SYNC_TIMES.get(cache_key)
+            if last_sync is not None and (time.monotonic() - last_sync) < ttl_seconds:
                 return True
         now = datetime.now(timezone.utc)
         for r in rows:
@@ -683,6 +696,11 @@ def sync_and_get_quota_state(
                     return QuotaStateList(fresh_rows)
                 else:
                     return QuotaStateList(cached_rows)
+        elif ls_fetcher is None:
+            _LAST_QUOTA_SYNC_TIMES[cache_key] = (
+                time.monotonic()
+                - max(0.0, ttl_seconds - _LS_NEGATIVE_CACHE_TTL_SECONDS)
+            )
 
         if cached_rows:
             return QuotaStateList(cached_rows)
@@ -1047,11 +1065,16 @@ def calculate_quota_pacing(
     elif conn is not None or db_path is not None:
         def _query_tokens(db_conn: sqlite3.Connection) -> tuple[int, int]:
             if reset_dt is not None:
-                start_win = reset_dt - timedelta(hours=eff_window)
+                start_win = max(
+                    reset_dt - timedelta(hours=eff_window),
+                    now_dt - timedelta(hours=eff_window),
+                )
             else:
                 start_win = now_dt - timedelta(hours=elapsed_hours if elapsed_hours > 0 else eff_window)
             start_iso = start_win.strftime("%Y-%m-%dT%H:%M:%S")
             end_iso = now_dt.strftime("%Y-%m-%dT%H:%M:%S")
+            idx_start = start_iso[:10]
+            idx_end = end_iso + "z"
             b_tok = 0
             e_tok = 0
             is_3p_bucket = bucket_id is not None and any(k in bucket_id for k in ("3p", "claude", "gpt"))
@@ -1063,10 +1086,12 @@ def calculate_quota_pacing(
                            COALESCE(billed_input_tokens, 0) + COALESCE(billed_output_tokens, 0)
                     FROM steps
                     WHERE created_at IS NOT NULL AND created_at != ''
+                      AND created_at >= ?
+                      AND created_at <= ?
                       AND substr(replace(created_at, ' ', 'T'), 1, 19) >= ?
                       AND substr(replace(created_at, ' ', 'T'), 1, 19) <= ?
                     """,
-                    (start_iso, end_iso),
+                    (idx_start, idx_end, start_iso, end_iso),
                 )
                 for row in cur.fetchall():
                     m = row[0] or ""

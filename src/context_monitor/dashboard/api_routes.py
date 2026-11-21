@@ -1527,7 +1527,12 @@ def query_activity_matrix(conn, tz=None, project=None):
 
         cached = hour_cache.get(hour_key)
         if cached is None:
-            dt = datetime.fromisoformat(hour_key + ":00:00+00:00").astimezone(target_tz)
+            try:
+                dt = datetime.fromisoformat(hour_key + ":00:00+00:00").astimezone(
+                    target_tz
+                )
+            except (ValueError, TypeError):
+                continue
             cached = (dt.strftime("%Y-%m-%d"), dt.weekday(), dt.hour)
             hour_cache[hour_key] = cached
         d_str, weekday, hour = cached

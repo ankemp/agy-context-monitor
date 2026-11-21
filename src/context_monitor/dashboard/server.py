@@ -47,7 +47,9 @@ def clear_api_cache():
         _LAST_DATA_VERSIONS.clear()
         _ACTIVE_DB = None
     with _INFLIGHT_LOCK:
-        _INFLIGHT_KEYS.clear()
+        for key in list(_INFLIGHT_KEYS):
+            if not _INFLIGHT_KEYS[key].locked():
+                del _INFLIGHT_KEYS[key]
     try:
         from context_monitor.quota import invalidate_activity_profile_cache
 
@@ -331,16 +333,6 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                         "SELECT DISTINCT project FROM conversations WHERE project IS NOT NULL AND project != '' ORDER BY project ASC"
                     ).fetchall()
                     return [r["project"] for r in rows]
-                elif path == "/api/quota":
-                    model_param = qs.get("model", [None])[0]
-                    cost_param = qs.get("cost", qs.get("billed_cost", [0.0]))[0]
-                    try:
-                        cost_val = float(cost_param) if cost_param is not None else 0.0
-                    except (ValueError, TypeError):
-                        cost_val = 0.0
-                    return api_routes.query_quota_data(
-                        conn, model_name=model_param, billed_cost=cost_val
-                    )
                 elif path == "/api/summary":
                     return api_routes.query_summary_data(conn, target_tz, project_param)
                 elif path == "/api/timeline":

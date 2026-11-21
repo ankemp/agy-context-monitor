@@ -3212,7 +3212,9 @@ def test_query_activity_matrix_granular_normalizations_edge_cases(temp_db):
     assert all(isinstance(x, int) for row in matrix_empty["hourly_aggregate_30d"] for x in row)
 
     # 2. Multiple conversations & hours on the same calendar day count as 1 active date
-    now_utc = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+    now_utc = (datetime.now(timezone.utc) - timedelta(days=1)).replace(
+        hour=12, minute=0, second=0, microsecond=0
+    )
     hk1 = now_utc.strftime("%Y-%m-%dT%H")
     hr1 = now_utc.hour
     prev_hour_dt = now_utc - timedelta(hours=2)
@@ -3308,6 +3310,75 @@ def test_query_activity_matrix_granular_normalizations_edge_cases(temp_db):
     assert all(isinstance(x, int) for row in matrix_fallback["hourly_aggregate_30d"] for x in row)
 
     conn.close()
+
+
+def test_clear_api_cache_preserves_inflight_locks():
+    """Verifies clear_api_cache preserves active locked single-flight locks while pruning idle ones."""
+    active_lock = threading.Lock()
+    active_lock.acquire()
+    idle_lock = threading.Lock()
+    with server._INFLIGHT_LOCK:
+        had_summary = "/api/summary" in server._INFLIGHT_KEYS
+        prev_summary = server._INFLIGHT_KEYS.get("/api/summary")
+        had_idle = "/api/idle" in server._INFLIGHT_KEYS
+        prev_idle = server._INFLIGHT_KEYS.get("/api/idle")
+        server._INFLIGHT_KEYS["/api/summary"] = active_lock
+        server._INFLIGHT_KEYS["/api/idle"] = idle_lock
+    with server._API_CACHE_LOCK:
+        prev_cache = dict(server._API_CACHE)
+        server._API_CACHE["/api/summary"] = b'{"cached": true}'
+    try:
+        server.clear_api_cache()
+        with server._INFLIGHT_LOCK:
+            assert "/api/summary" in server._INFLIGHT_KEYS
+            assert server._INFLIGHT_KEYS["/api/summary"] is active_lock
+            assert active_lock.locked()
+            assert "/api/idle" not in server._INFLIGHT_KEYS
+        with server._API_CACHE_LOCK:
+            assert len(server._API_CACHE) == 0
+    finally:
+        if active_lock.locked():
+            active_lock.release()
+        with server._INFLIGHT_LOCK:
+            if had_summary:
+                server._INFLIGHT_KEYS["/api/summary"] = prev_summary
+            else:
+                server._INFLIGHT_KEYS.pop("/api/summary", None)
+            if had_idle:
+                server._INFLIGHT_KEYS["/api/idle"] = prev_idle
+            else:
+                server._INFLIGHT_KEYS.pop("/api/idle", None)
+        with server._API_CACHE_LOCK:
+            server._API_CACHE.clear()
+            server._API_CACHE.update(prev_cache)
+
+
+def test_query_activity_matrix_skips_malformed_hour_key(tmp_path: Path):
+    """Verifies query_activity_matrix skips malformed hour_key rows instead of raising ValueError."""
+    db_file = tmp_path / "test_malformed_hour_key.db"
+    init_db(db_file)
+    conn = get_db_connection(db_file)
+    try:
+        conn.execute("INSERT INTO conversations (id, project) VALUES ('c1', 'proj-a')")
+        conn.execute(
+            """
+            INSERT INTO hourly_step_rollups (hour_key, conversation_id, step_count, est_tokens, billed_tokens, billed_cost)
+            VALUES ('2026-11-20T12', 'c1', 42, 2100, 0, 0.0),
+                   ('not-a-date', 'c1', 99, 9999, 0, 0.0)
+            """
+        )
+        conn.commit()
+
+        matrix = query_activity_matrix(conn, tz="UTC")
+        valid_dt = datetime(2026, 11, 20, 12, 0, tzinfo=timezone.utc)
+        assert "2026-11-20" in matrix["daily"]
+        assert matrix["daily"]["2026-11-20"]["steps"] == 42
+        assert matrix["daily"]["2026-11-20"]["tokens"] == 2100
+        assert matrix["daily"]["2026-11-20"]["sessions"] == 1
+        assert matrix["hourly_aggregate"][valid_dt.weekday()][12] == 42
+        assert sum(d["steps"] for d in matrix["daily"].values()) == 42
+    finally:
+        conn.close()
 
 
 def test_heatmap_quantile_scaling_and_8_level_palette():
@@ -6412,6 +6483,387 @@ def test_conversation_explorer_model_search_filter_and_subagent_tracking():
     data = json.loads(res.stdout.strip().splitlines()[-1])
     assert data["status"] == "ok"
     assert data["checks"] == 7
+
+
+def test_dashboard_frontend_sse_coalescing_and_resilient_fetch():
+    """Verifies SSE coalescing, Promise.allSettled partial rendering, fetchJson ok checks, Chart CDN guard, and DOMContentLoaded SSE sequencing."""
+    dashboard_dir = (
+        Path(__file__).resolve().parent.parent / "src" / "context_monitor" / "dashboard"
+    )
+    js_file = dashboard_dir / "static" / "script.js"
+    js_content = js_file.read_text(encoding="utf-8")
+
+    # Static invariants
+    assert "setInterval" not in js_content, "Zero polling invariant: setInterval must not be used in script.js"
+    assert "function fetchJson(" in js_content, "Expected fetchJson helper in script.js"
+    assert "res.ok === false" in js_content, "Expected explicit res.ok === false guard in fetchJson"
+
+    upsert_body = js_content.split("function upsertChart(existingChart, canvas, config) {")[1].split(
+        "let allHotFiles"
+    )[0]
+    assert "typeof Chart === 'undefined'" in upsert_body, "upsertChart must guard missing Chart global"
+
+    fetch_body = js_content.split("async function fetchDashboardData(")[1].split(
+        "function renderQuotaSection("
+    )[0]
+    assert "Promise.allSettled(" in fetch_body, "fetchDashboardData must use Promise.allSettled"
+    assert "Promise.all(" not in fetch_body, "fetchDashboardData must not use all-or-nothing Promise.all"
+    assert "source === 'sse'" in fetch_body, "fetchDashboardData must distinguish SSE refreshes"
+    assert "isDashboardFetchInFlight" in js_content
+    assert "pendingSseRefresh" in js_content
+
+    sse_body = js_content.split("function initLiveSyncSSE()")[1].split(
+        "document.addEventListener('DOMContentLoaded'"
+    )[0]
+    assert "fetchDashboardData({ source: 'sse' })" in sse_body, (
+        "SSE db_update handler must invoke fetchDashboardData({ source: 'sse' })"
+    )
+
+    dom_body = js_content.split("document.addEventListener('DOMContentLoaded'")[1]
+    assert "fetchDashboardData().finally(" in dom_body, (
+        "DOMContentLoaded must start initLiveSyncSSE() inside fetchDashboardData().finally(...)"
+    )
+
+    # Node simulated-DOM execution test (with Chart === undefined to verify CDN guard)
+    node_script = """
+    const fs = require('fs');
+    const code = fs.readFileSync('src/context_monitor/dashboard/static/script.js', 'utf8');
+
+    function createMockElement() {
+      let _html = '';
+      const classes = new Set();
+      const attrs = {};
+      return {
+        textContent: '',
+        value: '',
+        title: '',
+        style: {},
+        className: '',
+        options: [],
+        children: [],
+        appendChild(child) { this.children.push(child); },
+        querySelector: () => null,
+        querySelectorAll: () => [],
+        getContext: () => ({}),
+        setAttribute(k, v) { attrs[k] = String(v); },
+        getAttribute(k) { return attrs[k]; },
+        addEventListener: () => {},
+        removeEventListener: () => {},
+        get innerHTML() { return _html; },
+        set innerHTML(val) {
+          _html = val;
+          if (val === '') this.children = [];
+        },
+        classList: {
+          add(...c) { c.forEach(x => classes.add(x)); },
+          remove(...c) { c.forEach(x => classes.delete(x)); },
+          contains(c) { return classes.has(c); }
+        }
+      };
+    }
+
+    const mockElements = {
+      tzLabel: createMockElement(),
+      syncText: createMockElement(),
+      liveSyncBadge: createMockElement(),
+      kpiTokens: createMockElement(),
+      kpiChars: createMockElement(),
+      kpiConvs: createMockElement(),
+      kpiDateRange: createMockElement(),
+      kpiSteps: createMockElement(),
+      kpiAvgSteps: createMockElement(),
+      kpiTools: createMockElement(),
+      kpiDuration: createMockElement(),
+      kpiPairingSub: createMockElement(),
+      kpiCost: createMockElement(),
+      kpiBilledTokens: createMockElement(),
+      streakCurrent: createMockElement(),
+      streakLongest: createMockElement(),
+      activeDaysCount: createMockElement(),
+      heatmapOpsCount: createMockElement(),
+      ghGrid: createMockElement(),
+      ghMonthLabels: createMockElement(),
+      convSearch: createMockElement(),
+      convModelFilter: createMockElement(),
+      convFilterCount: createMockElement(),
+      convTableBody: createMockElement(),
+      projectFilter: createMockElement(),
+    };
+    mockElements.syncText.textContent = 'Live Sync: SSE Active';
+
+    let omitSyncText = false;
+    const docListeners = {};
+    const mockDocument = {
+      getElementById: (id) => {
+        if (id === 'syncText' && omitSyncText) return null;
+        return mockElements[id] || createMockElement();
+      },
+      createElement: () => createMockElement(),
+      querySelectorAll: () => [],
+      addEventListener: (evt, cb) => { docListeners[evt] = cb; }
+    };
+
+    const mockWindow = {
+      location: { search: '', href: 'http://localhost:8765/', pathname: '/', hash: '' },
+      addEventListener: () => {},
+      history: { pushState: () => {} }
+    };
+
+    let eventSourceCount = 0;
+    const sseListeners = {};
+    class MockEventSource {
+      constructor(url) {
+        this.url = url;
+        eventSourceCount++;
+      }
+      addEventListener(evt, cb) { sseListeners[evt] = cb; }
+      close() {}
+    }
+    global.EventSource = MockEventSource;
+
+    const capturedErrors = [];
+    const origConsoleError = console.error;
+    console.error = (...args) => {
+      capturedErrors.push(args.map(a => (a && a.message) ? a.message : String(a)).join(' '));
+    };
+
+    let deferNextFetch = false;
+    let pendingResolvers = [];
+    let failTools500 = false;
+    let failSummary500 = false;
+    let streakVal = 2;
+    const fetchUrls = [];
+
+    function makeResponseForUrl(u) {
+      if (u.includes('/api/projects')) {
+        return { json: async () => ['proj-a'] };
+      }
+      if (u.includes('/api/summary')) {
+        if (failSummary500) {
+          return {
+            ok: false,
+            status: 500,
+            json: async () => { throw new Error('Unexpected token < in HTML'); }
+          };
+        }
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({
+            total_tokens: 42000,
+            total_chars: 120000,
+            total_convs: 3,
+            total_steps: 10,
+            avg_steps: 3.3,
+            total_tools: 15,
+            total_billed_cost: 1.25,
+            total_billed_input_tokens: 30000,
+            total_billed_output_tokens: 12000,
+            timezone_label: 'UTC',
+            models: [{ model_name: 'Gemini Pro', tokens: 42000 }],
+            categories: [{ category: 'Execution', tokens: 42000 }],
+            phases: [{ phase: 'execution', tokens: 42000 }]
+          })
+        };
+      }
+      if (u.includes('/api/tools')) {
+        if (failTools500) {
+          return {
+            ok: false,
+            status: 500,
+            json: async () => { throw new Error('Unexpected token < in HTML'); }
+          };
+        }
+        return { json: async () => [{ tool_name: 'read_file', total_calls: 5, is_mcp: false }] };
+      }
+      if (u.includes('/api/activity-matrix')) {
+        return {
+          json: async () => ({
+            daily: { '2026-11-20': { steps: 7, tokens: 500, sessions: 1 } },
+            streak: { current: streakVal, longest: streakVal, total_active_days: 5 },
+            timezone_abbr: 'UTC'
+          })
+        };
+      }
+      if (u.includes('/api/conversations')) {
+        return {
+          json: async () => ([
+            { id: 'c1', title: 'Healthy Conv', total_steps: 5, tokens: 1000, billed_cost: 0.1, subagent_count: 0, subagents: [] }
+          ])
+        };
+      }
+      if (u.includes('/api/cost-by-project')) {
+        return { json: async () => ({ total_cost: 1.25, projects: [] }) };
+      }
+      if (u.includes('/api/timeline') || u.includes('/api/mcp') || u.includes('/api/hot-files')) {
+        return { json: async () => [] };
+      }
+      return { json: async () => ({}) };
+    }
+
+    const mockFetch = (url, opts) => {
+      const u = String(url || '');
+      fetchUrls.push(u);
+      if (deferNextFetch && !u.includes('/api/projects')) {
+        return new Promise((resolve) => {
+          pendingResolvers.push(() => resolve(makeResponseForUrl(u)));
+        });
+      }
+      return Promise.resolve(makeResponseForUrl(u));
+    };
+
+    const fn = new Function('window', 'document', 'Chart', 'lucide', 'fetch', `
+      ${code}
+      return {
+        upsertChart,
+        fetchJson,
+        fetchDashboardData,
+        initLiveSyncSSE,
+        getAbortController: () => dashboardAbortController,
+        getIsInFlight: () => isDashboardFetchInFlight,
+        getPendingSse: () => pendingSseRefresh
+      };
+    `);
+
+    const api = fn(mockWindow, mockDocument, undefined, { createIcons: () => {} }, mockFetch);
+
+    async function flush() {
+      for (let i = 0; i < 6; i++) {
+        await Promise.resolve();
+      }
+      await new Promise(r => setTimeout(r, 15));
+    }
+
+    async function runTests() {
+      // 1. Guarded upsertChart when Chart is undefined
+      const chartRes = api.upsertChart(null, createMockElement(), { type: 'bar', data: { labels: [], datasets: [] } });
+      if (chartRes !== null) {
+        throw new Error(`Expected upsertChart to return null when Chart is undefined, got ${chartRes}`);
+      }
+
+      // 2. SSE coalescing: in-flight fetch is NOT aborted and queues a single follow-up refresh
+      deferNextFetch = true;
+      const pInitial = api.fetchDashboardData();
+      const ctrl1 = api.getAbortController();
+      if (!ctrl1 || ctrl1.signal.aborted) throw new Error('Expected active AbortController for initial fetch');
+      if (!api.getIsInFlight()) throw new Error('Expected isDashboardFetchInFlight === true while pending');
+      if (fetchUrls.length !== 8) throw new Error(`Expected 8 initial fetches, got ${fetchUrls.length}`);
+
+      await api.fetchDashboardData({ source: 'sse' });
+      await api.fetchDashboardData({ source: 'sse' });
+      if (ctrl1.signal.aborted) throw new Error('SSE refresh must NOT abort in-flight fetchDashboardData()');
+      if (fetchUrls.length !== 8) throw new Error(`Coalesced SSE must not start concurrent fetches while in-flight, got ${fetchUrls.length}`);
+      if (!api.getPendingSse()) throw new Error('Expected pendingSseRefresh === true');
+
+      // Resolve initial 8 fetches -> triggers exactly one coalesced follow-up refresh (8 more fetches)
+      deferNextFetch = false;
+      const batch1 = pendingResolvers.splice(0, pendingResolvers.length);
+      batch1.forEach(r => r());
+      await pInitial;
+      await flush();
+
+      if (fetchUrls.length !== 16) {
+        throw new Error(`Expected exactly 16 total fetches after 1 coalesced SSE follow-up, got ${fetchUrls.length}`);
+      }
+      if (api.getIsInFlight() || api.getPendingSse()) {
+        throw new Error('Expected in-flight and pending SSE flags cleared after coalesced follow-up settled');
+      }
+
+      // 3. User-initiated fetch DOES abort prior in-flight controller
+      deferNextFetch = true;
+      const pUser1 = api.fetchDashboardData();
+      const ctrlA = api.getAbortController();
+      const pUser2 = api.fetchDashboardData();
+      const ctrlB = api.getAbortController();
+      if (!ctrlA.signal.aborted) throw new Error('Expected user-initiated fetch to abort prior in-flight controller');
+      if (ctrlB.signal.aborted || ctrlA === ctrlB) throw new Error('Expected new controller to remain active');
+      deferNextFetch = false;
+      pendingResolvers.splice(0, pendingResolvers.length).forEach(r => r());
+      await Promise.all([pUser1, pUser2]);
+      await flush();
+
+      // 4. Non-summary HTTP 500 does not block healthy sections
+      failTools500 = true;
+      capturedErrors.length = 0;
+      await api.fetchDashboardData();
+      failTools500 = false;
+      if (!mockElements.kpiConvs.textContent.includes('3')) {
+        throw new Error(`Expected healthy KPIs rendered despite /api/tools 500, got kpiConvs=${mockElements.kpiConvs.textContent}`);
+      }
+      if (mockElements.streakCurrent.textContent !== '2 days') {
+        throw new Error(`Expected healthy heatmap rendered despite /api/tools 500, got ${mockElements.streakCurrent.textContent}`);
+      }
+      if (mockElements.convTableBody.children.length !== 1) {
+        throw new Error(`Expected healthy conversations rendered despite /api/tools 500, got ${mockElements.convTableBody.children.length}`);
+      }
+      if (!capturedErrors.some(e => e.includes('/api/tools'))) {
+        throw new Error(`Expected console.error for /api/tools 500, got ${JSON.stringify(capturedErrors)}`);
+      }
+
+      // 5. /api/summary HTTP 500 sets subtle #syncText warning while rendering other endpoints, then recovers
+      mockElements.syncText.textContent = 'Live Sync: SSE Active';
+      failSummary500 = true;
+      streakVal = 9;
+      await api.fetchDashboardData();
+      if (mockElements.streakCurrent.textContent !== '9 days') {
+        throw new Error(`Expected heatmap to still update when /api/summary fails, got ${mockElements.streakCurrent.textContent}`);
+      }
+      if (mockElements.syncText.textContent === 'Live Sync: SSE Active' || !mockElements.syncText.textContent) {
+        throw new Error(`Expected subtle #syncText warning on /api/summary failure, got "${mockElements.syncText.textContent}"`);
+      }
+
+      failSummary500 = false;
+      await api.fetchDashboardData();
+      if (mockElements.syncText.textContent !== 'Live Sync: SSE Active') {
+        throw new Error(`Expected #syncText restored to 'Live Sync: SSE Active' on recovery, got "${mockElements.syncText.textContent}"`);
+      }
+
+      // Defensive DOM check when #syncText is omitted
+      omitSyncText = true;
+      failSummary500 = true;
+      await api.fetchDashboardData();
+      failSummary500 = false;
+      await api.fetchDashboardData();
+      omitSyncText = false;
+
+      // 6. DOMContentLoaded starts initLiveSyncSSE() only after fetchDashboardData() settles
+      if (typeof docListeners['DOMContentLoaded'] !== 'function') {
+        throw new Error('Expected DOMContentLoaded listener registered');
+      }
+      eventSourceCount = 0;
+      deferNextFetch = true;
+      const domP = docListeners['DOMContentLoaded']();
+      await flush();
+      if (eventSourceCount !== 0) {
+        throw new Error(`Expected initLiveSyncSSE NOT started before initial fetch settles, got count=${eventSourceCount}`);
+      }
+      deferNextFetch = false;
+      pendingResolvers.splice(0, pendingResolvers.length).forEach(r => r());
+      await domP;
+      await flush();
+      if (eventSourceCount !== 1) {
+        throw new Error(`Expected initLiveSyncSSE started once after initial fetch settles, got count=${eventSourceCount}`);
+      }
+
+      console.error = origConsoleError;
+      console.log(JSON.stringify({ status: 'ok', totalFetches: fetchUrls.length, eventSourceCount }));
+    }
+
+    runTests().catch(err => {
+      console.error = origConsoleError;
+      console.error(err);
+      process.exit(1);
+    });
+    """
+
+    res = subprocess.run(
+        ["node", "-e", node_script], capture_output=True, text=True, cwd=Path.cwd()
+    )
+    assert res.returncode == 0, f"Node script failed: {res.stderr}\nstdout: {res.stdout}"
+    data = json.loads(res.stdout.strip().splitlines()[-1])
+    assert data["status"] == "ok"
+    assert data["eventSourceCount"] == 1
+
 
 
 
