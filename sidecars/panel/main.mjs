@@ -117,7 +117,7 @@ async function startHostRuntime() {
 
   app.page('/', () => readLocal('index.html'));
   app.page('/app.js', () => readLocal('app.js'));
-  app.api('/styles.css', () => new Response(readLocal('styles.css'), { contentType: 'text/css' }), 'GET');
+  app.page('/styles.css', () => new Response(readLocal('styles.css'), { contentType: 'text/css' }));
 
   app.api('/api/session', (data) => getSessionPayload(data?.cid, data?.inspect_cid), 'GET');
   app.api('/api/global', () => getGlobalPayload(), 'GET');

@@ -572,9 +572,11 @@ export function getQuotaSummary(db, modelName = 'Gemini 3.7 Flash', sessionCost 
           const diffSec = Math.max(0, Math.floor((resetDate.getTime() - nowDate.getTime()) / 1000));
           const remainingHours = diffSec / 3600.0;
           const elapsedHours = Math.max(0, Math.min(windowHours, windowHours - remainingHours));
-          const startWin = new Date(resetDate.getTime() - windowHours * 3600 * 1000).toISOString().replace(/\.\d{3}Z$/, 'Z').slice(0, 19);
+          const windowMs = windowHours * 3600 * 1000;
+          const effectiveStartMs = Math.max(resetDate.getTime() - windowMs, nowDate.getTime() - windowMs);
+          const startWin = new Date(effectiveStartMs).toISOString().replace(/\.\d{3}Z$/, 'Z').slice(0, 19);
           const endWin = nowDate.toISOString().replace(/\.\d{3}Z$/, 'Z').slice(0, 19);
-          const idxStart = startWin.slice(0, 10);
+          const idxStart = is5h ? startWin.slice(0, 13) : startWin.slice(0, 10);
           const idxEnd = endWin + 'z';
 
           const filterClause = is3p
@@ -582,21 +584,31 @@ export function getQuotaSummary(db, modelName = 'Gemini 3.7 Flash', sessionCost 
             : `AND (model_name IS NULL OR NOT (LOWER(model_name) LIKE '%claude%' OR LOWER(model_name) LIKE '%sonnet%' OR LOWER(model_name) LIKE '%opus%' OR LOWER(model_name) LIKE '%gpt%' OR LOWER(model_name) LIKE '%o1%' OR LOWER(model_name) LIKE '%o3%'))`;
 
           let tokRow = null;
+          // Fast path: aggregate from hourly_step_rollups (~10k rows) instead of scanning multi-GB steps table.
           try {
-            tokRow = db.prepare(`
-              SELECT COALESCE(SUM(COALESCE(billed_input_tokens, 0) + COALESCE(billed_output_tokens, 0)), 0) as b_tok
-              FROM steps
-              WHERE created_at IS NOT NULL AND created_at != ''
-                AND created_at >= ?
-                AND created_at <= ?
-                AND substr(replace(created_at, ' ', 'T'), 1, 19) >= ?
-                AND substr(replace(created_at, ' ', 'T'), 1, 19) <= ?
-                ${filterClause}
-            `).get(idxStart, idxEnd, startWin, endWin);
+            const startHourKey = startWin.slice(0, 13);
+            const endHourKey = endWin.slice(0, 13);
+            const rollupFilter = is3p
+              ? `AND (c.model_name IS NOT NULL AND (LOWER(c.model_name) LIKE '%claude%' OR LOWER(c.model_name) LIKE '%sonnet%' OR LOWER(c.model_name) LIKE '%opus%' OR LOWER(c.model_name) LIKE '%gpt%' OR LOWER(c.model_name) LIKE '%o1%' OR LOWER(c.model_name) LIKE '%o3%'))`
+              : `AND (c.model_name IS NULL OR NOT (LOWER(c.model_name) LIKE '%claude%' OR LOWER(c.model_name) LIKE '%sonnet%' OR LOWER(c.model_name) LIKE '%opus%' OR LOWER(c.model_name) LIKE '%gpt%' OR LOWER(c.model_name) LIKE '%o1%' OR LOWER(c.model_name) LIKE '%o3%'))`;
+            const rollupRow = db.prepare(`
+              SELECT COALESCE(SUM(r.billed_tokens), 0) AS b_tok, COUNT(*) AS cnt
+              FROM hourly_step_rollups r
+              LEFT JOIN conversations c ON c.id = r.conversation_id
+              WHERE r.hour_key >= ? AND r.hour_key <= ?
+                ${rollupFilter}
+            `).get(startHourKey, endHourKey);
+            if (rollupRow && Number(rollupRow.cnt) > 0) {
+              tokRow = rollupRow;
+            }
           } catch {
+            // hourly_step_rollups table may not exist in older or minimal test schemas
+          }
+
+          if (!tokRow) {
             try {
               tokRow = db.prepare(`
-                SELECT COALESCE(SUM(COALESCE(billed_input_tokens, 0)), 0) as b_tok
+                SELECT COALESCE(SUM(COALESCE(billed_input_tokens, 0) + COALESCE(billed_output_tokens, 0)), 0) as b_tok
                 FROM steps
                 WHERE created_at IS NOT NULL AND created_at != ''
                   AND created_at >= ?
@@ -608,18 +620,19 @@ export function getQuotaSummary(db, modelName = 'Gemini 3.7 Flash', sessionCost 
             } catch {
               try {
                 tokRow = db.prepare(`
-                  SELECT COALESCE(SUM(COALESCE(billed_input_tokens, 0) + COALESCE(billed_output_tokens, 0)), 0) as b_tok
+                  SELECT COALESCE(SUM(COALESCE(billed_input_tokens, 0)), 0) as b_tok
                   FROM steps
                   WHERE created_at IS NOT NULL AND created_at != ''
                     AND created_at >= ?
                     AND created_at <= ?
                     AND substr(replace(created_at, ' ', 'T'), 1, 19) >= ?
                     AND substr(replace(created_at, ' ', 'T'), 1, 19) <= ?
+                    ${filterClause}
                 `).get(idxStart, idxEnd, startWin, endWin);
               } catch {
                 try {
                   tokRow = db.prepare(`
-                    SELECT COALESCE(SUM(COALESCE(billed_input_tokens, 0)), 0) as b_tok
+                    SELECT COALESCE(SUM(COALESCE(billed_input_tokens, 0) + COALESCE(billed_output_tokens, 0)), 0) as b_tok
                     FROM steps
                     WHERE created_at IS NOT NULL AND created_at != ''
                       AND created_at >= ?
@@ -628,7 +641,19 @@ export function getQuotaSummary(db, modelName = 'Gemini 3.7 Flash', sessionCost 
                       AND substr(replace(created_at, ' ', 'T'), 1, 19) <= ?
                   `).get(idxStart, idxEnd, startWin, endWin);
                 } catch {
-                  tokRow = null;
+                  try {
+                    tokRow = db.prepare(`
+                      SELECT COALESCE(SUM(COALESCE(billed_input_tokens, 0)), 0) as b_tok
+                      FROM steps
+                      WHERE created_at IS NOT NULL AND created_at != ''
+                        AND created_at >= ?
+                        AND created_at <= ?
+                        AND substr(replace(created_at, ' ', 'T'), 1, 19) >= ?
+                        AND substr(replace(created_at, ' ', 'T'), 1, 19) <= ?
+                    `).get(idxStart, idxEnd, startWin, endWin);
+                  } catch {
+                    tokRow = null;
+                  }
                 }
               }
             }

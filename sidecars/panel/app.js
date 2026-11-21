@@ -7,6 +7,7 @@ const sidecar = window.sidecar;
 const $ = (id) => document.getElementById(id);
 
 let isInitialized = false;
+let pageLoaded = (typeof document === 'undefined' || document.readyState === 'complete');
 let eventSource = null;
 let streamKey = null;
 let isRefreshing = false;
@@ -606,6 +607,7 @@ function closeEventStream() {
 
 function connectEventStream() {
   if (typeof document !== 'undefined' && document.hidden) return;
+  if (!pageLoaded) return;
 
   const cid = getCurrentConversationId();
   const currentKey = `${cid || ''}::${inspectedCid || ''}`;
@@ -986,8 +988,21 @@ function init() {
     }
   });
 
-  // Initial fetch and SSE event stream subscription
-  connectEventStream();
+  // Initial fetch; defer opening the long-lived SSE stream until window load
+  // so Chromium/Electron iframes finish their load event immediately.
+  if (
+    !pageLoaded &&
+    typeof window !== 'undefined' &&
+    typeof window.addEventListener === 'function'
+  ) {
+    window.addEventListener('load', () => {
+      pageLoaded = true;
+      connectEventStream();
+    }, { once: true });
+  } else {
+    pageLoaded = true;
+    connectEventStream();
+  }
   refreshTelemetry();
 }
 
