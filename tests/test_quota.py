@@ -64,8 +64,18 @@ def test_quota_state_table_and_default_settings(tmp_path: Path):
     assert settings["default_5h_capacity_3p"] == 70.0
 
 
-def test_discover_language_server_credentials_mock(tmp_path: Path):
+def test_discover_language_server_credentials_mock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
     """Verifies discovery of port from log file and CSRF token from ps output."""
+    for env_key in (
+        "AGY_HTTP_PORT",
+        "AGY_CSRF_TOKEN",
+        "ANTIGRAVITY_LS_ADDRESS",
+        "ANTIGRAVITY_CSRF_TOKEN",
+    ):
+        monkeypatch.delenv(env_key, raising=False)
+
     log_file = tmp_path / "language_server.log"
     log_file.write_text(
         "I1012 21:06:08.430961 1 server.go:651] Language server listening on random port at 49152 for HTTP\n"
@@ -98,8 +108,18 @@ def test_discover_language_server_credentials_env_overrides(
     assert token == "env-csrf-token-999"
 
 
-def test_discover_language_server_missing_process_or_log(tmp_path: Path):
+def test_discover_language_server_missing_process_or_log(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
     """Verifies graceful handling when process or log is missing."""
+    for env_key in (
+        "AGY_HTTP_PORT",
+        "AGY_CSRF_TOKEN",
+        "ANTIGRAVITY_LS_ADDRESS",
+        "ANTIGRAVITY_CSRF_TOKEN",
+    ):
+        monkeypatch.delenv(env_key, raising=False)
+
     with patch("subprocess.run") as mock_run:
         mock_run.return_value = MagicMock(
             returncode=0, stdout="  PID COMMAND\n123 /bin/other\n"
@@ -111,8 +131,18 @@ def test_discover_language_server_missing_process_or_log(tmp_path: Path):
     assert token is None
 
 
-def test_discover_language_server_large_log_reads_backward(tmp_path: Path):
+def test_discover_language_server_large_log_reads_backward(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
     """Verifies that large logs are scanned backwards and find the latest HTTP port."""
+    for env_key in (
+        "AGY_HTTP_PORT",
+        "AGY_CSRF_TOKEN",
+        "ANTIGRAVITY_LS_ADDRESS",
+        "ANTIGRAVITY_CSRF_TOKEN",
+    ):
+        monkeypatch.delenv(env_key, raising=False)
+
     log_file = tmp_path / "large_language_server.log"
     with open(log_file, "wb") as f:
         # Older startup port
@@ -2661,4 +2691,116 @@ def test_calculate_quota_pacing_query_tokens_sargable_and_clamped(tmp_path: Path
     # Only the recent step (168,000 billed / 168h = 1,000 tph; 8,400 est / 168h = 50 tph) counts
     assert res["billed_tph"] == 1_000.0
     assert res["est_tph"] == 50.0
+    conn.close()
+
+
+def test_discover_language_server_antigravity_env_vars(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Verifies ANTIGRAVITY_LS_ADDRESS and ANTIGRAVITY_CSRF_TOKEN discovery and AGY_* precedence."""
+    import context_monitor.quota as quota_mod
+
+    monkeypatch.setattr(quota_mod, "_CACHED_LS_CREDS", (None, None, 0.0))
+    monkeypatch.delenv("AGY_HTTP_PORT", raising=False)
+    monkeypatch.delenv("AGY_CSRF_TOKEN", raising=False)
+    monkeypatch.setenv("ANTIGRAVITY_LS_ADDRESS", "localhost:60090")
+    monkeypatch.setenv("ANTIGRAVITY_CSRF_TOKEN", "agy-runtime-token-123456")
+
+    port, token = discover_language_server_credentials(force_refresh=True)
+    assert port == 60090
+    assert token == "agy-runtime-token-123456"
+
+    # Full URL form also supported
+    monkeypatch.setenv("ANTIGRAVITY_LS_ADDRESS", "http://127.0.0.1:60091")
+    port2, token2 = discover_language_server_credentials(force_refresh=True)
+    assert port2 == 60091
+    assert token2 == "agy-runtime-token-123456"
+
+    # AGY_* overrides ANTIGRAVITY_*
+    monkeypatch.setenv("AGY_HTTP_PORT", "54321")
+    monkeypatch.setenv("AGY_CSRF_TOKEN", "explicit-override-token")
+    port3, token3 = discover_language_server_credentials(force_refresh=True)
+    assert port3 == 54321
+    assert token3 == "explicit-override-token"
+
+
+def test_sync_refreshes_expired_reset_time_within_ttl_and_metrics_estimate(
+    tmp_path: Path,
+):
+    """Verifies expired reset_time forces LS refresh within TTL and marks expired metrics with local estimate."""
+    db_file = tmp_path / "test_expired_refresh.db"
+    init_db(db_file)
+    conn = get_db_connection(db_file)
+
+    now = datetime.now(timezone.utc)
+    past_reset = (now - timedelta(seconds=10)).isoformat()
+    recent_fetch = (now - timedelta(seconds=20)).isoformat()
+
+    upsert_quota_state(
+        conn,
+        [
+            {
+                "bucket_id": "gemini-weekly",
+                "group_name": "Gemini Models",
+                "window": "weekly",
+                "remaining_fraction": 0.50,
+                "reset_time": past_reset,
+                "calibrated_capacity": 500.0,
+                "fetched_at": recent_fetch,
+            }
+        ],
+    )
+
+    conn.execute("INSERT INTO conversations (id, title) VALUES ('c1', 'Conv')")
+    conn.execute(
+        """
+        INSERT INTO steps (conversation_id, step_index, created_at, billed_cost, model_name)
+        VALUES ('c1', 1, ?, 25.0, 'Gemini 4 Neon')
+        """,
+        ((now - timedelta(minutes=30)).strftime("%Y-%m-%dT%H:%M:%SZ"),),
+    )
+    conn.commit()
+
+    # Even within ttl_seconds=300, expired reset_time triggers ls_fetcher
+    future_reset = (now + timedelta(days=7)).isoformat()
+    refreshed = sync_and_get_quota_state(
+        conn,
+        ttl_seconds=300,
+        ls_fetcher=lambda: {
+            "groups": [
+                {
+                    "displayName": "Gemini Models",
+                    "buckets": [
+                        {
+                            "bucketId": "gemini-weekly",
+                            "window": "weekly",
+                            "remainingFraction": 0.99,
+                            "resetTime": future_reset,
+                        }
+                    ],
+                }
+            ]
+        },
+    )
+    assert refreshed["gemini-weekly"]["remaining_fraction"] == 0.99
+
+    # When offline with expired row, calculate_quota_metrics marks is_expired and estimates rolling usage
+    expired_metrics = calculate_quota_metrics(
+        billed_cost=0.0,
+        model_name="Gemini 4 Neon",
+        quota_state=[
+            {
+                "bucket_id": "gemini-weekly",
+                "remaining_fraction": 0.50,
+                "reset_time": past_reset,
+                "calibrated_capacity": 500.0,
+            }
+        ],
+        now=now,
+        conn=conn,
+    )
+    assert expired_metrics["weekly_is_expired"] is True
+    assert expired_metrics["gemini-weekly"]["is_expired"] is True
+    # $25 / $500 = 5% used -> 95.0% estimated remaining
+    assert expired_metrics["weekly_estimated_remaining_pct"] == 95.0
     conn.close()

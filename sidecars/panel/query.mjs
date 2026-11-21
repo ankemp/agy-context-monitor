@@ -554,7 +554,9 @@ export function getQuotaSummary(db, modelName = 'Gemini 3.7 Flash', sessionCost 
     const sessionImpactPct = cap > 0 ? Number(((applicableCost / cap) * 100).toFixed(4)) : 0;
 
     let bucketTph = 0;
-    if (db && resetTime) {
+    let isExpired = false;
+    let estimatedRemainingPct = null;
+    if (resetTime) {
       try {
         const is3p = def.bucket_id.startsWith('3p');
         const is5h = def.bucket_id.includes('5h');
@@ -569,6 +571,7 @@ export function getQuotaSummary(db, modelName = 'Gemini 3.7 Flash', sessionCost 
           nowDate = new Date();
         }
         if (!isNaN(resetDate.getTime())) {
+          isExpired = resetDate.getTime() <= nowDate.getTime();
           const diffSec = Math.max(0, Math.floor((resetDate.getTime() - nowDate.getTime()) / 1000));
           const remainingHours = diffSec / 3600.0;
           const elapsedHours = Math.max(0, Math.min(windowHours, windowHours - remainingHours));
@@ -584,43 +587,32 @@ export function getQuotaSummary(db, modelName = 'Gemini 3.7 Flash', sessionCost 
             : `AND (model_name IS NULL OR NOT (LOWER(model_name) LIKE '%claude%' OR LOWER(model_name) LIKE '%sonnet%' OR LOWER(model_name) LIKE '%opus%' OR LOWER(model_name) LIKE '%gpt%' OR LOWER(model_name) LIKE '%o1%' OR LOWER(model_name) LIKE '%o3%'))`;
 
           let tokRow = null;
-          // Fast path: aggregate from hourly_step_rollups (~10k rows) instead of scanning multi-GB steps table.
-          try {
-            const startHourKey = startWin.slice(0, 13);
-            const endHourKey = endWin.slice(0, 13);
-            const rollupFilter = is3p
-              ? `AND (c.model_name IS NOT NULL AND (LOWER(c.model_name) LIKE '%claude%' OR LOWER(c.model_name) LIKE '%sonnet%' OR LOWER(c.model_name) LIKE '%opus%' OR LOWER(c.model_name) LIKE '%gpt%' OR LOWER(c.model_name) LIKE '%o1%' OR LOWER(c.model_name) LIKE '%o3%'))`
-              : `AND (c.model_name IS NULL OR NOT (LOWER(c.model_name) LIKE '%claude%' OR LOWER(c.model_name) LIKE '%sonnet%' OR LOWER(c.model_name) LIKE '%opus%' OR LOWER(c.model_name) LIKE '%gpt%' OR LOWER(c.model_name) LIKE '%o1%' OR LOWER(c.model_name) LIKE '%o3%'))`;
-            const rollupRow = db.prepare(`
-              SELECT COALESCE(SUM(r.billed_tokens), 0) AS b_tok, COUNT(*) AS cnt
-              FROM hourly_step_rollups r
-              LEFT JOIN conversations c ON c.id = r.conversation_id
-              WHERE r.hour_key >= ? AND r.hour_key <= ?
-                ${rollupFilter}
-            `).get(startHourKey, endHourKey);
-            if (rollupRow && Number(rollupRow.cnt) > 0) {
-              tokRow = rollupRow;
-            }
-          } catch {
-            // hourly_step_rollups table may not exist in older or minimal test schemas
-          }
-
-          if (!tokRow) {
+          if (db) {
+            // Fast path: aggregate from hourly_step_rollups (~10k rows) instead of scanning multi-GB steps table.
             try {
-              tokRow = db.prepare(`
-                SELECT COALESCE(SUM(COALESCE(billed_input_tokens, 0) + COALESCE(billed_output_tokens, 0)), 0) as b_tok
-                FROM steps
-                WHERE created_at IS NOT NULL AND created_at != ''
-                  AND created_at >= ?
-                  AND created_at <= ?
-                  AND substr(replace(created_at, ' ', 'T'), 1, 19) >= ?
-                  AND substr(replace(created_at, ' ', 'T'), 1, 19) <= ?
-                  ${filterClause}
-              `).get(idxStart, idxEnd, startWin, endWin);
+              const startHourKey = startWin.slice(0, 13);
+              const endHourKey = endWin.slice(0, 13);
+              const rollupFilter = is3p
+                ? `AND (c.model_name IS NOT NULL AND (LOWER(c.model_name) LIKE '%claude%' OR LOWER(c.model_name) LIKE '%sonnet%' OR LOWER(c.model_name) LIKE '%opus%' OR LOWER(c.model_name) LIKE '%gpt%' OR LOWER(c.model_name) LIKE '%o1%' OR LOWER(c.model_name) LIKE '%o3%'))`
+                : `AND (c.model_name IS NULL OR NOT (LOWER(c.model_name) LIKE '%claude%' OR LOWER(c.model_name) LIKE '%sonnet%' OR LOWER(c.model_name) LIKE '%opus%' OR LOWER(c.model_name) LIKE '%gpt%' OR LOWER(c.model_name) LIKE '%o1%' OR LOWER(c.model_name) LIKE '%o3%'))`;
+              const rollupRow = db.prepare(`
+                SELECT COALESCE(SUM(r.billed_tokens), 0) AS b_tok, COUNT(*) AS cnt
+                FROM hourly_step_rollups r
+                LEFT JOIN conversations c ON c.id = r.conversation_id
+                WHERE r.hour_key >= ? AND r.hour_key <= ?
+                  ${rollupFilter}
+              `).get(startHourKey, endHourKey);
+              if (rollupRow && Number(rollupRow.cnt) > 0) {
+                tokRow = rollupRow;
+              }
             } catch {
+              // hourly_step_rollups table may not exist in older or minimal test schemas
+            }
+
+            if (!tokRow) {
               try {
                 tokRow = db.prepare(`
-                  SELECT COALESCE(SUM(COALESCE(billed_input_tokens, 0)), 0) as b_tok
+                  SELECT COALESCE(SUM(COALESCE(billed_input_tokens, 0) + COALESCE(billed_output_tokens, 0)), 0) as b_tok
                   FROM steps
                   WHERE created_at IS NOT NULL AND created_at != ''
                     AND created_at >= ?
@@ -632,18 +624,19 @@ export function getQuotaSummary(db, modelName = 'Gemini 3.7 Flash', sessionCost 
               } catch {
                 try {
                   tokRow = db.prepare(`
-                    SELECT COALESCE(SUM(COALESCE(billed_input_tokens, 0) + COALESCE(billed_output_tokens, 0)), 0) as b_tok
+                    SELECT COALESCE(SUM(COALESCE(billed_input_tokens, 0)), 0) as b_tok
                     FROM steps
                     WHERE created_at IS NOT NULL AND created_at != ''
                       AND created_at >= ?
                       AND created_at <= ?
                       AND substr(replace(created_at, ' ', 'T'), 1, 19) >= ?
                       AND substr(replace(created_at, ' ', 'T'), 1, 19) <= ?
+                      ${filterClause}
                   `).get(idxStart, idxEnd, startWin, endWin);
                 } catch {
                   try {
                     tokRow = db.prepare(`
-                      SELECT COALESCE(SUM(COALESCE(billed_input_tokens, 0)), 0) as b_tok
+                      SELECT COALESCE(SUM(COALESCE(billed_input_tokens, 0) + COALESCE(billed_output_tokens, 0)), 0) as b_tok
                       FROM steps
                       WHERE created_at IS NOT NULL AND created_at != ''
                         AND created_at >= ?
@@ -652,9 +645,64 @@ export function getQuotaSummary(db, modelName = 'Gemini 3.7 Flash', sessionCost 
                         AND substr(replace(created_at, ' ', 'T'), 1, 19) <= ?
                     `).get(idxStart, idxEnd, startWin, endWin);
                   } catch {
-                    tokRow = null;
+                    try {
+                      tokRow = db.prepare(`
+                        SELECT COALESCE(SUM(COALESCE(billed_input_tokens, 0)), 0) as b_tok
+                        FROM steps
+                        WHERE created_at IS NOT NULL AND created_at != ''
+                          AND created_at >= ?
+                          AND created_at <= ?
+                          AND substr(replace(created_at, ' ', 'T'), 1, 19) >= ?
+                          AND substr(replace(created_at, ' ', 'T'), 1, 19) <= ?
+                      `).get(idxStart, idxEnd, startWin, endWin);
+                    } catch {
+                      tokRow = null;
+                    }
                   }
                 }
+              }
+            }
+
+            if (isExpired && cap > 0) {
+              let costRow = null;
+              try {
+                const startHourKey = startWin.slice(0, 13);
+                const endHourKey = endWin.slice(0, 13);
+                const rollupFilter = is3p
+                  ? `AND (c.model_name IS NOT NULL AND (LOWER(c.model_name) LIKE '%claude%' OR LOWER(c.model_name) LIKE '%sonnet%' OR LOWER(c.model_name) LIKE '%opus%' OR LOWER(c.model_name) LIKE '%gpt%' OR LOWER(c.model_name) LIKE '%o1%' OR LOWER(c.model_name) LIKE '%o3%'))`
+                  : `AND (c.model_name IS NULL OR NOT (LOWER(c.model_name) LIKE '%claude%' OR LOWER(c.model_name) LIKE '%sonnet%' OR LOWER(c.model_name) LIKE '%opus%' OR LOWER(c.model_name) LIKE '%gpt%' OR LOWER(c.model_name) LIKE '%o1%' OR LOWER(c.model_name) LIKE '%o3%'))`;
+                const rCost = db.prepare(`
+                  SELECT COALESCE(SUM(r.billed_cost), 0) AS b_cost, COUNT(*) AS cnt
+                  FROM hourly_step_rollups r
+                  LEFT JOIN conversations c ON c.id = r.conversation_id
+                  WHERE r.hour_key >= ? AND r.hour_key <= ?
+                    ${rollupFilter}
+                `).get(startHourKey, endHourKey);
+                if (rCost && Number(rCost.cnt) > 0) {
+                  costRow = rCost;
+                }
+              } catch {
+                // optional table
+              }
+              if (!costRow) {
+                try {
+                  costRow = db.prepare(`
+                    SELECT COALESCE(SUM(COALESCE(billed_cost, 0)), 0) AS b_cost
+                    FROM steps
+                    WHERE created_at IS NOT NULL AND created_at != ''
+                      AND created_at >= ?
+                      AND created_at <= ?
+                      AND substr(replace(created_at, ' ', 'T'), 1, 19) >= ?
+                      AND substr(replace(created_at, ' ', 'T'), 1, 19) <= ?
+                      ${filterClause}
+                  `).get(idxStart, idxEnd, startWin, endWin);
+                } catch {
+                  costRow = null;
+                }
+              }
+              if (costRow) {
+                const bCost = Number(costRow.b_cost) || 0;
+                estimatedRemainingPct = Math.round(Math.max(0, 100 - (bCost / cap) * 100) * 10) / 10;
               }
             }
           }
@@ -679,6 +727,8 @@ export function getQuotaSummary(db, modelName = 'Gemini 3.7 Flash', sessionCost 
       used_pct: Math.max(0, usedPct),
       reset_time: resetTime,
       reset_countdown: resetCountdown,
+      is_expired: isExpired,
+      estimated_remaining_pct: estimatedRemainingPct,
       calibrated_capacity: cap,
       session_impact_pct: sessionImpactPct,
       billed_tph: bucketTph,
@@ -750,6 +800,10 @@ export function getQuotaSummary(db, modelName = 'Gemini 3.7 Flash', sessionCost 
     five_hour_reset_time: active5h.reset_time,
     weekly_reset_countdown: activeWeekly.reset_countdown,
     five_hour_reset_countdown: active5h.reset_countdown,
+    weekly_is_expired: Boolean(activeWeekly.is_expired),
+    five_hour_is_expired: Boolean(active5h.is_expired),
+    weekly_estimated_remaining_pct: activeWeekly.estimated_remaining_pct ?? null,
+    five_hour_estimated_remaining_pct: active5h.estimated_remaining_pct ?? null,
     calibrated_weekly_capacity: activeWeekly.calibrated_capacity,
     calibrated_5h_capacity: active5h.calibrated_capacity,
     session_weekly_pct: activeWeekly.session_impact_pct,

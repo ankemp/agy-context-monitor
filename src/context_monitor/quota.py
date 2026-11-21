@@ -22,6 +22,7 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from context_monitor.db import get_db_connection, get_quota_state, upsert_quota_state
 from context_monitor.pricing import get_pricing_key
@@ -45,6 +46,7 @@ __all__ = [
     "calculate_quota_pacing",
     "format_reset_countdown",
     "format_quota_pct",
+    "is_reset_expired",
     "QuotaStateList",
     "CAPACITY_BOUNDS",
     "get_capacity_bounds",
@@ -227,11 +229,27 @@ def discover_language_server_credentials(
 discover_language_server = discover_language_server_credentials
 
 
+def _parse_ls_address_port(raw_addr: str) -> int | None:
+    """Extracts a valid TCP port from ANTIGRAVITY_LS_ADDRESS (e.g. 'localhost:60090')."""
+    addr = (raw_addr or "").strip()
+    if not addr:
+        return None
+    try:
+        parsed = urlparse(addr if "://" in addr else f"http://{addr}")
+        port = parsed.port
+        if port is not None and 1 <= port <= 65535:
+            return int(port)
+    except Exception:
+        return None
+    return None
+
+
 def _discover_csrf_token() -> str | None:
-    """Discovers CSRF token from running language_server process args."""
-    env_token = os.environ.get("AGY_CSRF_TOKEN")
-    if env_token:
-        return env_token.strip()
+    """Discovers CSRF token from AGY/Antigravity env vars or running language_server args."""
+    for env_key in ("AGY_CSRF_TOKEN", "ANTIGRAVITY_CSRF_TOKEN"):
+        env_token = os.environ.get(env_key)
+        if env_token and env_token.strip():
+            return env_token.strip()
 
     ps_commands = [
         ["ps", "-ww", "-eo", "pid,command"],
@@ -263,8 +281,8 @@ def _discover_csrf_token() -> str | None:
 
 def _discover_http_port(log_file: Path | str | None = None) -> int | None:
     r"""
-    Discovers HTTP port from language_server.log matching
-    'listening on random port at (\d+) for HTTP\b'.
+    Discovers HTTP port from AGY_HTTP_PORT, ANTIGRAVITY_LS_ADDRESS, or
+    language_server.log matching 'listening on random port at (\d+) for HTTP\b'.
     Searches backward from the end of the file to handle large logs efficiently.
     """
     env_port = os.environ.get("AGY_HTTP_PORT")
@@ -273,6 +291,13 @@ def _discover_http_port(log_file: Path | str | None = None) -> int | None:
             return int(env_port)
         except ValueError:
             pass
+
+    if log_file is None:
+        ls_addr = os.environ.get("ANTIGRAVITY_LS_ADDRESS")
+        if ls_addr:
+            addr_port = _parse_ls_address_port(ls_addr)
+            if addr_port is not None:
+                return addr_port
 
     if log_file is not None:
         path = Path(log_file)
@@ -396,6 +421,57 @@ def get_capacity_bounds(bucket_id: str) -> tuple[float, float]:
     return (100.0, 400.0) if is_5h else (350.0, 1000.0)
 
 
+def _sum_window_billed_cost(
+    conn: sqlite3.Connection,
+    start_dt: datetime,
+    end_dt: datetime,
+    is_3p: bool,
+) -> float | None:
+    """Sums steps.billed_cost in [start_dt, end_dt] filtered to 3P or Gemini models."""
+    window_start_prefix = start_dt.strftime("%Y-%m-%dT%H:%M:%S")
+    window_end_prefix = end_dt.strftime("%Y-%m-%dT%H:%M:%S") + "z"
+    total_billed_cost = 0.0
+    try:
+        try:
+            cur = conn.execute(
+                "SELECT model_name, SUM(billed_cost) FROM steps INDEXED BY idx_steps_created_cost WHERE created_at >= ? AND created_at <= ? GROUP BY model_name",
+                (window_start_prefix, window_end_prefix),
+            )
+        except sqlite3.OperationalError:
+            cur = conn.execute(
+                "SELECT model_name, SUM(billed_cost) FROM steps WHERE created_at >= ? AND created_at <= ? GROUP BY model_name",
+                (window_start_prefix, window_end_prefix),
+            )
+
+        for r in cur.fetchall():
+            m_name = r[0] or ""
+            cost = float(r[1] or 0.0)
+            pkey = get_pricing_key(m_name)
+            if is_3p and pkey in ("claude", "gpt"):
+                total_billed_cost += cost
+            elif not is_3p and pkey not in ("claude", "gpt"):
+                total_billed_cost += cost
+        return total_billed_cost
+    except Exception:
+        return None
+
+
+def is_reset_expired(
+    reset_time_iso: str | datetime | None,
+    now: datetime | str | None = None,
+) -> bool:
+    """Returns True if reset_time_iso is a valid timestamp at or before now."""
+    if not reset_time_iso:
+        return False
+    reset_dt = _to_utc_datetime(reset_time_iso)
+    if reset_dt is None:
+        return False
+    now_dt = _to_utc_datetime(now, default_now=True)
+    if now_dt is None:
+        now_dt = datetime.now(timezone.utc)
+    return reset_dt <= now_dt
+
+
 def calibrate_capacity(
     conn: sqlite3.Connection,
     bucket_id: str,
@@ -462,9 +538,6 @@ def calibrate_capacity(
     window_delta = timedelta(hours=5) if is_5h else timedelta(days=7)
     start_dt = max(reset_dt - window_delta, now_utc - window_delta)
     end_dt = min(reset_dt, now_utc) if reset_dt > start_dt else now_utc
-    # Prefix format in UTC matches steps.created_at ISO format
-    window_start_prefix = start_dt.strftime("%Y-%m-%dT%H:%M:%S")
-    window_end_prefix = end_dt.strftime("%Y-%m-%dT%H:%M:%S") + "z"
 
     try:
         rem_val = float(remaining_fraction) if remaining_fraction is not None else 1.0
@@ -478,32 +551,8 @@ def calibrate_capacity(
         return fallback_val
 
     is_3p = "3p" in bid or "claude" in bid or "gpt" in bid
-    total_billed_cost = 0.0
-
-    try:
-        try:
-            cur = conn.execute(
-                "SELECT model_name, SUM(billed_cost) FROM steps INDEXED BY idx_steps_created_cost WHERE created_at >= ? AND created_at <= ? GROUP BY model_name",
-                (window_start_prefix, window_end_prefix),
-            )
-        except sqlite3.OperationalError:
-            cur = conn.execute(
-                "SELECT model_name, SUM(billed_cost) FROM steps WHERE created_at >= ? AND created_at <= ? GROUP BY model_name",
-                (window_start_prefix, window_end_prefix),
-            )
-
-        for r in cur.fetchall():
-            m_name = r[0] or ""
-            cost = float(r[1] or 0.0)
-            pkey = get_pricing_key(m_name)
-            if is_3p and pkey in ("claude", "gpt"):
-                total_billed_cost += cost
-            elif not is_3p and pkey not in ("claude", "gpt"):
-                total_billed_cost += cost
-    except Exception:
-        return fallback_val
-
-    if total_billed_cost < 0.50:
+    total_billed_cost = _sum_window_billed_cost(conn, start_dt, end_dt, is_3p)
+    if total_billed_cost is None or total_billed_cost < 0.50:
         return fallback_val
 
     raw_calibrated = total_billed_cost / used_fraction
@@ -567,6 +616,11 @@ def sync_and_get_quota_state(
             fetched_dt = _to_utc_datetime(fetched_at_str)
             if fetched_dt is None or (now - fetched_dt).total_seconds() > ttl_seconds:
                 return False
+            reset_str = r.get("reset_time") or r.get("resetTime")
+            if reset_str:
+                reset_dt = _to_utc_datetime(reset_str)
+                if reset_dt is not None and reset_dt <= now and fetched_dt < reset_dt:
+                    return False
         return True
 
     if not force_refresh and _check_freshness(cached_rows):
@@ -1280,6 +1334,20 @@ def calculate_quota_metrics(
 
         is_5h = "5h" in bid
         w_hours = 5.0 if is_5h else 168.0
+        is_expired = is_reset_expired(r_time, now=eff_now)
+        est_rem_pct: float | None = None
+        if is_expired and kwargs.get("conn") is not None and cap > 0:
+            eff_now_dt = _to_utc_datetime(eff_now, default_now=True) or datetime.now(
+                timezone.utc
+            )
+            est_cost = _sum_window_billed_cost(
+                kwargs["conn"],
+                eff_now_dt - timedelta(hours=w_hours),
+                eff_now_dt,
+                is_3p=("3p" in bid),
+            )
+            if est_cost is not None:
+                est_rem_pct = round(max(0.0, 100.0 - (est_cost / cap) * 100.0), 1)
         pacing = calculate_quota_pacing(
             remaining_fraction=rem_frac,
             reset_time_iso=r_time,
@@ -1301,6 +1369,8 @@ def calculate_quota_metrics(
             "reset_time": r_time,
             "calibrated_capacity": cap,
             "reset_countdown": format_reset_countdown(r_time, now=eff_now),
+            "is_expired": is_expired,
+            "estimated_remaining_pct": est_rem_pct,
             "pacing": pacing,
             "billed_tph": pacing.get("billed_tph", 0.0),
             "est_tph": pacing.get("est_tph", 0.0),
@@ -1343,6 +1413,10 @@ def calculate_quota_metrics(
         "five_hour_reset_time": five_h_m["reset_time"],
         "weekly_reset_countdown": weekly_m["reset_countdown"],
         "five_hour_reset_countdown": five_h_m["reset_countdown"],
+        "weekly_is_expired": weekly_m["is_expired"],
+        "five_hour_is_expired": five_h_m["is_expired"],
+        "weekly_estimated_remaining_pct": weekly_m["estimated_remaining_pct"],
+        "five_hour_estimated_remaining_pct": five_h_m["estimated_remaining_pct"],
         "calibrated_weekly_capacity": weekly_m["calibrated_capacity"],
         "calibrated_5h_capacity": five_h_m["calibrated_capacity"],
         # Pacing and projection metrics

@@ -494,5 +494,19 @@ def test_checkpoint_wal_if_needed_edge_cases():
     assert not checkpoint_wal_if_needed(conn, max_wal_bytes=1)
 
 
+def test_db_default_path_resolved_at_call_time(tmp_path, monkeypatch):
+    """Monkeypatching context_monitor.db.DEFAULT_DB_PATH redirects init_db() and get_db_connection()."""
+    test_db = tmp_path / "monkeypatched.db"
+    monkeypatch.setattr("context_monitor.db.DEFAULT_DB_PATH", test_db)
+
+    init_db()
+    assert test_db.exists()
+
+    with get_db_connection() as conn:
+        db_file = conn.execute("PRAGMA database_list;").fetchone()[2]
+    assert db_file == str(test_db)
+    conn.close()
+
+
 
 

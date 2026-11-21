@@ -1809,6 +1809,129 @@ def test_sidecar_sse_filtered_by_conversation(tmp_path):
     assert data["isWatcherRunning"] is False, "Watcher must stop running when all clients disconnect"
 
 
+def test_sidecar_ls_quota_sync_and_expired_fallback(tmp_path):
+    """Tests sidecars/panel/ls_quota.mjs credential resolution, sync, and getQuotaSummary expired fallback."""
+    db_path = tmp_path / "test_sidecar_ls_quota.db"
+    conn = sqlite3.connect(db_path)
+    conn.executescript("""
+        CREATE TABLE quota_state (
+            bucket_id TEXT PRIMARY KEY,
+            group_name TEXT NOT NULL,
+            window TEXT NOT NULL,
+            remaining_fraction REAL NOT NULL,
+            reset_time TEXT NOT NULL,
+            calibrated_capacity REAL NOT NULL,
+            fetched_at TEXT NOT NULL
+        );
+        CREATE TABLE hourly_step_rollups (
+            hour_key TEXT NOT NULL,
+            conversation_id TEXT NOT NULL,
+            step_count INTEGER DEFAULT 0,
+            est_tokens INTEGER DEFAULT 0,
+            billed_tokens INTEGER DEFAULT 0,
+            billed_cost REAL DEFAULT 0.0,
+            PRIMARY KEY (hour_key, conversation_id)
+        );
+        CREATE TABLE conversations (
+            id TEXT PRIMARY KEY,
+            model_name TEXT
+        );
+        INSERT INTO conversations (id, model_name) VALUES ('c1', 'Gemini 4 Neon');
+        INSERT INTO quota_state VALUES
+            ('gemini-weekly', 'Gemini Models', 'weekly', 0.88, '2026-10-21T00:00:00Z', 500.0, '2026-10-20T00:00:00Z');
+    """)
+    now_hour = "2026-11-21T15"
+    conn.execute(
+        "INSERT INTO hourly_step_rollups VALUES (?, 'c1', 5, 10000, 50000, 25.0)",
+        (now_hour,),
+    )
+    conn.commit()
+    conn.close()
+
+    node_code = f"""
+    import {{ openDatabase, getQuotaSummary }} from './sidecars/panel/query.mjs';
+    import {{ resolveLsCredentials, needsQuotaSync, createLsQuotaSyncer }} from './sidecars/panel/ls_quota.mjs';
+
+    const db = openDatabase('{db_path.as_posix()}');
+    const expiredSummary = getQuotaSummary(db, 'Gemini 4 Neon', 0, null, new Date('2026-11-21T16:00:00Z'));
+    db.close();
+
+    const creds = resolveLsCredentials({{
+      ANTIGRAVITY_LS_ADDRESS: 'localhost:60090',
+      ANTIGRAVITY_CSRF_TOKEN: 'sidecar-token-123'
+    }});
+
+    let fetchCount = 0;
+    const syncer = createLsQuotaSyncer({{
+      dbPath: '{db_path.as_posix()}',
+      env: {{
+        ANTIGRAVITY_LS_ADDRESS: 'localhost:60090',
+        ANTIGRAVITY_CSRF_TOKEN: 'sidecar-token-123'
+      }},
+      fetchImpl: async () => {{
+        fetchCount += 1;
+        return {{
+          ok: true,
+          json: async () => ({{
+            response: {{
+              groups: [{{
+                displayName: 'Gemini Models',
+                buckets: [{{
+                  bucketId: 'gemini-weekly',
+                  window: 'weekly',
+                  remainingFraction: 0.985,
+                  resetTime: '2026-11-28T16:00:00Z'
+                }}]
+              }}]
+            }}
+          }})
+        }};
+      }}
+    }});
+
+    const wroteFirst = await syncer.syncIfNeeded();
+    const wroteSecond = await syncer.syncIfNeeded();
+
+    const dbAfter = openDatabase('{db_path.as_posix()}');
+    const freshSummary = getQuotaSummary(dbAfter, 'Gemini 4 Neon', 0, null, new Date('2026-11-21T16:00:00Z'));
+    dbAfter.close();
+
+    console.log(JSON.stringify({{
+      expiredSummary,
+      creds,
+      fetchCount,
+      wroteFirst,
+      wroteSecond,
+      freshSummary,
+      needsSyncOnEmpty: needsQuotaSync([])
+    }}));
+    """
+    res = subprocess.run(
+        ["node", "--input-type=module", "-e", node_code],
+        capture_output=True,
+        text=True,
+        cwd=Path.cwd(),
+    )
+    assert res.returncode == 0, f"Node script failed: {res.stderr}\nStdout: {res.stdout}"
+    data = json.loads(res.stdout)
+
+    assert data["creds"] == {"baseUrl": "http://localhost:60090", "csrfToken": "sidecar-token-123"}
+    assert data["needsSyncOnEmpty"] is True
+
+    exp = data["expiredSummary"]
+    assert exp["weekly_is_expired"] is True
+    assert exp["weekly_estimated_remaining_pct"] == 95.0
+
+    assert data["wroteFirst"] is True
+    assert data["wroteSecond"] is False
+    assert data["fetchCount"] == 1
+
+    fresh = data["freshSummary"]
+    assert fresh["weekly_is_expired"] is False
+    assert fresh["weekly_remaining_pct"] == 98.5
+    assert fresh["calibrated_weekly_capacity"] == 500.0
+
+
 
 
 

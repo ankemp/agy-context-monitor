@@ -39,6 +39,7 @@ from context_monitor.pricing import (  # noqa: E402
 )
 from context_monitor.quota import (  # noqa: E402
     calculate_quota_metrics,
+    is_reset_expired,
     sync_and_get_quota_state,
 )
 from context_monitor.settings import (  # noqa: E402
@@ -139,6 +140,13 @@ def calculate_billed_cost(conn):
     return total_cost, total_in, total_out
 
 
+def _format_reset_label(bucket: dict) -> str:
+    """Formats a bucket reset countdown, labeling expired windows as stale."""
+    if bucket.get("is_expired") or is_reset_expired(bucket.get("reset_time")):
+        return "stale (expired)"
+    return bucket.get("reset_countdown") or "n/a"
+
+
 def _get_weekly_project_costs(
     cur, gw: dict
 ) -> tuple[dict[str, float], float, str | None]:
@@ -154,7 +162,23 @@ def _get_weekly_project_costs(
     if gw_reset:
         try:
             r_dt = datetime.fromisoformat(gw_reset.replace("Z", "+00:00"))
-            w_start_dt = r_dt - timedelta(days=7)
+            if r_dt.tzinfo is None:
+                r_dt = r_dt.replace(tzinfo=timezone.utc)
+            now_utc = datetime.now(timezone.utc)
+            anchor_dt = r_dt
+            if r_dt <= now_utc:
+                max_row = cur.execute(
+                    "SELECT MAX(created_at) FROM conversations WHERE created_at IS NOT NULL AND created_at != ''"
+                ).fetchone()
+                if max_row and max_row[0]:
+                    max_dt = datetime.fromisoformat(
+                        str(max_row[0]).replace(" ", "T").replace("Z", "+00:00")
+                    )
+                    if max_dt.tzinfo is None:
+                        max_dt = max_dt.replace(tzinfo=timezone.utc)
+                    if max_dt > r_dt:
+                        anchor_dt = max(now_utc, max_dt)
+            w_start_dt = anchor_dt - timedelta(days=7)
             window_start = w_start_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
         except Exception:
             window_start = None
@@ -367,16 +391,16 @@ def print_summary(conn):
     tpw = q_metrics.get("3p-weekly", {})
     tp5 = q_metrics.get("3p-5h", {})
     print(
-        f" Gemini Weekly Quota         : {gw.get('quota_remaining_pct', 100):.1f}% remaining (resets in {gw.get('reset_countdown') or 'n/a'}) [Cap: ${gw.get('calibrated_capacity', DEFAULT_GEMINI_WEEKLY_CAPACITY):.1f}]"
+        f" Gemini Weekly Quota         : {gw.get('quota_remaining_pct', 100):.1f}% remaining (resets in {_format_reset_label(gw)}) [Cap: ${gw.get('calibrated_capacity', DEFAULT_GEMINI_WEEKLY_CAPACITY):.1f}]"
     )
     print(
-        f" Gemini 5-Hour Quota         : {g5.get('quota_remaining_pct', 100):.1f}% remaining (resets in {g5.get('reset_countdown') or 'n/a'}) [Cap: ${g5.get('calibrated_capacity', DEFAULT_GEMINI_5H_CAPACITY):.1f}]"
+        f" Gemini 5-Hour Quota         : {g5.get('quota_remaining_pct', 100):.1f}% remaining (resets in {_format_reset_label(g5)}) [Cap: ${g5.get('calibrated_capacity', DEFAULT_GEMINI_5H_CAPACITY):.1f}]"
     )
     print(
-        f" Claude/3P Weekly Quota      : {tpw.get('quota_remaining_pct', 100):.1f}% remaining (resets in {tpw.get('reset_countdown') or 'n/a'}) [Cap: ${tpw.get('calibrated_capacity', DEFAULT_3P_WEEKLY_CAPACITY):.1f}]"
+        f" Claude/3P Weekly Quota      : {tpw.get('quota_remaining_pct', 100):.1f}% remaining (resets in {_format_reset_label(tpw)}) [Cap: ${tpw.get('calibrated_capacity', DEFAULT_3P_WEEKLY_CAPACITY):.1f}]"
     )
     print(
-        f" Claude/3P 5-Hour Quota      : {tp5.get('quota_remaining_pct', 100):.1f}% remaining (resets in {tp5.get('reset_countdown') or 'n/a'}) [Cap: ${tp5.get('calibrated_capacity', DEFAULT_3P_5H_CAPACITY):.1f}]"
+        f" Claude/3P 5-Hour Quota      : {tp5.get('quota_remaining_pct', 100):.1f}% remaining (resets in {_format_reset_label(tp5)}) [Cap: ${tp5.get('calibrated_capacity', DEFAULT_3P_5H_CAPACITY):.1f}]"
     )
     if row["earliest"] and row["latest"]:
         try:
@@ -492,16 +516,16 @@ def print_quota(conn, cid: str | None = None):
         print(" ANTIGRAVITY SUBSCRIPTION QUOTA & RATE LIMIT STATUS")
         print("=" * 75)
         print(
-            f" Gemini Weekly Quota    : {gw.get('quota_remaining_pct', 100):.1f}% remaining | Reset: {gw.get('reset_countdown') or 'n/a'} | Cap: ${gw.get('calibrated_capacity', DEFAULT_GEMINI_WEEKLY_CAPACITY):.1f}"
+            f" Gemini Weekly Quota    : {gw.get('quota_remaining_pct', 100):.1f}% remaining | Reset: {_format_reset_label(gw)} | Cap: ${gw.get('calibrated_capacity', DEFAULT_GEMINI_WEEKLY_CAPACITY):.1f}"
         )
         print(
-            f" Gemini 5-Hour Quota    : {g5.get('quota_remaining_pct', 100):.1f}% remaining | Reset: {g5.get('reset_countdown') or 'n/a'} | Cap: ${g5.get('calibrated_capacity', DEFAULT_GEMINI_5H_CAPACITY):.1f}"
+            f" Gemini 5-Hour Quota    : {g5.get('quota_remaining_pct', 100):.1f}% remaining | Reset: {_format_reset_label(g5)} | Cap: ${g5.get('calibrated_capacity', DEFAULT_GEMINI_5H_CAPACITY):.1f}"
         )
         print(
-            f" Claude/3P Weekly Quota : {tpw.get('quota_remaining_pct', 100):.1f}% remaining | Reset: {tpw.get('reset_countdown') or 'n/a'} | Cap: ${tpw.get('calibrated_capacity', DEFAULT_3P_WEEKLY_CAPACITY):.1f}"
+            f" Claude/3P Weekly Quota : {tpw.get('quota_remaining_pct', 100):.1f}% remaining | Reset: {_format_reset_label(tpw)} | Cap: ${tpw.get('calibrated_capacity', DEFAULT_3P_WEEKLY_CAPACITY):.1f}"
         )
         print(
-            f" Claude/3P 5-Hour Quota : {tp5.get('quota_remaining_pct', 100):.1f}% remaining | Reset: {tp5.get('reset_countdown') or 'n/a'} | Cap: ${tp5.get('calibrated_capacity', DEFAULT_3P_5H_CAPACITY):.1f}"
+            f" Claude/3P 5-Hour Quota : {tp5.get('quota_remaining_pct', 100):.1f}% remaining | Reset: {_format_reset_label(tp5)} | Cap: ${tp5.get('calibrated_capacity', DEFAULT_3P_5H_CAPACITY):.1f}"
         )
         print("-" * 75)
 
@@ -1360,10 +1384,10 @@ def generate_global_report(
             "\n## 5. Subscription Quotas & Rate Limits\n",
             "| Quota Bucket | Window | Remaining % | Reset Countdown | Calibrated Capacity |",
             "| :--- | :--- | :--- | :--- | :--- |",
-            f"| Gemini Models | Weekly | {gw.get('quota_remaining_pct', 100):.1f}% | {gw.get('reset_countdown') or 'n/a'} | ${gw.get('calibrated_capacity', DEFAULT_GEMINI_WEEKLY_CAPACITY):.2f} |",
-            f"| Gemini Models | 5-Hour | {g5.get('quota_remaining_pct', 100):.1f}% | {g5.get('reset_countdown') or 'n/a'} | ${g5.get('calibrated_capacity', DEFAULT_GEMINI_5H_CAPACITY):.2f} |",
-            f"| Claude / 3P Models | Weekly | {tpw.get('quota_remaining_pct', 100):.1f}% | {tpw.get('reset_countdown') or 'n/a'} | ${tpw.get('calibrated_capacity', DEFAULT_3P_WEEKLY_CAPACITY):.2f} |",
-            f"| Claude / 3P Models | 5-Hour | {tp5.get('quota_remaining_pct', 100):.1f}% | {tp5.get('reset_countdown') or 'n/a'} | ${tp5.get('calibrated_capacity', DEFAULT_3P_5H_CAPACITY):.2f} |",
+            f"| Gemini Models | Weekly | {gw.get('quota_remaining_pct', 100):.1f}% | {_format_reset_label(gw)} | ${gw.get('calibrated_capacity', DEFAULT_GEMINI_WEEKLY_CAPACITY):.2f} |",
+            f"| Gemini Models | 5-Hour | {g5.get('quota_remaining_pct', 100):.1f}% | {_format_reset_label(g5)} | ${g5.get('calibrated_capacity', DEFAULT_GEMINI_5H_CAPACITY):.2f} |",
+            f"| Claude / 3P Models | Weekly | {tpw.get('quota_remaining_pct', 100):.1f}% | {_format_reset_label(tpw)} | ${tpw.get('calibrated_capacity', DEFAULT_3P_WEEKLY_CAPACITY):.2f} |",
+            f"| Claude / 3P Models | 5-Hour | {tp5.get('quota_remaining_pct', 100):.1f}% | {_format_reset_label(tp5)} | ${tp5.get('calibrated_capacity', DEFAULT_3P_5H_CAPACITY):.2f} |",
         ]
     )
 

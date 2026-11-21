@@ -63,6 +63,7 @@ from context_monitor.quota import (  # noqa: E402
     format_quota_pct,
     format_reset_countdown,
     get_hourly_activity_profile,
+    is_reset_expired,
     sync_and_get_quota_state,
 )
 from context_monitor.settings import should_generate_artifacts  # noqa: E402
@@ -132,11 +133,15 @@ def format_ephemeral_status(
     has_valid_quota = False
     if quota_metrics and isinstance(quota_metrics, dict):
         has_rem = quota_metrics.get("weekly_remaining_pct") is not None
-        has_reset = bool(
-            quota_metrics.get("weekly_reset_countdown")
-            or quota_metrics.get("weekly_reset_time")
+        wk_cd_raw = quota_metrics.get("weekly_reset_countdown")
+        wk_r_time = str(quota_metrics.get("weekly_reset_time") or "")
+        wk_expired = bool(quota_metrics.get("weekly_is_expired")) or (
+            bool(wk_r_time)
+            and is_reset_expired(wk_r_time)
+            and (not wk_cd_raw or wk_cd_raw == "0m")
         )
-        if has_rem and has_reset:
+        has_reset = bool(wk_cd_raw or wk_r_time)
+        if has_rem and has_reset and not wk_expired:
             has_valid_quota = True
 
     if not has_valid_quota:
@@ -179,13 +184,17 @@ def format_ephemeral_status(
 
     rem_5h_pct = quota_metrics.get("five_hour_remaining_pct")
     if rem_5h_pct is not None and rem_5h_pct < 25.0:
-        cd_5h = quota_metrics.get(
-            "five_hour_reset_countdown"
-        ) or format_reset_countdown(
-            str(quota_metrics.get("five_hour_reset_time") or "")
+        cd_5h_raw = quota_metrics.get("five_hour_reset_countdown")
+        r_time_5h = str(quota_metrics.get("five_hour_reset_time") or "")
+        five_h_expired = bool(quota_metrics.get("five_hour_is_expired")) or (
+            bool(r_time_5h)
+            and is_reset_expired(r_time_5h)
+            and (not cd_5h_raw or cd_5h_raw == "0m")
         )
-        cd_5h_str = f" ({cd_5h})" if cd_5h else ""
-        parts.append(f"5h Limit: {format_quota_pct(rem_5h_pct, 1)}{cd_5h_str}")
+        if not five_h_expired:
+            cd_5h = cd_5h_raw or format_reset_countdown(r_time_5h)
+            cd_5h_str = f" ({cd_5h})" if cd_5h else ""
+            parts.append(f"5h Limit: {format_quota_pct(rem_5h_pct, 1)}{cd_5h_str}")
 
     return " · ".join(parts)
 
@@ -1710,13 +1719,20 @@ def _extract_bucket_view(
     rem_pct = float(rem_raw if rem_raw is not None else 1.0) * 100.0
     r_time = str(b.get("reset_time") or b.get("resetTime") or "")
     cd = format_reset_countdown(r_time)
-    cd_str = f"`{cd}` to reset" if cd else "no reset scheduled"
+    is_expired = is_reset_expired(r_time)
+    if is_expired:
+        cd_str = "stale (expired)"
+    elif cd:
+        cd_str = f"`{cd}` to reset"
+    else:
+        cd_str = "no reset scheduled"
     return {
         "capacity": cap,
         "remaining_pct": rem_pct,
         "reset_time": r_time,
         "countdown": cd,
         "countdown_str": cd_str,
+        "is_expired": is_expired,
     }
 
 

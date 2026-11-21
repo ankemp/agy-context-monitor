@@ -10,6 +10,7 @@ Covers:
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import re
 from unittest.mock import MagicMock, patch
@@ -625,12 +626,13 @@ def test_format_ephemeral_status_with_session_cost_kwarg():
 
 
 def test_format_ephemeral_status_computes_countdown_from_reset_time_if_missing():
-    """Verifies that countdown is computed on the fly if weekly_reset_countdown is missing."""
+    """Verifies countdown computation for active reset times and stale fallback for expired reset times."""
+    now = datetime.now(timezone.utc)
     qm = {
         "weekly_remaining_pct": 91.5,
-        "weekly_reset_time": "2026-10-21T02:27:22Z",
+        "weekly_reset_time": (now + timedelta(days=5)).isoformat(),
         "five_hour_remaining_pct": 20.0,
-        "five_hour_reset_time": "2026-10-14T18:00:00Z",
+        "five_hour_reset_time": (now + timedelta(hours=3)).isoformat(),
     }
     msg = format_ephemeral_status(
         active_pct=10.0,
@@ -640,6 +642,24 @@ def test_format_ephemeral_status_computes_countdown_from_reset_time_if_missing()
     )
     assert "Quota: 91.5% wk (" in msg
     assert "5h Limit: 20.0% (" in msg
+
+    # Expired reset_time must not display stale '88.0% wk (0m)'; falls back to Session Value
+    qm_expired = {
+        "weekly_remaining_pct": 88.0,
+        "weekly_reset_time": (now - timedelta(hours=2)).isoformat(),
+        "weekly_reset_countdown": "0m",
+        "weekly_is_expired": True,
+    }
+    msg_expired = format_ephemeral_status(
+        active_pct=10.0,
+        active_tokens=100000,
+        active_max=1000000,
+        turn_cost=1.25,
+        quota_metrics=qm_expired,
+    )
+    assert "Quota:" not in msg_expired
+    assert "(0m)" not in msg_expired
+    assert "Session Value: $1.25" in msg_expired
 
 
 def test_generate_context_usage_report_plain_list_and_camelcase_buckets():
@@ -772,28 +792,35 @@ def test_generate_context_usage_report_multi_step_tool_reversed_cost():
 
 
 def test_extract_bucket_view_helper():
-    """Verifies _extract_bucket_view parses snake_case, camelCase, and fallbacks."""
+    """Verifies _extract_bucket_view parses snake_case, camelCase, expired resets, and fallbacks."""
+    now = datetime.now(timezone.utc)
+    future_reset = (now + timedelta(days=5)).isoformat()
+    past_reset = (now - timedelta(hours=2)).isoformat()
+
     buckets = {
         "gemini-weekly": {
             "calibrated_capacity": 672.0,
             "remaining_fraction": 0.85,
-            "reset_time": "2026-10-21T02:27:22Z",
+            "reset_time": future_reset,
         },
         "3p-weekly": {
             "calibratedCapacity": 250.0,
             "remainingFraction": 0.90,
-            "resetTime": "2026-10-21T02:27:22Z",
+            "resetTime": past_reset,
         },
     }
 
     v_gem = _extract_bucket_view(buckets, "gemini-weekly", 672.0)
     assert v_gem["capacity"] == 672.0
     assert v_gem["remaining_pct"] == 85.0
+    assert v_gem["is_expired"] is False
     assert "to reset" in v_gem["countdown_str"]
 
     v_3p = _extract_bucket_view(buckets, "3p-weekly", 200.0)
     assert v_3p["capacity"] == 250.0
     assert v_3p["remaining_pct"] == 90.0
+    assert v_3p["is_expired"] is True
+    assert v_3p["countdown_str"] == "stale (expired)"
 
     v_fallback = _extract_bucket_view(buckets, "nonexistent", 100.0)
     assert v_fallback["capacity"] == 100.0

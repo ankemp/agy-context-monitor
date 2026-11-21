@@ -299,11 +299,15 @@ function renderQuota(quotaData, sessionImpactPct, fleet = null) {
   const rawRemWk = weeklyBucket?.remaining_pct ?? quotaData.weekly_remaining_pct ?? 100.0;
   const remWk = Number.isFinite(rawRemWk) ? rawRemWk : 100.0;
   const resetWk = weeklyBucket?.reset_countdown ?? quotaData.weekly_reset_countdown ?? '';
+  const wkExpired = Boolean(weeklyBucket?.is_expired ?? quotaData.weekly_is_expired);
+  const wkEstRem = weeklyBucket?.estimated_remaining_pct ?? quotaData.weekly_estimated_remaining_pct;
   const capWk = weeklyBucket?.calibrated_capacity ?? quotaData.calibrated_weekly_capacity ?? (activeQuotaFamily === 'gemini' ? 672.0 : 200.0);
 
   const rawRem5h = fiveHBucket?.remaining_pct ?? quotaData.five_hour_remaining_pct ?? 100.0;
   const rem5h = Number.isFinite(rawRem5h) ? rawRem5h : 100.0;
   const reset5h = fiveHBucket?.reset_countdown ?? quotaData.five_hour_reset_countdown ?? '';
+  const fiveHExpired = Boolean(fiveHBucket?.is_expired ?? quotaData.five_hour_is_expired);
+  const fiveHEstRem = fiveHBucket?.estimated_remaining_pct ?? quotaData.five_hour_estimated_remaining_pct;
   const cap5h = fiveHBucket?.calibrated_capacity ?? quotaData.calibrated_5h_capacity ?? (activeQuotaFamily === 'gemini' ? 236.7 : 70.0);
 
   const sessionImpact = weeklyBucket?.session_impact_pct ?? sessionImpactPct ?? quotaData.session_weekly_pct ?? 0.0;
@@ -324,55 +328,57 @@ function renderQuota(quotaData, sessionImpactPct, fleet = null) {
     }
   }
 
-  // Weekly bucket
-  const wkPctEl = $('quota-weekly-pct');
-  if (wkPctEl) {
-    wkPctEl.textContent = `${Number(remWk).toFixed(1)}% remaining`;
-    wkPctEl.className = `quota-val ${remWk <= 10 ? 'error' : remWk <= 25 ? 'warning' : 'ok'}`;
-  }
-  const wkResetEl = $('quota-weekly-reset');
-  if (wkResetEl) {
-    wkResetEl.textContent = resetWk ? `resets in ${resetWk}` : '';
-  }
-  const wkSubEl = $('quota-weekly-sub');
-  if (wkSubEl) {
-    wkSubEl.textContent = `Calibrated capacity: $${Number(capWk).toFixed(2)}`;
-  }
-  const wkClamped = Math.min(100, Math.max(0, remWk));
-  const wkBarEl = $('quota-weekly-bar');
-  if (wkBarEl) {
-    wkBarEl.style.width = `${wkClamped}%`;
-    wkBarEl.className = `quota-bar ${remWk <= 10 ? 'error' : remWk <= 25 ? 'warning' : 'ok'}`;
-  }
-  const wkTrackEl = $('quota-weekly-track');
-  if (wkTrackEl && typeof wkTrackEl.setAttribute === 'function') {
-    wkTrackEl.setAttribute('aria-valuenow', String(Math.round(wkClamped)));
-  }
+  const BUCKET_IDS = {
+    weekly: {
+      pct: 'quota-weekly-pct',
+      reset: 'quota-weekly-reset',
+      sub: 'quota-weekly-sub',
+      bar: 'quota-weekly-bar',
+      track: 'quota-weekly-track',
+    },
+    '5h': {
+      pct: 'quota-5h-pct',
+      reset: 'quota-5h-reset',
+      sub: 'quota-5h-sub',
+      bar: 'quota-5h-bar',
+      track: 'quota-5h-track',
+    },
+  };
 
-  // 5-Hour bucket
-  const fhPctEl = $('quota-5h-pct');
-  if (fhPctEl) {
-    fhPctEl.textContent = `${Number(rem5h).toFixed(1)}% remaining`;
-    fhPctEl.className = `quota-val ${rem5h <= 10 ? 'error' : rem5h <= 25 ? 'warning' : 'ok'}`;
-  }
-  const fhResetEl = $('quota-5h-reset');
-  if (fhResetEl) {
-    fhResetEl.textContent = reset5h ? `resets in ${reset5h}` : '';
-  }
-  const fhSubEl = $('quota-5h-sub');
-  if (fhSubEl) {
-    fhSubEl.textContent = `Calibrated capacity: $${Number(cap5h).toFixed(2)}`;
-  }
-  const fhClamped = Math.min(100, Math.max(0, rem5h));
-  const fhBarEl = $('quota-5h-bar');
-  if (fhBarEl) {
-    fhBarEl.style.width = `${fhClamped}%`;
-    fhBarEl.className = `quota-bar ${rem5h <= 10 ? 'error' : rem5h <= 25 ? 'warning' : 'ok'}`;
-  }
-  const fhTrackEl = $('quota-5h-track');
-  if (fhTrackEl && typeof fhTrackEl.setAttribute === 'function') {
-    fhTrackEl.setAttribute('aria-valuenow', String(Math.round(fhClamped)));
-  }
+  const applyBucketView = (ids, rawRem, resetStr, cap, isExpired, estRem) => {
+    const hasEst = isExpired && estRem !== null && estRem !== undefined && Number.isFinite(Number(estRem));
+    const displayRem = hasEst ? Number(estRem) : Number(rawRem);
+    const pctEl = $(ids.pct);
+    if (pctEl) {
+      pctEl.textContent = isExpired
+        ? (hasEst ? `~${displayRem.toFixed(1)}% est. remaining` : `${displayRem.toFixed(1)}% remaining (stale)`)
+        : `${displayRem.toFixed(1)}% remaining`;
+      pctEl.className = `quota-val ${displayRem <= 10 ? 'error' : displayRem <= 25 ? 'warning' : 'ok'}`;
+    }
+    const resetEl = $(ids.reset);
+    if (resetEl) {
+      resetEl.textContent = isExpired
+        ? 'expired — awaiting sync'
+        : (resetStr ? `resets in ${resetStr}` : '');
+    }
+    const subEl = $(ids.sub);
+    if (subEl) {
+      subEl.textContent = `Calibrated capacity: $${Number(cap).toFixed(2)}`;
+    }
+    const clamped = Math.min(100, Math.max(0, displayRem));
+    const barEl = $(ids.bar);
+    if (barEl) {
+      barEl.style.width = `${clamped}%`;
+      barEl.className = `quota-bar ${displayRem <= 10 ? 'error' : displayRem <= 25 ? 'warning' : 'ok'}`;
+    }
+    const trackEl = $(ids.track);
+    if (trackEl && typeof trackEl.setAttribute === 'function') {
+      trackEl.setAttribute('aria-valuenow', String(Math.round(clamped)));
+    }
+  };
+
+  applyBucketView(BUCKET_IDS.weekly, remWk, resetWk, capWk, wkExpired, wkEstRem);
+  applyBucketView(BUCKET_IDS['5h'], rem5h, reset5h, cap5h, fiveHExpired, fiveHEstRem);
 }
 
 function renderCategories(container, categories) {

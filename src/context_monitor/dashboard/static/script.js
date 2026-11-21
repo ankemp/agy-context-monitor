@@ -835,61 +835,47 @@
       const pw = buckets['3p-weekly'] || quota['3p-weekly'] || quota.threep_weekly;
       const p5 = buckets['3p-5h'] || quota['3p-5h'] || quota.threep_5h;
 
-      if (gw) {
-        const rem = gw.quota_remaining_pct != null ? gw.quota_remaining_pct : (gw.remaining_pct != null ? gw.remaining_pct : (gw.remaining_fraction != null ? gw.remaining_fraction * 100 : 100));
-        const cap = gw.calibrated_capacity || quota.calibrated_weekly_capacity || 672.0;
-        const cd = gw.reset_countdown || quota.weekly_reset_countdown || '';
-        const elRem = document.getElementById('quotaGeminiWeeklyRem');
-        const elBar = document.getElementById('quotaGeminiWeeklyBar');
-        const elReset = document.getElementById('quotaGeminiWeeklyReset');
-        const elCap = document.getElementById('quotaGeminiWeeklyCap');
-        if (elRem) elRem.textContent = `${Number(rem).toFixed(1)}% rem`;
-        if (elBar) elBar.style.width = `${Math.min(Math.max(0, 100 - rem), 100)}%`;
-        if (elReset) elReset.textContent = cd ? `Reset: ${cd}` : 'Reset: --';
-        if (elCap) elCap.textContent = `Cap: $${Number(cap).toFixed(2)}`;
-      }
+      const renderBucket = (bucket, prefixId, defaultCap, fallbackRem, fallbackCd) => {
+        if (!bucket) return;
+        const rawRem = bucket.quota_remaining_pct != null
+          ? bucket.quota_remaining_pct
+          : (bucket.remaining_pct != null
+              ? bucket.remaining_pct
+              : (bucket.remaining_fraction != null ? bucket.remaining_fraction * 100 : 100));
+        const rem = fallbackRem != null && bucket.quota_remaining_pct == null && bucket.remaining_pct == null && bucket.remaining_fraction == null
+          ? fallbackRem
+          : rawRem;
+        const cap = bucket.calibrated_capacity || defaultCap;
+        const cd = bucket.reset_countdown || fallbackCd || '';
+        const isExpired = Boolean(bucket.is_expired);
+        const estRem = bucket.estimated_remaining_pct;
 
-      if (g5) {
-        const rem = g5.quota_remaining_pct != null ? g5.quota_remaining_pct : (g5.remaining_pct != null ? g5.remaining_pct : (g5.remaining_fraction != null ? g5.remaining_fraction * 100 : 100));
-        const cap = g5.calibrated_capacity || quota.calibrated_5h_capacity || 236.7;
-        const cd = g5.reset_countdown || quota.five_hour_reset_countdown || '';
-        const elRem = document.getElementById('quotaGemini5hRem');
-        const elBar = document.getElementById('quotaGemini5hBar');
-        const elReset = document.getElementById('quotaGemini5hReset');
-        const elCap = document.getElementById('quotaGemini5hCap');
-        if (elRem) elRem.textContent = `${Number(rem).toFixed(1)}% rem`;
-        if (elBar) elBar.style.width = `${Math.min(Math.max(0, 100 - rem), 100)}%`;
-        if (elReset) elReset.textContent = cd ? `Reset: ${cd}` : 'Reset: --';
-        if (elCap) elCap.textContent = `Cap: $${Number(cap).toFixed(2)}`;
-      }
+        const elRem = document.getElementById(`${prefixId}Rem`);
+        const elBar = document.getElementById(`${prefixId}Bar`);
+        const elReset = document.getElementById(`${prefixId}Reset`);
+        const elCap = document.getElementById(`${prefixId}Cap`);
 
-      if (pw) {
-        const rem = pw.quota_remaining_pct != null ? pw.quota_remaining_pct : (pw.remaining_pct != null ? pw.remaining_pct : (pw.remaining_fraction != null ? pw.remaining_fraction * 100 : 100));
-        const cap = pw.calibrated_capacity || 200.0;
-        const cd = pw.reset_countdown || '';
-        const elRem = document.getElementById('quota3pWeeklyRem');
-        const elBar = document.getElementById('quota3pWeeklyBar');
-        const elReset = document.getElementById('quota3pWeeklyReset');
-        const elCap = document.getElementById('quota3pWeeklyCap');
-        if (elRem) elRem.textContent = `${Number(rem).toFixed(1)}% rem`;
-        if (elBar) elBar.style.width = `${Math.min(Math.max(0, 100 - rem), 100)}%`;
-        if (elReset) elReset.textContent = cd ? `Reset: ${cd}` : 'Reset: --';
+        if (isExpired) {
+          if (estRem != null && !isNaN(Number(estRem))) {
+            if (elRem) elRem.textContent = `~${Number(estRem).toFixed(1)}% est.`;
+            if (elBar) elBar.style.width = `${Math.min(Math.max(0, 100 - Number(estRem)), 100)}%`;
+          } else {
+            if (elRem) elRem.textContent = `${Number(rem).toFixed(1)}% rem (stale)`;
+            if (elBar) elBar.style.width = `${Math.min(Math.max(0, 100 - rem), 100)}%`;
+          }
+          if (elReset) elReset.textContent = 'Reset: Expired (stale)';
+        } else {
+          if (elRem) elRem.textContent = `${Number(rem).toFixed(1)}% rem`;
+          if (elBar) elBar.style.width = `${Math.min(Math.max(0, 100 - rem), 100)}%`;
+          if (elReset) elReset.textContent = cd ? `Reset: ${cd}` : 'Reset: --';
+        }
         if (elCap) elCap.textContent = `Cap: $${Number(cap).toFixed(2)}`;
-      }
+      };
 
-      if (p5) {
-        const rem = p5.quota_remaining_pct != null ? p5.quota_remaining_pct : (p5.remaining_pct != null ? p5.remaining_pct : (p5.remaining_fraction != null ? p5.remaining_fraction * 100 : 100));
-        const cap = p5.calibrated_capacity || 70.0;
-        const cd = p5.reset_countdown || '';
-        const elRem = document.getElementById('quota3p5hRem');
-        const elBar = document.getElementById('quota3p5hBar');
-        const elReset = document.getElementById('quota3p5hReset');
-        const elCap = document.getElementById('quota3p5hCap');
-        if (elRem) elRem.textContent = `${Number(rem).toFixed(1)}% rem`;
-        if (elBar) elBar.style.width = `${Math.min(Math.max(0, 100 - rem), 100)}%`;
-        if (elReset) elReset.textContent = cd ? `Reset: ${cd}` : 'Reset: --';
-        if (elCap) elCap.textContent = `Cap: $${Number(cap).toFixed(2)}`;
-      }
+      renderBucket(gw, 'quotaGeminiWeekly', quota.calibrated_weekly_capacity || 672.0, null, quota.weekly_reset_countdown);
+      renderBucket(g5, 'quotaGemini5h', quota.calibrated_5h_capacity || 236.7, null, quota.five_hour_reset_countdown);
+      renderBucket(pw, 'quota3pWeekly', 200.0, null, '');
+      renderBucket(p5, 'quota3p5h', 70.0, null, '');
 
       // Pacing and projection calculation
       const weeklyPacing = quota.weekly_pacing || (gw && gw.pacing) || (pw && pw.pacing) || null;
@@ -903,12 +889,16 @@
         ? quota.projected_weekly_cost
         : (weeklyPacing && weeklyPacing.projected_cost != null ? weeklyPacing.projected_cost : null);
 
+      const weeklyExpired = Boolean(quota.weekly_is_expired || (gw && gw.is_expired));
+
       // Determine calibration state defensively
-      const isCalibrating = (weeklyPacing && weeklyPacing.is_calibrating != null)
-        ? Boolean(weeklyPacing.is_calibrating)
-        : (quota.is_calibrating != null
-            ? Boolean(quota.is_calibrating)
-            : (projWkPct == null || isNaN(Number(projWkPct))));
+      const isCalibrating = weeklyExpired || (
+        (weeklyPacing && weeklyPacing.is_calibrating != null)
+          ? Boolean(weeklyPacing.is_calibrating)
+          : (quota.is_calibrating != null
+              ? Boolean(quota.is_calibrating)
+              : (projWkPct == null || isNaN(Number(projWkPct))))
+      );
 
       // Determine pacing status: prefer explicit status; if absent, infer from projected %
       let rawStatus = quota.pacing_status || (weeklyPacing && weeklyPacing.status) || null;

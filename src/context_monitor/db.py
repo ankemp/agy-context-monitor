@@ -175,10 +175,11 @@ CREATE INDEX IF NOT EXISTS idx_rollups_conv ON hourly_step_rollups(conversation_
 
 
 def get_db_connection(
-    db_path: Path | str = DEFAULT_DB_PATH, timeout: float = 30.0
+    db_path: Path | str | None = None, timeout: float = 30.0
 ) -> sqlite3.Connection:
     """Returns an initialized SQLite connection configured for concurrent WAL-mode access."""
-    path = Path(db_path) if isinstance(db_path, str) else db_path
+    resolved = DEFAULT_DB_PATH if db_path is None else db_path
+    path = Path(resolved) if isinstance(resolved, str) else resolved
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path), timeout=timeout)
     conn.row_factory = sqlite3.Row
@@ -228,11 +229,13 @@ def checkpoint_wal_if_needed(
     return False
 
 
-def init_db(db_or_conn: Path | str | sqlite3.Connection = DEFAULT_DB_PATH):
+def init_db(db_or_conn: Path | str | sqlite3.Connection | None = None):
     """Initializes the database schema and performs automatic column migrations if needed.
 
     Accepts either a database file path (Path or str) or an existing sqlite3.Connection.
     """
+    if db_or_conn is None:
+        db_or_conn = DEFAULT_DB_PATH
     if isinstance(db_or_conn, sqlite3.Connection) or (
         hasattr(db_or_conn, "cursor") and not isinstance(db_or_conn, (str, Path))
     ):

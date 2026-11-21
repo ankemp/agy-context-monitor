@@ -6,11 +6,12 @@
 // Outside Antigravity (when ANTIGRAVITY_SIDECAR_WEB_PORT is unset), falls back
 // to a standalone node:http dev server on 127.0.0.1.
 
-import { readFileSync } from 'node:fs';
+import { readFileSync, watch } from 'node:fs';
 import { createServer } from 'node:http';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { getDatabase, getSessionData, getGlobalData, getConversationFingerprint, clearQueryCache } from './query.mjs';
+import { getDatabase, getDefaultDbPath, getSessionData, getGlobalData, getConversationFingerprint, clearQueryCache } from './query.mjs';
+import { createLsQuotaSyncer } from './ls_quota.mjs';
 import { createSseHub, attachSseRoute } from './sse.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -38,8 +39,48 @@ const readLocal = (name) => readFileSync(join(HERE, name), 'utf8');
 
 // Resolve DB handle on demand to recover gracefully if DB initializes after boot.
 const resolveDb = () => getDatabase(dbPath);
-const getSessionPayload = (cid, inspectCid) => getSessionData(resolveDb(), cid, inspectCid);
-const getGlobalPayload = () => getGlobalData(resolveDb());
+const lsQuotaSyncer = createLsQuotaSyncer({
+  dbPath,
+  onWrite: () => clearQueryCache(),
+});
+const getSessionPayload = async (cid, inspectCid) => {
+  await lsQuotaSyncer.syncIfNeeded();
+  return getSessionData(resolveDb(), cid, inspectCid);
+};
+const getGlobalPayload = async () => {
+  await lsQuotaSyncer.syncIfNeeded();
+  return getGlobalData(resolveDb());
+};
+
+function startEventDrivenQuotaSync() {
+  // Initial non-blocking sync on startup so post-reset or post-upgrade state refreshes immediately.
+  lsQuotaSyncer.syncIfNeeded({ force: true }).catch(() => {});
+
+  // Event-driven fs.watch on DB / WAL writes (zero idle polling): refreshes quota_state
+  // after hook writes when TTL or reset boundary has elapsed.
+  const targetDb = dbPath || getDefaultDbPath();
+  const targetDir = dirname(targetDb);
+  const dbBase = basename(targetDb);
+  const walBase = `${dbBase}-wal`;
+  let debounceTimer = null;
+
+  try {
+    const watcher = watch(targetDir, (_eventType, filename) => {
+      if (filename && filename !== dbBase && filename !== walBase) {
+        return;
+      }
+      if (debounceTimer) return;
+      debounceTimer = setTimeout(() => {
+        debounceTimer = null;
+        lsQuotaSyncer.syncIfNeeded().catch(() => {});
+      }, 500);
+      debounceTimer.unref?.();
+    });
+    watcher.unref?.();
+  } catch {
+    // Directory may not exist yet; /api/session and /api/global still sync on demand.
+  }
+}
 
 const sseHub = createSseHub({
   getDb: resolveDb,
@@ -92,12 +133,24 @@ function handleStandaloneRequest(req, res) {
     if (url.pathname === '/api/session') {
       const cid = url.searchParams.get('cid');
       const inspectCid = url.searchParams.get('inspect_cid');
-      sendJson(res, 200, getSessionPayload(cid, inspectCid));
+      Promise.resolve(getSessionPayload(cid, inspectCid))
+        .then((payload) => sendJson(res, 200, payload))
+        .catch((err) => {
+          if (!res.headersSent) {
+            sendJson(res, 500, { error: err?.message || 'Internal Server Error' });
+          }
+        });
       return;
     }
 
     if (url.pathname === '/api/global') {
-      sendJson(res, 200, getGlobalPayload());
+      Promise.resolve(getGlobalPayload())
+        .then((payload) => sendJson(res, 200, payload))
+        .catch((err) => {
+          if (!res.headersSent) {
+            sendJson(res, 500, { error: err?.message || 'Internal Server Error' });
+          }
+        });
       return;
     }
 
@@ -119,9 +172,10 @@ async function startHostRuntime() {
   app.page('/app.js', () => readLocal('app.js'));
   app.page('/styles.css', () => new Response(readLocal('styles.css'), { contentType: 'text/css' }));
 
-  app.api('/api/session', (data) => getSessionPayload(data?.cid, data?.inspect_cid), 'GET');
-  app.api('/api/global', () => getGlobalPayload(), 'GET');
+  app.api('/api/session', async (data) => getSessionPayload(data?.cid, data?.inspect_cid), 'GET');
+  app.api('/api/global', async () => getGlobalPayload(), 'GET');
 
+  startEventDrivenQuotaSync();
   const server = await app.run();
   attachSseRoute(server, sseHub);
 }
