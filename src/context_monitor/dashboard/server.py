@@ -333,6 +333,38 @@ class DashboardHTTPHandler(BaseHTTPRequestHandler):
                         "SELECT DISTINCT project FROM conversations WHERE project IS NOT NULL AND project != '' ORDER BY project ASC"
                     ).fetchall()
                     return [r["project"] for r in rows]
+                elif path == "/api/quota-resets":
+                    scope = qs.get("scope", ["all"])[0]
+                    bucket_id = qs.get("bucket_id", [None])[0]
+                    limit_param = qs.get("limit", [None])[0]
+                    if limit_param is not None:
+                        try:
+                            limit_val = int(limit_param)
+                            if limit_val < 0:
+                                return (
+                                    "error",
+                                    400,
+                                    "Invalid limit parameter: must be non-negative",
+                                )
+                        except ValueError:
+                            return (
+                                "error",
+                                400,
+                                "Invalid limit parameter: must be an integer",
+                            )
+                        return api_routes.query_quota_resets(
+                            conn,
+                            tz=target_tz,
+                            scope=scope,
+                            bucket_id=bucket_id,
+                            limit=limit_val,
+                        )
+                    return api_routes.query_quota_resets(
+                        conn,
+                        tz=target_tz,
+                        scope=scope,
+                        bucket_id=bucket_id,
+                    )
                 elif path == "/api/summary":
                     return api_routes.query_summary_data(conn, target_tz, project_param)
                 elif path == "/api/timeline":
@@ -447,6 +479,7 @@ def build_static_bundle(
         else []
     )
     quota = api_routes.query_quota_data(conn)
+    quota_resets = api_routes.query_quota_resets(conn, target_tz)
     return {
         "summary": summary,
         "timeline": timeline,
@@ -458,6 +491,7 @@ def build_static_bundle(
         "activity_matrix": activity_matrix,
         "conversations": conversations,
         "quota": quota,
+        "quota_resets": quota_resets,
     }
 
 
@@ -488,6 +522,21 @@ def export_standalone_html(
       window.fetch = async function(url) {{
         const urlStr = (url && url.url) ? url.url : (url && url.href ? url.href : String(url));
         if (urlStr.includes('/api/summary')) return {{ json: async () => STATIC_DATA.summary }};
+        if (urlStr.includes('/api/quota-resets')) {{
+          const resets = STATIC_DATA.quota_resets || [];
+          const qIdx = urlStr.indexOf('?');
+          if (qIdx !== -1 && typeof URLSearchParams !== 'undefined') {{
+            const params = new URLSearchParams(urlStr.slice(qIdx + 1));
+            const scope = (params.get('scope') || 'all').toLowerCase();
+            const bucketId = params.get('bucket_id');
+            let filtered = resets;
+            if (scope === 'weekly') filtered = filtered.filter(e => Boolean(e && (e.is_weekly || String(e.window || '').toLowerCase() === 'weekly')));
+            else if (scope === '5h') filtered = filtered.filter(e => Boolean(e && (String(e.window || '').toLowerCase() === '5h' || (!e.is_weekly && String(e.bucket_id || '').toLowerCase().includes('5h')))));
+            if (bucketId && bucketId.toLowerCase() !== 'all') filtered = filtered.filter(e => e && e.bucket_id === bucketId);
+            return {{ json: async () => filtered }};
+          }}
+          return {{ json: async () => resets }};
+        }}
         if (urlStr.includes('/api/quota')) return {{ json: async () => STATIC_DATA.quota }};
         if (urlStr.includes('/api/timeline')) {{
           if (urlStr.toLowerCase().includes('days=cycle') && STATIC_DATA.timeline_cycle) {{

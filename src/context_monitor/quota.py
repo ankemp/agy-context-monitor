@@ -24,7 +24,13 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from context_monitor.db import get_db_connection, get_quota_state, upsert_quota_state
+from context_monitor.db import (
+    get_db_connection,
+    get_latest_quota_reset,
+    get_quota_state,
+    insert_quota_reset_events,
+    upsert_quota_state,
+)
 from context_monitor.pricing import get_pricing_key
 from context_monitor.settings import (
     get_3p_5h_capacity,
@@ -40,6 +46,12 @@ __all__ = [
     "discover_language_server",
     "fetch_raw_quota_summary",
     "fetch_live_quota_from_ls",
+    "IDLE_REMAINING_THRESHOLD",
+    "MIN_REMAINING_JUMP",
+    "FULL_RESET_REMAINING_FLOOR",
+    "SCHEDULED_TOLERANCE_SECONDS",
+    "RESET_TIME_SHIFT_THRESHOLD_SECONDS",
+    "detect_quota_reset_event",
     "calibrate_capacity",
     "sync_and_get_quota_state",
     "calculate_quota_metrics",
@@ -57,6 +69,12 @@ __all__ = [
     "normalize_activity_profile",
     "_CACHED_LS_CREDS",
 ]
+
+IDLE_REMAINING_THRESHOLD: float = 0.99
+MIN_REMAINING_JUMP: float = 0.05
+FULL_RESET_REMAINING_FLOOR: float = 0.90
+SCHEDULED_TOLERANCE_SECONDS: int = 900
+RESET_TIME_SHIFT_THRESHOLD_SECONDS: int = 900
 
 MIN_PROFILE_STEPS: int = 50
 LAPLACE_ALPHA: float = 0.15
@@ -472,6 +490,145 @@ def is_reset_expired(
     return reset_dt <= now_dt
 
 
+def _pick_field(row: dict[str, Any], *keys: str) -> Any:
+    """Returns the first non-None value found among keys in row."""
+    for key in keys:
+        val = row.get(key)
+        if val is not None:
+            return val
+    return None
+
+
+def detect_quota_reset_event(
+    old_row: dict | None,
+    new_row: dict,
+    detected_at: datetime | str | None = None,
+    source: str = "python",
+) -> dict | None:
+    """Detects and classifies a quota reset or top-up transition between persisted and live quota rows."""
+    if old_row is None or not isinstance(old_row, dict) or not isinstance(new_row, dict):
+        return None
+
+    raw_bid = _pick_field(new_row, "bucket_id", "bucketId") or _pick_field(
+        old_row, "bucket_id", "bucketId"
+    )
+    bucket_id = str(raw_bid).strip() if raw_bid is not None else ""
+    if not bucket_id:
+        return None
+
+    raw_old_reset = _pick_field(old_row, "reset_time", "resetTime")
+    old_reset_time = str(raw_old_reset).strip() if raw_old_reset is not None else ""
+    if not old_reset_time:
+        return None
+
+    raw_old_rem = _pick_field(old_row, "remaining_fraction", "remainingFraction")
+    raw_new_rem = _pick_field(new_row, "remaining_fraction", "remainingFraction")
+    try:
+        old_rem = float(raw_old_rem) if raw_old_rem is not None else None
+        new_rem = float(raw_new_rem) if raw_new_rem is not None else None
+    except (ValueError, TypeError):
+        return None
+    if (
+        old_rem is None
+        or new_rem is None
+        or not math.isfinite(old_rem)
+        or not math.isfinite(new_rem)
+    ):
+        return None
+
+    if old_rem >= IDLE_REMAINING_THRESHOLD:
+        return None
+
+    raw_new_reset = _pick_field(new_row, "reset_time", "resetTime")
+    new_reset_time = str(raw_new_reset).strip() if raw_new_reset is not None else ""
+
+    detected_dt = _to_utc_datetime(detected_at, default_now=True) or datetime.now(
+        timezone.utc
+    )
+    old_reset_dt = _to_utc_datetime(old_reset_time)
+    new_reset_dt = _to_utc_datetime(new_reset_time)
+
+    delta = new_rem - old_rem
+    reset_advanced = (
+        new_reset_dt is not None
+        and old_reset_dt is not None
+        and (new_reset_dt - old_reset_dt).total_seconds()
+        > RESET_TIME_SHIFT_THRESHOLD_SECONDS
+    )
+    near_or_past_old_reset = (
+        old_reset_dt is not None
+        and old_reset_dt <= detected_dt + timedelta(seconds=SCHEDULED_TOLERANCE_SECONDS)
+    )
+    # 1e-9 tolerance prevents IEEE-754 representation artifacts (e.g. 0.35 - 0.30 = 0.04999999999999999)
+    delta_jump = delta + 1e-9 >= MIN_REMAINING_JUMP
+
+    if not (
+        delta_jump or (reset_advanced and (near_or_past_old_reset or delta > 0.005))
+    ):
+        return None
+
+    if near_or_past_old_reset:
+        event_type = "scheduled"
+        reset_at = old_reset_time
+    else:
+        shift_seconds = (
+            abs((new_reset_dt - old_reset_dt).total_seconds())
+            if (new_reset_dt is not None and old_reset_dt is not None)
+            else 0.0
+        )
+        has_reset_shift = shift_seconds > RESET_TIME_SHIFT_THRESHOLD_SECONDS
+
+        if new_rem >= FULL_RESET_REMAINING_FLOOR or has_reset_shift:
+            event_type = "early_reset"
+            window_delta = (
+                timedelta(hours=5) if "5h" in bucket_id.lower() else timedelta(days=7)
+            )
+            old_fetched_dt = _to_utc_datetime(
+                _pick_field(old_row, "fetched_at", "fetchedAt", "updated_at", "updatedAt")
+            )
+            reset_at = detected_dt.isoformat()
+            if new_reset_dt is not None:
+                inferred_dt = new_reset_dt - window_delta
+                if (
+                    old_fetched_dt is None or inferred_dt >= old_fetched_dt
+                ) and inferred_dt <= detected_dt:
+                    reset_at = inferred_dt.isoformat()
+        elif delta_jump and new_rem < FULL_RESET_REMAINING_FLOOR and not has_reset_shift:
+            event_type = "top_up"
+            reset_at = detected_dt.isoformat()
+        else:
+            return None
+
+    raw_grp = _pick_field(new_row, "group_name", "groupName", "displayName")
+    if raw_grp is None:
+        raw_grp = _pick_field(old_row, "group_name", "groupName", "displayName")
+    group_name = str(raw_grp) if raw_grp is not None else ""
+
+    raw_win = new_row.get("window") or old_row.get("window")
+    window = (
+        str(raw_win).strip()
+        if raw_win
+        else ("5h" if "5h" in bucket_id.lower() else "weekly")
+    )
+
+    eff_source = (str(source).strip() if source is not None else "") or "python"
+
+    return {
+        "bucket_id": bucket_id,
+        "group_name": group_name,
+        "window": window,
+        "event_type": event_type,
+        "reset_at": reset_at,
+        "detected_at": detected_dt.isoformat(),
+        "old_remaining_fraction": old_rem,
+        "new_remaining_fraction": new_rem,
+        "delta_fraction": round(delta, 8),
+        "old_reset_time": old_reset_time,
+        "new_reset_time": new_reset_time,
+        "source": eff_source,
+    }
+
+
 def calibrate_capacity(
     conn: sqlite3.Connection,
     bucket_id: str,
@@ -537,6 +694,24 @@ def calibrate_capacity(
     now_utc = datetime.now(timezone.utc)
     window_delta = timedelta(hours=5) if is_5h else timedelta(days=7)
     start_dt = max(reset_dt - window_delta, now_utc - window_delta)
+
+    latest_reset: dict[str, Any] | None = None
+    try:
+        latest_reset = get_latest_quota_reset(
+            conn, bucket_id, since=start_dt.isoformat()
+        )
+    except sqlite3.OperationalError:
+        latest_reset = None
+
+    if latest_reset is not None:
+        event_type = latest_reset.get("event_type")
+        if event_type == "top_up":
+            return fallback_val
+        if event_type in ("early_reset", "scheduled"):
+            reset_at_dt = _to_utc_datetime(latest_reset.get("reset_at"))
+            if reset_at_dt is not None:
+                start_dt = max(start_dt, reset_at_dt)
+
     end_dt = min(reset_dt, now_utc) if reset_dt > start_dt else now_utc
 
     try:
@@ -566,6 +741,42 @@ def calibrate_capacity(
     calibrated = max(min_cap, min(max_cap, calibrated))
 
     return round(calibrated, 2)
+
+
+def _quota_rows_differ(
+    rows_to_upsert: list[dict[str, Any]],
+    cached_rows: list[dict[str, Any]],
+    cached_by_id: dict[str, dict[str, Any]],
+) -> bool:
+    """Returns True if new quota rows differ materially from cached rows."""
+    if not cached_rows or len(rows_to_upsert) != len(cached_rows):
+        return True
+    for new_r in rows_to_upsert:
+        bid = str(new_r.get("bucket_id") or "").strip().lower()
+        old_r = cached_by_id.get(bid)
+        if old_r is None:
+            return True
+        try:
+            new_rem = float(new_r.get("remaining_fraction", 0.0))
+            old_rem = float(old_r.get("remaining_fraction", 0.0))
+            if abs(new_rem - old_rem) > 1e-4:
+                return True
+        except (ValueError, TypeError):
+            return True
+
+        new_reset = str(new_r.get("reset_time", "") or "").strip()
+        old_reset = str(old_r.get("reset_time", "") or "").strip()
+        if new_reset != old_reset:
+            return True
+
+        try:
+            new_cap = float(new_r.get("calibrated_capacity", 0.0))
+            old_cap = float(old_r.get("calibrated_capacity", 0.0))
+            if abs(new_cap - old_cap) > 1e-2:
+                return True
+        except (ValueError, TypeError):
+            return True
+    return False
 
 
 def sync_and_get_quota_state(
@@ -658,12 +869,16 @@ def sync_and_get_quota_state(
                 else raw_payload
             )
             groups = response_data.get("groups", [])
-            rows_to_upsert = []
             now_iso = datetime.now(timezone.utc).isoformat()
+            parsed_buckets: list[dict[str, Any]] = []
 
             for grp in groups:
+                if not isinstance(grp, dict):
+                    continue
                 group_name = grp.get("displayName") or grp.get("group_name", "")
                 for b in grp.get("buckets", []):
+                    if not isinstance(b, dict):
+                        continue
                     bucket_id = b.get("bucketId") or b.get("bucket_id")
                     if not bucket_id:
                         continue
@@ -678,78 +893,99 @@ def sync_and_get_quota_state(
                     except (ValueError, TypeError):
                         rem_frac = 1.0
                     reset_time = b.get("resetTime") or b.get("reset_time") or ""
-                    fallback_cap = _get_default_capacity(bucket_id)
-
-                    calibrated = calibrate_capacity(
-                        conn=conn,
-                        bucket_id=bucket_id,
-                        remaining_fraction=rem_frac,
-                        reset_time=reset_time,
-                        fallback_capacity=fallback_cap,
-                    )
-
-                    rows_to_upsert.append(
+                    parsed_buckets.append(
                         {
                             "bucket_id": bucket_id,
                             "group_name": group_name,
                             "window": window,
                             "remaining_fraction": rem_frac,
                             "reset_time": reset_time,
-                            "calibrated_capacity": calibrated,
                             "fetched_at": now_iso,
                         }
                     )
 
-            if rows_to_upsert:
-                should_write = False
-                if not cached_rows:
-                    should_write = True
-                else:
+            if parsed_buckets:
+                started_tx = False
+                if not getattr(conn, "in_transaction", False):
+                    try:
+                        conn.execute("BEGIN IMMEDIATE")
+                        started_tx = True
+                    except sqlite3.OperationalError:
+                        started_tx = False
+
+                try:
+                    cached_rows = get_quota_state(conn)
                     cached_by_id = {
                         (r.get("bucket_id") or r.get("bucketId") or "").strip().lower(): r
                         for r in cached_rows
                     }
-                    if len(rows_to_upsert) != len(cached_rows):
-                        should_write = True
+
+                    detected_events: list[dict[str, Any]] = []
+                    for pb in parsed_buckets:
+                        bid = str(pb.get("bucket_id") or "").strip().lower()
+                        old_r = cached_by_id.get(bid)
+                        ev = detect_quota_reset_event(
+                            old_r,
+                            pb,
+                            detected_at=now_iso,
+                            source="python",
+                        )
+                        if ev is not None:
+                            detected_events.append(ev)
+
+                    if detected_events:
+                        try:
+                            insert_quota_reset_events(conn, detected_events)
+                        except sqlite3.OperationalError as exc:
+                            if "no such table" not in str(exc).lower():
+                                raise
+
+                    rows_to_upsert: list[dict[str, Any]] = []
+                    for pb in parsed_buckets:
+                        bucket_id = pb["bucket_id"]
+                        rem_frac = pb["remaining_fraction"]
+                        reset_time = pb["reset_time"]
+                        fallback_cap = _get_default_capacity(bucket_id)
+                        calibrated = calibrate_capacity(
+                            conn=conn,
+                            bucket_id=bucket_id,
+                            remaining_fraction=rem_frac,
+                            reset_time=reset_time,
+                            fallback_capacity=fallback_cap,
+                        )
+                        rows_to_upsert.append(
+                            {
+                                "bucket_id": bucket_id,
+                                "group_name": pb["group_name"],
+                                "window": pb["window"],
+                                "remaining_fraction": rem_frac,
+                                "reset_time": reset_time,
+                                "calibrated_capacity": calibrated,
+                                "fetched_at": now_iso,
+                            }
+                        )
+
+                    should_write = bool(detected_events) or _quota_rows_differ(
+                        rows_to_upsert, cached_rows, cached_by_id
+                    )
+
+                    if should_write:
+                        upsert_quota_state(conn, rows_to_upsert)
+                        if started_tx and getattr(conn, "in_transaction", False):
+                            conn.commit()
+                        fresh_rows = get_quota_state(conn)
+                        return QuotaStateList(fresh_rows)
                     else:
-                        for new_r in rows_to_upsert:
-                            bid = str(new_r.get("bucket_id") or "").strip().lower()
-                            old_r = cached_by_id.get(bid)
-                            if old_r is None:
-                                should_write = True
-                                break
-                            try:
-                                new_rem = float(new_r.get("remaining_fraction", 0.0))
-                                old_rem = float(old_r.get("remaining_fraction", 0.0))
-                                if abs(new_rem - old_rem) > 1e-4:
-                                    should_write = True
-                                    break
-                            except (ValueError, TypeError):
-                                should_write = True
-                                break
-
-                            new_reset = str(new_r.get("reset_time", "") or "").strip()
-                            old_reset = str(old_r.get("reset_time", "") or "").strip()
-                            if new_reset != old_reset:
-                                should_write = True
-                                break
-
-                            try:
-                                new_cap = float(new_r.get("calibrated_capacity", 0.0))
-                                old_cap = float(old_r.get("calibrated_capacity", 0.0))
-                                if abs(new_cap - old_cap) > 1e-2:
-                                    should_write = True
-                                    break
-                            except (ValueError, TypeError):
-                                should_write = True
-                                break
-
-                if should_write:
-                    upsert_quota_state(conn, rows_to_upsert)
-                    fresh_rows = get_quota_state(conn)
-                    return QuotaStateList(fresh_rows)
-                else:
-                    return QuotaStateList(cached_rows)
+                        if started_tx and getattr(conn, "in_transaction", False):
+                            conn.commit()
+                        return QuotaStateList(cached_rows)
+                except Exception:
+                    if started_tx and getattr(conn, "in_transaction", False):
+                        try:
+                            conn.rollback()
+                        except Exception:
+                            pass
+                    raise
         elif ls_fetcher is None:
             _LAST_QUOTA_SYNC_TIMES[cache_key] = (
                 time.monotonic()

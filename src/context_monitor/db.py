@@ -22,11 +22,15 @@ __all__ = [
     "DEFAULT_DB_PATH",
     "TABLES_SQL",
     "INDEXES_SQL",
+    "VALID_QUOTA_RESET_EVENT_TYPES",
     "get_db_connection",
     "checkpoint_wal_if_needed",
     "init_db",
     "upsert_quota_state",
     "get_quota_state",
+    "insert_quota_reset_events",
+    "get_quota_reset_events",
+    "get_latest_quota_reset",
     "refresh_conversation_rollups",
     "ensure_rollups_synced",
     "invalidate_rollups_sync_cache",
@@ -34,6 +38,7 @@ __all__ = [
 
 DEFAULT_DB_PATH = Path(os.path.expanduser("~/.gemini/antigravity/analytics.db"))
 MAX_ID_FULL_SYNC_THRESHOLD = 5000
+VALID_QUOTA_RESET_EVENT_TYPES = ("scheduled", "early_reset", "top_up")
 
 TABLES_SQL = """
 CREATE TABLE IF NOT EXISTS conversations (
@@ -129,6 +134,22 @@ CREATE TABLE IF NOT EXISTS quota_state (
     fetched_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS quota_reset_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    bucket_id TEXT NOT NULL,
+    group_name TEXT NOT NULL,
+    window TEXT NOT NULL,
+    event_type TEXT NOT NULL CHECK(event_type IN ('scheduled', 'early_reset', 'top_up')),
+    reset_at TEXT NOT NULL,
+    detected_at TEXT NOT NULL,
+    old_remaining_fraction REAL NOT NULL,
+    new_remaining_fraction REAL NOT NULL,
+    delta_fraction REAL NOT NULL,
+    old_reset_time TEXT DEFAULT '',
+    new_reset_time TEXT DEFAULT '',
+    source TEXT NOT NULL DEFAULT 'python'
+);
+
 CREATE TABLE IF NOT EXISTS hourly_step_rollups (
     hour_key TEXT NOT NULL,
     conversation_id TEXT NOT NULL,
@@ -171,6 +192,8 @@ CREATE INDEX IF NOT EXISTS idx_blocks_conv_hash ON transcript_blocks(conversatio
 CREATE INDEX IF NOT EXISTS idx_blocks_conv_step ON transcript_blocks(conversation_id, step_index);
 CREATE INDEX IF NOT EXISTS idx_blocks_tools ON transcript_blocks(block_type) WHERE block_type = 'tools';
 CREATE INDEX IF NOT EXISTS idx_rollups_conv ON hourly_step_rollups(conversation_id);
+CREATE INDEX IF NOT EXISTS idx_quota_resets_reset_at ON quota_reset_events(reset_at);
+CREATE INDEX IF NOT EXISTS idx_quota_resets_bucket_time ON quota_reset_events(bucket_id, reset_at DESC);
 """
 
 
@@ -577,6 +600,348 @@ def get_quota_state(
             row_dict["updated_at"] = row_dict.get("fetched_at", "")
         result.append(row_dict)
     return result
+
+
+_QUOTA_RESET_SELECT_COLS = """
+    id,
+    bucket_id,
+    group_name,
+    window,
+    event_type,
+    reset_at,
+    detected_at,
+    old_remaining_fraction,
+    new_remaining_fraction,
+    delta_fraction,
+    old_reset_time,
+    new_reset_time,
+    source
+"""
+
+
+def _coerce_iso_str(value: Any, default: str = "") -> str:
+    if value is None:
+        return default
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return str(value)
+
+
+def _coerce_finite_float(value: Any, field_name: str) -> float:
+    if value is None:
+        raise ValueError(f"{field_name} is required for quota_reset_events insert")
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field_name} must be a finite number, got {value!r}") from exc
+    if not math.isfinite(parsed):
+        raise ValueError(f"{field_name} must be finite, got {value!r}")
+    return parsed
+
+
+def _normalize_quota_reset_event(row: dict[str, Any], default_detected_at: str) -> dict[str, Any]:
+    if not isinstance(row, dict):
+        raise ValueError("Each quota reset event must be a dictionary")
+
+    raw_bid = row.get("bucket_id")
+    if raw_bid is None:
+        raw_bid = row.get("bucketId")
+    if not raw_bid or not str(raw_bid).strip():
+        raise ValueError(
+            "bucket_id is required and cannot be empty for quota_reset_events insert"
+        )
+    bucket_id = str(raw_bid).strip()
+
+    raw_type = row.get("event_type")
+    if raw_type is None:
+        raw_type = row.get("eventType")
+    event_type = str(raw_type).strip() if raw_type is not None else ""
+    if event_type not in VALID_QUOTA_RESET_EVENT_TYPES:
+        raise ValueError(
+            f"Invalid event_type {raw_type!r}; must be one of {VALID_QUOTA_RESET_EVENT_TYPES}"
+        )
+
+    raw_grp = row.get("group_name")
+    if raw_grp is None:
+        raw_grp = row.get("groupName") or row.get("displayName")
+    group_name = str(raw_grp) if raw_grp is not None else ""
+
+    raw_win = row.get("window")
+    window = str(raw_win) if raw_win is not None else ""
+
+    raw_detected = row.get("detected_at")
+    if raw_detected is None:
+        raw_detected = row.get("detectedAt")
+    detected_str = _coerce_iso_str(raw_detected).strip()
+    detected_at = detected_str or default_detected_at
+
+    raw_reset_at = row.get("reset_at")
+    if raw_reset_at is None:
+        raw_reset_at = row.get("resetAt")
+    reset_at = _coerce_iso_str(raw_reset_at).strip()
+    if not reset_at:
+        raise ValueError(
+            "reset_at is required and cannot be empty for quota_reset_events insert"
+        )
+
+    raw_old_rem = row.get("old_remaining_fraction")
+    if raw_old_rem is None:
+        raw_old_rem = row.get("oldRemainingFraction")
+    old_remaining_fraction = _coerce_finite_float(raw_old_rem, "old_remaining_fraction")
+
+    raw_new_rem = row.get("new_remaining_fraction")
+    if raw_new_rem is None:
+        raw_new_rem = row.get("newRemainingFraction")
+    new_remaining_fraction = _coerce_finite_float(raw_new_rem, "new_remaining_fraction")
+
+    raw_delta = row.get("delta_fraction")
+    if raw_delta is None:
+        raw_delta = row.get("deltaFraction")
+    if raw_delta is None:
+        delta_fraction = new_remaining_fraction - old_remaining_fraction
+    else:
+        delta_fraction = _coerce_finite_float(raw_delta, "delta_fraction")
+
+    raw_old_reset = row.get("old_reset_time")
+    if raw_old_reset is None:
+        raw_old_reset = row.get("oldResetTime")
+    old_reset_time = _coerce_iso_str(raw_old_reset, default="")
+
+    raw_new_reset = row.get("new_reset_time")
+    if raw_new_reset is None:
+        raw_new_reset = row.get("newResetTime")
+    new_reset_time = _coerce_iso_str(raw_new_reset, default="")
+
+    raw_source = row.get("source")
+    source_str = str(raw_source).strip() if raw_source is not None else ""
+    source = source_str or "python"
+
+    return {
+        "bucket_id": bucket_id,
+        "group_name": group_name,
+        "window": window,
+        "event_type": event_type,
+        "reset_at": reset_at,
+        "detected_at": detected_at,
+        "old_remaining_fraction": old_remaining_fraction,
+        "new_remaining_fraction": new_remaining_fraction,
+        "delta_fraction": delta_fraction,
+        "old_reset_time": old_reset_time,
+        "new_reset_time": new_reset_time,
+        "source": source,
+    }
+
+
+def _row_to_quota_reset_dict(row: Any) -> dict[str, Any]:
+    if isinstance(row, sqlite3.Row):
+        data = dict(row)
+        data["old_reset_time"] = data.get("old_reset_time") or ""
+        data["new_reset_time"] = data.get("new_reset_time") or ""
+        data["source"] = data.get("source") or "python"
+        return data
+    return {
+        "id": int(row[0]),
+        "bucket_id": row[1],
+        "group_name": row[2],
+        "window": row[3],
+        "event_type": row[4],
+        "reset_at": row[5],
+        "detected_at": row[6],
+        "old_remaining_fraction": float(row[7]),
+        "new_remaining_fraction": float(row[8]),
+        "delta_fraction": float(row[9]),
+        "old_reset_time": row[10] or "",
+        "new_reset_time": row[11] or "",
+        "source": row[12] or "python",
+    }
+
+
+def _build_iso_bound_clause(op: str, param_name: str) -> str:
+    # Compare parsed UTC julian timestamps when valid so mixed 'Z' / '+00:00' formats match accurately.
+    return (
+        f"((julianday(reset_at) IS NOT NULL AND julianday(:{param_name}) IS NOT NULL "
+        f"AND julianday(reset_at) {op} julianday(:{param_name})) "
+        f"OR ((julianday(reset_at) IS NULL OR julianday(:{param_name}) IS NULL) "
+        f"AND reset_at {op} :{param_name}))"
+    )
+
+
+def insert_quota_reset_events(
+    conn: sqlite3.Connection, events: list[dict] | dict | None
+) -> int:
+    """Inserts quota reset events with a 5-minute deduplication guard.
+
+    Validates all records before touching the database, skips events matching an
+    existing `(bucket_id, event_type, new_reset_time)` within 300 seconds of
+    `detected_at`, and respects an active outer transaction (`conn.in_transaction`).
+
+    Args:
+        conn: An open SQLite connection.
+        events: A single event dict, a list of event dicts, or empty/None.
+
+    Returns:
+        The number of rows inserted.
+    """
+    if not events:
+        return 0
+
+    event_list = [events] if isinstance(events, dict) else list(events)
+    if not event_list:
+        return 0
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    normalized = [_normalize_quota_reset_event(item, now_iso) for item in event_list]
+
+    dedup_sql = """
+        SELECT 1 FROM quota_reset_events
+        WHERE bucket_id = ?
+          AND event_type = ?
+          AND new_reset_time = ?
+          AND ABS(strftime('%s', detected_at) - strftime('%s', ?)) <= 300
+        LIMIT 1
+    """
+    insert_sql = """
+        INSERT INTO quota_reset_events (
+            bucket_id,
+            group_name,
+            window,
+            event_type,
+            reset_at,
+            detected_at,
+            old_remaining_fraction,
+            new_remaining_fraction,
+            delta_fraction,
+            old_reset_time,
+            new_reset_time,
+            source
+        ) VALUES (
+            :bucket_id,
+            :group_name,
+            :window,
+            :event_type,
+            :reset_at,
+            :detected_at,
+            :old_remaining_fraction,
+            :new_remaining_fraction,
+            :delta_fraction,
+            :old_reset_time,
+            :new_reset_time,
+            :source
+        )
+    """
+
+    def _execute_inserts() -> int:
+        inserted = 0
+        for item in normalized:
+            dup = conn.execute(
+                dedup_sql,
+                (
+                    item["bucket_id"],
+                    item["event_type"],
+                    item["new_reset_time"],
+                    item["detected_at"],
+                ),
+            ).fetchone()
+            if dup is not None:
+                continue
+            conn.execute(insert_sql, item)
+            inserted += 1
+        return inserted
+
+    if getattr(conn, "in_transaction", False):
+        return _execute_inserts()
+    with conn:
+        return _execute_inserts()
+
+
+def get_quota_reset_events(
+    conn: sqlite3.Connection,
+    *,
+    bucket_id: str | None = None,
+    window: str | None = None,
+    since: str | None = None,
+    until: str | None = None,
+    limit: int = 500,
+) -> list[dict]:
+    """Retrieves recorded quota reset events ordered chronologically by reset_at ASC, id ASC.
+
+    Args:
+        conn: An open SQLite connection.
+        bucket_id: Optional bucket_id filter.
+        window: Optional quota window filter ('weekly' or '5h').
+        since: Optional inclusive lower bound on reset_at (ISO timestamp).
+        until: Optional inclusive upper bound on reset_at (ISO timestamp).
+        limit: Maximum number of rows to return (non-negative, default 500).
+
+    Returns:
+        List of quota reset event dicts.
+    """
+    if limit < 0:
+        raise ValueError("limit must be non-negative")
+    if limit == 0:
+        return []
+
+    conditions: list[str] = []
+    params: dict[str, Any] = {"limit": int(limit)}
+
+    if bucket_id:
+        conditions.append("bucket_id = :bucket_id")
+        params["bucket_id"] = str(bucket_id).strip()
+    if window:
+        conditions.append("window = :window")
+        params["window"] = str(window).strip()
+    if since:
+        conditions.append(_build_iso_bound_clause(">=", "since"))
+        params["since"] = _coerce_iso_str(since).strip()
+    if until:
+        conditions.append(_build_iso_bound_clause("<=", "until"))
+        params["until"] = _coerce_iso_str(until).strip()
+
+    where_sql = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+    sql = (
+        f"SELECT {_QUOTA_RESET_SELECT_COLS} "
+        f"FROM quota_reset_events {where_sql} "
+        "ORDER BY COALESCE(julianday(reset_at), 0.0) ASC, id ASC "
+        "LIMIT :limit"
+    )
+    rows = conn.execute(sql, params).fetchall()
+    return [_row_to_quota_reset_dict(r) for r in rows]
+
+
+def get_latest_quota_reset(
+    conn: sqlite3.Connection,
+    bucket_id: str,
+    *,
+    since: str | None = None,
+) -> dict | None:
+    """Retrieves the most recent quota reset event for a bucket, optionally bounded by since.
+
+    Args:
+        conn: An open SQLite connection.
+        bucket_id: Target quota bucket identifier.
+        since: Optional inclusive lower bound on reset_at (ISO timestamp).
+
+    Returns:
+        Most recent event dict ordered by reset_at DESC, id DESC, or None.
+    """
+    if not bucket_id or not str(bucket_id).strip():
+        return None
+
+    conditions = ["bucket_id = :bucket_id"]
+    params: dict[str, Any] = {"bucket_id": str(bucket_id).strip()}
+
+    if since:
+        conditions.append(_build_iso_bound_clause(">=", "since"))
+        params["since"] = _coerce_iso_str(since).strip()
+
+    sql = (
+        f"SELECT {_QUOTA_RESET_SELECT_COLS} "
+        f"FROM quota_reset_events WHERE {' AND '.join(conditions)} "
+        "ORDER BY COALESCE(julianday(reset_at), 0.0) DESC, id DESC "
+        "LIMIT 1"
+    )
+    row = conn.execute(sql, params).fetchone()
+    return _row_to_quota_reset_dict(row) if row is not None else None
 
 
 def refresh_conversation_rollups(

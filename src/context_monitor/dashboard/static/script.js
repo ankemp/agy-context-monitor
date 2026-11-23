@@ -94,6 +94,8 @@
     let allHotFiles = [];
     let allConversations = [];
     let allTimelineData = [];
+    let allQuotaResets = (typeof STATIC_DATA !== 'undefined' && STATIC_DATA && Array.isArray(STATIC_DATA.quota_resets)) ? STATIC_DATA.quota_resets : [];
+    let currentTimelineResetMode = 'weekly'; // 'weekly' | 'all' | 'off'
     let cycleTimelineData = (typeof STATIC_DATA !== 'undefined' && STATIC_DATA && STATIC_DATA.timeline_cycle) ? STATIC_DATA.timeline_cycle : null;
     let cachedCycleProject = (typeof STATIC_DATA !== 'undefined' && STATIC_DATA && STATIC_DATA.timeline_cycle) ? 'all' : null;
     let allHourlySeries = (typeof STATIC_DATA !== 'undefined' && STATIC_DATA)
@@ -690,6 +692,7 @@
         const fetchOpts = signal ? { signal } : {};
         const isCycleActive = (typeof currentTimelineDays === 'string' && currentTimelineDays.toLowerCase().trim() === 'cycle');
         const activeTimelineUrl = isCycleActive ? `/api/timeline${cycleQueryStr}` : `/api/timeline${queryStr}`;
+        const tzOnlyQueryStr = clientTz ? `?tz=${encodeURIComponent(clientTz)}` : '';
 
         const endpointNames = [
           '/api/summary',
@@ -699,7 +702,8 @@
           '/api/mcp',
           '/api/hot-files',
           '/api/activity-matrix',
-          '/api/conversations'
+          '/api/conversations',
+          '/api/quota-resets'
         ];
         const settled = await Promise.allSettled([
           fetchJson(`/api/summary${queryStr}`, fetchOpts),
@@ -709,7 +713,8 @@
           fetchJson(`/api/mcp${queryStr}`, fetchOpts),
           fetchJson(`/api/hot-files${queryStr}`, fetchOpts),
           fetchJson(`/api/activity-matrix${queryStr}`, fetchOpts),
-          fetchJson(`/api/conversations${convQueryStr}`, fetchOpts)
+          fetchJson(`/api/conversations${convQueryStr}`, fetchOpts),
+          fetchJson(`/api/quota-resets${tzOnlyQueryStr}`, fetchOpts)
         ]);
 
         if (signal && signal.aborted) return;
@@ -729,7 +734,8 @@
           mcpSettled,
           hotFilesSettled,
           matrixSettled,
-          convsSettled
+          convsSettled,
+          resetsSettled
         ] = settled;
 
         const summaryRes = summarySettled.status === 'fulfilled' ? summarySettled.value : null;
@@ -769,6 +775,11 @@
           }
         }
 
+        const resetsUpdated = resetsSettled.status === 'fulfilled' && Array.isArray(resetsSettled.value);
+        if (resetsUpdated) {
+          allQuotaResets = resetsSettled.value;
+        }
+
         if (timelineSettled.status === 'fulfilled') {
           const timelineActiveRes = timelineSettled.value;
           if (isCycleActive) {
@@ -778,6 +789,11 @@
             allTimelineData = Array.isArray(timelineActiveRes) ? timelineActiveRes : [];
           }
           setTimelineRange(currentTimelineDays);
+        } else if (resetsUpdated) {
+          const activeTimeline = isCycleActive ? cycleTimelineData : allTimelineData;
+          if (Array.isArray(activeTimeline) && activeTimeline.length > 0) {
+            setTimelineRange(currentTimelineDays);
+          }
         }
 
         if (costProjSettled.status === 'fulfilled') {
@@ -1998,6 +2014,336 @@
     // ==========================================
     // CHARTS & TABLES
     // ==========================================
+    const QUOTA_RESET_STYLES = {
+      scheduled: {
+        color: '#10b981',
+        dash: [4, 4],
+        label: 'Reset',
+        priority: 1,
+        bg: 'rgba(6, 78, 59, 0.88)',
+        border: 'rgba(16, 185, 129, 0.65)',
+        text: '#6ee7b7'
+      },
+      early_reset: {
+        color: '#f59e0b',
+        dash: [8, 3],
+        label: 'Early',
+        priority: 3,
+        bg: 'rgba(120, 53, 15, 0.90)',
+        border: 'rgba(245, 158, 11, 0.70)',
+        text: '#fcd34d'
+      },
+      top_up: {
+        color: '#a855f7',
+        dash: [2, 3],
+        label: 'Top-up',
+        priority: 2,
+        bg: 'rgba(88, 28, 135, 0.90)',
+        border: 'rgba(168, 85, 247, 0.70)',
+        text: '#d8b4fe'
+      }
+    };
+
+    const QUOTA_RESET_PRIORITY = {
+      early_reset: 3,
+      top_up: 2,
+      scheduled: 1
+    };
+
+    const QUOTA_RESET_TOOLTIP_LABELS = {
+      early_reset: 'Early Reset',
+      top_up: 'Top-up',
+      scheduled: 'Scheduled Reset'
+    };
+
+    function filterQuotaResetsForMode(events, mode = currentTimelineResetMode) {
+      if (!Array.isArray(events)) return [];
+      const m = String(mode || 'weekly').toLowerCase().trim();
+      if (m === 'off') return [];
+      const valid = events.filter(e => e && typeof e === 'object');
+      if (m === 'all') return valid.slice();
+      return valid.filter(e => Boolean(
+        e.is_weekly ||
+        String(e.window || '').toLowerCase() === 'weekly' ||
+        String(e.bucket_id || '').toLowerCase().includes('weekly')
+      ));
+    }
+
+    function compareQuotaResetEvents(a, b) {
+      const parseTs = (ev) => {
+        if (!ev) return NaN;
+        if (ev.reset_at) {
+          const t = Date.parse(ev.reset_at);
+          if (Number.isFinite(t)) return t;
+        }
+        if (ev.detected_at) {
+          const t = Date.parse(ev.detected_at);
+          if (Number.isFinite(t)) return t;
+        }
+        return NaN;
+      };
+      const tA = parseTs(a);
+      const tB = parseTs(b);
+      if (Number.isFinite(tA) && Number.isFinite(tB) && tA !== tB) {
+        return tA - tB;
+      }
+      const timeCmp = String(a?.local_time || '').localeCompare(String(b?.local_time || ''));
+      if (timeCmp !== 0) return timeCmp;
+      return (Number(a?.id) || 0) - (Number(b?.id) || 0);
+    }
+
+    function groupQuotaResetsByDay(events, timelineData) {
+      if (!Array.isArray(events) || events.length === 0 || !Array.isArray(timelineData) || timelineData.length === 0) {
+        return {};
+      }
+      const dayToIndex = Object.create(null);
+      timelineData.forEach((item, idx) => {
+        if (item && item.day) {
+          dayToIndex[String(item.day)] = idx;
+        }
+      });
+
+      const byIndex = {};
+      for (const ev of events) {
+        if (!ev || !ev.day) continue;
+        const idx = dayToIndex[String(ev.day)];
+        if (idx === undefined) continue;
+        if (!byIndex[idx]) {
+          byIndex[idx] = {
+            index: idx,
+            day: String(ev.day),
+            events: [],
+            dominantType: null,
+            dominantEvent: null
+          };
+        }
+        byIndex[idx].events.push(ev);
+      }
+
+      Object.values(byIndex).forEach((group) => {
+        group.events.sort(compareQuotaResetEvents);
+        let bestEvent = group.events[0] || null;
+        let bestPriority = -1;
+        for (const ev of group.events) {
+          const prio = QUOTA_RESET_PRIORITY[ev.event_type] || 0;
+          if (prio > bestPriority) {
+            bestPriority = prio;
+            bestEvent = ev;
+          }
+        }
+        group.dominantEvent = bestEvent;
+        group.dominantType = (bestEvent && bestEvent.event_type) ? bestEvent.event_type : 'scheduled';
+      });
+
+      return byIndex;
+    }
+
+    function formatResetPctValue(pctVal, fracVal) {
+      let num = null;
+      if (pctVal !== undefined && pctVal !== null && pctVal !== '' && Number.isFinite(Number(pctVal))) {
+        num = Number(pctVal);
+      } else if (fracVal !== undefined && fracVal !== null && fracVal !== '' && Number.isFinite(Number(fracVal))) {
+        num = Number(fracVal) * 100;
+      }
+      if (num === null) return null;
+      const rounded = Math.round(num * 10) / 10;
+      return Number.isInteger(rounded) ? `${rounded}%` : `${rounded.toFixed(1)}%`;
+    }
+
+    function formatResetTooltipLines(dayGroupOrEvents) {
+      const events = Array.isArray(dayGroupOrEvents)
+        ? dayGroupOrEvents
+        : (dayGroupOrEvents && Array.isArray(dayGroupOrEvents.events) ? dayGroupOrEvents.events : []);
+      if (events.length === 0) return [];
+
+      const lines = [];
+      for (const ev of events) {
+        if (!ev || typeof ev !== 'object') continue;
+        const typeLabel = QUOTA_RESET_TOOLTIP_LABELS[ev.event_type]
+          || (ev.event_type ? String(ev.event_type).replace(/_/g, ' ') : 'Quota Reset');
+        const bucketName = ev.bucket_label || ev.bucket_id || 'Quota';
+        const timePart = ev.local_time ? ` @ ${ev.local_time}` : '';
+        const oldStr = formatResetPctValue(ev.old_remaining_pct, ev.old_remaining_fraction);
+        const newStr = formatResetPctValue(ev.new_remaining_pct, ev.new_remaining_fraction);
+        const pctPart = (oldStr !== null && newStr !== null) ? ` (${oldStr} → ${newStr})` : '';
+        lines.push(`${typeLabel} · ${bucketName}${timePart}${pctPart}`);
+      }
+      return lines;
+    }
+
+    function drawQuotaResetPill(ctx, pillLeft, pillTop, pillW, pillH, labelText, style, pillFont) {
+      const radius = Math.min(4, pillH / 2, pillW / 2);
+      ctx.beginPath();
+      if (typeof ctx.roundRect === 'function') {
+        ctx.roundRect(pillLeft, pillTop, pillW, pillH, radius);
+        ctx.fillStyle = style.bg;
+        ctx.fill();
+        ctx.strokeStyle = style.border;
+        ctx.lineWidth = 1;
+        ctx.stroke();
+      } else if (typeof ctx.quadraticCurveTo === 'function') {
+        ctx.moveTo(pillLeft + radius, pillTop);
+        ctx.lineTo(pillLeft + pillW - radius, pillTop);
+        ctx.quadraticCurveTo(pillLeft + pillW, pillTop, pillLeft + pillW, pillTop + radius);
+        ctx.lineTo(pillLeft + pillW, pillTop + pillH - radius);
+        ctx.quadraticCurveTo(pillLeft + pillW, pillTop + pillH, pillLeft + pillW - radius, pillTop + pillH);
+        ctx.lineTo(pillLeft + radius, pillTop + pillH);
+        ctx.quadraticCurveTo(pillLeft, pillTop + pillH, pillLeft, pillTop + pillH - radius);
+        ctx.lineTo(pillLeft, pillTop + radius);
+        ctx.quadraticCurveTo(pillLeft, pillTop, pillLeft + radius, pillTop);
+        ctx.closePath();
+        ctx.fillStyle = style.bg;
+        ctx.fill();
+        ctx.strokeStyle = style.border;
+        ctx.lineWidth = 1;
+        ctx.stroke();
+      } else {
+        ctx.fillStyle = style.bg;
+        if (typeof ctx.fillRect === 'function') ctx.fillRect(pillLeft, pillTop, pillW, pillH);
+        ctx.strokeStyle = style.border;
+        ctx.lineWidth = 1;
+        if (typeof ctx.strokeRect === 'function') ctx.strokeRect(pillLeft, pillTop, pillW, pillH);
+      }
+
+      ctx.fillStyle = style.text;
+      ctx.font = pillFont;
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      if (typeof ctx.fillText === 'function') {
+        ctx.fillText(labelText, pillLeft + pillW / 2, pillTop + pillH / 2 + 0.5);
+      }
+    }
+
+    const quotaResetLinesPlugin = {
+      id: 'quotaResetLines',
+      afterDatasetsDraw(chart, args, pluginOptions) {
+        const eventsByIndex = (pluginOptions && pluginOptions.eventsByIndex)
+          || (chart && chart.options && chart.options.plugins && chart.options.plugins.quotaResetLines && chart.options.plugins.quotaResetLines.eventsByIndex);
+        if (!chart || !chart.ctx || !chart.chartArea || !chart.scales || !chart.scales.x) return;
+        if (!eventsByIndex || typeof eventsByIndex !== 'object') return;
+
+        const entries = Object.entries(eventsByIndex);
+        if (entries.length === 0) return;
+
+        const { ctx, chartArea } = chart;
+        const xScale = chart.scales.x;
+        if (typeof xScale.getPixelForValue !== 'function') return;
+
+        const items = [];
+        for (const [idxKey, group] of entries) {
+          const idx = Number(idxKey);
+          if (!Number.isFinite(idx) || !group || !Array.isArray(group.events) || group.events.length === 0) {
+            continue;
+          }
+          const x = xScale.getPixelForValue(idx);
+          if (!Number.isFinite(x) || x < chartArea.left - 1 || x > chartArea.right + 1) {
+            continue;
+          }
+          const style = QUOTA_RESET_STYLES[group.dominantType] || QUOTA_RESET_STYLES.scheduled;
+          items.push({
+            idx,
+            x,
+            group,
+            style,
+            count: group.events.length,
+            priority: style.priority || 1
+          });
+        }
+        if (items.length === 0) return;
+
+        // Draw vertical dashed lines for every reset day in slice
+        for (const item of items) {
+          ctx.save();
+          ctx.beginPath();
+          if (typeof ctx.setLineDash === 'function') {
+            ctx.setLineDash(item.style.dash);
+          }
+          ctx.strokeStyle = item.style.color;
+          ctx.lineWidth = 1.5;
+          ctx.moveTo(item.x, chartArea.top);
+          ctx.lineTo(item.x, chartArea.bottom);
+          ctx.stroke();
+          ctx.restore();
+        }
+
+        // Draw top pill badges in priority order (early_reset > top_up > scheduled, tie-break left-to-right)
+        const pillOrder = items.slice().sort((a, b) => {
+          if (b.priority !== a.priority) return b.priority - a.priority;
+          return a.x - b.x;
+        });
+
+        const placedPills = [];
+        const minLeft = chartArea.left + 2;
+        const maxRight = chartArea.right - 2;
+        const pillH = 15;
+        const pillTop = chartArea.top + 4;
+        const padX = 5;
+        const pillFont = '600 10px ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace';
+
+        for (const item of pillOrder) {
+          const labelText = item.count > 1 ? `${item.style.label} ×${item.count}` : item.style.label;
+          ctx.save();
+          ctx.font = pillFont;
+          const textWidth = (typeof ctx.measureText === 'function')
+            ? (ctx.measureText(labelText)?.width || labelText.length * 6)
+            : labelText.length * 6;
+          const pillW = Math.ceil(textWidth + padX * 2);
+
+          let pillLeft = item.x - pillW / 2;
+          if (pillLeft < minLeft) pillLeft = minLeft;
+          if (pillLeft + pillW > maxRight) {
+            pillLeft = Math.max(minLeft, maxRight - pillW);
+          }
+          const pillRight = pillLeft + pillW;
+
+          const boxLeft = pillLeft - 4;
+          const boxRight = pillRight + 4;
+          if (placedPills.some(p => boxLeft <= p.right && boxRight >= p.left)) {
+            ctx.restore();
+            continue;
+          }
+
+          placedPills.push({ left: pillLeft, right: pillRight });
+          drawQuotaResetPill(ctx, pillLeft, pillTop, pillW, pillH, labelText, item.style, pillFont);
+          ctx.restore();
+        }
+      }
+    };
+
+    if (typeof Chart !== 'undefined' && typeof Chart.register === 'function') {
+      const alreadyRegistered = Boolean(
+        Chart.registry &&
+        Chart.registry.plugins &&
+        typeof Chart.registry.plugins.get === 'function' &&
+        Chart.registry.plugins.get('quotaResetLines')
+      );
+      if (!alreadyRegistered) {
+        Chart.register(quotaResetLinesPlugin);
+      }
+    }
+
+    function setTimelineResetMode(mode) {
+      const normalized = (mode === 'all' || mode === 'off' || mode === 'weekly') ? mode : 'weekly';
+      currentTimelineResetMode = normalized;
+      const btnWeekly = document.getElementById('btnResetWeekly');
+      const btnAll = document.getElementById('btnResetAll');
+      const btnOff = document.getElementById('btnResetOff');
+      const btnClasses = {
+        active: 'px-2.5 py-1 rounded-md bg-brand-600 text-white font-medium shadow-sm transition text-[11px] whitespace-nowrap outline-none focus:outline-none focus:ring-0',
+        inactive: 'px-2.5 py-1 rounded-md text-gray-400 hover:text-white transition text-[11px] whitespace-nowrap outline-none focus:outline-none focus:ring-0'
+      };
+      if (btnWeekly) btnWeekly.className = normalized === 'weekly' ? btnClasses.active : btnClasses.inactive;
+      if (btnAll) btnAll.className = normalized === 'all' ? btnClasses.active : btnClasses.inactive;
+      if (btnOff) btnOff.className = normalized === 'off' ? btnClasses.active : btnClasses.inactive;
+      setTimelineRange(currentTimelineDays);
+    }
+
+    window.setTimelineResetMode = setTimelineResetMode;
+    window.filterQuotaResetsForMode = filterQuotaResetsForMode;
+    window.groupQuotaResetsByDay = groupQuotaResetsByDay;
+    window.formatResetTooltipLines = formatResetTooltipLines;
+    window.quotaResetLinesPlugin = quotaResetLinesPlugin;
+
     function setTimelineRange(days) {
       currentTimelineDays = days;
       const isCycle = (typeof days === 'string' && days.toLowerCase().trim() === 'cycle');
@@ -2210,6 +2556,10 @@
         }
       ];
 
+      const filteredResets = filterQuotaResetsForMode(allQuotaResets, currentTimelineResetMode);
+      const resetsByIndex = groupQuotaResetsByDay(filteredResets, data);
+      const hasResetMarkers = Object.keys(resetsByIndex).length > 0;
+
       timelineChart = upsertChart(timelineChart, canvas, {
         type: 'bar',
         data: {
@@ -2220,8 +2570,16 @@
           animation: false,
           responsive: true,
           maintainAspectRatio: false,
+          layout: {
+            padding: {
+              top: hasResetMarkers ? 18 : 0
+            }
+          },
           interaction: { mode: 'index', intersect: false },
           plugins: {
+            quotaResetLines: {
+              eventsByIndex: resetsByIndex
+            },
             legend: { 
               labels: { 
                 color: '#9ca3af', 
@@ -2294,6 +2652,12 @@
                   const dayCost = data[idx]?.cost || 0;
                   const dayQuotaPct = currentWeeklyQuotaCapacity > 0 ? ((dayCost / currentWeeklyQuotaCapacity) * 100).toFixed(2) : '0.00';
                   return `Total API Tokens: ${formatTokens(dayTokens)} (${dayQuotaPct}% of weekly quota)${suffix}`;
+                },
+                afterBody: (items) => {
+                  if (!items || items.length === 0) return [];
+                  const idx = items[0]?.dataIndex;
+                  if (idx === undefined || idx === null) return [];
+                  return formatResetTooltipLines(resetsByIndex[idx]);
                 }
               }
             }

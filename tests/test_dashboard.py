@@ -21,7 +21,12 @@ from zoneinfo import ZoneInfo
 import pytest
 from context_monitor.dashboard import api_routes, server
 from context_monitor.dashboard.api_routes import query_activity_matrix
-from context_monitor.db import get_db_connection, init_db, upsert_quota_state
+from context_monitor.db import (
+    get_db_connection,
+    init_db,
+    insert_quota_reset_events,
+    upsert_quota_state,
+)
 
 get_connection = get_db_connection
 
@@ -4208,9 +4213,9 @@ def test_frontend_lazy_heatmap_and_abort_execution():
       // Advance past trailing timer
       await new Promise(r => setTimeout(r, 2050));
 
-      // Exactly 8 fetches for the single collapsed Promise.all fetch (active timeline only)
-      if (fetchCount !== beforeBurstFetches + 8) {
-        throw new Error(`Expected exactly 8 fetches after debounce window, got ${fetchCount - beforeBurstFetches}`);
+      // Exactly 9 fetches for the single collapsed Promise.allSettled fetch (active timeline + quota-resets)
+      if (fetchCount !== beforeBurstFetches + 9) {
+        throw new Error(`Expected exactly 9 fetches after debounce window, got ${fetchCount - beforeBurstFetches}`);
       }
 
       // 9. Test AbortError rejection handling: should not throw unhandled rejection
@@ -6695,7 +6700,7 @@ def test_dashboard_frontend_sse_coalescing_and_resilient_fetch():
       if (u.includes('/api/cost-by-project')) {
         return { json: async () => ({ total_cost: 1.25, projects: [] }) };
       }
-      if (u.includes('/api/timeline') || u.includes('/api/mcp') || u.includes('/api/hot-files')) {
+      if (u.includes('/api/timeline') || u.includes('/api/mcp') || u.includes('/api/hot-files') || u.includes('/api/quota-resets')) {
         return { json: async () => [] };
       }
       return { json: async () => ({}) };
@@ -6747,23 +6752,23 @@ def test_dashboard_frontend_sse_coalescing_and_resilient_fetch():
       const ctrl1 = api.getAbortController();
       if (!ctrl1 || ctrl1.signal.aborted) throw new Error('Expected active AbortController for initial fetch');
       if (!api.getIsInFlight()) throw new Error('Expected isDashboardFetchInFlight === true while pending');
-      if (fetchUrls.length !== 8) throw new Error(`Expected 8 initial fetches, got ${fetchUrls.length}`);
+      if (fetchUrls.length !== 9) throw new Error(`Expected 9 initial fetches, got ${fetchUrls.length}`);
 
       await api.fetchDashboardData({ source: 'sse' });
       await api.fetchDashboardData({ source: 'sse' });
       if (ctrl1.signal.aborted) throw new Error('SSE refresh must NOT abort in-flight fetchDashboardData()');
-      if (fetchUrls.length !== 8) throw new Error(`Coalesced SSE must not start concurrent fetches while in-flight, got ${fetchUrls.length}`);
+      if (fetchUrls.length !== 9) throw new Error(`Coalesced SSE must not start concurrent fetches while in-flight, got ${fetchUrls.length}`);
       if (!api.getPendingSse()) throw new Error('Expected pendingSseRefresh === true');
 
-      // Resolve initial 8 fetches -> triggers exactly one coalesced follow-up refresh (8 more fetches)
+      // Resolve initial 9 fetches -> triggers exactly one coalesced follow-up refresh (9 more fetches)
       deferNextFetch = false;
       const batch1 = pendingResolvers.splice(0, pendingResolvers.length);
       batch1.forEach(r => r());
       await pInitial;
       await flush();
 
-      if (fetchUrls.length !== 16) {
-        throw new Error(`Expected exactly 16 total fetches after 1 coalesced SSE follow-up, got ${fetchUrls.length}`);
+      if (fetchUrls.length !== 18) {
+        throw new Error(`Expected exactly 18 total fetches after 1 coalesced SSE follow-up, got ${fetchUrls.length}`);
       }
       if (api.getIsInFlight() || api.getPendingSse()) {
         throw new Error('Expected in-flight and pending SSE flags cleared after coalesced follow-up settled');
@@ -6865,8 +6870,862 @@ def test_dashboard_frontend_sse_coalescing_and_resilient_fetch():
     assert data["eventSourceCount"] == 1
 
 
+def test_query_quota_resets_timezone_and_scope(tmp_path: Path):
+    """Verifies query_quota_resets handles timezone conversion, scopes, bucket labels, and edge cases."""
+    import sqlite3 as _sqlite3
+
+    # 1. None connection and missing table return [] gracefully
+    assert api_routes.query_quota_resets(None) == []
+    legacy_conn = _sqlite3.connect(":memory:")
+    try:
+        assert api_routes.query_quota_resets(legacy_conn) == []
+    finally:
+        legacy_conn.close()
+
+    # 2. Seed events across weekly and 5h buckets
+    db_file = tmp_path / "resets_api.db"
+    init_db(db_file)
+    with get_db_connection(db_file) as conn:
+        insert_quota_reset_events(
+            conn,
+            [
+                {
+                    "bucket_id": "gemini-weekly",
+                    "group_name": "Gemini Models",
+                    "window": "weekly",
+                    "event_type": "early_reset",
+                    "reset_at": "2026-11-26T02:15:00+00:00",
+                    "detected_at": "2026-11-26T02:16:00+00:00",
+                    "old_remaining_fraction": 0.42,
+                    "new_remaining_fraction": 1.0,
+                    "delta_fraction": 0.58,
+                    "old_reset_time": "2026-11-30T20:00:00Z",
+                    "new_reset_time": "2026-12-03T02:15:00Z",
+                    "source": "python",
+                },
+                {
+                    "bucket_id": "gemini-5h",
+                    "group_name": "Gemini Models",
+                    "window": "5h",
+                    "event_type": "scheduled",
+                    "reset_at": "2026-11-26T10:00:00+00:00",
+                    "detected_at": "2026-11-26T10:05:00+00:00",
+                    "old_remaining_fraction": 0.15,
+                    "new_remaining_fraction": 1.0,
+                    "delta_fraction": 0.85,
+                    "old_reset_time": "2026-11-26T10:00:00Z",
+                    "new_reset_time": "2026-11-26T15:00:00Z",
+                    "source": "sidecar",
+                },
+                {
+                    "bucket_id": "3p-5h",
+                    "group_name": "Claude and GPT models",
+                    "window": "5h",
+                    "event_type": "top_up",
+                    "reset_at": "2026-11-26T12:30:00+00:00",
+                    "detected_at": "2026-11-26T12:30:00+00:00",
+                    "old_remaining_fraction": 0.30,
+                    "new_remaining_fraction": 0.55,
+                    "delta_fraction": 0.25,
+                    "old_reset_time": "2026-11-26T16:00:00Z",
+                    "new_reset_time": "2026-11-26T16:00:00Z",
+                    "source": "python",
+                },
+            ],
+        )
+
+        # Scope = all in America/Chicago (UTC-6 in late November)
+        all_rows = api_routes.query_quota_resets(conn, tz="America/Chicago", scope="all")
+        assert len(all_rows) == 3
+
+        expected_keys = {
+            "id",
+            "bucket_id",
+            "bucket_label",
+            "group_name",
+            "window",
+            "is_weekly",
+            "event_type",
+            "reset_at",
+            "detected_at",
+            "day",
+            "local_time",
+            "local_datetime",
+            "old_remaining_fraction",
+            "new_remaining_fraction",
+            "delta_fraction",
+            "old_remaining_pct",
+            "new_remaining_pct",
+            "old_reset_time",
+            "new_reset_time",
+            "source",
+        }
+        for item in all_rows:
+            assert set(item.keys()) == expected_keys
+
+        weekly_item = all_rows[0]
+        assert weekly_item["bucket_id"] == "gemini-weekly"
+        assert weekly_item["bucket_label"] == "Gemini Weekly"
+        assert weekly_item["is_weekly"] is True
+        assert weekly_item["event_type"] == "early_reset"
+        assert weekly_item["day"] == "2026-11-25"
+        assert weekly_item["local_time"] == "20:15"
+        assert weekly_item["local_datetime"].startswith("2026-11-25 20:15")
+        assert weekly_item["old_remaining_pct"] == 42.0
+        assert weekly_item["new_remaining_pct"] == 100.0
+
+        g5_item = all_rows[1]
+        assert g5_item["bucket_id"] == "gemini-5h"
+        assert g5_item["bucket_label"] == "Gemini 5-Hour"
+        assert g5_item["is_weekly"] is False
+        assert g5_item["day"] == "2026-11-26"
+        assert g5_item["local_time"] == "04:00"
+        assert g5_item["old_remaining_pct"] == 15.0
+        assert g5_item["new_remaining_pct"] == 100.0
+
+        p5_item = all_rows[2]
+        assert p5_item["bucket_id"] == "3p-5h"
+        assert p5_item["bucket_label"] == "3P 5-Hour"
+        assert p5_item["is_weekly"] is False
+        assert p5_item["event_type"] == "top_up"
+        assert p5_item["old_remaining_pct"] == 30.0
+        assert p5_item["new_remaining_pct"] == 55.0
+
+        # Scope = weekly returns only weekly events
+        weekly_only = api_routes.query_quota_resets(conn, tz="America/Chicago", scope="weekly")
+        assert [r["bucket_id"] for r in weekly_only] == ["gemini-weekly"]
+
+        # Scope = 5h returns only 5h events
+        five_h_only = api_routes.query_quota_resets(conn, tz="America/Chicago", scope="5h")
+        assert [r["bucket_id"] for r in five_h_only] == ["gemini-5h", "3p-5h"]
+
+        # Unknown/empty scope falls back to all
+        assert len(api_routes.query_quota_resets(conn, tz="America/Chicago", scope="unknown")) == 3
+
+        # bucket_id & limit filters
+        assert [r["bucket_id"] for r in api_routes.query_quota_resets(conn, bucket_id="3p-5h")] == ["3p-5h"]
+        assert len(api_routes.query_quota_resets(conn, limit=1)) == 1
+
+        # Fallback to detected_at when reset_at is unparseable + fallback bucket_label
+        conn.execute(
+            """
+            INSERT INTO quota_reset_events (
+                bucket_id, group_name, window, event_type, reset_at, detected_at,
+                old_remaining_fraction, new_remaining_fraction, delta_fraction, source
+            ) VALUES (
+                'custom-weekly', 'Custom Group', '', 'early_reset',
+                'invalid-iso', '2026-11-26T02:15:00+00:00',
+                0.2, 1.0, 0.8, 'python'
+            )
+            """
+        )
+        conn.commit()
+        custom_rows = api_routes.query_quota_resets(
+            conn, tz="America/Chicago", bucket_id="custom-weekly"
+        )
+        assert len(custom_rows) == 1
+        assert custom_rows[0]["day"] == "2026-11-25"
+        assert custom_rows[0]["local_time"] == "20:15"
+        assert custom_rows[0]["bucket_label"] == "Custom Weekly"
+        assert custom_rows[0]["is_weekly"] is True
 
 
+def test_api_quota_resets_http_endpoint(test_db: Path):
+    """Verifies GET /api/quota-resets returns HTTP 200 and supports tz, scope, and bucket_id params."""
+    with get_db_connection(test_db) as conn:
+        insert_quota_reset_events(
+            conn,
+            [
+                {
+                    "bucket_id": "gemini-weekly",
+                    "group_name": "Gemini Models",
+                    "window": "weekly",
+                    "event_type": "early_reset",
+                    "reset_at": "2026-11-26T02:15:00+00:00",
+                    "detected_at": "2026-11-26T02:15:00+00:00",
+                    "old_remaining_fraction": 0.40,
+                    "new_remaining_fraction": 1.0,
+                    "delta_fraction": 0.60,
+                    "old_reset_time": "2026-11-30T20:00:00Z",
+                    "new_reset_time": "2026-12-03T02:15:00Z",
+                    "source": "python",
+                },
+                {
+                    "bucket_id": "3p-weekly",
+                    "group_name": "Claude and GPT models",
+                    "window": "weekly",
+                    "event_type": "scheduled",
+                    "reset_at": "2026-11-27T00:00:00+00:00",
+                    "detected_at": "2026-11-27T00:01:00+00:00",
+                    "old_remaining_fraction": 0.10,
+                    "new_remaining_fraction": 1.0,
+                    "delta_fraction": 0.90,
+                    "old_reset_time": "2026-11-27T00:00:00Z",
+                    "new_reset_time": "2026-12-04T00:00:00Z",
+                    "source": "python",
+                },
+                {
+                    "bucket_id": "gemini-5h",
+                    "group_name": "Gemini Models",
+                    "window": "5h",
+                    "event_type": "top_up",
+                    "reset_at": "2026-11-26T15:00:00+00:00",
+                    "detected_at": "2026-11-26T15:00:00+00:00",
+                    "old_remaining_fraction": 0.25,
+                    "new_remaining_fraction": 0.60,
+                    "delta_fraction": 0.35,
+                    "old_reset_time": "2026-11-26T18:00:00Z",
+                    "new_reset_time": "2026-11-26T18:00:00Z",
+                    "source": "sidecar",
+                },
+            ],
+        )
+
+    server.clear_api_cache()
+    with (
+        patch(
+            "context_monitor.dashboard.server.get_db_connection",
+            lambda *args, **kwargs: get_db_connection(test_db),
+        ),
+        patch(
+            "context_monitor.quota.discover_language_server_credentials",
+            return_value=(None, None),
+        ),
+    ):
+        httpd = server.DashboardServer(("127.0.0.1", 0), server.DashboardHTTPHandler)
+        port = httpd.server_address[1]
+        server_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        server_thread.start()
+        base_url = f"http://127.0.0.1:{port}"
+
+        try:
+            with urllib.request.urlopen(
+                f"{base_url}/api/quota-resets?tz=America/Chicago&scope=all", timeout=5
+            ) as resp:
+                assert resp.status == 200
+                all_data = json.loads(resp.read().decode("utf-8"))
+                assert isinstance(all_data, list)
+                assert len(all_data) == 3
+                assert all_data[0]["bucket_id"] == "gemini-weekly"
+                assert all_data[0]["day"] == "2026-11-25"
+                assert all_data[0]["local_time"] == "20:15"
+
+            with urllib.request.urlopen(
+                f"{base_url}/api/quota-resets?tz=America/Chicago&scope=weekly", timeout=5
+            ) as resp:
+                assert resp.status == 200
+                weekly_data = json.loads(resp.read().decode("utf-8"))
+                assert [r["bucket_id"] for r in weekly_data] == ["gemini-weekly", "3p-weekly"]
+                assert weekly_data[1]["bucket_label"] == "3P Weekly"
+
+            with urllib.request.urlopen(
+                f"{base_url}/api/quota-resets?tz=America/Chicago&bucket_id=gemini-5h", timeout=5
+            ) as resp:
+                assert resp.status == 200
+                bucket_data = json.loads(resp.read().decode("utf-8"))
+                assert len(bucket_data) == 1
+                assert bucket_data[0]["event_type"] == "top_up"
+                assert bucket_data[0]["new_remaining_pct"] == 60.0
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            server_thread.join(timeout=2)
 
 
+def test_static_html_export_includes_and_routes_quota_resets_before_quota(
+    test_db: Path, tmp_path: Path
+):
+    """Verifies static bundle embeds quota_resets and window.fetch matches /api/quota-resets before /api/quota."""
+    with get_db_connection(test_db) as conn:
+        insert_quota_reset_events(
+            conn,
+            [
+                {
+                    "bucket_id": "gemini-weekly",
+                    "group_name": "Gemini Models",
+                    "window": "weekly",
+                    "event_type": "early_reset",
+                    "reset_at": "2026-11-26T02:15:00+00:00",
+                    "detected_at": "2026-11-26T02:15:00+00:00",
+                    "old_remaining_fraction": 0.42,
+                    "new_remaining_fraction": 1.0,
+                    "delta_fraction": 0.58,
+                    "old_reset_time": "2026-11-30T20:00:00Z",
+                    "new_reset_time": "2026-12-03T02:15:00Z",
+                    "source": "python",
+                },
+                {
+                    "bucket_id": "gemini-5h",
+                    "group_name": "Gemini Models",
+                    "window": "5h",
+                    "event_type": "scheduled",
+                    "reset_at": "2026-11-26T10:00:00+00:00",
+                    "detected_at": "2026-11-26T10:01:00+00:00",
+                    "old_remaining_fraction": 0.20,
+                    "new_remaining_fraction": 1.0,
+                    "delta_fraction": 0.80,
+                    "old_reset_time": "2026-11-26T10:00:00Z",
+                    "new_reset_time": "2026-11-26T15:00:00Z",
+                    "source": "python",
+                },
+            ],
+        )
+
+    out_file = tmp_path / "standalone_quota_resets.html"
+    with (
+        patch(
+            "context_monitor.dashboard.server.get_db_connection",
+            lambda *args, **kwargs: get_db_connection(test_db),
+        ),
+        patch(
+            "context_monitor.quota.discover_language_server_credentials",
+            return_value=(None, None),
+        ),
+    ):
+        server.export_standalone_html(out_file, tz="America/Chicago")
+
+    assert out_file.exists()
+    html = out_file.read_text(encoding="utf-8")
+    assert '"quota_resets":' in html
+
+    embedded_match = re.search(
+        r"<script>(\s*const IS_STATIC_EXPORT = true;[\s\S]*?)</script>", html
+    )
+    assert embedded_match is not None
+    embedded_js = embedded_match.group(1)
+
+    resets_idx = embedded_js.find("'/api/quota-resets'")
+    quota_idx = embedded_js.find("'/api/quota'")
+    assert resets_idx != -1, "Expected '/api/quota-resets' interception in static fetch shim"
+    assert quota_idx != -1, "Expected '/api/quota' interception in static fetch shim"
+    assert resets_idx < quota_idx, (
+        "'/api/quota-resets' must be intercepted BEFORE '/api/quota' in static fetch shim"
+    )
+
+    embedded_js_json = json.dumps(embedded_js)
+    node_script = f"""
+    const window = {{
+      location: {{ search: '' }},
+      addEventListener: () => {{}},
+      history: {{ pushState: () => {{}} }}
+    }};
+    const evalEmbedded = new Function('window', {embedded_js_json} + '; return {{ STATIC_DATA, IS_STATIC_EXPORT }};');
+    const {{ STATIC_DATA, IS_STATIC_EXPORT }} = evalEmbedded(window);
+
+    (async () => {{
+      if (!Array.isArray(STATIC_DATA.quota_resets) || STATIC_DATA.quota_resets.length !== 2) {{
+        throw new Error('Expected 2 embedded quota_resets in STATIC_DATA');
+      }}
+      const resetsAll = await (await window.fetch('/api/quota-resets')).json();
+      if (!Array.isArray(resetsAll) || resetsAll.length !== 2) {{
+        throw new Error('Expected /api/quota-resets to return array of 2 resets, got ' + JSON.stringify(resetsAll));
+      }}
+      if (resetsAll[0].day !== '2026-11-25' || resetsAll[0].local_time !== '20:15') {{
+        throw new Error('Expected America/Chicago localized reset date/time, got ' + JSON.stringify(resetsAll[0]));
+      }}
+
+      const resetsWeekly = await (await window.fetch('/api/quota-resets?tz=America/Chicago&scope=weekly')).json();
+      if (!Array.isArray(resetsWeekly) || resetsWeekly.length !== 1 || resetsWeekly[0].bucket_id !== 'gemini-weekly') {{
+        throw new Error('Expected scope=weekly filter in static shim, got ' + JSON.stringify(resetsWeekly));
+      }}
+
+      const quotaPayload = await (await window.fetch('/api/quota')).json();
+      if (Array.isArray(quotaPayload) || !quotaPayload['gemini-weekly']) {{
+        throw new Error('Expected /api/quota to still return STATIC_DATA.quota object');
+      }}
+
+      console.log(JSON.stringify({{ status: 'ok', countAll: resetsAll.length, countWeekly: resetsWeekly.length }}));
+    }})().catch(err => {{
+      console.error(err);
+      process.exit(1);
+    }});
+    """
+
+    res = subprocess.run(
+        ["node", "-e", node_script], capture_output=True, text=True, cwd=Path.cwd()
+    )
+    assert res.returncode == 0, f"Node script failed: {res.stderr}\nstdout: {res.stdout}"
+    data = json.loads(res.stdout.strip().splitlines()[-1])
+    assert data["status"] == "ok"
+    assert data["countAll"] == 2
+    assert data["countWeekly"] == 1
+
+
+def test_timeline_reset_toggle_controls_present_in_html():
+    """Verifies #timelineResetGroup toggle controls, responsive wrapping, and default active state in index.html."""
+    dashboard_dir = (
+        Path(__file__).resolve().parent.parent / "src" / "context_monitor" / "dashboard"
+    )
+    html_content = (dashboard_dir / "templates" / "index.html").read_text(
+        encoding="utf-8"
+    )
+    js_content = (dashboard_dir / "static" / "script.js").read_text(encoding="utf-8")
+
+    # Zero polling invariant
+    assert "setInterval" not in js_content
+
+    # Isolate the Token Consumption Velocity card header
+    velocity_section = html_content.split("Token Consumption Velocity")[1].split(
+        'id="timelineChart"'
+    )[0]
+
+    for token in (
+        'id="timelineResetDivider"',
+        'id="timelineResetGroup"',
+        'id="btnResetWeekly"',
+        'id="btnResetAll"',
+        'id="btnResetOff"',
+        "setTimelineResetMode('weekly')",
+        "setTimelineResetMode('all')",
+        "setTimelineResetMode('off')",
+        ">Resets: Wk<",
+        ">All<",
+        ">Off<",
+        "flex-wrap",
+    ):
+        assert token in velocity_section, (
+            f"Expected '{token}' in Token Consumption Velocity header of index.html"
+        )
+
+    # Order: timelineModeGroup -> timelineDivider -> timelineRangeGroup -> timelineResetDivider -> timelineResetGroup
+    range_idx = velocity_section.find('id="timelineRangeGroup"')
+    reset_div_idx = velocity_section.find('id="timelineResetDivider"')
+    reset_grp_idx = velocity_section.find('id="timelineResetGroup"')
+    assert range_idx != -1 and reset_div_idx != -1 and reset_grp_idx != -1
+    assert range_idx < reset_div_idx < reset_grp_idx
+
+    # #btnResetWeekly is active by default; #btnResetAll and #btnResetOff are inactive
+    btn_wk_line = [
+        line for line in velocity_section.splitlines() if 'id="btnResetWeekly"' in line
+    ][0]
+    btn_all_line = [
+        line for line in velocity_section.splitlines() if 'id="btnResetAll"' in line
+    ][0]
+    btn_off_line = [
+        line for line in velocity_section.splitlines() if 'id="btnResetOff"' in line
+    ][0]
+    assert "bg-brand-600" in btn_wk_line and "text-white" in btn_wk_line
+    assert "text-gray-400" in btn_all_line and "bg-brand-600" not in btn_all_line
+    assert "text-gray-400" in btn_off_line and "bg-brand-600" not in btn_off_line
+
+
+def test_js_quota_reset_filtering_grouping_and_tooltips():
+    """Verifies quota reset filtering, grouping, tooltip formatting, plugin drawing/collision handling, toggle state, and fetch/SSE integration."""
+    node_script = r"""
+    const fs = require('fs');
+    const code = fs.readFileSync('src/context_monitor/dashboard/static/script.js', 'utf8');
+
+    const elements = {};
+    const makeMockEl = (id = '') => ({
+      id,
+      textContent: '',
+      value: '',
+      title: '',
+      className: '',
+      style: {},
+      options: [],
+      children: [],
+      innerHTML: '',
+      classList: { add: () => {}, remove: () => {}, contains: () => false },
+      setAttribute: () => {},
+      getAttribute: () => null,
+      querySelector: () => null,
+      querySelectorAll: () => [],
+      appendChild(child) { this.children.push(child); },
+      addEventListener: () => {},
+      removeEventListener: () => {}
+    });
+    const getEl = (id) => {
+      if (id === 'timelineChart') {
+        return elements.timelineChart || (elements.timelineChart = Object.assign(makeMockEl('timelineChart'), { getContext: () => ({}) }));
+      }
+      if (!elements[id]) {
+        elements[id] = makeMockEl(id);
+      }
+      return elements[id];
+    };
+    const mockDocument = {
+      getElementById: getEl,
+      querySelectorAll: () => [],
+      createElement: () => makeMockEl(),
+      addEventListener: () => {}
+    };
+    const mockWindow = {
+      location: { search: '' },
+      addEventListener: () => {},
+      history: { pushState: () => {} }
+    };
+    const registeredPlugins = [];
+    const mockChart = {
+      defaults: { font: {}, elements: {}, plugins: {} },
+      register: (p) => { registeredPlugins.push(p); }
+    };
+
+    const fetchUrls = [];
+    let mockResetsPayload = [
+      {
+        id: 10,
+        bucket_id: 'gemini-weekly',
+        bucket_label: 'Gemini Weekly',
+        window: 'weekly',
+        is_weekly: true,
+        event_type: 'early_reset',
+        reset_at: '2026-11-26T02:15:00+00:00',
+        day: '2026-11-25',
+        local_time: '20:15',
+        old_remaining_pct: 42.5,
+        new_remaining_pct: 100.0
+      },
+      {
+        id: 11,
+        bucket_id: 'gemini-5h',
+        bucket_label: 'Gemini 5-Hour',
+        window: '5h',
+        is_weekly: false,
+        event_type: 'scheduled',
+        reset_at: '2026-11-25T10:00:00+00:00',
+        day: '2026-11-25',
+        local_time: '04:00',
+        old_remaining_pct: 15.0,
+        new_remaining_pct: 100.0
+      },
+      {
+        id: 12,
+        bucket_id: '3p-5h',
+        bucket_label: '3P 5-Hour',
+        window: '5h',
+        is_weekly: false,
+        event_type: 'top_up',
+        reset_at: '2026-11-26T16:30:00+00:00',
+        day: '2026-11-26',
+        local_time: '10:30',
+        old_remaining_pct: 30.0,
+        new_remaining_pct: 55.0
+      }
+    ];
+    let failTimelineFetch = false;
+
+    const mockFetch = async (url) => {
+      const u = String(url || '');
+      fetchUrls.push(u);
+      if (u.includes('/api/quota-resets')) {
+        return { ok: true, status: 200, json: async () => mockResetsPayload };
+      }
+      if (u.includes('/api/timeline')) {
+        if (failTimelineFetch) {
+          return { ok: false, status: 500, json: async () => ({}) };
+        }
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ([
+            { day: '2026-11-24', label: '2026-11-24', tokens: 1000, cost: 1.0, sessions: 1 },
+            { day: '2026-11-25', label: '2026-11-25', tokens: 2000, cost: 2.0, sessions: 2 },
+            { day: '2026-11-26', label: '2026-11-26', tokens: 3000, cost: 3.0, sessions: 3 }
+          ])
+        };
+      }
+      if (u.includes('/api/summary')) {
+        return { ok: true, status: 200, json: async () => ({ models: [], categories: [], phases: [], timezone_label: 'UTC' }) };
+      }
+      if (u.includes('/api/cost-by-project')) {
+        return { ok: true, status: 200, json: async () => ({ total_cost: 0, projects: [] }) };
+      }
+      if (u.includes('/api/activity-matrix')) {
+        return { ok: true, status: 200, json: async () => ({ daily: {}, streak: { current: 0, longest: 0, total_active_days: 0 } }) };
+      }
+      return { ok: true, status: 200, json: async () => [] };
+    };
+
+    const fn = new Function('window', 'document', 'Chart', 'lucide', 'fetch', 'STATIC_DATA', `
+      let capturedConfig = null;
+      ${code.replace(
+        'function upsertChart(existingChart, canvas, config) {',
+        'function upsertChart(existingChart, canvas, config) { if (canvas && canvas.id === "timelineChart") { capturedConfig = config; } return { update: () => {}, config };'
+      )}
+      return {
+        filterQuotaResetsForMode,
+        groupQuotaResetsByDay,
+        formatResetTooltipLines,
+        setTimelineResetMode,
+        quotaResetLinesPlugin,
+        renderTimelineChart,
+        setTimelineRange,
+        fetchDashboardData,
+        handleProjectChange: window.handleProjectChange,
+        getAllQuotaResets: () => allQuotaResets,
+        setAllQuotaResets: (v) => { allQuotaResets = v; },
+        getResetMode: () => currentTimelineResetMode,
+        getConfig: () => capturedConfig,
+        getRegisteredPlugins: () => registeredPlugins
+      };
+    `);
+
+    async function run() {
+      const staticSeed = [
+        {
+          id: 99,
+          bucket_id: '3p-weekly',
+          bucket_label: '3P Weekly',
+          window: 'weekly',
+          is_weekly: true,
+          event_type: 'scheduled',
+          reset_at: '2026-11-24T00:00:00+00:00',
+          day: '2026-11-24',
+          local_time: '00:00',
+          old_remaining_pct: 10.0,
+          new_remaining_pct: 100.0
+        }
+      ];
+      const api = fn(mockWindow, mockDocument, mockChart, { createIcons: () => {} }, mockFetch, {
+        quota_resets: staticSeed,
+        timeline_cycle: [
+          { day: '2026-11-24', label: 'Tue 00:00', tokens: 1000, cost: 1.0, sessions: 1 },
+          { day: '2026-11-25', label: '2026-11-25', tokens: 2000, cost: 2.0, sessions: 2 },
+          { day: '2026-11-26', label: 'Tue 00:00', tokens: 3000, cost: 3.0, sessions: 3 }
+        ]
+      });
+
+      // 1. Registered plugin & window exports
+      if (!api.getRegisteredPlugins().some(p => p && p.id === 'quotaResetLines')) {
+        throw new Error('Expected quotaResetLinesPlugin registered on Chart');
+      }
+      for (const exp of ['setTimelineResetMode', 'filterQuotaResetsForMode', 'groupQuotaResetsByDay', 'formatResetTooltipLines', 'quotaResetLinesPlugin']) {
+        if (!mockWindow[exp]) {
+          throw new Error(`Expected window.${exp} to be exposed`);
+        }
+      }
+      if (api.getAllQuotaResets().length !== 1 || api.getAllQuotaResets()[0].bucket_id !== '3p-weekly') {
+        throw new Error('Expected allQuotaResets initialized from STATIC_DATA.quota_resets');
+      }
+
+      // 2. filterQuotaResetsForMode
+      const sampleEvents = [
+        { bucket_id: 'gemini-weekly', window: 'weekly', is_weekly: true, event_type: 'early_reset', day: '2026-11-25', local_time: '20:15', old_remaining_pct: 42.5, new_remaining_pct: 100 },
+        { bucket_id: 'custom-weekly', window: '', is_weekly: false, event_type: 'scheduled', day: '2026-11-24', local_time: '06:00', old_remaining_pct: 0, new_remaining_pct: 100 },
+        { bucket_id: 'gemini-5h', window: '5h', is_weekly: false, event_type: 'scheduled', day: '2026-11-25', local_time: '04:00', old_remaining_pct: 15, new_remaining_pct: 100 },
+        { bucket_id: '3p-5h', window: '5h', is_weekly: false, event_type: 'top_up', day: '2026-11-26', local_time: '10:30', old_remaining_pct: 30, new_remaining_pct: 55 }
+      ];
+      if (api.filterQuotaResetsForMode(sampleEvents, 'off').length !== 0) {
+        throw new Error('Expected mode=off to return []');
+      }
+      const wkFiltered = api.filterQuotaResetsForMode(sampleEvents, 'weekly');
+      if (wkFiltered.length !== 2 || wkFiltered.some(e => e.bucket_id === 'gemini-5h' || e.bucket_id === '3p-5h')) {
+        throw new Error('Expected mode=weekly to return only weekly events, got ' + JSON.stringify(wkFiltered));
+      }
+      const allFiltered = api.filterQuotaResetsForMode(sampleEvents, 'all');
+      if (allFiltered.length !== 4) {
+        throw new Error('Expected mode=all to return all 4 events');
+      }
+
+      // 3. groupQuotaResetsByDay: chronological sort + priority (early_reset > top_up > scheduled) + out-of-range skip
+      const timelineSlice = [
+        { day: '2026-11-25', tokens: 2000, cost: 2.0, sessions: 2 },
+        { day: '2026-11-26', tokens: 3000, cost: 3.0, sessions: 3 }
+      ];
+      const grouped = api.groupQuotaResetsByDay(sampleEvents, timelineSlice);
+      if (Object.keys(grouped).length !== 2) {
+        throw new Error('Expected 2 grouped days in slice (skipping 2026-11-24), got ' + JSON.stringify(grouped));
+      }
+      const g0 = grouped[0];
+      if (!g0 || g0.dominantType !== 'early_reset' || g0.events.length !== 2) {
+        throw new Error('Expected day index 0 dominantType=early_reset with 2 events, got ' + JSON.stringify(g0));
+      }
+      if (g0.events[0].local_time !== '04:00' || g0.events[1].local_time !== '20:15') {
+        throw new Error('Expected chronological sort within same day (04:00 before 20:15), got ' + JSON.stringify(g0.events));
+      }
+      const g1 = grouped[1];
+      if (!g1 || g1.dominantType !== 'top_up') {
+        throw new Error('Expected day index 1 dominantType=top_up');
+      }
+
+      // Also verify top_up beats scheduled on same day
+      const sameDayTopUp = api.groupQuotaResetsByDay([
+        { bucket_id: 'a', event_type: 'scheduled', day: '2026-11-25', local_time: '01:00' },
+        { bucket_id: 'b', event_type: 'top_up', day: '2026-11-25', local_time: '02:00' }
+      ], timelineSlice);
+      if (sameDayTopUp[0].dominantType !== 'top_up') {
+        throw new Error('Expected top_up (2) to outrank scheduled (1)');
+      }
+
+      // 4. formatResetTooltipLines
+      if (api.formatResetTooltipLines([]).length !== 0 || api.formatResetTooltipLines(null).length !== 0) {
+        throw new Error('Expected empty array for empty input');
+      }
+      const lines = api.formatResetTooltipLines(g0);
+      if (lines.length !== 2) {
+        throw new Error('Expected 2 tooltip lines, got ' + JSON.stringify(lines));
+      }
+      if (!lines[0].includes('Scheduled Reset') || !lines[0].includes('@ 04:00') || !lines[0].includes('(15% → 100%)')) {
+        throw new Error('Unexpected scheduled tooltip line: ' + lines[0]);
+      }
+      if (!lines[1].includes('Early Reset') || !lines[1].includes('@ 20:15') || !lines[1].includes('(42.5% → 100%)')) {
+        throw new Error('Unexpected early_reset tooltip line with fractional pct: ' + lines[1]);
+      }
+      const noTimeLine = api.formatResetTooltipLines([{
+        event_type: 'top_up',
+        bucket_label: '3P 5-Hour',
+        local_time: '',
+        old_remaining_pct: 30,
+        new_remaining_pct: 55
+      }])[0];
+      if (noTimeLine.includes('@') || !noTimeLine.includes('Top-up · 3P 5-Hour (30% → 55%)')) {
+        throw new Error('Expected clean tooltip line without @ when local_time missing: ' + noTimeLine);
+      }
+
+      // 5. Toggle setTimelineResetMode in static/cached mode (0 extra fetches) + button classes + chart config
+      const fetchesBeforeToggle = fetchUrls.length;
+      api.setTimelineResetMode('weekly');
+      let cfg = api.getConfig();
+      if (!cfg || !cfg.options.layout || cfg.options.layout.padding.top !== 18) {
+        throw new Error('Expected layout.padding.top === 18 when reset markers exist');
+      }
+      if (!cfg.options.plugins.quotaResetLines || !cfg.options.plugins.quotaResetLines.eventsByIndex[0]) {
+        throw new Error('Expected quotaResetLines.eventsByIndex[0] populated for 2026-11-24');
+      }
+      const afterBodyFn = cfg.options.plugins.tooltip.callbacks.afterBody;
+      const bar0Extra = afterBodyFn([{ dataIndex: 0 }]);
+      const bar1Extra = afterBodyFn([{ dataIndex: 1 }]);
+      if (!Array.isArray(bar0Extra) || bar0Extra.length !== 1 || !Array.isArray(bar1Extra) || bar1Extra.length !== 0) {
+        throw new Error('Expected tooltip afterBody non-empty only on reset bar');
+      }
+
+      api.setTimelineResetMode('off');
+      if (!getEl('btnResetOff').className.includes('bg-brand-600') || getEl('btnResetWeekly').className.includes('bg-brand-600')) {
+        throw new Error('Expected btnResetOff active and btnResetWeekly inactive');
+      }
+      cfg = api.getConfig();
+      if (cfg.options.layout.padding.top !== 0 || Object.keys(cfg.options.plugins.quotaResetLines.eventsByIndex).length !== 0) {
+        throw new Error('Expected 0 padding and empty eventsByIndex when reset mode is off');
+      }
+      if (fetchUrls.length !== fetchesBeforeToggle) {
+        throw new Error('Expected 0 fetch calls when toggling reset mode with cached timeline');
+      }
+
+      // 6. quotaResetLinesPlugin drawing & collision resolution
+      const drawnLines = [];
+      const drawnPills = [];
+      const mockCtx = {
+        strokeStyle: '',
+        fillStyle: '',
+        lineWidth: 1,
+        font: '',
+        textAlign: '',
+        textBaseline: '',
+        _dash: [],
+        _lastMove: null,
+        _lastLine: null,
+        save() {},
+        restore() {},
+        beginPath() { this._lastMove = null; this._lastLine = null; },
+        closePath() {},
+        setLineDash(d) { this._dash = d.slice(); },
+        moveTo(x, y) { this._lastMove = { x, y }; },
+        lineTo(x, y) { this._lastLine = { x, y }; },
+        stroke() {
+          if (this._lastMove && this._lastLine && this._lastMove.x === this._lastLine.x) {
+            drawnLines.push({ x: this._lastMove.x, dash: this._dash.slice(), color: this.strokeStyle });
+          }
+        },
+        roundRect() {},
+        fill() {},
+        measureText(t) { return { width: String(t).length * 7 }; },
+        fillText(text, x, y) { drawnPills.push({ text, x, y, color: this.fillStyle }); }
+      };
+      const pixelsByIdx = { 0: 22, 1: 120, 2: 132, 3: 320 };
+      api.quotaResetLinesPlugin.afterDatasetsDraw(
+        {
+          ctx: mockCtx,
+          chartArea: { left: 20, right: 340, top: 20, bottom: 220 },
+          scales: { x: { getPixelForValue: (i) => pixelsByIdx[i] } }
+        },
+        {},
+        {
+          eventsByIndex: {
+            0: { index: 0, day: '2026-11-24', events: [{ event_type: 'scheduled' }, { event_type: 'scheduled' }], dominantType: 'scheduled' },
+            1: { index: 1, day: '2026-11-25', events: [{ event_type: 'scheduled' }], dominantType: 'scheduled' },
+            2: { index: 2, day: '2026-11-26', events: [{ event_type: 'early_reset' }], dominantType: 'early_reset' },
+            3: { index: 3, day: '2026-11-27', events: [{ event_type: 'top_up' }], dominantType: 'top_up' }
+          }
+        }
+      );
+
+      // ALL 4 vertical lines must be drawn, even when index 1 pill collides with index 2 pill!
+      if (drawnLines.length !== 4) {
+        throw new Error(`Expected all 4 vertical lines drawn, got ${drawnLines.length}`);
+      }
+      const lineByX = Object.fromEntries(drawnLines.map(l => [l.x, l]));
+      if (JSON.stringify(lineByX[22].dash) !== '[4,4]' || JSON.stringify(lineByX[132].dash) !== '[8,3]' || JSON.stringify(lineByX[320].dash) !== '[2,3]') {
+        throw new Error('Unexpected dash patterns: ' + JSON.stringify(drawnLines));
+      }
+      // Index 1 ('Reset' at x=120) must be skipped because Index 2 ('Early' at x=132) has higher priority
+      if (drawnPills.length !== 3) {
+        throw new Error(`Expected 3 non-colliding pills (index 1 skipped), got ${JSON.stringify(drawnPills)}`);
+      }
+      const pillTexts = drawnPills.map(p => p.text);
+      if (!pillTexts.includes('Reset ×2') || !pillTexts.includes('Early') || !pillTexts.includes('Top-up')) {
+        throw new Error('Unexpected pill labels: ' + JSON.stringify(pillTexts));
+      }
+      // Edge clamping check: index 0 at x=22 (near left=20) must shift right so pill left >= chartArea.left + 2
+      const leftEdgePill = drawnPills.find(p => p.text === 'Reset ×2');
+      if (leftEdgePill.x <= 22) {
+        throw new Error(`Expected left edge pill center clamped right of 22, got ${leftEdgePill.x}`);
+      }
+
+      // 7. fetchDashboardData refreshes quota-resets WITHOUT project param even when project is filtered
+      api.setTimelineResetMode('all');
+      api.handleProjectChange('my-proj', false);
+      await new Promise(r => setTimeout(r, 20));
+      const resetFetch = fetchUrls.find(u => u.includes('/api/quota-resets'));
+      if (!resetFetch || resetFetch.includes('project=')) {
+        throw new Error('Expected /api/quota-resets fetch without project query param, got ' + resetFetch);
+      }
+      if (api.getAllQuotaResets().length !== 3) {
+        throw new Error('Expected allQuotaResets updated from /api/quota-resets fetch');
+      }
+      cfg = api.getConfig();
+      if (Object.keys(cfg.options.plugins.quotaResetLines.eventsByIndex).length !== 2) {
+        throw new Error('Expected 2 reset marker days in active chart after fetchDashboardData');
+      }
+
+      // 8. Independent update when /api/timeline fails but /api/quota-resets succeeds
+      failTimelineFetch = true;
+      mockResetsPayload = [
+        {
+          id: 21,
+          bucket_id: 'gemini-weekly',
+          bucket_label: 'Gemini Weekly',
+          window: 'weekly',
+          is_weekly: true,
+          event_type: 'scheduled',
+          day: '2026-11-24',
+          local_time: '12:00',
+          old_remaining_pct: 5.0,
+          new_remaining_pct: 100.0
+        }
+      ];
+      await api.fetchDashboardData({ source: 'sse' });
+      failTimelineFetch = false;
+      cfg = api.getConfig();
+      const idxMap = cfg.options.plugins.quotaResetLines.eventsByIndex;
+      if (Object.keys(idxMap).length !== 1 || !idxMap[0] || idxMap[0].events[0].id !== 21) {
+        throw new Error('Expected chart resets updated even when timeline fetch failed, got ' + JSON.stringify(idxMap));
+      }
+
+      console.log(JSON.stringify({ status: 'ok', pills: pillTexts, lineCount: drawnLines.length }));
+    }
+
+    run().catch(err => {
+      console.error(err);
+      process.exit(1);
+    });
+    """
+
+    res = subprocess.run(
+        ["node", "-e", node_script], capture_output=True, text=True, cwd=Path.cwd()
+    )
+    assert res.returncode == 0, f"Node script failed: {res.stderr}\nstdout: {res.stdout}"
+    data = json.loads(res.stdout.strip().splitlines()[-1])
+    assert data["status"] == "ok"
+    assert data["lineCount"] == 4
 

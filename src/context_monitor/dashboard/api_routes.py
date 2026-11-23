@@ -8,7 +8,11 @@ from datetime import datetime, timedelta, tzinfo
 from typing import Any, NamedTuple
 from zoneinfo import ZoneInfo
 
-from context_monitor.db import get_quota_state, ensure_rollups_synced
+from context_monitor.db import (
+    ensure_rollups_synced,
+    get_quota_reset_events,
+    get_quota_state,
+)
 from context_monitor.pricing import (
     get_model_context_limit,
     get_model_family,
@@ -322,6 +326,116 @@ def query_quota_data(
         "3p-5h": metrics.get("3p-5h"),
     }
     return res
+
+
+_QUOTA_RESET_BUCKET_LABELS = {
+    "gemini-weekly": "Gemini Weekly",
+    "gemini-5h": "Gemini 5-Hour",
+    "3p-weekly": "3P Weekly",
+    "3p-5h": "3P 5-Hour",
+}
+
+
+def _format_reset_bucket_label(bucket_id: str) -> str:
+    """Maps a quota bucket identifier to a human-friendly display label."""
+    clean = str(bucket_id or "").strip()
+    if not clean:
+        return "Unknown"
+    normalized = clean.lower().replace("_", "-")
+    if normalized in _QUOTA_RESET_BUCKET_LABELS:
+        return _QUOTA_RESET_BUCKET_LABELS[normalized]
+    return clean.replace("-", " ").replace("_", " ").title()
+
+
+def query_quota_resets(
+    conn,
+    tz=None,
+    scope: str = "all",
+    bucket_id: str | None = None,
+    limit: int = 500,
+) -> list[dict]:
+    """Queries recorded quota reset events localized to the target timezone."""
+    if conn is None:
+        return []
+
+    scope_norm = str(scope or "").strip().lower()
+    if scope_norm == "weekly":
+        window_filter: str | None = "weekly"
+    elif scope_norm == "5h":
+        window_filter = "5h"
+    else:
+        window_filter = None
+
+    raw_bucket = str(bucket_id).strip() if bucket_id is not None else ""
+    clean_bucket_id = raw_bucket if raw_bucket and raw_bucket.lower() != "all" else None
+    eff_limit = 500 if limit is None else int(limit)
+
+    try:
+        rows = get_quota_reset_events(
+            conn,
+            bucket_id=clean_bucket_id,
+            window=window_filter,
+            limit=eff_limit,
+        )
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc).lower():
+            return []
+        raise
+
+    target_tz = get_target_tz(tz)
+    results: list[dict] = []
+    for row in rows:
+        bid = str(row.get("bucket_id") or "").strip()
+        win = str(row.get("window") or "").strip()
+        reset_at = str(row.get("reset_at") or "")
+        detected_at = str(row.get("detected_at") or "")
+
+        utc_dt = _to_utc_datetime(reset_at)
+        if utc_dt is None and detected_at:
+            utc_dt = _to_utc_datetime(detected_at)
+
+        if utc_dt is not None:
+            local_dt = utc_dt.astimezone(target_tz)
+            day_str = local_dt.strftime("%Y-%m-%d")
+            local_time_str = local_dt.strftime("%H:%M")
+            local_datetime_str = local_dt.strftime("%Y-%m-%d %H:%M %Z").strip()
+        else:
+            day_str = ""
+            local_time_str = ""
+            local_datetime_str = ""
+
+        raw_old = row.get("old_remaining_fraction")
+        old_rem = float(raw_old) if raw_old is not None else 0.0
+        raw_new = row.get("new_remaining_fraction")
+        new_rem = float(raw_new) if raw_new is not None else 0.0
+        raw_delta = row.get("delta_fraction")
+        delta_frac = float(raw_delta) if raw_delta is not None else (new_rem - old_rem)
+
+        results.append(
+            {
+                "id": row.get("id"),
+                "bucket_id": bid,
+                "bucket_label": _format_reset_bucket_label(bid),
+                "group_name": str(row.get("group_name") or ""),
+                "window": win,
+                "is_weekly": (win.lower() == "weekly") or ("weekly" in bid.lower()),
+                "event_type": str(row.get("event_type") or ""),
+                "reset_at": reset_at,
+                "detected_at": detected_at,
+                "day": day_str,
+                "local_time": local_time_str,
+                "local_datetime": local_datetime_str,
+                "old_remaining_fraction": old_rem,
+                "new_remaining_fraction": new_rem,
+                "delta_fraction": delta_frac,
+                "old_remaining_pct": round(old_rem * 100.0, 1),
+                "new_remaining_pct": round(new_rem * 100.0, 1),
+                "old_reset_time": str(row.get("old_reset_time") or ""),
+                "new_reset_time": str(row.get("new_reset_time") or ""),
+                "source": str(row.get("source") or "python"),
+            }
+        )
+    return results
 
 
 def query_summary_data(conn, tz=None, project=None):
