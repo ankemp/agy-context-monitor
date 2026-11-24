@@ -2646,6 +2646,257 @@ def test_sidecar_bridge_url_fallback_workspace_change_and_sse_reconnect():
     assert case_c["afterRecover"]["liveStale"] is False
 
 
+def test_sidecar_frontend_shared_leader_sse_and_lifecycle_hardening():
+    """Verifies that multiple same-origin sidecar panels multiplex over ONE leader EventSource
+    via Web Locks + BroadcastChannel, hand off leadership cleanly on pagehide, and recover from
+    EventSource.CLOSED (readyState === 2) in direct mode."""
+    import json
+    import subprocess
+
+    node_script = r"""
+    import fs from 'node:fs';
+
+    const code = fs.readFileSync('sidecars/panel/app.js', 'utf8');
+
+    // Shared in-memory BroadcastChannel bus across simulated iframes
+    const channels = new Map();
+    class MockBroadcastChannel {
+      constructor(name) {
+        this.name = name;
+        this.listeners = [];
+        this.closed = false;
+        if (!channels.has(name)) channels.set(name, new Set());
+        channels.get(name).add(this);
+      }
+      addEventListener(type, fn) {
+        if (type === 'message') this.listeners.push(fn);
+      }
+      postMessage(data) {
+        if (this.closed) return;
+        for (const peer of channels.get(this.name) || []) {
+          if (peer !== this && !peer.closed) {
+            for (const fn of peer.listeners) fn({ data });
+          }
+        }
+      }
+      close() {
+        this.closed = true;
+        channels.get(this.name)?.delete(this);
+      }
+    }
+
+    // Shared in-memory Web Locks manager (exclusive queue per lock name)
+    const lockQueues = new Map();
+    const lockHeld = new Map();
+    function createMockLocks() {
+      return {
+        request(name, optsOrCb, maybeCb) {
+          const cb = typeof optsOrCb === 'function' ? optsOrCb : maybeCb;
+          const opts = typeof optsOrCb === 'function' ? {} : (optsOrCb || {});
+          return new Promise((resolve, reject) => {
+            const entry = { cb, opts, resolve, reject, aborted: false };
+            if (opts.signal) {
+              opts.signal.addEventListener('abort', () => {
+                entry.aborted = true;
+                reject(new Error('AbortError'));
+              });
+            }
+            if (!lockQueues.has(name)) lockQueues.set(name, []);
+            lockQueues.get(name).push(entry);
+            drain(name);
+          });
+        }
+      };
+    }
+    function drain(name) {
+      if (lockHeld.get(name)) return;
+      const q = lockQueues.get(name) || [];
+      while (q.length > 0) {
+        const next = q.shift();
+        if (next.aborted) continue;
+        lockHeld.set(name, true);
+        Promise.resolve()
+          .then(() => next.cb({ name }))
+          .then((v) => {
+            lockHeld.set(name, false);
+            next.resolve(v);
+            drain(name);
+          })
+          .catch((err) => {
+            lockHeld.set(name, false);
+            next.reject(err);
+            drain(name);
+          });
+        return;
+      }
+    }
+
+    class MockEventSource {
+      static instances = [];
+      constructor(url) {
+        this.url = url;
+        this.listeners = {};
+        this.readyState = 1;
+        this.closed = false;
+        this.onerror = null;
+        MockEventSource.instances.push(this);
+      }
+      addEventListener(event, fn) {
+        if (!this.listeners[event]) this.listeners[event] = [];
+        this.listeners[event].push(fn);
+      }
+      emit(event, data) {
+        for (const fn of (this.listeners[event] || [])) {
+          fn({ data: JSON.stringify(data) });
+        }
+      }
+      close() {
+        this.closed = true;
+        this.readyState = 2;
+      }
+    }
+
+    function createPanel(cid, { enableShared = true } = {}) {
+      let fetchCount = 0;
+      const winListeners = {};
+      const docListeners = {};
+      const makeEl = () => ({
+        textContent: '',
+        className: '',
+        hidden: false,
+        innerHTML: '',
+        style: {},
+        classList: { add() {}, remove() {}, toggle() {}, contains() { return false; } },
+        setAttribute() {},
+        getAttribute() { return null; },
+        addEventListener() {},
+        appendChild() {},
+      });
+      const els = {};
+      const mockDocument = {
+        getElementById: (id) => (els[id] ||= makeEl()),
+        createElement: () => makeEl(),
+        documentElement: { style: { setProperty() {} } },
+        addEventListener: (ev, fn) => { (docListeners[ev] ||= []).push(fn); },
+        readyState: 'complete',
+        hidden: false,
+      };
+      const mockWindow = {
+        EventSource: MockEventSource,
+        location: { search: '?token=tok1' },
+        addEventListener: (ev, fn) => { (winListeners[ev] ||= []).push(fn); },
+        sidecar: {
+          conversationId: cid,
+          fetch: async () => {
+            fetchCount++;
+            return {
+              ok: true,
+              json: async () => ({
+                cid,
+                model_name: 'Gemini 4 Neon',
+                billed_cost: 0.1,
+                pct: 10,
+                active_tokens: 100000,
+                max_tokens: 1000000,
+                categories: [],
+                top_steps: [],
+              }),
+            };
+          },
+        },
+      };
+      if (enableShared) {
+        mockWindow.BroadcastChannel = MockBroadcastChannel;
+        mockWindow.navigator = { locks: createMockLocks() };
+      }
+
+      const fn = new Function('window', 'document', 'EventSource', 'fetch', code);
+      fn(mockWindow, mockDocument, MockEventSource, mockWindow.sidecar.fetch);
+
+      return {
+        get fetchCount() { return fetchCount; },
+        fireWindow(ev) {
+          for (const l of (winListeners[ev] || [])) l();
+        },
+        fireDoc(ev) {
+          for (const l of (docListeners[ev] || [])) l();
+        },
+        mockDocument,
+      };
+    }
+
+    // 1. Mount TWO panels on the same origin -> must open ONLY 1 shared EventSource
+    const p1 = createPanel('conv-a', { enableShared: true });
+    const p2 = createPanel('conv-b', { enableShared: true });
+    await new Promise((r) => setTimeout(r, 60));
+
+    const esCountWithTwoPanels = MockEventSource.instances.length;
+    const p1FetchesBeforeUpdate = p1.fetchCount;
+    const p2FetchesBeforeUpdate = p2.fetchCount;
+
+    // 2. Single leader SSE update must broadcast and refresh BOTH panels
+    const leaderEs = MockEventSource.instances[0];
+    leaderEs.emit('update', { timestamp: new Date().toISOString() });
+    await new Promise((r) => setTimeout(r, 60));
+    const p1FetchesAfterUpdate = p1.fetchCount;
+    const p2FetchesAfterUpdate = p2.fetchCount;
+
+    // 3. Unload leader (pagehide) -> closes leader ES and hands leadership to p2
+    p1.fireWindow('pagehide');
+    await new Promise((r) => setTimeout(r, 60));
+    const leaderClosedOnUnload = leaderEs.closed;
+    const esCountAfterHandoff = MockEventSource.instances.length;
+    const newLeaderEs = MockEventSource.instances[1];
+    const newLeaderOpen = Boolean(newLeaderEs && !newLeaderEs.closed);
+    p2.fireWindow('pagehide');
+
+    // 4. Direct mode: CLOSED EventSource (readyState=2) must recover on reconnect & close on pagehide
+    const directStartCount = MockEventSource.instances.length;
+    const p3 = createPanel('conv-direct', { enableShared: false });
+    await new Promise((r) => setTimeout(r, 60));
+    const directEs1 = MockEventSource.instances[directStartCount];
+    directEs1.readyState = 2;
+    if (typeof directEs1.onerror === 'function') directEs1.onerror();
+    // Simulate visibility toggle or reconnect attempt -> should open a new EventSource
+    p3.fireDoc('visibilitychange');
+    await new Promise((r) => setTimeout(r, 40));
+    const directReconnected = MockEventSource.instances.length === directStartCount + 2;
+    const directEs2 = MockEventSource.instances[MockEventSource.instances.length - 1];
+    p3.fireWindow('pagehide');
+    const directClosedOnPagehide = directEs2.closed;
+
+    console.log(JSON.stringify({
+      esCountWithTwoPanels,
+      p1Delta: p1FetchesAfterUpdate - p1FetchesBeforeUpdate,
+      p2Delta: p2FetchesAfterUpdate - p2FetchesBeforeUpdate,
+      leaderClosedOnUnload,
+      esCountAfterHandoff,
+      newLeaderOpen,
+      directReconnected,
+      directClosedOnPagehide,
+    }));
+    """
+
+    res = subprocess.run(
+        ["node", "--input-type=module", "-e", node_script],
+        capture_output=True,
+        text=True,
+        cwd=Path.cwd(),
+    )
+    assert res.returncode == 0, f"Node script failed: {res.stderr}\nStdout: {res.stdout}"
+    data = json.loads(res.stdout)
+
+    assert data["esCountWithTwoPanels"] == 1
+    assert data["p1Delta"] >= 1
+    assert data["p2Delta"] >= 1
+    assert data["leaderClosedOnUnload"] is True
+    assert data["esCountAfterHandoff"] == 2
+    assert data["newLeaderOpen"] is True
+    assert data["directReconnected"] is True
+    assert data["directClosedOnPagehide"] is True
+
+
+
 
 
 

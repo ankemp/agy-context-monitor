@@ -1932,6 +1932,132 @@ def test_sidecar_ls_quota_sync_and_expired_fallback(tmp_path):
     assert fresh["calibrated_weekly_capacity"] == 500.0
 
 
+def test_sse_hub_max_clients_eviction_and_dead_client_cleanup():
+    """Verifies SSE hub caps concurrent clients (preventing Chromium 6-conn HTTP/1.1 starvation),
+    evicts dead clients on write failure, and guards malformed URLs in attachSseRoute."""
+    node_code = r"""
+    import { EventEmitter } from 'node:events';
+    import { createSseHub, attachSseRoute } from './sidecars/panel/sse.mjs';
+
+    let fpVersion = 1;
+    const hub = createSseHub({
+      getDb: () => ({}),
+      getFingerprint: () => `fp-${fpVersion}`,
+      onCacheInvalidate: () => {},
+      checkIntervalMs: 60000,
+      heartbeatMs: 60000,
+      maxClients: 2,
+      dbPath: null,
+    });
+
+    function makeMockReqRes({ failOnWrite = false } = {}) {
+      const req = new EventEmitter();
+      req.method = 'GET';
+      req.url = '/api/events';
+      req.timeoutSet = null;
+      req.setTimeout = (ms) => { req.timeoutSet = ms; };
+
+      const res = new EventEmitter();
+      res.writable = true;
+      res.writableEnded = false;
+      res.timeoutSet = null;
+      res.writes = [];
+      res.ended = false;
+      res.setTimeout = (ms) => { res.timeoutSet = ms; };
+      res.writeHead = () => {};
+      res.write = (chunk) => {
+        if (failOnWrite && res.writes.length >= 1) {
+          throw new Error('EPIPE');
+        }
+        res.writes.push(chunk);
+        return true;
+      };
+      res.end = () => {
+        res.ended = true;
+        res.writableEnded = true;
+        res.writable = false;
+      };
+      return { req, res };
+    }
+
+    const c1 = makeMockReqRes();
+    const c2 = makeMockReqRes();
+    const c3 = makeMockReqRes({ failOnWrite: true });
+
+    hub.handleRequest(c1.req, c1.res, new URL('http://127.0.0.1/api/events'));
+    hub.handleRequest(c2.req, c2.res, new URL('http://127.0.0.1/api/events'));
+    const countAtCap = hub.activeClientCount;
+
+    // 3rd client must evict oldest (c1) so activeClientCount never exceeds maxClients=2
+    hub.handleRequest(c3.req, c3.res, new URL('http://127.0.0.1/api/events'));
+    const countAfterEvict = hub.activeClientCount;
+    const c1EndedOnEvict = c1.res.ended;
+    const c2StillOpen = !c2.res.ended;
+
+    // Trigger fingerprint change: c3 fails write (EPIPE) and must be evicted automatically
+    fpVersion = 2;
+    await hub.checkChanges();
+    const countAfterWriteFailure = hub.activeClientCount;
+    const c3EndedOnFailure = c3.res.ended;
+
+    // Close remaining c2 -> watcher stops
+    c2.req.emit('close');
+    const countAfterAllClosed = hub.activeClientCount;
+    const watcherRunningAfterAllClosed = hub.isWatcherRunning;
+
+    // Verify attachSseRoute guards malformed req.url without throwing
+    const fakeServer = new EventEmitter();
+    let fallbackCalled = false;
+    fakeServer.on('request', () => { fallbackCalled = true; });
+    attachSseRoute(fakeServer, hub);
+    let malformedThrew = false;
+    try {
+      fakeServer.emit('request', { url: 'http://[::1', method: 'GET' }, {});
+    } catch {
+      malformedThrew = true;
+    }
+
+    hub.close();
+
+    console.log(JSON.stringify({
+      countAtCap,
+      countAfterEvict,
+      c1EndedOnEvict,
+      c2StillOpen,
+      countAfterWriteFailure,
+      c3EndedOnFailure,
+      countAfterAllClosed,
+      watcherRunningAfterAllClosed,
+      reqTimeoutSet: c1.req.timeoutSet,
+      resTimeoutSet: c1.res.timeoutSet,
+      malformedThrew,
+      fallbackCalled,
+    }));
+    """
+    res = subprocess.run(
+        ["node", "--input-type=module", "-e", node_code],
+        capture_output=True,
+        text=True,
+        cwd=Path.cwd(),
+    )
+    assert res.returncode == 0, f"Node script failed: {res.stderr}\nStdout: {res.stdout}"
+    data = json.loads(res.stdout)
+
+    assert data["countAtCap"] == 2
+    assert data["countAfterEvict"] == 2
+    assert data["c1EndedOnEvict"] is True
+    assert data["c2StillOpen"] is True
+    assert data["countAfterWriteFailure"] == 1
+    assert data["c3EndedOnFailure"] is True
+    assert data["countAfterAllClosed"] == 0
+    assert data["watcherRunningAfterAllClosed"] is False
+    assert data["reqTimeoutSet"] == 0
+    assert data["resTimeoutSet"] == 0
+    assert data["malformedThrew"] is False
+    assert data["fallbackCalled"] is True
+
+
+
 
 
 

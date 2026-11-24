@@ -64,8 +64,9 @@ function startEventDrivenQuotaSync() {
   const walBase = `${dbBase}-wal`;
   let debounceTimer = null;
 
+  let watcher = null;
   try {
-    const watcher = watch(targetDir, (_eventType, filename) => {
+    watcher = watch(targetDir, (_eventType, filename) => {
       if (filename && filename !== dbBase && filename !== walBase) {
         return;
       }
@@ -76,10 +77,22 @@ function startEventDrivenQuotaSync() {
       }, 500);
       debounceTimer.unref?.();
     });
+    watcher.on('error', () => {});
     watcher.unref?.();
   } catch {
     // Directory may not exist yet; /api/session and /api/global still sync on demand.
   }
+
+  return () => {
+    if (debounceTimer) {
+      clearTimeout(debounceTimer);
+      debounceTimer = null;
+    }
+    try {
+      watcher?.close();
+    } catch {}
+    watcher = null;
+  };
 }
 
 const sseHub = createSseHub({
@@ -175,9 +188,18 @@ async function startHostRuntime() {
   app.api('/api/session', async (data) => getSessionPayload(data?.cid, data?.inspect_cid), 'GET');
   app.api('/api/global', async () => getGlobalPayload(), 'GET');
 
-  startEventDrivenQuotaSync();
+  const stopQuotaSync = startEventDrivenQuotaSync();
   const server = await app.run();
   attachSseRoute(server, sseHub);
+
+  const shutdown = () => {
+    stopQuotaSync();
+    sseHub.close();
+    server.closeAllConnections?.();
+    server.close(() => process.exit(0));
+  };
+  process.once('SIGINT', shutdown);
+  process.once('SIGTERM', shutdown);
 }
 
 async function startStandaloneServer() {

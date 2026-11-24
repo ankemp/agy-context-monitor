@@ -30,19 +30,27 @@ class SseClient {
   }
 
   sendComment(comment) {
-    if (!this.res.writableEnded && this.res.writable) {
-      try {
-        this.res.write(`: ${comment}\n\n`);
-      } catch {}
+    if (this.res.writableEnded || !this.res.writable) {
+      return false;
+    }
+    try {
+      this.res.write(`: ${comment}\n\n`);
+      return true;
+    } catch {
+      return false;
     }
   }
 
   sendEvent(eventName, payload) {
-    if (!this.res.writableEnded && this.res.writable) {
-      try {
-        const dataStr = typeof payload === 'string' ? payload : JSON.stringify(payload);
-        this.res.write(`event: ${eventName}\ndata: ${dataStr}\n\n`);
-      } catch {}
+    if (this.res.writableEnded || !this.res.writable) {
+      return false;
+    }
+    try {
+      const dataStr = typeof payload === 'string' ? payload : JSON.stringify(payload);
+      this.res.write(`event: ${eventName}\ndata: ${dataStr}\n\n`);
+      return true;
+    } catch {
+      return false;
     }
   }
 
@@ -63,6 +71,7 @@ export function createSseHub(options = {}) {
     checkIntervalMs = 500,
     settleWindowMs = 300,
     heartbeatMs = 25000,
+    maxClients = 3,
     dbPath = getDefaultDbPath(),
   } = options;
 
@@ -100,9 +109,20 @@ export function createSseHub(options = {}) {
     }
   }
 
+  function removeClient(client) {
+    if (!clients.has(client)) return;
+    clients.delete(client);
+    if (clients.size === 0) {
+      stopWatcher();
+    }
+  }
+
   function sendHeartbeat() {
-    for (const client of clients) {
-      client.sendComment('ping');
+    for (const client of Array.from(clients)) {
+      if (!client.sendComment('ping')) {
+        removeClient(client);
+        client.close();
+      }
     }
   }
 
@@ -159,11 +179,15 @@ export function createSseHub(options = {}) {
         for (const client of groupClients) {
           if (client.lastFingerprint !== currentFp) {
             client.lastFingerprint = currentFp;
-            client.sendEvent('update', {
+            const ok = client.sendEvent('update', {
               cid: client.cid,
               inspect_cid: client.inspectCid,
               timestamp: new Date().toISOString(),
             });
+            if (!ok) {
+              removeClient(client);
+              client.close();
+            }
           }
         }
       }
@@ -177,6 +201,18 @@ export function createSseHub(options = {}) {
       res.writeHead(405, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'Method Not Allowed' }));
       return;
+    }
+
+    if (typeof req.setTimeout === 'function') req.setTimeout(0);
+    if (typeof res.setTimeout === 'function') res.setTimeout(0);
+
+    // Cap concurrent SSE streams well below Chromium's 6-connection-per-origin HTTP/1.1 limit
+    // so HTML/JS/CSS and /api/* requests can never be starved by accumulated sidecar tabs.
+    while (maxClients > 0 && clients.size >= maxClients) {
+      const oldest = clients.values().next().value;
+      if (!oldest) break;
+      removeClient(oldest);
+      oldest.close();
     }
 
     res.writeHead(200, {
@@ -216,11 +252,7 @@ export function createSseHub(options = {}) {
     }
 
     const cleanup = () => {
-      if (!clients.has(client)) return;
-      clients.delete(client);
-      if (clients.size === 0) {
-        stopWatcher();
-      }
+      removeClient(client);
     };
 
     req.on('close', cleanup);
@@ -253,8 +285,13 @@ export function attachSseRoute(server, hub) {
   const existingListeners = server.listeners('request').slice();
   server.removeAllListeners('request');
   server.on('request', (req, res) => {
-    const url = new URL(req.url, 'http://127.0.0.1');
-    if (url.pathname === '/api/events') {
+    let url = null;
+    try {
+      url = new URL(req.url || '/', 'http://127.0.0.1');
+    } catch {
+      url = null;
+    }
+    if (url && url.pathname === '/api/events') {
       hub.handleRequest(req, res, url);
       return;
     }

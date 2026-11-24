@@ -6,10 +6,18 @@
 const sidecar = window.sidecar;
 const $ = (id) => document.getElementById(id);
 
+const SSE_CHANNEL_NAME = 'context-monitor-sse-v1';
+const SSE_LEADER_LOCK_NAME = 'context-monitor-sse-leader-v1';
+const API_FETCH_TIMEOUT_MS = 10000;
+
 let isInitialized = false;
 let pageLoaded = (typeof document === 'undefined' || document.readyState === 'complete');
 let eventSource = null;
 let streamKey = null;
+let sseChannel = null;
+let leaderLockRelease = null;
+let leaderLockAbort = null;
+let leaderElectionActive = false;
 let isRefreshing = false;
 let pendingRefresh = false;
 let activeQuota = null;
@@ -226,11 +234,32 @@ async function callApi(path) {
     ? sidecar.fetch.bind(sidecar)
     : fetch;
 
-  const res = await fetchFn(path);
-  if (!res.ok) {
-    throw new Error(`API returned HTTP ${res.status}`);
+  const AbortControllerCtor =
+    (typeof window !== 'undefined' && window.AbortController) ||
+    (typeof AbortController !== 'undefined' ? AbortController : null);
+  const controller = AbortControllerCtor ? new AbortControllerCtor() : null;
+  let timeoutId = null;
+  if (controller) {
+    timeoutId = setTimeout(() => {
+      try {
+        controller.abort();
+      } catch {}
+    }, API_FETCH_TIMEOUT_MS);
   }
-  return res.json();
+
+  try {
+    const res = controller
+      ? await fetchFn(path, { signal: controller.signal })
+      : await fetchFn(path);
+    if (!res.ok) {
+      throw new Error(`API returned HTTP ${res.status}`);
+    }
+    return res.json();
+  } finally {
+    if (timeoutId !== null) {
+      clearTimeout(timeoutId);
+    }
+  }
 }
 
 async function fetchSessionData(cid, inspectCid = null) {
@@ -601,40 +630,61 @@ function renderFleetCard(fleet) {
   }
 }
 
-function closeEventStream() {
-  if (eventSource) {
-    try {
-      eventSource.close();
-    } catch {}
-    eventSource = null;
-  }
-  streamKey = null;
+function getSharedSseApis() {
+  if (typeof window === 'undefined' || !window) return null;
+  const BcCtor = typeof window.BroadcastChannel === 'function' ? window.BroadcastChannel : null;
+  const locks =
+    window.navigator &&
+    window.navigator.locks &&
+    typeof window.navigator.locks.request === 'function'
+      ? window.navigator.locks
+      : null;
+  if (!BcCtor || !locks) return null;
+  return { BcCtor, locks };
 }
 
-function connectEventStream() {
-  if (typeof document !== 'undefined' && document.hidden) return;
-  if (!pageLoaded) return;
-
-  const cid = getCurrentConversationId();
-  const currentKey = `${cid || ''}::${inspectedCid || ''}`;
-
-  if (eventSource && streamKey === currentKey) {
-    return;
+function ensureSseChannel(BcCtor) {
+  if (sseChannel) return sseChannel;
+  try {
+    sseChannel = new BcCtor(SSE_CHANNEL_NAME);
+    const onMessage = (ev) => {
+      const msg = ev && ev.data ? ev.data : ev;
+      if (msg && msg.type === 'update') {
+        refreshTelemetry();
+      }
+    };
+    if (typeof sseChannel.addEventListener === 'function') {
+      sseChannel.addEventListener('message', onMessage);
+    } else {
+      sseChannel.onmessage = onMessage;
+    }
+  } catch {
+    sseChannel = null;
   }
+  return sseChannel;
+}
 
-  closeEventStream();
-
-  const EventSourceCtor =
-    (typeof window !== 'undefined' && window.EventSource) ||
-    (typeof EventSource !== 'undefined' ? EventSource : null);
-
-  if (!EventSourceCtor) {
-    return;
+function releaseLeaderLock() {
+  if (leaderLockAbort) {
+    try {
+      leaderLockAbort.abort();
+    } catch {}
+    leaderLockAbort = null;
   }
+  if (leaderLockRelease) {
+    const release = leaderLockRelease;
+    leaderLockRelease = null;
+    try {
+      release();
+    } catch {}
+  }
+  leaderElectionActive = false;
+}
 
+function buildSseUrl(cid, inspectCidVal) {
   const params = new URLSearchParams();
   if (cid) params.set('cid', cid);
-  if (inspectedCid) params.set('inspect_cid', inspectedCid);
+  if (inspectCidVal) params.set('inspect_cid', inspectCidVal);
 
   if (
     typeof window !== 'undefined' &&
@@ -648,20 +698,56 @@ function connectEventStream() {
   }
 
   const queryStr = params.toString();
-  const sseUrl = `/api/events${queryStr ? '?' + queryStr : ''}`;
+  return `/api/events${queryStr ? '?' + queryStr : ''}`;
+}
+
+function closeEventStream({ releaseLeadership = true } = {}) {
+  if (eventSource) {
+    try {
+      eventSource.close();
+    } catch {}
+    eventSource = null;
+  }
+  streamKey = null;
+  if (releaseLeadership) {
+    releaseLeaderLock();
+  }
+}
+
+function openDirectEventSource(sseUrl, key, { broadcastUpdates = false } = {}) {
+  const EventSourceCtor =
+    (typeof window !== 'undefined' && window.EventSource) ||
+    (typeof EventSource !== 'undefined' ? EventSource : null);
+
+  if (!EventSourceCtor) {
+    return;
+  }
 
   try {
     const es = new EventSourceCtor(sseUrl);
     eventSource = es;
-    streamKey = currentKey;
+    streamKey = key;
 
     const handleIncomingUpdate = () => {
+      if (broadcastUpdates && sseChannel) {
+        try {
+          sseChannel.postMessage({ type: 'update', timestamp: Date.now() });
+        } catch {}
+      }
       refreshTelemetry();
     };
 
     es.addEventListener('update', handleIncomingUpdate);
     es.addEventListener('message', handleIncomingUpdate);
     es.onerror = () => {
+      // If the browser permanently closed the stream (readyState === CLOSED / 2),
+      // clear the reference so subsequent connectEventStream() calls can recover.
+      if (es.readyState === 2) {
+        if (eventSource === es) {
+          eventSource = null;
+          streamKey = null;
+        }
+      }
       // EventSource automatically reconnects per SSE specification
       const statusBadge = $('status-badge');
       if (statusBadge) {
@@ -673,6 +759,69 @@ function connectEventStream() {
   } catch (err) {
     console.warn('[app.js] Failed to connect EventSource:', err);
   }
+}
+
+function connectEventStream() {
+  if (typeof document !== 'undefined' && document.hidden) return;
+  if (!pageLoaded) return;
+
+  // Multiplex all same-origin sidecar iframes over a single leader SSE connection
+  // via Web Locks + BroadcastChannel so accumulated Hub tabs never exhaust Chromium's
+  // 6-connection-per-origin HTTP/1.1 pool.
+  const sharedApis = getSharedSseApis();
+  if (sharedApis) {
+    ensureSseChannel(sharedApis.BcCtor);
+    if (leaderLockRelease) {
+      if (!eventSource || eventSource.readyState === 2) {
+        openDirectEventSource(buildSseUrl(null, null), '__shared_leader__', { broadcastUpdates: true });
+      }
+      return;
+    }
+    if (leaderElectionActive) {
+      return;
+    }
+
+    leaderElectionActive = true;
+    const AbortControllerCtor =
+      (typeof window !== 'undefined' && window.AbortController) ||
+      (typeof AbortController !== 'undefined' ? AbortController : null);
+    const abortCtrl = AbortControllerCtor ? new AbortControllerCtor() : null;
+    leaderLockAbort = abortCtrl;
+
+    const lockOpts = abortCtrl ? { signal: abortCtrl.signal } : {};
+    Promise.resolve(
+      sharedApis.locks.request(SSE_LEADER_LOCK_NAME, lockOpts, () => {
+        leaderLockAbort = null;
+        if (typeof document !== 'undefined' && document.hidden) {
+          leaderElectionActive = false;
+          return Promise.resolve();
+        }
+        return new Promise((resolve) => {
+          leaderLockRelease = () => {
+            leaderLockRelease = null;
+            leaderElectionActive = false;
+            resolve();
+          };
+          openDirectEventSource(buildSseUrl(null, null), '__shared_leader__', { broadcastUpdates: true });
+        });
+      })
+    ).catch(() => {
+      leaderLockAbort = null;
+      leaderLockRelease = null;
+      leaderElectionActive = false;
+    });
+    return;
+  }
+
+  const cid = getCurrentConversationId();
+  const currentKey = `${cid || ''}::${inspectedCid || ''}`;
+
+  if (eventSource && streamKey === currentKey && eventSource.readyState !== 2) {
+    return;
+  }
+
+  closeEventStream({ releaseLeadership: false });
+  openDirectEventSource(buildSseUrl(cid, inspectedCid), currentKey, { broadcastUpdates: false });
 }
 
 function selectFleetNode(nodeId) {
@@ -993,6 +1142,21 @@ function init() {
       refreshTelemetry();
     }
   });
+
+  // Always tear down EventSource and BroadcastChannel on iframe unload/navigation
+  if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+    const handleUnload = () => {
+      closeEventStream({ releaseLeadership: true });
+      if (sseChannel) {
+        try {
+          sseChannel.close();
+        } catch {}
+        sseChannel = null;
+      }
+    };
+    window.addEventListener('pagehide', handleUnload);
+    window.addEventListener('beforeunload', handleUnload);
+  }
 
   // Initial fetch; defer opening the long-lived SSE stream until window load
   // so Chromium/Electron iframes finish their load event immediately.
